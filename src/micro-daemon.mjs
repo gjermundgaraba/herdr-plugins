@@ -19,6 +19,7 @@ import {
   slotLighting,
 } from "./micro-protocol.mjs";
 import { reviewPrompt } from "./review-prompt.mjs";
+import { submitArgs } from "./submit.mjs";
 
 const run = promisify(execFile);
 const herdrBin = process.env.HERDR_BIN_PATH ?? "herdr";
@@ -34,6 +35,7 @@ let stopping = false;
 let effortBusy = false;
 let promptBusy = false;
 let diffBusy = false;
+let submitBusy = false;
 let lastLighting = "";
 let lastFocusedApp = "";
 let lastOpenError = "";
@@ -204,6 +206,21 @@ async function openDiff() {
   }
 }
 
+async function submitFocusedAgent() {
+  if (submitBusy) return;
+  submitBusy = true;
+  try {
+    const current = (await listAgents()).find((agent) => agent.focused);
+    if (!current) throw new Error("no focused Herdr agent");
+    await run(herdrBin, submitArgs(current));
+    log(`submit: ${current.agent} in ${current.pane_id}`);
+  } catch (error) {
+    log(`submit failed: ${error.message}`);
+  } finally {
+    submitBusy = false;
+  }
+}
+
 function onDeviceEvent(event) {
   if (event.type !== "key") return;
   const match = /^AG0([0-5])$/.exec(event.key);
@@ -218,6 +235,8 @@ function onDeviceEvent(event) {
     void submitReviewPrompt();
   } else if (event.key === "ACT07" && event.action === 1) {
     void openDiff();
+  } else if (event.key === "ACT12" && event.action === 1) {
+    void submitFocusedAgent();
   }
 }
 

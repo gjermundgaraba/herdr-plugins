@@ -16,6 +16,7 @@ import {
   slotLighting,
 } from "../src/micro-protocol.mjs";
 import { reviewPrompt } from "../src/review-prompt.mjs";
+import { submitArgs } from "../src/submit.mjs";
 
 const agent = (id, status, seq = 0) => ({
   terminal_id: id,
@@ -99,6 +100,16 @@ test("opens Hunk in the focused agent's repository", () => {
     ],
   );
   assert.throws(() => diffPaneArgs({}), /no repository context/);
+});
+
+test("submits one Enter to the focused agent", () => {
+  assert.deepEqual(submitArgs({ pane_id: "w1:p2" }), [
+    "agent",
+    "send-keys",
+    "w1:p2",
+    "enter",
+  ]);
+  assert.throws(() => submitArgs({}), /no pane/);
 });
 
 test("Codex owns the device only while it is frontmost", () => {
