@@ -1,0 +1,62 @@
+# herdr-history
+
+Vim-style back/forward focus history for [Herdr](https://herdr.dev): jump through
+previously focused panes across tabs and workspaces, like vim's `ctrl+o` / `ctrl+i`
+jumplist or browser back/forward. New navigation after going back truncates the
+forward branch, closed panes are pruned automatically, and hitting either end of
+the history shows a toast.
+
+Unlike the native `keys.last_pane` (a 1-deep toggle), this keeps a 100-entry stack.
+
+## Install
+
+```sh
+herdr plugin install gjermundgaraba/herdr-plugins/history
+```
+
+Or for local development:
+
+```sh
+herdr plugin link /path/to/herdr-plugins/history
+```
+
+Then bind keys in `~/.config/herdr/config.toml` (there is no plugin key registration
+in Herdr's plugin API v1). `prefix+o` is Herdr's default `open_notification_target`,
+so free it first — a conflicting `[[keys.command]]` is silently disabled otherwise:
+
+```toml
+open_notification_target = ""
+
+[[keys.command]]
+key = "prefix+o"
+type = "plugin_action"
+command = "gjermundgaraba.herdr-history.back"
+description = "History back"
+
+[[keys.command]]
+key = "prefix+i"
+type = "plugin_action"
+command = "gjermundgaraba.herdr-history.forward"
+description = "History forward"
+```
+
+Reload with `herdr server reload-config`. Requires Herdr >= 0.7.5 and `node` on PATH.
+
+## How it works
+
+A `pane.focused` event hook records pane ids into a locked JSON file under
+`HERDR_PLUGIN_STATE_DIR`; back/forward call the socket method `pane.focus`, which
+switches workspace and tab automatically. Focus events caused by the plugin's own
+jumps carry no origin marker, so each jump pre-registers its target as an expected
+"echo" that the next record consumes instead of recording. History resets when the
+server socket identity changes, because pane ids recycle across server restarts.
+
+## Development
+
+```sh
+node --test                                                # pure history logic
+herdr plugin log list --plugin gjermundgaraba.herdr-history  # per-invocation logs
+```
+
+By default, state lives at
+`~/.local/state/herdr/plugins/gjermundgaraba.herdr-history/history.json`.

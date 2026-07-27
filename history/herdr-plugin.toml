@@ -1,0 +1,22 @@
+id = "gjermundgaraba.herdr-history"
+name = "Herdr History"
+version = "0.1.0"
+min_herdr_version = "0.7.5"
+description = "Vim-style back/forward focus history across panes, tabs, and workspaces"
+platforms = ["macos", "linux"]
+
+[[events]]
+on = "pane.focused"
+command = ["node", "main.mjs", "record"]
+
+[[actions]]
+id = "back"
+title = "History back"
+description = "Jump to the previously focused pane (vim ctrl+o)"
+command = ["node", "main.mjs", "back"]
+
+[[actions]]
+id = "forward"
+title = "History forward"
+description = "Jump forward in focus history (vim ctrl+i)"
+command = ["node", "main.mjs", "forward"]

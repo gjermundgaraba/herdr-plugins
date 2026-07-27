@@ -1,0 +1,28 @@
+id = "gjermundgaraba.herdr-clanker-picker"
+name = "clanker-picker"
+version = "0.3.0"
+min_herdr_version = "0.7.5"
+description = "Agent inbox: every agent in the session, attention-ranked"
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["cargo", "build", "--release", "--locked"]
+
+# Keybinds resolve plugin *actions*, not panes; action argv gets no env
+# expansion — hence sh -c.
+[[actions]]
+id = "open"
+title = "Open clanker picker"
+description = "Open the agent inbox popup"
+command = ["sh", "-c", "exec \"${HERDR_BIN_PATH:-herdr}\" plugin pane open --plugin gjermundgaraba.herdr-clanker-picker --entrypoint picker"]
+
+[[panes]]
+id = "picker"
+# Herdr draws this title in the popup border; it cannot be blank.
+title = "agents"
+placement = "popup"
+# Native modal margins are width/16 and height/10 -> ~87.5% x 80%.
+width = "88%"
+height = "80%"
+# The ./ prefix is load-bearing: bare relative paths go through PATH lookup.
+command = ["./target/release/herdr-clanker-picker"]
