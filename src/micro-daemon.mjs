@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { diffPaneArgs } from "./diff-pane.mjs";
 import { changeEffort } from "./effort.mjs";
 import {
   focusedAppForClaim,
@@ -32,6 +33,7 @@ let owner = null;
 let stopping = false;
 let effortBusy = false;
 let promptBusy = false;
+let diffBusy = false;
 let lastLighting = "";
 let lastFocusedApp = "";
 let lastOpenError = "";
@@ -103,6 +105,7 @@ async function listAgents() {
       : "unknown",
     state_change_seq: Number(agent.state_change_seq ?? 0),
     focused: agent.focused === true,
+    cwd: String(agent.foreground_cwd ?? agent.cwd ?? ""),
   }));
 }
 
@@ -186,6 +189,21 @@ async function submitReviewPrompt() {
   }
 }
 
+async function openDiff() {
+  if (diffBusy) return;
+  diffBusy = true;
+  try {
+    const current = (await listAgents()).find((agent) => agent.focused);
+    if (!current) throw new Error("no focused Herdr agent");
+    await run(herdrBin, diffPaneArgs(current));
+    log(`diff opened: ${current.cwd}`);
+  } catch (error) {
+    log(`diff open failed: ${error.message}`);
+  } finally {
+    diffBusy = false;
+  }
+}
+
 function onDeviceEvent(event) {
   if (event.type !== "key") return;
   const match = /^AG0([0-5])$/.exec(event.key);
@@ -198,6 +216,8 @@ function onDeviceEvent(event) {
     if (direction) void adjustEffort(direction);
   } else if (event.key === "ACT06" && event.action === 1) {
     void submitReviewPrompt();
+  } else if (event.key === "ACT07" && event.action === 1) {
+    void openDiff();
   }
 }
 

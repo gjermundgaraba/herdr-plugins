@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { diffPaneArgs } from "../src/diff-pane.mjs";
 import {
   claimIdentity,
   configureAppSense,
@@ -77,6 +78,27 @@ test("translates the review skill syntax for each focused agent", () => {
     "/skill:deslop /skill:ponytail:ponytail-review\nReview scope: uncomitted changes",
   );
   assert.throws(() => reviewPrompt("other"), /unsupported focused agent/);
+});
+
+test("opens Hunk in the focused agent's repository", () => {
+  assert.deepEqual(
+    diffPaneArgs({
+      cwd: "/repo",
+    }),
+    [
+      "plugin",
+      "pane",
+      "open",
+      "--plugin",
+      "gjermundgaraba.herdr-micro",
+      "--entrypoint",
+      "diff",
+      "--cwd",
+      "/repo",
+      "--focus",
+    ],
+  );
+  assert.throws(() => diffPaneArgs({}), /no repository context/);
 });
 
 test("Codex owns the device only while it is frontmost", () => {

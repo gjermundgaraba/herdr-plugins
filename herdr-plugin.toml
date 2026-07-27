@@ -20,6 +20,14 @@ command = ["/usr/bin/swiftc", "native/micro-hid.swift", "-o", "bin/micro-hid", "
 [[startup]]
 command = ["node", "src/micro-start.mjs"]
 
+[[panes]]
+id = "diff"
+title = "diff"
+placement = "popup"
+width = "95%"
+height = "90%"
+command = ["hunk", "diff", "--watch"]
+
 [[actions]]
 id = "status"
 title = "Show Herdr status"

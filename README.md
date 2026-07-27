@@ -4,7 +4,7 @@ Herdr plugin for the Work Louder Codex Micro.
 
 ## Development
 
-Requires Herdr 0.7.5 or newer and Node.js 22 or newer.
+Requires Herdr 0.7.5 or newer, Node.js 22 or newer, and Hunk 0.17 or newer.
 
 ```sh
 npm install

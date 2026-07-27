@@ -17,6 +17,8 @@ Work Louder Input and the Codex/ChatGPT host are closed. It:
   raise; and
 - maps `ACT06` to a focused-agent review prompt using the native Codex,
   Claude Code, or Pi skill syntax;
+- maps `ACT07` to a temporary Hunk diff popup rooted at the focused agent's
+  repository; and
 - blanks and releases the device on shutdown or when a known official owner
   starts.
 
@@ -76,6 +78,9 @@ need additional rotation before the firmware emits a detent/event.
 The user also physically confirmed dial effort control in Codex and Claude
 Code. Layer 2 RGB, Agent-key focus, and effort control for Codex, Pi, and
 Claude Code are now all proven on the physical device.
+
+The user physically confirmed that `ACT06` submits the agent-specific review
+prompt and `ACT07` opens and closes the focused repository's Hunk popup.
 
 Automatic selection is also proven on the device. A no-match sample selected
 firmware `layer_index: 1`; a matching foreground Chrome sample selected
