@@ -14,6 +14,7 @@ import {
   Reassembler,
   slotLighting,
 } from "../src/micro-protocol.mjs";
+import { reviewPrompt } from "../src/review-prompt.mjs";
 
 const agent = (id, status, seq = 0) => ({
   terminal_id: id,
@@ -60,6 +61,22 @@ test("decodes IOKit reports with and without the report ID", () => {
 test("maps the physical dial direction to effort direction", () => {
   assert.equal(encoderEffortDirection("ENC_CW"), "lower");
   assert.equal(encoderEffortDirection("ENC_CC"), "raise");
+});
+
+test("translates the review skill syntax for each focused agent", () => {
+  assert.equal(
+    reviewPrompt("codex"),
+    "$deslop $ponytail:ponytail-review\nReview scope: uncomitted changes",
+  );
+  assert.equal(
+    reviewPrompt("claude"),
+    "/deslop /ponytail:ponytail-review\nReview scope: uncomitted changes",
+  );
+  assert.equal(
+    reviewPrompt("pi"),
+    "/skill:deslop /skill:ponytail:ponytail-review\nReview scope: uncomitted changes",
+  );
+  assert.throws(() => reviewPrompt("other"), /unsupported focused agent/);
 });
 
 test("Codex owns the device only while it is frontmost", () => {

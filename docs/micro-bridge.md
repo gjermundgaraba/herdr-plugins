@@ -15,6 +15,8 @@ Work Louder Input and the Codex/ChatGPT host are closed. It:
 - focuses the pane assigned to `AG00` through `AG05`;
 - maps the observed `ENC_CW` event to effort lower and `ENC_CC` to effort
   raise; and
+- maps `ACT06` to a focused-agent review prompt using the native Codex,
+  Claude Code, or Pi skill syntax;
 - blanks and releases the device on shutdown or when a known official owner
   starts.
 

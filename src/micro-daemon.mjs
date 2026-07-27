@@ -17,6 +17,7 @@ import {
   SLOT_COUNT,
   slotLighting,
 } from "./micro-protocol.mjs";
+import { reviewPrompt } from "./review-prompt.mjs";
 
 const run = promisify(execFile);
 const herdrBin = process.env.HERDR_BIN_PATH ?? "herdr";
@@ -30,6 +31,7 @@ let deviceState = "starting";
 let owner = null;
 let stopping = false;
 let effortBusy = false;
+let promptBusy = false;
 let lastLighting = "";
 let lastFocusedApp = "";
 let lastOpenError = "";
@@ -161,6 +163,29 @@ async function adjustEffort(direction) {
   }
 }
 
+async function submitReviewPrompt() {
+  if (promptBusy) return;
+  promptBusy = true;
+  try {
+    const current = (await listAgents()).find((agent) => agent.focused);
+    if (!current) throw new Error("no focused Herdr agent");
+    if (!["idle", "done"].includes(current.agent_status)) {
+      throw new Error(`focused agent is ${current.agent_status}`);
+    }
+    await run(herdrBin, [
+      "agent",
+      "prompt",
+      current.pane_id,
+      reviewPrompt(current.agent),
+    ]);
+    log(`review prompt submitted: ${current.agent} in ${current.pane_id}`);
+  } catch (error) {
+    log(`review prompt failed: ${error.message}`);
+  } finally {
+    promptBusy = false;
+  }
+}
+
 function onDeviceEvent(event) {
   if (event.type !== "key") return;
   const match = /^AG0([0-5])$/.exec(event.key);
@@ -171,6 +196,8 @@ function onDeviceEvent(event) {
   } else if (event.action === 2) {
     const direction = encoderEffortDirection(event.key);
     if (direction) void adjustEffort(direction);
+  } else if (event.key === "ACT06" && event.action === 1) {
+    void submitReviewPrompt();
   }
 }
 
