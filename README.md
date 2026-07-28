@@ -42,7 +42,8 @@ known limitations.
 
 The bridge owns the Codex Micro vendor HID interface over USB or
 Bluetooth LE, mirrors six Herdr Agent states onto the RGB keys, focuses those
-panes, and maps the dial to the effort actions. See
+panes, maps the dial to the effort actions, and maps Button 3 to `/fast` for
+Codex and Pi. See
 [`docs/micro-bridge.md`](docs/micro-bridge.md) for its process and safety
 boundaries.
 

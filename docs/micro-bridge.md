@@ -19,6 +19,7 @@ Work Louder Input and the Codex/ChatGPT host are closed. It:
   Claude Code, or Pi skill syntax;
 - maps `ACT07` to a temporary Hunk diff popup rooted at the focused agent's
   repository;
+- maps `ACT08` to `/fast` for the focused Codex or Pi agent;
 - maps `ACT12` to Enter on the focused agent; and
 - blanks and releases the device on shutdown or when a known official owner
   starts.

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { diffPaneArgs } from "../src/diff-pane.mjs";
+import { fastModePlan } from "../src/fast-mode.mjs";
 import {
   claimIdentity,
   configureAppSense,
@@ -110,6 +111,20 @@ test("submits one Enter to the focused agent", () => {
     "enter",
   ]);
   assert.throws(() => submitArgs({}), /no pane/);
+});
+
+test("toggles fast mode in Codex and Pi", () => {
+  assert.deepEqual(fastModePlan({ agent: "codex", pane_id: "w1:p1" }), [
+    ["agent", "prompt", "w1:p1", "/fast"],
+  ]);
+  assert.deepEqual(fastModePlan({ agent: "pi", pane_id: "w1:p2" }), [
+    ["pane", "send-text", "w1:p2", "/fast"],
+    ["agent", "send-keys", "w1:p2", "enter"],
+  ]);
+  assert.throws(
+    () => fastModePlan({ agent: "claude", pane_id: "w1:p3" }),
+    /unsupported focused agent/,
+  );
 });
 
 test("Codex owns the device only while it is frontmost", () => {

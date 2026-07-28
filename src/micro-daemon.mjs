@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { diffPaneArgs } from "./diff-pane.mjs";
 import { changeEffort } from "./effort.mjs";
+import { fastModePlan } from "./fast-mode.mjs";
 import {
   focusedAppForClaim,
   loadLayerClaims,
@@ -191,6 +192,24 @@ async function submitReviewPrompt() {
   }
 }
 
+async function enableFastMode() {
+  if (promptBusy) return;
+  promptBusy = true;
+  try {
+    const current = (await listAgents()).find((agent) => agent.focused);
+    if (!current) throw new Error("no focused Herdr agent");
+    if (!["idle", "done"].includes(current.agent_status)) {
+      throw new Error(`focused agent is ${current.agent_status}`);
+    }
+    for (const args of fastModePlan(current)) await run(herdrBin, args);
+    log(`fast mode toggled: ${current.agent} in ${current.pane_id}`);
+  } catch (error) {
+    log(`fast mode failed: ${error.message}`);
+  } finally {
+    promptBusy = false;
+  }
+}
+
 async function openDiff() {
   if (diffBusy) return;
   diffBusy = true;
@@ -235,6 +254,8 @@ function onDeviceEvent(event) {
     void submitReviewPrompt();
   } else if (event.key === "ACT07" && event.action === 1) {
     void openDiff();
+  } else if (event.key === "ACT08" && event.action === 1) {
+    void enableFastMode();
   } else if (event.key === "ACT12" && event.action === 1) {
     void submitFocusedAgent();
   }
