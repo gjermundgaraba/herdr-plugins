@@ -67,6 +67,7 @@ a modal or settings screen is up shows a toast instead.
 | `enter` | jump to the selected agent's pane and close |
 | `/` | focus the search box — matches title, workspace, and agent (`esc` to leave) |
 | `f` | mark/unmark the selected agent for focus (★, pinned to the top; survives across opens) |
+| `r` | toggle newest/oldest state change first |
 | `b` `w` `i` `d` | toggle blocked/working/idle/done state filters (multi-select) |
 | `a` / `backspace` | clear all state filters |
 | `j`/`k`/`↑`/`↓`, `ctrl+d`/`ctrl+u`, `home`/`end`/`G` | move |
@@ -76,8 +77,21 @@ Mouse: hover selects, click jumps, wheel scrolls.
 
 ## Configuration
 
-None. The ranking and agents-only behavior are the product. Theming follows
-the host automatically (below).
+Create `config.toml` in the directory printed by:
+
+```bash
+herdr plugin config-dir gjermundgaraba.herdr-clanker-picker
+```
+
+To reverse the default recency order:
+
+```toml
+recency_order = "oldest-first"
+```
+
+The default is `"newest-first"`. Pressing `r` toggles the order for the
+currently open popup; it does not rewrite the config file. Theming follows the
+host automatically (below).
 
 ## Theming
 

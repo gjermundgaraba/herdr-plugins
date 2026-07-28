@@ -10,6 +10,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+use crate::config::RecencyOrder;
 use herdr_client::{AgentStatus, SessionSnapshot};
 
 /// Herdr's public status collapses `(AgentState, seen)` into one value;
@@ -208,6 +209,7 @@ pub struct Picker {
     /// not a pane, so this comes from HERDR_PLUGIN_CONTEXT_JSON with the
     /// snapshot's focused_pane_id as fallback.
     pub current_pane_id: Option<String>,
+    pub recency_order: RecencyOrder,
 }
 
 impl Picker {
@@ -218,6 +220,7 @@ impl Picker {
         mut snapshot: SessionSnapshot,
         current_pane_id: Option<String>,
         mut pinned: HashSet<String>,
+        recency_order: RecencyOrder,
     ) -> Self {
         strip_agentless(&mut snapshot);
         // Drop focus marks whose panes no longer exist.
@@ -232,6 +235,7 @@ impl Picker {
             state_filters: BTreeSet::new(),
             pinned,
             visible_rows: 0,
+            recency_order,
         }
     }
 
@@ -376,7 +380,7 @@ impl Picker {
                 .collect(),
         };
 
-        // Focus marks beat everything; then attention, then recency. Stable
+        // Focus marks beat everything; then attention, then configured recency. Stable
         // sort: agents that never changed state (seq 0) keep snapshot order
         // among themselves.
         rows.sort_by_key(|row| {
@@ -387,10 +391,23 @@ impl Picker {
             (
                 Reverse(row.pinned),
                 Reverse(triage_priority(row.status, row.seen)),
-                Reverse(seq),
+                match self.recency_order {
+                    RecencyOrder::NewestFirst => u64::MAX - seq,
+                    RecencyOrder::OldestFirst => seq,
+                },
             )
         });
         rows
+    }
+
+    /// Reverse recency and select the top-ranked agent.
+    pub fn toggle_recency_order(&mut self) {
+        self.recency_order = match self.recency_order {
+            RecencyOrder::NewestFirst => RecencyOrder::OldestFirst,
+            RecencyOrder::OldestFirst => RecencyOrder::NewestFirst,
+        };
+        self.selected = 0;
+        self.scroll = 0;
     }
 
     /// Toggle the focus mark on the selected agent, keeping the cursor on
@@ -582,7 +599,7 @@ mod tests {
 
     fn picker() -> Picker {
         let snapshot: SessionSnapshot = serde_json::from_str(SNAPSHOT).unwrap();
-        Picker::open(snapshot, None, HashSet::new())
+        Picker::open(snapshot, None, HashSet::new(), RecencyOrder::NewestFirst)
     }
 
     #[test]
@@ -709,6 +726,7 @@ mod tests {
             snapshot,
             None,
             HashSet::from(["w1:p1".to_string(), "gone:p9".to_string()]),
+            RecencyOrder::NewestFirst,
         );
         assert_eq!(picker.pinned, HashSet::from(["w1:p1".to_string()]));
         assert!(picker.rows()[0].pinned);
@@ -735,6 +753,18 @@ mod tests {
             picker().activity_summary(),
             "1 blocked · 2 done · 1 working"
         );
+    }
+
+    #[test]
+    fn recency_order_toggles_and_selects_first_agent() {
+        let mut picker = picker();
+        picker.selected = 1; // done seq 5
+        picker.toggle_recency_order();
+
+        assert_eq!(picker.recency_order, RecencyOrder::OldestFirst);
+        assert_eq!(picker.rows()[1].label, "fixer"); // done seq 3 before seq 5
+        assert_eq!(picker.selected, 0);
+        assert_eq!(picker.scroll, 0);
     }
 
     #[test]

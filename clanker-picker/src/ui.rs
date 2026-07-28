@@ -15,7 +15,7 @@ use ratatui::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::config::Palette;
+use crate::config::{Palette, RecencyOrder};
 use crate::model::{AgentRow, AgentState, Picker, StateFilter};
 
 /// Each agent takes two lines: workspace + agent·state, then the task line.
@@ -589,6 +589,14 @@ fn render_footer(picker: &Picker, p: &Palette, frame: &mut Frame, area: Rect) {
             Span::styled(" states  ", dim),
             Span::styled("f", key),
             Span::styled(" focus  ", dim),
+            Span::styled("r", key),
+            Span::styled(
+                match picker.recency_order {
+                    RecencyOrder::NewestFirst => " newest  ",
+                    RecencyOrder::OldestFirst => " oldest  ",
+                },
+                dim,
+            ),
             Span::styled("j/k/↑↓", key),
             Span::styled(" move  ", dim),
             Span::styled("esc", key),

@@ -39,13 +39,19 @@ fn main() -> ExitCode {
 
     let config_dir = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR").map(PathBuf::from);
     let palette = config::resolve_palette(config_dir.as_deref());
+    let recency_order = config::load_recency_order(config_dir.as_deref());
 
     let client = Client::new(Path::new(&socket_path));
     let snapshot = match client.snapshot() {
         Ok(snapshot) => snapshot,
         Err(e) => return fail_visibly(&format!("{e:#}")),
     };
-    let mut picker = Picker::open(snapshot, context_focused_pane_id(), load_pins());
+    let mut picker = Picker::open(
+        snapshot,
+        context_focused_pane_id(),
+        load_pins(),
+        recency_order,
+    );
 
     // Poll with a timeout instead of blocking on input: idle timeouts advance
     // the tick that animates the working-status spinner, exactly like the
@@ -198,6 +204,7 @@ fn handle_key(picker: &mut Picker, key: KeyEvent) -> Outcome {
             picker.toggle_pin();
             save_pins(&picker.pinned);
         }
+        KeyCode::Char('r') if key.modifiers.is_empty() => picker.toggle_recency_order(),
         KeyCode::Char('j') | KeyCode::Down => picker.move_selection(1),
         KeyCode::Char('k') | KeyCode::Up => picker.move_selection(-1),
         KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => {

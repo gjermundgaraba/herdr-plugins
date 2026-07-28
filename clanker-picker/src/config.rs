@@ -1,5 +1,4 @@
-//! Host-theme resolution. The picker itself has no configuration — the
-//! ranking and agents-only behavior are the product.
+//! Picker configuration and host-theme resolution.
 //!
 //! There is no plugin theme API, so the picker follows the host theme the
 //! only way possible: `$HERDR_PLUGIN_CONFIG_DIR` is
@@ -14,6 +13,28 @@ use std::path::{Path, PathBuf};
 
 use ratatui::style::Color;
 use serde::Deserialize;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecencyOrder {
+    #[default]
+    NewestFirst,
+    OldestFirst,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(default)]
+struct PickerConfig {
+    recency_order: RecencyOrder,
+}
+
+pub fn load_recency_order(plugin_config_dir: Option<&Path>) -> RecencyOrder {
+    plugin_config_dir
+        .and_then(|dir| std::fs::read_to_string(dir.join("config.toml")).ok())
+        .and_then(|raw| toml::from_str::<PickerConfig>(&raw).ok())
+        .map(|config| config.recency_order)
+        .unwrap_or_default()
+}
 
 // --- host theme resolution (mirrors herdr src/app/mod.rs) ------------------
 
@@ -224,6 +245,20 @@ fn resolve_palette_from(host: &HostConfig) -> Palette {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recency_order_defaults_and_parses() {
+        assert_eq!(
+            toml::from_str::<PickerConfig>("").unwrap().recency_order,
+            RecencyOrder::NewestFirst
+        );
+        assert_eq!(
+            toml::from_str::<PickerConfig>("recency_order = \"oldest-first\"")
+                .unwrap()
+                .recency_order,
+            RecencyOrder::OldestFirst
+        );
+    }
 
     #[test]
     fn theme_resolution_matches_herdr() {
