@@ -5,7 +5,6 @@
 //! reference for the proven popup mechanics); key and mouse handling copied
 //! from herdr src/app/input/{modal,overlays}.rs (Apache-2.0).
 
-mod client;
 mod config;
 mod model;
 mod ui;
@@ -17,7 +16,7 @@ use std::process::ExitCode;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
 
-use client::SocketClient;
+use herdr_client::Client;
 use model::{Picker, StateFilter};
 
 enum Outcome {
@@ -41,10 +40,7 @@ fn main() -> ExitCode {
     let config_dir = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR").map(PathBuf::from);
     let palette = config::resolve_palette(config_dir.as_deref());
 
-    let mut client = match SocketClient::connect(Path::new(&socket_path)) {
-        Ok(client) => client,
-        Err(e) => return fail_visibly(&format!("{e:#}")),
-    };
+    let client = Client::new(Path::new(&socket_path));
     let snapshot = match client.snapshot() {
         Ok(snapshot) => snapshot,
         Err(e) => return fail_visibly(&format!("{e:#}")),
@@ -115,7 +111,8 @@ fn main() -> ExitCode {
     restore();
 
     if let Some(pane_id) = selection {
-        if let Err(e) = client.focus_pane(&pane_id) {
+        if let Err(e) = client.call_value("pane.focus", &serde_json::json!({ "pane_id": pane_id }))
+        {
             // The popup (and its stderr) vanishes the moment we return, so
             // the log file is the only place this error can survive.
             report_warnings(&[format!("focus failed for pane {pane_id}: {e:#}")]);

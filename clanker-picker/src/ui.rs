@@ -15,9 +15,8 @@ use ratatui::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::client::AgentState;
 use crate::config::Palette;
-use crate::model::{AgentRow, Picker, StateFilter};
+use crate::model::{AgentRow, AgentState, Picker, StateFilter};
 
 /// Each agent takes two lines: workspace + agent·state, then the task line.
 pub const ROW_HEIGHT: u16 = 2;

@@ -10,7 +10,27 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use crate::client::{split, AgentState, SessionSnapshot};
+use herdr_client::{AgentStatus, SessionSnapshot};
+
+/// Herdr's public status collapses `(AgentState, seen)` into one value;
+/// the picker ranking uses the two original dimensions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentState {
+    Idle,
+    Working,
+    Blocked,
+    Unknown,
+}
+
+fn split(status: &AgentStatus) -> (AgentState, bool) {
+    match status.as_str() {
+        AgentStatus::BLOCKED => (AgentState::Blocked, true),
+        AgentStatus::WORKING => (AgentState::Working, true),
+        AgentStatus::DONE => (AgentState::Idle, false),
+        AgentStatus::IDLE => (AgentState::Idle, true),
+        _ => (AgentState::Unknown, true),
+    }
+}
 
 /// One agent in the inbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,7 +259,7 @@ impl Picker {
     /// (attention, recency).
     pub fn rows(&self) -> Vec<AgentRow> {
         let (query, kind) = self.query_kind();
-        let agents_by_pane: HashMap<&str, &crate::client::AgentInfo> = self
+        let agents_by_pane: HashMap<&str, &herdr_client::AgentInfo> = self
             .snapshot
             .agents
             .iter()
@@ -290,7 +310,7 @@ impl Picker {
                 .as_deref()
                 .or(agent_name)
                 .or(pane.agent.as_deref());
-            let (state, seen) = split(pane.agent_status);
+            let (state, seen) = split(&pane.agent_status);
             let status_label = pane
                 .state_labels
                 .get(state_label_text(state, seen))
@@ -399,7 +419,7 @@ impl Picker {
         let mut done = 0usize;
         let mut working = 0usize;
         for pane in &self.snapshot.panes {
-            match split(pane.agent_status) {
+            match split(&pane.agent_status) {
                 (AgentState::Blocked, _) => blocked += 1,
                 (AgentState::Idle, false) => done += 1,
                 (AgentState::Working, _) => working += 1,
@@ -499,42 +519,65 @@ impl Picker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::AgentStatus;
 
     const SNAPSHOT: &str = r#"{
+        "version": "0.7.5",
+        "protocol": 17,
         "focused_workspace_id": "w1",
+        "focused_tab_id": "w1:t1",
         "focused_pane_id": "w1:p1",
         "workspaces": [
-            {"workspace_id": "w1", "label": "api"},
-            {"workspace_id": "w2", "label": "web"}
+            {"workspace_id": "w1", "number": 1, "label": "api", "focused": true,
+             "pane_count": 2, "tab_count": 1, "active_tab_id": "w1:t1",
+             "agent_status": "done"},
+            {"workspace_id": "w2", "number": 2, "label": "web", "focused": false,
+             "pane_count": 3, "tab_count": 2, "active_tab_id": "w2:t1",
+             "agent_status": "blocked"}
         ],
         "tabs": [
-            {"tab_id": "w1:t1", "workspace_id": "w1", "label": "main"},
-            {"tab_id": "w2:t1", "workspace_id": "w2", "label": "1"},
-            {"tab_id": "w2:t2", "workspace_id": "w2", "label": "tests"}
+            {"tab_id": "w1:t1", "workspace_id": "w1", "number": 1, "label": "main",
+             "focused": true, "pane_count": 2, "agent_status": "done"},
+            {"tab_id": "w2:t1", "workspace_id": "w2", "number": 1, "label": "1",
+             "focused": false, "pane_count": 1, "agent_status": "blocked"},
+            {"tab_id": "w2:t2", "workspace_id": "w2", "number": 2, "label": "tests",
+             "focused": false, "pane_count": 2, "agent_status": "working"}
         ],
         "panes": [
-            {"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1",
+            {"pane_id": "w1:p1", "terminal_id": "term-1", "workspace_id": "w1",
+             "tab_id": "w1:t1", "focused": true, "revision": 1,
              "agent": "claude", "agent_status": "done",
              "state_labels": {"done": "Done"}},
-            {"pane_id": "w1:p2", "workspace_id": "w1", "tab_id": "w1:t1",
+            {"pane_id": "w1:p2", "terminal_id": "term-2", "workspace_id": "w1",
+             "tab_id": "w1:t1", "focused": false, "revision": 1,
              "agent_status": "unknown"},
-            {"pane_id": "w2:p1", "workspace_id": "w2", "tab_id": "w2:t1",
+            {"pane_id": "w2:p1", "terminal_id": "term-3", "workspace_id": "w2",
+             "tab_id": "w2:t1", "focused": false, "revision": 1,
              "agent": "claude", "title": "fix tests", "agent_status": "blocked"},
-            {"pane_id": "w2:p2", "workspace_id": "w2", "tab_id": "w2:t2",
+            {"pane_id": "w2:p2", "terminal_id": "term-4", "workspace_id": "w2",
+             "tab_id": "w2:t2", "focused": false, "revision": 1,
              "agent": "codex", "agent_status": "working"},
-            {"pane_id": "w2:p3", "workspace_id": "w2", "tab_id": "w2:t2",
+            {"pane_id": "w2:p3", "terminal_id": "term-5", "workspace_id": "w2",
+             "tab_id": "w2:t2", "focused": false, "revision": 1,
              "agent": "claude", "agent_status": "done"}
         ],
         "agents": [
-            {"pane_id": "w1:p1", "name": "fixer", "state_change_seq": 3,
+            {"terminal_id": "term-1", "pane_id": "w1:p1", "workspace_id": "w1",
+             "tab_id": "w1:t1", "focused": true, "revision": 1,
+             "agent_status": "done", "name": "fixer", "state_change_seq": 3,
              "cwd": "/tmp/api"},
-            {"pane_id": "w2:p1", "state_change_seq": 7,
+            {"terminal_id": "term-3", "pane_id": "w2:p1", "workspace_id": "w2",
+             "tab_id": "w2:t1", "focused": false, "revision": 1,
+             "agent_status": "blocked", "state_change_seq": 7,
              "cwd": "/x/one", "foreground_cwd": "/x/two"},
-            {"pane_id": "w2:p2", "state_change_seq": 1},
-            {"pane_id": "w2:p3", "state_change_seq": 5,
+            {"terminal_id": "term-4", "pane_id": "w2:p2", "workspace_id": "w2",
+             "tab_id": "w2:t2", "focused": false, "revision": 1,
+             "agent_status": "working", "state_change_seq": 1},
+            {"terminal_id": "term-5", "pane_id": "w2:p3", "workspace_id": "w2",
+             "tab_id": "w2:t2", "focused": false, "revision": 1,
+             "agent_status": "done", "state_change_seq": 5,
              "terminal_title_stripped": "review docs"}
-        ]
+        ],
+        "layouts": []
     }"#;
 
     fn picker() -> Picker {
@@ -703,7 +746,10 @@ mod tests {
 
     #[test]
     fn split_status_roundtrip() {
-        assert_eq!(split(AgentStatus::Done), (AgentState::Idle, false));
+        assert_eq!(
+            split(&AgentStatus::from(AgentStatus::DONE)),
+            (AgentState::Idle, false)
+        );
     }
 
     #[test]
