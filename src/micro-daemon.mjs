@@ -202,6 +202,10 @@ function submitReviewPrompt() {
   return submitAgentPrompt(reviewPrompt, "review prompt");
 }
 
+function copyLastOutput() {
+  return submitAgentPrompt(() => "/copy", "copy");
+}
+
 function submitConfiguredPrompt(prompts) {
   return submitAgentPrompt((agent) => {
     const prompt = prompts[agent];
@@ -262,6 +266,7 @@ const buttonHandlers = {
   review: submitReviewPrompt,
   diff: openDiff,
   fast: enableFastMode,
+  copy: copyLastOutput,
   submit: submitFocusedAgent,
 };
 

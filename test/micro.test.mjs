@@ -32,7 +32,7 @@ const agent = (id, status, seq = 0) => ({
 
 test("maps readable button configuration to vendor events", () => {
   assert.equal(buttonAction(DEFAULT_BUTTONS, "ACT06"), "review");
-  assert.equal(buttonAction(DEFAULT_BUTTONS, "ACT09"), null);
+  assert.equal(buttonAction(DEFAULT_BUTTONS, "ACT09"), "copy");
   assert.equal(buttonAction(DEFAULT_BUTTONS, "ACT12"), "submit");
   assert.deepEqual(
     validateButtons({

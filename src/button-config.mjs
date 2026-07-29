@@ -3,14 +3,14 @@ import os from "node:os";
 import path from "node:path";
 
 const PLUGIN_ID = "gjermundgaraba.herdr-micro";
-const BUILT_INS = new Set(["review", "diff", "fast", "submit"]);
+const BUILT_INS = new Set(["review", "diff", "fast", "copy", "submit"]);
 const AGENTS = new Set(["codex", "claude", "pi"]);
 
 export const DEFAULT_BUTTONS = {
   1: "review",
   2: "diff",
   3: "fast",
-  4: null,
+  4: "copy",
   5: null,
   6: null,
   7: "submit",
