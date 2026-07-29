@@ -141,8 +141,7 @@ node src/micro-action.mjs stop
 ## Source basis
 
 The framing, VID/PID, OAI methods, event names, and single-owner constraint were
-confirmed in the physical-device research under
-`/Users/gg/Documents/codex-micro`. The direct-IOKit access and
+confirmed in the archived [physical-device research](research/). The direct-IOKit access and
 transport-dependent framing were independently verified against the
 MIT-licensed
 [`eliBenven/freemicro`](https://github.com/eliBenven/freemicro/tree/1e78198c1b4bfe43b7e4aee3246c73314b9bcc0f).
