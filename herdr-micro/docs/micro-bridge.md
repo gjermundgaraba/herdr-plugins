@@ -13,17 +13,16 @@ Work Louder Input and the Codex/ChatGPT host are closed. It:
 - selects the layer claimed by the frontmost window and preserves the previous
   applicable layer when no claim matches;
 - focuses the pane assigned to `AG00` through `AG05`;
-- maps the observed `ENC_CW` event to effort lower and `ENC_CC` to effort
-  raise;
-- maps dial press to the focused agent's `/model` command;
-- maps joystick directions to adjacent Herdr pane focus;
-- maps configured action buttons to built-ins or per-agent prompts; and
+- maps action buttons, dial turns and press, and joystick directions through
+  one agent-aware control configuration;
 - blanks and releases the device on shutdown or when a known official owner
   starts.
 
-`buttons.json` in `HERDR_PLUGIN_CONFIG_DIR` maps physical buttons 1 through 7
-to `diff`, `fast`, `copy`, `submit`, `null`, or an agent-specific prompt
-object. It is validated and reloaded on every button press.
+`controls.json` in `HERDR_PLUGIN_CONFIG_DIR` maps physical buttons 1 through 7,
+dial clockwise/counterclockwise/press, and four joystick directions to
+validated action objects. Every binding can use a direct action, `null`, or a
+`byAgent` map selected from the currently focused Herdr agent. The config is
+reloaded once per bridge poll.
 
 Layer 2 must retain `KV_OAI_AG00` through `KV_OAI_AG05` plus
 `KV_OAI_ENC_CW` and `KV_OAI_ENC_CC`. The same bridge can be tested on the
@@ -44,13 +43,13 @@ payload. A successful `device.status` round trip is required before the daemon
 reports the device connected.
 
 The daemon shares `src/effort.mjs` with the manifest actions. It resolves the
-currently focused Herdr agent immediately before each dial change, so it never
-depends on the startup action's stale context.
+currently focused Herdr agent immediately before each configured control
+action, so it never depends on the startup action's stale context.
 
 The joystick arrives as `v.oai.rad` with normalized angle and distance. The
-bridge engages beyond `0.75`, releases below `0.3`, and fires again when the
-stick crosses into another quadrant. It resolves the currently focused pane
-before every direction and sends an explicit `pane focus --direction` command.
+default config engages beyond `0.75`, releases below `0.3`, and fires again
+when the stick crosses into another quadrant. Both thresholds and all four
+direction actions are configurable.
 
 `lighting.json` controls the per-state color, brightness, effect, and speed.
 The focused Agent key is raised to `focusedBrightness`. Optional aggregate

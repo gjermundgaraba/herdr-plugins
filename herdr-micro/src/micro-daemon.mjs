@@ -3,11 +3,12 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import {
-  buttonAction,
-  configuredPrompt,
-  ensureButtonConfig,
-  loadButtons,
-} from "./button-config.mjs";
+  DEFAULT_CONTROLS,
+  ensureControlConfig,
+  keyBinding,
+  loadControls,
+  resolveBinding,
+} from "./control-config.mjs";
 import { diffPaneArgs } from "./diff-pane.mjs";
 import { changeEffort } from "./effort.mjs";
 import { fastModePlan } from "./fast-mode.mjs";
@@ -23,17 +24,16 @@ import {
   assignSlots,
   aggregateLighting,
   deviceOwner,
-  encoderEffortDirection,
   joystickEvent,
   SLOT_COUNT,
   slotLighting,
 } from "./micro-protocol.mjs";
-import { submitArgs } from "./submit.mjs";
+import { promptArgs, submitArgs } from "./submit.mjs";
 
 const run = promisify(execFile);
 const herdrBin = process.env.HERDR_BIN_PATH ?? "herdr";
 const frontmostBin = fileURLToPath(new URL("../bin/frontmost", import.meta.url));
-const buttonConfigFile = ensureButtonConfig();
+const controlConfigFile = ensureControlConfig();
 const liveHerdrEnv = { ...process.env };
 for (const key of [
   "HERDR_PANE_ID",
@@ -50,25 +50,35 @@ let device = null;
 let deviceState = "starting";
 let owner = null;
 let stopping = false;
-let effortBusy = false;
-let promptBusy = false;
-let diffBusy = false;
-let submitBusy = false;
+let controls = DEFAULT_CONTROLS;
 let lastLighting = "";
 let lastFocusedApp = "";
 let lastOpenError = "";
 let lastHerdrError = "";
 let lastFrontmostError = "";
+let lastControlConfigError = "";
 let lastLightingConfigError = "";
 let herdrLostAt = null;
 let frontmost = null;
 let layerClaim = null;
 let lastJoystickSector = null;
-let joystickQueue = Promise.resolve();
+let controlQueue = Promise.resolve();
 let managedAggregateZones = new Set();
 
 function log(message) {
   console.log(`${new Date().toISOString()} ${message}`);
+}
+
+function refreshControls() {
+  try {
+    controls = loadControls(controlConfigFile);
+    lastControlConfigError = "";
+  } catch (error) {
+    if (error.message !== lastControlConfigError) {
+      lastControlConfigError = error.message;
+      log(`control configuration failed: ${error.message}`);
+    }
+  }
 }
 
 function status() {
@@ -195,110 +205,17 @@ async function focusSlot(index) {
   await run(herdrBin, ["agent", "focus", agent.pane_id]);
 }
 
-async function adjustEffort(direction) {
-  if (effortBusy) return;
-  effortBusy = true;
-  try {
-    const current = (await listAgents()).find((agent) => agent.focused);
-    if (!current) throw new Error("no focused Herdr agent");
-    await changeEffort({
-      herdrBin,
-      agent: current.agent,
-      direction,
-      paneId: current.pane_id,
-    });
-    log(`effort ${direction}: ${current.agent} in ${current.pane_id}`);
-  } catch (error) {
-    log(`effort ${direction} failed: ${error.message}`);
-  } finally {
-    effortBusy = false;
+function requireAgent(current) {
+  if (!current) throw new Error("no focused Herdr agent");
+  return current;
+}
+
+async function runPrompt(action, current) {
+  requireAgent(current);
+  if (!["idle", "done"].includes(current.agent_status)) {
+    throw new Error(`focused agent is ${current.agent_status}`);
   }
-}
-
-async function submitAgentPrompt(promptFor, label) {
-  if (promptBusy) return;
-  promptBusy = true;
-  try {
-    const current = (await listAgents()).find((agent) => agent.focused);
-    if (!current) throw new Error("no focused Herdr agent");
-    if (!["idle", "done"].includes(current.agent_status)) {
-      throw new Error(`focused agent is ${current.agent_status}`);
-    }
-    await run(herdrBin, [
-      "agent",
-      "prompt",
-      current.pane_id,
-      promptFor(current.agent),
-    ]);
-    log(`${label} submitted: ${current.agent} in ${current.pane_id}`);
-  } catch (error) {
-    log(`${label} failed: ${error.message}`);
-  } finally {
-    promptBusy = false;
-  }
-}
-
-function copyLastOutput() {
-  return submitAgentPrompt(() => "/copy", "copy");
-}
-
-function openModelPicker() {
-  return submitAgentPrompt(() => "/model", "model picker");
-}
-
-function submitConfiguredPrompt(prompts) {
-  return submitAgentPrompt(
-    (agent) => configuredPrompt(prompts, agent),
-    "custom prompt",
-  );
-}
-
-async function enableFastMode() {
-  if (promptBusy) return;
-  promptBusy = true;
-  try {
-    const current = (await listAgents()).find((agent) => agent.focused);
-    if (!current) throw new Error("no focused Herdr agent");
-    if (!["idle", "done"].includes(current.agent_status)) {
-      throw new Error(`focused agent is ${current.agent_status}`);
-    }
-    for (const args of fastModePlan(current)) await run(herdrBin, args);
-    log(`fast mode toggled: ${current.agent} in ${current.pane_id}`);
-  } catch (error) {
-    log(`fast mode failed: ${error.message}`);
-  } finally {
-    promptBusy = false;
-  }
-}
-
-async function openDiff() {
-  if (diffBusy) return;
-  diffBusy = true;
-  try {
-    const current = (await listAgents()).find((agent) => agent.focused);
-    if (!current) throw new Error("no focused Herdr agent");
-    await run(herdrBin, diffPaneArgs(current));
-    log(`diff opened: ${current.cwd}`);
-  } catch (error) {
-    log(`diff open failed: ${error.message}`);
-  } finally {
-    diffBusy = false;
-  }
-}
-
-async function submitFocusedAgent() {
-  if (submitBusy) return;
-  submitBusy = true;
-  try {
-    const current = (await listAgents()).find((agent) => agent.focused);
-    if (!current) throw new Error("no focused Herdr agent");
-    await run(herdrBin, submitArgs(current));
-    log(`submit: ${current.agent} in ${current.pane_id}`);
-  } catch (error) {
-    log(`submit failed: ${error.message}`);
-  } finally {
-    submitBusy = false;
-  }
+  await run(herdrBin, promptArgs(action, current));
 }
 
 async function focusAdjacentPane(direction) {
@@ -317,23 +234,52 @@ async function focusAdjacentPane(direction) {
   log(`joystick focus ${direction}: ${paneId}`);
 }
 
-const buttonHandlers = {
-  diff: openDiff,
-  fast: enableFastMode,
-  copy: copyLastOutput,
-  submit: submitFocusedAgent,
-};
-
-function pressConfiguredButton(eventKey) {
-  try {
-    const action = buttonAction(loadButtons(buttonConfigFile), eventKey);
-    if (!action) return;
-    void (typeof action === "object"
-      ? submitConfiguredPrompt(action)
-      : buttonHandlers[action]());
-  } catch (error) {
-    log(`button configuration failed: ${error.message}`);
+async function executeAction(action, current) {
+  switch (action.action) {
+    case "prompt":
+      await runPrompt(action, current);
+      break;
+    case "diff":
+      await run(herdrBin, diffPaneArgs(requireAgent(current)));
+      break;
+    case "fast":
+      requireAgent(current);
+      if (!["idle", "done"].includes(current.agent_status)) {
+        throw new Error(`focused agent is ${current.agent_status}`);
+      }
+      for (const args of fastModePlan(current)) await run(herdrBin, args);
+      break;
+    case "submit":
+      await run(herdrBin, submitArgs(requireAgent(current)));
+      break;
+    case "effort":
+      requireAgent(current);
+      await changeEffort({
+        herdrBin,
+        agent: current.agent,
+        direction: action.direction,
+        paneId: current.pane_id,
+      });
+      break;
+    case "focus-pane":
+      await focusAdjacentPane(action.direction);
+      break;
   }
+}
+
+function dispatchControl(binding, source) {
+  controlQueue = controlQueue
+    .then(async () => {
+      const current = (await listAgents()).find((agent) => agent.focused);
+      const action = resolveBinding(binding, current?.agent);
+      if (!action) return;
+      await executeAction(action, current);
+      log(
+        `${source}: ${action.action}` +
+          (current ? ` for ${current.agent} in ${current.pane_id}` : ""),
+      );
+    })
+    .catch((error) => log(`${source} failed: ${error.message}`));
 }
 
 function onDeviceEvent(event) {
@@ -342,12 +288,14 @@ function onDeviceEvent(event) {
       event.angle,
       event.distance,
       lastJoystickSector,
+      controls.joystick,
     );
     lastJoystickSector = next.sector;
     if (next.direction) {
-      joystickQueue = joystickQueue
-        .then(() => focusAdjacentPane(next.direction))
-        .catch((error) => log(`joystick focus failed: ${error.message}`));
+      dispatchControl(
+        controls.joystick[next.direction] ?? null,
+        `joystick ${next.direction}`,
+      );
     }
     return;
   }
@@ -357,13 +305,9 @@ function onDeviceEvent(event) {
     void focusSlot(Number(match[1])).catch((error) =>
       log(`agent focus failed: ${error.message}`),
     );
-  } else if (event.action === 2) {
-    const direction = encoderEffortDirection(event.key);
-    if (direction) void adjustEffort(direction);
-  } else if (event.key === "ENC_CLK" && event.action === 1) {
-    void openModelPicker();
-  } else if (/^ACT(0[6-9]|1[0-2])$/.test(event.key) && event.action === 1) {
-    pressConfiguredButton(event.key);
+  } else {
+    const binding = keyBinding(controls, event.key, event.action);
+    if (binding) dispatchControl(binding, event.key);
   }
 }
 
@@ -433,11 +377,13 @@ async function shutdown() {
 const closeControl = await listenForControl(status, () => void shutdown());
 process.on("SIGINT", () => void shutdown());
 process.on("SIGTERM", () => void shutdown());
+refreshControls();
 log("bridge started");
 
 let ownerScanDue = 0;
 while (!stopping) {
   try {
+    refreshControls();
     await refreshLayerClaim();
     if (Date.now() >= ownerScanDue) {
       ownerScanDue = Date.now() + 1_000;

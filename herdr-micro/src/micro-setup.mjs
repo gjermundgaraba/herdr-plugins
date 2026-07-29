@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { ensureButtonConfig } from "./button-config.mjs";
+import { ensureControlConfig } from "./control-config.mjs";
 import { ensureEffortConfig } from "./effort-config.mjs";
 import { ensureLightingConfig } from "./lighting-config.mjs";
 import {
@@ -101,7 +101,7 @@ try {
 
   const { stdout } = await run(frontmostBin, []);
   const frontmost = JSON.parse(stdout);
-  const buttons = ensureButtonConfig();
+  const controls = ensureControlConfig();
   const effort = ensureEffortConfig();
   const lighting = ensureLightingConfig();
   const claims = ensureLayerClaims([
@@ -117,7 +117,7 @@ try {
     },
   ]);
   console.log(`Firmware ${status.version}: compatible OAI keymap detected`);
-  console.log(`Buttons: ${buttons}`);
+  console.log(`Controls: ${controls}`);
   console.log(`Effort: ${effort}`);
   console.log(`Lighting: ${lighting}`);
   console.log(`Layer claims: ${claims}`);

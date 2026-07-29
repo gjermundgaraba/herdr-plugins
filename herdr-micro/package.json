@@ -1,13 +1,13 @@
 {
   "name": "herdr-micro",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "engines": {
     "node": ">=20"
   },
   "scripts": {
-    "buttons": "node src/micro-configure-buttons.mjs",
+    "controls": "node src/micro-configure-controls.mjs",
     "doctor": "node src/doctor.mjs",
     "setup": "node src/micro-setup.mjs",
     "setup:pi": "node src/setup-pi-effort.mjs",

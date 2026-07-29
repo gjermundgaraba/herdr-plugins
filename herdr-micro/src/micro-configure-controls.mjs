@@ -1,10 +1,10 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import {
-  buttonConfigPath,
-  ensureButtonConfig,
-} from "./button-config.mjs";
+  controlConfigPath,
+  ensureControlConfig,
+} from "./control-config.mjs";
 
-const file = ensureButtonConfig(buttonConfigPath());
+const file = ensureControlConfig(controlConfigPath());
 await promisify(execFile)("/usr/bin/open", ["-t", file]);
 console.log(file);

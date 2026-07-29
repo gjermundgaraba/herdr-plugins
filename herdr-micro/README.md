@@ -53,7 +53,7 @@ herdr plugin link . --enabled
    herdr plugin action invoke doctor --plugin gjermundgaraba.herdr-micro
    ```
 
-4. Edit `buttons.json`, `claims.json`, `effort.json`, and `lighting.json` in:
+4. Edit `controls.json`, `claims.json`, `effort.json`, and `lighting.json` in:
 
    ```sh
    herdr plugin config-dir gjermundgaraba.herdr-micro
@@ -63,37 +63,67 @@ The setup refuses to overwrite a nonblank target layer or run while another
 known device owner is active. Pass layers 2–6 when running the script directly:
 `node src/micro-setup.mjs 3`.
 
-## Buttons
+## Controls
 
-`buttons.json` maps the seven physical action events. It is validated and
-reloaded on every press:
+`controls.json` maps the seven action buttons, dial, and joystick. It is
+validated and reloaded while the bridge runs:
 
 ```json
 {
-  "1": {
-    "codex": "$review",
-    "claude": "/review",
-    "pi": "/skill:review",
-    "default": "Review the current changes"
+  "version": 1,
+  "buttons": {
+    "1": {
+      "byAgent": {
+        "codex": { "action": "prompt", "prompt": "$review", "submit": true },
+        "claude": { "action": "prompt", "prompt": "/review", "submit": true },
+        "pi": { "action": "prompt", "prompt": "/skill:review", "submit": true },
+        "default": null
+      }
+    },
+    "2": { "action": "diff" },
+    "3": {
+      "byAgent": {
+        "codex": { "action": "fast" },
+        "pi": { "action": "fast" },
+        "default": null
+      }
+    },
+    "4": { "action": "prompt", "prompt": "/copy", "submit": true },
+    "5": null,
+    "6": null,
+    "7": { "action": "submit" }
   },
-  "2": "diff",
-  "3": "fast",
-  "4": "copy",
-  "5": null,
-  "6": null,
-  "7": "submit"
+  "dial": {
+    "clockwise": { "action": "effort", "direction": "raise" },
+    "counterclockwise": { "action": "effort", "direction": "lower" },
+    "press": { "action": "prompt", "prompt": "/model", "submit": true }
+  },
+  "joystick": {
+    "engageDistance": 0.75,
+    "releaseDistance": 0.3,
+    "up": { "action": "focus-pane", "direction": "up" },
+    "down": { "action": "focus-pane", "direction": "down" },
+    "left": { "action": "focus-pane", "direction": "left" },
+    "right": { "action": "focus-pane", "direction": "right" }
+  }
 }
 ```
 
-Built-ins are `diff`, `fast`, `copy`, and `submit`; `null` disables a button.
-A prompt object may use any lowercase Herdr agent name and an optional
-`default` fallback. `fast` supports Codex and Pi. Buttons mapped to ordinary
-keys such as F19 in Input bypass the plugin.
+Every control accepts a direct action, `null`, or a `byAgent` map. An exact
+focused-agent match wins, followed by `default`; missing and `null` actions do
+nothing. Agent entries are complete actions and do not merge with defaults.
 
-Use **Configure Micro buttons** in Herdr or:
+Actions are `prompt`, `diff`, `fast`, `submit`, `effort`, and `focus-pane`.
+`prompt` requires a nonempty `prompt`; `submit` defaults to `true`, while
+`false` types without pressing Enter. `fast` supports Codex and Pi. Dial and
+joystick bindings can use any action, and the joystick distances are hardware
+calibration values between zero and one. Buttons mapped to ordinary keys such
+as F19 in Input bypass the plugin.
+
+Use **Configure Micro controls** in Herdr or:
 
 ```sh
-npm run buttons
+npm run controls
 ```
 
 ## Automatic layers
@@ -149,12 +179,7 @@ Match them in the plugin's `effort.json`:
 }
 ```
 
-## Dial, joystick, and lighting
-
-Pressing the dial submits `/model` to the focused Codex, Claude Code, or Pi
-agent. The four joystick directions focus the adjacent Herdr pane. A direction
-fires once when the stick is pushed outward and rearms after it returns to
-center.
+## Lighting
 
 `lighting.json` controls the six individual Agent keys and the optional
 aggregate zones:

@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  buttonAction,
-  configuredPrompt,
-  DEFAULT_BUTTONS,
-  validateButtons,
-} from "../src/button-config.mjs";
+  DEFAULT_CONTROLS,
+  keyBinding,
+  resolveBinding,
+  validateControls,
+} from "../src/control-config.mjs";
 import { diffPaneArgs } from "../src/diff-pane.mjs";
 import { fastModePlan } from "../src/fast-mode.mjs";
 import {
@@ -26,12 +26,11 @@ import {
   assignSlots,
   deviceOwner,
   encodeMessage,
-  encoderEffortDirection,
   joystickEvent,
   Reassembler,
   slotLighting,
 } from "../src/micro-protocol.mjs";
-import { submitArgs } from "../src/submit.mjs";
+import { promptArgs, submitArgs } from "../src/submit.mjs";
 
 const agent = (id, status, seq = 0) => ({
   terminal_id: id,
@@ -39,20 +38,39 @@ const agent = (id, status, seq = 0) => ({
   state_change_seq: seq,
 });
 
-test("maps readable button configuration to vendor events", () => {
-  assert.equal(buttonAction(DEFAULT_BUTTONS, "ACT06"), null);
-  assert.equal(buttonAction(DEFAULT_BUTTONS, "ACT09"), "copy");
-  assert.equal(buttonAction(DEFAULT_BUTTONS, "ACT12"), "submit");
+test("validates controls and resolves device and agent bindings", () => {
+  assert.equal(validateControls(DEFAULT_CONTROLS), DEFAULT_CONTROLS);
+  assert.deepEqual(keyBinding(DEFAULT_CONTROLS, "ACT09", 1), {
+    action: "prompt",
+    prompt: "/copy",
+    submit: true,
+  });
+  assert.deepEqual(keyBinding(DEFAULT_CONTROLS, "ENC_CC", 2), {
+    action: "effort",
+    direction: "raise",
+  });
+  assert.equal(keyBinding(DEFAULT_CONTROLS, "ENC_CC", 1), null);
   assert.deepEqual(
-    validateButtons({
-      1: { opencode: "/review", default: "Review this change" },
-    }),
-    {
-      1: { opencode: "/review", default: "Review this change" },
-    },
+    resolveBinding(DEFAULT_CONTROLS.buttons[3], "codex"),
+    { action: "fast" },
   );
-  assert.throws(() => validateButtons({ 8: "copy" }), /invalid button/);
-  assert.throws(() => validateButtons({ 4: "unknown" }), /invalid action/);
+  assert.equal(resolveBinding(DEFAULT_CONTROLS.buttons[3], "claude"), null);
+  assert.throws(
+    () =>
+      validateControls({
+        ...DEFAULT_CONTROLS,
+        buttons: { 8: { action: "submit" } },
+      }),
+    /invalid button/,
+  );
+  assert.throws(
+    () =>
+      validateControls({
+        ...DEFAULT_CONTROLS,
+        dial: { press: { action: "prompt", prompt: "", submit: true } },
+      }),
+    /non-empty string/,
+  );
 });
 
 test("keeps slots sticky, admits urgent agents, and frames device messages", () => {
@@ -105,11 +123,6 @@ test("decodes key and joystick device notifications", () => {
   assert.equal(deviceEvent("other", {}), null);
 });
 
-test("maps the physical dial direction to effort direction", () => {
-  assert.equal(encoderEffortDirection("ENC_CW"), "lower");
-  assert.equal(encoderEffortDirection("ENC_CC"), "raise");
-});
-
 test("maps joystick vectors once per sector and rearms at center", () => {
   assert.deepEqual(joystickEvent(0, 0.5, null), {
     sector: null,
@@ -131,6 +144,13 @@ test("maps joystick vectors once per sector and rearms at center", () => {
     sector: null,
     direction: null,
   });
+  assert.deepEqual(
+    joystickEvent(0, 0.65, null, {
+      engageDistance: 0.6,
+      releaseDistance: 0.2,
+    }),
+    { sector: 0, direction: "right" },
+  );
 });
 
 test("configures per-agent and aggregate status lighting", () => {
@@ -166,16 +186,6 @@ test("configures per-agent and aggregate status lighting", () => {
   );
 });
 
-test("uses an agent-specific prompt with a default fallback", () => {
-  const prompts = { codex: "$review", default: "Review this change" };
-  assert.equal(configuredPrompt(prompts, "codex"), "$review");
-  assert.equal(configuredPrompt(prompts, "opencode"), "Review this change");
-  assert.throws(
-    () => configuredPrompt({ codex: "$review" }, "pi"),
-    /no prompt configured/,
-  );
-});
-
 test("opens Hunk in the focused agent's repository", () => {
   assert.deepEqual(
     diffPaneArgs({
@@ -198,6 +208,20 @@ test("opens Hunk in the focused agent's repository", () => {
 });
 
 test("submits one Enter to the focused agent", () => {
+  assert.deepEqual(
+    promptArgs(
+      { action: "prompt", prompt: "/model" },
+      { pane_id: "w1:p2" },
+    ),
+    ["agent", "prompt", "w1:p2", "/model"],
+  );
+  assert.deepEqual(
+    promptArgs(
+      { action: "prompt", prompt: "/model", submit: false },
+      { pane_id: "w1:p2" },
+    ),
+    ["pane", "send-text", "w1:p2", "/model"],
+  );
   assert.deepEqual(submitArgs({ pane_id: "w1:p2" }), [
     "agent",
     "send-keys",

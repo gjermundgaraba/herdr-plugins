@@ -1,6 +1,6 @@
 id = "gjermundgaraba.herdr-micro"
 name = "Herdr Micro"
-version = "0.3.0"
+version = "0.4.0"
 min_herdr_version = "0.7.5"
 description = "Control Herdr from a Work Louder Codex Micro."
 platforms = ["macos"]
@@ -56,9 +56,9 @@ title = "Show Micro bridge status"
 command = ["node", "src/micro-action.mjs", "status"]
 
 [[actions]]
-id = "micro-configure-buttons"
-title = "Configure Micro buttons"
-command = ["node", "src/micro-configure-buttons.mjs"]
+id = "micro-configure-controls"
+title = "Configure Micro controls"
+command = ["node", "src/micro-configure-controls.mjs"]
 
 [[actions]]
 id = "setup-pi-effort"

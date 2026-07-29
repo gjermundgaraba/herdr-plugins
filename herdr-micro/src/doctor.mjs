@@ -5,9 +5,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import {
-  buttonConfigPath,
-  loadButtons,
-} from "./button-config.mjs";
+  controlConfigPath,
+  loadControls,
+} from "./control-config.mjs";
 import {
   effortConfigPath,
   loadEffortConfig,
@@ -51,9 +51,9 @@ for (const binary of ["frontmost", "micro-hid"]) {
     return "executable";
   });
 }
-check("button configuration", () => {
-  loadButtons();
-  return buttonConfigPath();
+check("control configuration", () => {
+  loadControls();
+  return controlConfigPath();
 });
 let effort;
 check("effort configuration", () => {

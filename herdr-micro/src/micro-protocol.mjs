@@ -47,20 +47,19 @@ const CHANNEL_RPC = 2;
 const REPORT_SIZE = 64;
 const MAX_PAYLOAD = 61;
 
-export function encoderEffortDirection(key) {
-  if (key === "ENC_CW") return "lower";
-  if (key === "ENC_CC") return "raise";
-  return null;
-}
-
 const JOYSTICK_DIRECTIONS = ["right", "down", "left", "up"];
 
-export function joystickEvent(angle, distance, lastSector) {
+export function joystickEvent(
+  angle,
+  distance,
+  lastSector,
+  { engageDistance = 0.75, releaseDistance = 0.3 } = {},
+) {
   if (!Number.isFinite(angle) || !Number.isFinite(distance)) {
     return { sector: lastSector, direction: null };
   }
-  if (distance <= 0.3) return { sector: null, direction: null };
-  if (lastSector === null && distance < 0.75) {
+  if (distance <= releaseDistance) return { sector: null, direction: null };
+  if (lastSector === null && distance < engageDistance) {
     return { sector: null, direction: null };
   }
   const sector = Math.round(angle * 4) % 4;
