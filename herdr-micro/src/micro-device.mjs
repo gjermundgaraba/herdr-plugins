@@ -5,6 +5,24 @@ import { encodeMessage, Reassembler } from "./micro-protocol.mjs";
 
 const helper = fileURLToPath(new URL("../bin/micro-hid", import.meta.url));
 
+export function deviceEvent(method, params) {
+  if (method === "v.oai.hid") {
+    return {
+      type: "key",
+      key: String(params?.k ?? ""),
+      action: Number(params?.act ?? 0),
+    };
+  }
+  if (method === "v.oai.rad") {
+    return {
+      type: "joystick",
+      angle: Number(params?.a ?? 0),
+      distance: Number(params?.d ?? 0),
+    };
+  }
+  return null;
+}
+
 export class MicroDevice {
   #child;
   #closed = false;
@@ -72,13 +90,8 @@ export class MicroDevice {
               } else {
                 const method = envelope.m ?? envelope.method;
                 const params = envelope.p ?? envelope.params;
-                if (method === "v.oai.hid") {
-                  onEvent({
-                    type: "key",
-                    key: String(params?.k ?? ""),
-                    action: Number(params?.act ?? 0),
-                  });
-                }
+                const event = deviceEvent(method, params);
+                if (event) onEvent(event);
               }
             }
           }
@@ -152,6 +165,10 @@ export class MicroDevice {
 
   setLighting(slots) {
     return this.#send("v.oai.thstatus", slots);
+  }
+
+  setAggregateLighting(zones) {
+    return this.#send("v.oai.rgbcfg", zones);
   }
 
   setFocusedApp(app) {

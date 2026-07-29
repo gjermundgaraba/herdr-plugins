@@ -17,10 +17,17 @@ import {
   validateLayerClaims,
 } from "../src/layer-claims.mjs";
 import {
+  DEFAULT_LIGHTING,
+  validateLightingConfig,
+} from "../src/lighting-config.mjs";
+import { deviceEvent } from "../src/micro-device.mjs";
+import {
+  aggregateLighting,
   assignSlots,
   deviceOwner,
   encodeMessage,
   encoderEffortDirection,
+  joystickEvent,
   Reassembler,
   slotLighting,
 } from "../src/micro-protocol.mjs";
@@ -84,9 +91,79 @@ test("decodes IOKit reports with and without the report ID", () => {
   assert.equal(new Reassembler().push(report.subarray(1)).length, 1);
 });
 
+test("decodes key and joystick device notifications", () => {
+  assert.deepEqual(deviceEvent("v.oai.hid", { k: "ENC_CLK", act: 1 }), {
+    type: "key",
+    key: "ENC_CLK",
+    action: 1,
+  });
+  assert.deepEqual(deviceEvent("v.oai.rad", { a: 0.75, d: 0.9 }), {
+    type: "joystick",
+    angle: 0.75,
+    distance: 0.9,
+  });
+  assert.equal(deviceEvent("other", {}), null);
+});
+
 test("maps the physical dial direction to effort direction", () => {
   assert.equal(encoderEffortDirection("ENC_CW"), "lower");
   assert.equal(encoderEffortDirection("ENC_CC"), "raise");
+});
+
+test("maps joystick vectors once per sector and rearms at center", () => {
+  assert.deepEqual(joystickEvent(0, 0.5, null), {
+    sector: null,
+    direction: null,
+  });
+  assert.deepEqual(joystickEvent(0, 0.8, null), {
+    sector: 0,
+    direction: "right",
+  });
+  assert.deepEqual(joystickEvent(0, 0.9, 0), {
+    sector: 0,
+    direction: null,
+  });
+  assert.deepEqual(joystickEvent(0.25, 0.9, 0), {
+    sector: 1,
+    direction: "down",
+  });
+  assert.deepEqual(joystickEvent(0.25, 0.1, 1), {
+    sector: null,
+    direction: null,
+  });
+});
+
+test("configures per-agent and aggregate status lighting", () => {
+  assert.equal(validateLightingConfig(DEFAULT_LIGHTING), DEFAULT_LIGHTING);
+  assert.throws(
+    () =>
+      validateLightingConfig({
+        ...DEFAULT_LIGHTING,
+        ambient: "rainbow",
+      }),
+    /ambient/,
+  );
+  const config = {
+    ...DEFAULT_LIGHTING,
+    states: {
+      blocked: { c: 0xffaa00, b: 1, e: 1, s: 0 },
+      done: { c: 0x22cc55, b: 1, e: 1, s: 0 },
+      working: { c: 0x2277ff, b: 1, e: 4, s: 0.35 },
+      idle: { c: 0xffffff, b: 0.25, e: 1, s: 0 },
+      unknown: { c: 0xffffff, b: 0.08, e: 1, s: 0 },
+    },
+  };
+  const agents = [
+    { ...agent("idle", "idle"), focused: true },
+    agent("blocked", "blocked"),
+  ];
+  assert.equal(slotLighting(["idle"], agents, config)[0].b, 1);
+  assert.deepEqual(
+    aggregateLighting(["idle", "blocked"], agents, config),
+    {
+      ambient: { e: 1, b: 1, s: 0, c: 0xffaa00 },
+    },
+  );
 });
 
 test("uses an agent-specific prompt with a default fallback", () => {

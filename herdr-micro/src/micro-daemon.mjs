@@ -16,12 +16,15 @@ import {
   loadLayerClaims,
   resolveLayerClaim,
 } from "./layer-claims.mjs";
+import { loadLightingConfig } from "./lighting-config.mjs";
 import { listenForControl } from "./micro-control.mjs";
 import { MicroDevice } from "./micro-device.mjs";
 import {
   assignSlots,
+  aggregateLighting,
   deviceOwner,
   encoderEffortDirection,
+  joystickEvent,
   SLOT_COUNT,
   slotLighting,
 } from "./micro-protocol.mjs";
@@ -31,6 +34,15 @@ const run = promisify(execFile);
 const herdrBin = process.env.HERDR_BIN_PATH ?? "herdr";
 const frontmostBin = fileURLToPath(new URL("../bin/frontmost", import.meta.url));
 const buttonConfigFile = ensureButtonConfig();
+const liveHerdrEnv = { ...process.env };
+for (const key of [
+  "HERDR_PANE_ID",
+  "HERDR_TAB_ID",
+  "HERDR_WORKSPACE_ID",
+  "HERDR_PLUGIN_CONTEXT_JSON",
+]) {
+  delete liveHerdrEnv[key];
+}
 
 let agents = [];
 let slots = Array.from({ length: SLOT_COUNT }, () => null);
@@ -47,9 +59,13 @@ let lastFocusedApp = "";
 let lastOpenError = "";
 let lastHerdrError = "";
 let lastFrontmostError = "";
+let lastLightingConfigError = "";
 let herdrLostAt = null;
 let frontmost = null;
 let layerClaim = null;
+let lastJoystickSector = null;
+let joystickQueue = Promise.resolve();
+let managedAggregateZones = new Set();
 
 function log(message) {
   console.log(`${new Date().toISOString()} ${message}`);
@@ -130,10 +146,34 @@ async function refreshAgents() {
     lastHerdrError = "";
     slots = assignSlots(slots, agents);
     if (!device) return;
-    const lighting = slotLighting(slots, agents);
+    let config;
+    try {
+      config = loadLightingConfig();
+      lastLightingConfigError = "";
+    } catch (error) {
+      if (error.message !== lastLightingConfigError) {
+        lastLightingConfigError = error.message;
+        log(`lighting configuration failed: ${error.message}`);
+      }
+      return;
+    }
+    const lighting = {
+      slots: slotLighting(slots, agents, config),
+      aggregate: aggregateLighting(slots, agents, config),
+    };
+    const nextZones = new Set(Object.keys(lighting.aggregate));
+    for (const zone of managedAggregateZones) {
+      if (!nextZones.has(zone)) {
+        lighting.aggregate[zone] = { e: 0, b: 0, s: 0, c: 0 };
+      }
+    }
     const signature = JSON.stringify(lighting);
     if (signature === lastLighting) return;
-    await device.setLighting(lighting);
+    if (Object.keys(lighting.aggregate).length > 0) {
+      await device.setAggregateLighting(lighting.aggregate);
+    }
+    await device.setLighting(lighting.slots);
+    managedAggregateZones = nextZones;
     lastLighting = signature;
   } catch (error) {
     herdrLostAt ??= Date.now();
@@ -202,6 +242,10 @@ function copyLastOutput() {
   return submitAgentPrompt(() => "/copy", "copy");
 }
 
+function openModelPicker() {
+  return submitAgentPrompt(() => "/model", "model picker");
+}
+
 function submitConfiguredPrompt(prompts) {
   return submitAgentPrompt(
     (agent) => configuredPrompt(prompts, agent),
@@ -257,6 +301,22 @@ async function submitFocusedAgent() {
   }
 }
 
+async function focusAdjacentPane(direction) {
+  const { stdout } = await run(
+    herdrBin,
+    ["pane", "current"],
+    { env: liveHerdrEnv },
+  );
+  const paneId = JSON.parse(stdout).result?.pane?.pane_id;
+  if (!paneId) throw new Error("no focused Herdr pane");
+  await run(
+    herdrBin,
+    ["pane", "focus", "--direction", direction, "--pane", paneId],
+    { env: liveHerdrEnv },
+  );
+  log(`joystick focus ${direction}: ${paneId}`);
+}
+
 const buttonHandlers = {
   diff: openDiff,
   fast: enableFastMode,
@@ -277,6 +337,20 @@ function pressConfiguredButton(eventKey) {
 }
 
 function onDeviceEvent(event) {
+  if (event.type === "joystick") {
+    const next = joystickEvent(
+      event.angle,
+      event.distance,
+      lastJoystickSector,
+    );
+    lastJoystickSector = next.sector;
+    if (next.direction) {
+      joystickQueue = joystickQueue
+        .then(() => focusAdjacentPane(next.direction))
+        .catch((error) => log(`joystick focus failed: ${error.message}`));
+    }
+    return;
+  }
   if (event.type !== "key") return;
   const match = /^AG0([0-5])$/.exec(event.key);
   if (match && event.action === 1) {
@@ -286,6 +360,8 @@ function onDeviceEvent(event) {
   } else if (event.action === 2) {
     const direction = encoderEffortDirection(event.key);
     if (direction) void adjustEffort(direction);
+  } else if (event.key === "ENC_CLK" && event.action === 1) {
+    void openModelPicker();
   } else if (/^ACT(0[6-9]|1[0-2])$/.test(event.key) && event.action === 1) {
     pressConfiguredButton(event.key);
   }
@@ -296,12 +372,26 @@ async function closeDevice(blank = true) {
   device = null;
   lastLighting = "";
   lastFocusedApp = "";
+  lastJoystickSector = null;
   if (!current) return;
   if (blank) {
+    if (managedAggregateZones.size > 0) {
+      await current
+        .setAggregateLighting(
+          Object.fromEntries(
+            [...managedAggregateZones].map((zone) => [
+              zone,
+              { e: 0, b: 0, s: 0, c: 0 },
+            ]),
+          ),
+        )
+        .catch(() => {});
+    }
     await current
       .setLighting(slotLighting(Array(SLOT_COUNT).fill(null), []))
       .catch(() => {});
   }
+  managedAggregateZones = new Set();
   await current.close();
 }
 

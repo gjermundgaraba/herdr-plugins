@@ -15,6 +15,8 @@ Work Louder Input and the Codex/ChatGPT host are closed. It:
 - focuses the pane assigned to `AG00` through `AG05`;
 - maps the observed `ENC_CW` event to effort lower and `ENC_CC` to effort
   raise;
+- maps dial press to the focused agent's `/model` command;
+- maps joystick directions to adjacent Herdr pane focus;
 - maps configured action buttons to built-ins or per-agent prompts; and
 - blanks and releases the device on shutdown or when a known official owner
   starts.
@@ -44,6 +46,17 @@ reports the device connected.
 The daemon shares `src/effort.mjs` with the manifest actions. It resolves the
 currently focused Herdr agent immediately before each dial change, so it never
 depends on the startup action's stale context.
+
+The joystick arrives as `v.oai.rad` with normalized angle and distance. The
+bridge engages beyond `0.75`, releases below `0.3`, and fires again when the
+stick crosses into another quadrant. It resolves the currently focused pane
+before every direction and sends an explicit `pane focus --direction` command.
+
+`lighting.json` controls the per-state color, brightness, effect, and speed.
+The focused Agent key is raised to `focusedBrightness`. Optional aggregate
+`ambient` and `keys` zones follow the highest-priority slotted status through
+`v.oai.rgbcfg`; the six per-agent keys are then applied through
+`v.oai.thstatus`.
 
 `bin/frontmost` is compiled from a small Swift source during the plugin build.
 It combines `NSWorkspace.frontmostApplication` with the top layer-zero
@@ -115,6 +128,18 @@ verified over both USB and BLE.
   do not run one beside this bridge.
 - Claude effort control requires an empty prompt.
 - Pi auto-discovers the installed extension; existing sessions need `/reload`.
+
+## Documented, not implemented
+
+- Mechanical-key release, hold, and double-tap actions. The firmware reports
+  press and release, so the bridge can add these later. A true held macOS key
+  would require synthetic input and Accessibility permission.
+- Custom joystick bindings, eight-way sectors, radial UI, and analog pointer
+  mode. The current four-way pane focus needs no additional permission.
+- Per-action-key RGB. The known interface individually addresses only the six
+  Agent keys; general key backlight and underglow are aggregate zones.
+- Agent-key synchronization flags for the aggregate key and ambient zones.
+  They exist in the protocol but remain hardware-unverified here.
 
 ## Commands
 

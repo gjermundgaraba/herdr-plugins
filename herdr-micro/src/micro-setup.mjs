@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { ensureButtonConfig } from "./button-config.mjs";
 import { ensureEffortConfig } from "./effort-config.mjs";
+import { ensureLightingConfig } from "./lighting-config.mjs";
 import {
   configureMicro,
   ensureLayerClaims,
@@ -102,6 +103,7 @@ try {
   const frontmost = JSON.parse(stdout);
   const buttons = ensureButtonConfig();
   const effort = ensureEffortConfig();
+  const lighting = ensureLightingConfig();
   const claims = ensureLayerClaims([
     {
       id: "herdr",
@@ -117,6 +119,7 @@ try {
   console.log(`Firmware ${status.version}: compatible OAI keymap detected`);
   console.log(`Buttons: ${buttons}`);
   console.log(`Effort: ${effort}`);
+  console.log(`Lighting: ${lighting}`);
   console.log(`Layer claims: ${claims}`);
 } finally {
   await device.close();

@@ -16,6 +16,10 @@ import {
   layerClaimsPath,
   loadLayerClaims,
 } from "./layer-claims.mjs";
+import {
+  lightingConfigPath,
+  loadLightingConfig,
+} from "./lighting-config.mjs";
 import { requestDaemon } from "./micro-control.mjs";
 
 const run = promisify(execFile);
@@ -55,6 +59,10 @@ let effort;
 check("effort configuration", () => {
   effort = loadEffortConfig();
   return effortConfigPath();
+});
+check("lighting configuration", () => {
+  loadLightingConfig();
+  return lightingConfigPath();
 });
 check("layer claims", () => {
   const claims = loadLayerClaims();

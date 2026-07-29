@@ -33,7 +33,7 @@ const PRIORITY = {
   blocked: 4,
 };
 
-const LIGHTS = {
+const DEFAULT_LIGHTS = {
   blocked: { c: 0xffaa00, b: 1, e: 1, s: 0 },
   done: { c: 0x22cc55, b: 1, e: 1, s: 0 },
   working: { c: 0x2277ff, b: 1, e: 4, s: 0.35 },
@@ -51,6 +51,24 @@ export function encoderEffortDirection(key) {
   if (key === "ENC_CW") return "lower";
   if (key === "ENC_CC") return "raise";
   return null;
+}
+
+const JOYSTICK_DIRECTIONS = ["right", "down", "left", "up"];
+
+export function joystickEvent(angle, distance, lastSector) {
+  if (!Number.isFinite(angle) || !Number.isFinite(distance)) {
+    return { sector: lastSector, direction: null };
+  }
+  if (distance <= 0.3) return { sector: null, direction: null };
+  if (lastSector === null && distance < 0.75) {
+    return { sector: null, direction: null };
+  }
+  const sector = Math.round(angle * 4) % 4;
+  return {
+    sector,
+    direction:
+      sector === lastSector ? null : JOYSTICK_DIRECTIONS[sector],
+  };
 }
 
 function comparePriority(a, b) {
@@ -96,12 +114,35 @@ export function assignSlots(previous, agents) {
   return slots;
 }
 
-export function slotLighting(slots, agents) {
+export function slotLighting(slots, agents, config = {}) {
   const byId = new Map(agents.map((agent) => [agent.terminal_id, agent]));
+  const lights = config.states ?? DEFAULT_LIGHTS;
   return slots.map((id, index) => {
-    const status = id ? byId.get(id)?.agent_status : null;
-    return { id: index, ...(status ? LIGHTS[status] : OFF) };
+    const agent = id ? byId.get(id) : null;
+    const light = agent ? lights[agent.agent_status] : OFF;
+    return {
+      id: index,
+      ...light,
+      ...(agent?.focused && config.focusedBrightness !== undefined
+        ? { b: Math.max(light.b, config.focusedBrightness) }
+        : {}),
+    };
   });
+}
+
+export function aggregateLighting(slots, agents, config) {
+  const byId = new Map(agents.map((agent) => [agent.terminal_id, agent]));
+  const status = slots
+    .map((id) => (id ? byId.get(id) : null))
+    .filter(Boolean)
+    .sort(comparePriority)[0]?.agent_status;
+  const light = status ? config.states[status] : OFF;
+  const side = { e: light.e, b: light.b, s: light.s, c: light.c };
+  return Object.fromEntries(
+    ["ambient", "keys"]
+      .filter((zone) => config[zone] === "status")
+      .map((zone) => [zone, side]),
+  );
 }
 
 export function encodeMessage(method, params, id) {

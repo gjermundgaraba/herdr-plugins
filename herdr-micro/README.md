@@ -53,7 +53,7 @@ herdr plugin link . --enabled
    herdr plugin action invoke doctor --plugin gjermundgaraba.herdr-micro
    ```
 
-4. Edit `buttons.json`, `claims.json`, and `effort.json` in:
+4. Edit `buttons.json`, `claims.json`, `effort.json`, and `lighting.json` in:
 
    ```sh
    herdr plugin config-dir gjermundgaraba.herdr-micro
@@ -148,6 +148,36 @@ Match them in the plugin's `effort.json`:
   }
 }
 ```
+
+## Dial, joystick, and lighting
+
+Pressing the dial submits `/model` to the focused Codex, Claude Code, or Pi
+agent. The four joystick directions focus the adjacent Herdr pane. A direction
+fires once when the stick is pushed outward and rearms after it returns to
+center.
+
+`lighting.json` controls the six individual Agent keys and the optional
+aggregate zones:
+
+```json
+{
+  "states": {
+    "blocked": { "color": "#ffaa00", "brightness": 1, "effect": "solid", "speed": 0 },
+    "done": { "color": "#22cc55", "brightness": 1, "effect": "solid", "speed": 0 },
+    "working": { "color": "#2277ff", "brightness": 1, "effect": "breath", "speed": 0.35 },
+    "idle": { "color": "#ffffff", "brightness": 0.25, "effect": "solid", "speed": 0 },
+    "unknown": { "color": "#ffffff", "brightness": 0.08, "effect": "solid", "speed": 0 }
+  },
+  "focusedBrightness": 1,
+  "ambient": "status",
+  "keys": null
+}
+```
+
+Effects are `off`, `solid`, `snake`, `rainbow`, `breath`, `gradient`, and
+`shallow-breath`. Set `ambient` or `keys` to `"status"` to make that aggregate
+zone follow the highest-priority slotted agent; use `null` to leave it alone.
+The configuration reloads while the bridge runs.
 
 ## Operations
 
