@@ -1,0 +1,69 @@
+id = "gjermundgaraba.herdr-micro"
+name = "Herdr Micro"
+version = "0.1.0"
+min_herdr_version = "0.7.5"
+description = "Control Herdr from a Work Louder Codex Micro."
+platforms = ["macos"]
+
+[[build]]
+command = ["npm", "install"]
+
+[[build]]
+command = ["mkdir", "-p", "bin"]
+
+[[build]]
+command = ["/usr/bin/swiftc", "native/frontmost.swift", "-o", "bin/frontmost"]
+
+[[build]]
+command = ["/usr/bin/swiftc", "native/micro-hid.swift", "-o", "bin/micro-hid", "-framework", "IOKit"]
+
+[[startup]]
+command = ["node", "src/micro-start.mjs"]
+
+[[panes]]
+id = "diff"
+title = "diff"
+placement = "popup"
+width = "95%"
+height = "90%"
+command = ["hunk", "diff", "--watch"]
+
+[[actions]]
+id = "status"
+title = "Show Herdr status"
+command = ["node", "src/status.mjs"]
+
+[[actions]]
+id = "effort-raise"
+title = "Raise focused agent effort"
+command = ["node", "src/effort-action.mjs", "raise"]
+
+[[actions]]
+id = "effort-lower"
+title = "Lower focused agent effort"
+command = ["node", "src/effort-action.mjs", "lower"]
+
+[[actions]]
+id = "micro-start"
+title = "Start Micro bridge"
+command = ["node", "src/micro-start.mjs"]
+
+[[actions]]
+id = "micro-status"
+title = "Show Micro bridge status"
+command = ["node", "src/micro-action.mjs", "status"]
+
+[[actions]]
+id = "micro-configure-buttons"
+title = "Configure Micro buttons"
+command = ["node", "src/micro-configure-buttons.mjs"]
+
+[[actions]]
+id = "micro-stop"
+title = "Stop Micro bridge"
+command = ["node", "src/micro-action.mjs", "stop"]
+
+[[actions]]
+id = "micro-setup-appsense"
+title = "Bind automatic Layers 1 and 2"
+command = ["node", "src/micro-setup-appsense.mjs"]

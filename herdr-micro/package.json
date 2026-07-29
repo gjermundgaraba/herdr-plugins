@@ -1,0 +1,13 @@
+{
+  "name": "herdr-micro",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "buttons": "node src/micro-configure-buttons.mjs",
+    "test": "node --test"
+  }
+}
