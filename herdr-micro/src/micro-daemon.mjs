@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import {
   buttonAction,
+  configuredPrompt,
   ensureButtonConfig,
   loadButtons,
 } from "./button-config.mjs";
@@ -24,14 +25,12 @@ import {
   SLOT_COUNT,
   slotLighting,
 } from "./micro-protocol.mjs";
-import { reviewPrompt } from "./review-prompt.mjs";
 import { submitArgs } from "./submit.mjs";
 
 const run = promisify(execFile);
 const herdrBin = process.env.HERDR_BIN_PATH ?? "herdr";
 const frontmostBin = fileURLToPath(new URL("../bin/frontmost", import.meta.url));
 const buttonConfigFile = ensureButtonConfig();
-const layerClaims = loadLayerClaims();
 
 let agents = [];
 let slots = Array.from({ length: SLOT_COUNT }, () => null);
@@ -80,6 +79,7 @@ function status() {
 
 async function refreshLayerClaim() {
   try {
+    const layerClaims = loadLayerClaims();
     const { stdout } = await run(frontmostBin, []);
     frontmost = JSON.parse(stdout);
     layerClaim = resolveLayerClaim(layerClaims, frontmost);
@@ -198,20 +198,15 @@ async function submitAgentPrompt(promptFor, label) {
   }
 }
 
-function submitReviewPrompt() {
-  return submitAgentPrompt(reviewPrompt, "review prompt");
-}
-
 function copyLastOutput() {
   return submitAgentPrompt(() => "/copy", "copy");
 }
 
 function submitConfiguredPrompt(prompts) {
-  return submitAgentPrompt((agent) => {
-    const prompt = prompts[agent];
-    if (!prompt) throw new Error(`no prompt configured for ${agent || "none"}`);
-    return prompt;
-  }, "custom prompt");
+  return submitAgentPrompt(
+    (agent) => configuredPrompt(prompts, agent),
+    "custom prompt",
+  );
 }
 
 async function enableFastMode() {
@@ -263,7 +258,6 @@ async function submitFocusedAgent() {
 }
 
 const buttonHandlers = {
-  review: submitReviewPrompt,
   diff: openDiff,
   fast: enableFastMode,
   copy: copyLastOutput,

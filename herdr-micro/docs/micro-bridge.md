@@ -14,18 +14,13 @@ Work Louder Input and the Codex/ChatGPT host are closed. It:
   applicable layer when no claim matches;
 - focuses the pane assigned to `AG00` through `AG05`;
 - maps the observed `ENC_CW` event to effort lower and `ENC_CC` to effort
-  raise; and
-- maps `ACT06` to a focused-agent review prompt using the native Codex,
-  Claude Code, or Pi skill syntax;
-- maps `ACT07` to a temporary Hunk diff popup rooted at the focused agent's
-  repository;
-- maps `ACT08` to `/fast` for the focused Codex or Pi agent;
-- maps `ACT12` to Enter on the focused agent; and
+  raise;
+- maps configured action buttons to built-ins or per-agent prompts; and
 - blanks and releases the device on shutdown or when a known official owner
   starts.
 
 `buttons.json` in `HERDR_PLUGIN_CONFIG_DIR` maps physical buttons 1 through 7
-to `review`, `diff`, `fast`, `submit`, `null`, or an agent-specific prompt
+to `diff`, `fast`, `copy`, `submit`, `null`, or an agent-specific prompt
 object. It is validated and reloaded on every button press.
 
 Layer 2 must retain `KV_OAI_AG00` through `KV_OAI_AG05` plus
@@ -68,8 +63,7 @@ On 2026-07-26 the bridge:
 - opened the paired Codex Micro over Bluetooth LE with the cable unplugged;
 - discovered 18 Herdr agents and populated all six sticky slots;
 - survived a controlled stop/start while blanking and repainting the keys; and
-- passed all 10 Node tests plus Swift compilation, syntax, and whitespace
-  checks.
+- passed the Node tests plus Swift compilation, syntax, and whitespace checks.
 
 Layer 2 was repaired from zero to 16 OAI assignments, synchronized through
 Input, and verified by a clean hardware read-back. It exactly matches the
@@ -85,9 +79,8 @@ The user also physically confirmed dial effort control in Codex and Claude
 Code. Layer 2 RGB, Agent-key focus, and effort control for Codex, Pi, and
 Claude Code are now all proven on the physical device.
 
-The user physically confirmed that `ACT06` submits the agent-specific review
-prompt, `ACT07` opens and closes the focused repository's Hunk popup, and
-`ACT12` submits the focused agent's composer.
+The user physically confirmed agent-specific prompts, the optional Hunk popup,
+`/fast`, `/copy`, submit, and an ordinary F19 mapping.
 
 Automatic selection is also proven on the device. A no-match sample selected
 firmware `layer_index: 1`; a matching foreground Chrome sample selected
@@ -109,9 +102,9 @@ verified over both USB and BLE.
 ## Safety boundary
 
 - The daemon performs no firmware or keymap writes.
-- The explicit one-time AppSense setup action backs up `keymap.json`, changes
-  only two linked-app records and two `linkedAppId` fields, then reads the full
-  file back.
+- The explicit one-time setup action backs up `keymap.json`, clones the Layer
+  1 OAI controls into a blank target layer, adds two AppSense bindings, then
+  reads the full file back.
 - No global synthetic keyboard events.
 - A running Input process always makes the bridge yield.
 - Codex/ChatGPT makes the bridge yield only while its bundle is frontmost;
@@ -121,18 +114,17 @@ verified over both USB and BLE.
 - Unknown third-party HID writers cannot participate in that ownership check;
   do not run one beside this bridge.
 - Claude effort control requires an empty prompt.
-- Pi loads `integrations/pi/herdr-effort.js` through its global
-  `settings.json`; Pi processes already running when it is added require a
-  restart.
+- Pi auto-discovers the installed extension; existing sessions need `/reload`.
 
 ## Commands
 
 ```sh
-npm install
 mkdir -p bin
 /usr/bin/swiftc native/frontmost.swift -o bin/frontmost
 /usr/bin/swiftc native/micro-hid.swift -o bin/micro-hid -framework IOKit
-node src/micro-setup-appsense.mjs
+node src/micro-setup.mjs
+node src/setup-pi-effort.mjs
+node src/doctor.mjs
 node src/micro-start.mjs
 node src/micro-action.mjs status
 node src/micro-action.mjs stop
@@ -141,8 +133,9 @@ node src/micro-action.mjs stop
 ## Source basis
 
 The framing, VID/PID, OAI methods, event names, and single-owner constraint were
-confirmed in the archived [physical-device research](research/). The direct-IOKit access and
-transport-dependent framing were independently verified against the
+confirmed in the archived [physical-device research](research/). The
+direct-IOKit access and transport-dependent framing were independently
+verified against the
 MIT-licensed
 [`eliBenven/freemicro`](https://github.com/eliBenven/freemicro/tree/1e78198c1b4bfe43b7e4aee3246c73314b9bcc0f).
 The MIT-licensed

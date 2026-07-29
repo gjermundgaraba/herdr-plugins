@@ -11,7 +11,7 @@ A minimal useful macOS manifest is:
 ```toml
 id = "gjermundgaraba.herdr-micro"
 name = "Herdr Micro"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.7.5"
 description = "Control Herdr from a Work Louder Codex Micro."
 platforms = ["macos"]

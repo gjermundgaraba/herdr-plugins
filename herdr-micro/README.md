@@ -1,87 +1,109 @@
 # herdr-micro
 
-Herdr plugin for the Work Louder Codex Micro.
+Unofficial [Herdr](https://herdr.dev/) plugin for the Work Louder Codex
+Micro. It shows six agent states on the RGB keys and controls focused Codex,
+Claude Code, and Pi agents.
 
-## Development
+Tested on macOS with Codex Micro firmware `v0.4.1` over USB and Bluetooth LE.
+The plugin talks directly to the vendor HID interface, so firmware changes may
+break it.
 
-Requires Herdr 0.7.5 or newer, Node.js 22 or newer, and Hunk 0.17 or newer.
+## Requirements
+
+- macOS, Herdr 0.7.5 or newer, and Node.js 20 or newer
+- A Codex Micro and Xcode Command Line Tools (`swiftc`)
+- Work Louder Input for the initial keyboard profile only
+- [Hunk](https://hunk.sh/) only if you map the optional `diff` action
+
+## Install
+
+From GitHub:
 
 ```sh
-npm install
+herdr plugin install gjermundgaraba/herdr-plugins/herdr-micro
+herdr plugin enable gjermundgaraba.herdr-micro
+```
+
+For local development:
+
+```sh
+git clone https://github.com/gjermundgaraba/herdr-plugins.git
+cd herdr-plugins/herdr-micro
 mkdir -p bin
 /usr/bin/swiftc native/frontmost.swift -o bin/frontmost
 /usr/bin/swiftc native/micro-hid.swift -o bin/micro-hid -framework IOKit
 herdr plugin link . --enabled
-herdr plugin action invoke status --plugin gjermundgaraba.herdr-micro
-node src/micro-action.mjs status
-node src/micro-action.mjs stop
-herdr plugin unlink gjermundgaraba.herdr-micro
 ```
 
-Herdr injects the active session socket and plugin paths into each command.
-The device daemon polls through the injected `HERDR_BIN_PATH`; its own Unix
-socket provides single-instance status and shutdown control.
+## First run
 
-Plugin notes and primary-source links are in
-[`docs/herdr-plugin-notes.md`](docs/herdr-plugin-notes.md).
+1. In Input, create a blank Layer 2. Connect by USB, then quit Input and the
+   Codex desktop app.
+2. Run the one-time guarded setup. It clones the private OAI layout from Layer
+   1, creates AppSense bindings, backs up the keymap, and verifies the write.
 
-## Thinking effort control
+   ```sh
+   herdr plugin action invoke micro-setup --plugin gjermundgaraba.herdr-micro
+   ```
 
-The plugin exposes `effort-raise` and `effort-lower` actions. It
-freezes Herdr's focused pane from the invocation context, then dispatches:
+3. Start the bridge and check the installation.
 
-- Codex: the locally configured reasoning-effort shortcuts;
-- Claude: the native `/effort` picker;
-- Pi: two extension-owned shortcuts from
-  [`integrations/pi/herdr-effort.js`](integrations/pi/herdr-effort.js).
+   ```sh
+   herdr plugin action invoke micro-start --plugin gjermundgaraba.herdr-micro
+   herdr plugin action invoke doctor --plugin gjermundgaraba.herdr-micro
+   ```
 
-See [`docs/effort-control.md`](docs/effort-control.md) for the test boundary and
-known limitations.
+4. Edit `buttons.json`, `claims.json`, and `effort.json` in:
 
-## Micro bridge
+   ```sh
+   herdr plugin config-dir gjermundgaraba.herdr-micro
+   ```
 
-The bridge owns the Codex Micro vendor HID interface over USB or
-Bluetooth LE, mirrors six Herdr Agent states onto the RGB keys, focuses those
-panes, maps the dial to the effort actions, and maps Button 3 to `/fast` for
-Codex and Pi. See
-[`docs/micro-bridge.md`](docs/micro-bridge.md) for its process and safety
-boundaries.
+The setup refuses to overwrite a nonblank target layer or run while another
+known device owner is active. Pass layers 2–6 when running the script directly:
+`node src/micro-setup.mjs 3`.
 
-## Button configuration
+## Buttons
 
-Run `npm run buttons` (or invoke the Herdr action **Configure Micro buttons**)
-to open the live configuration. Save the file and press a button; the bridge
-reloads it for every press.
+`buttons.json` maps the seven physical action events. It is validated and
+reloaded on every press:
 
 ```json
 {
-  "1": "review",
+  "1": {
+    "codex": "$review",
+    "claude": "/review",
+    "pi": "/skill:review",
+    "default": "Review the current changes"
+  },
   "2": "diff",
   "3": "fast",
-  "4": {
-    "codex": "$my-skill",
-    "claude": "/my-skill",
-    "pi": "/skill:my-skill"
-  },
+  "4": "copy",
   "5": null,
   "6": null,
   "7": "submit"
 }
 ```
 
-Built-in actions are `review`, `diff`, `fast`, and `submit`. `null` disables a
-button. An object submits the prompt matching the focused agent. Buttons
-mapped to ordinary keys such as F19 in Input bypass this file.
+Built-ins are `diff`, `fast`, `copy`, and `submit`; `null` disables a button.
+A prompt object may use any lowercase Herdr agent name and an optional
+`default` fallback. `fast` supports Codex and Pi. Buttons mapped to ordinary
+keys such as F19 in Input bypass the plugin.
 
-## Automatic Layer 2
+Use **Configure Micro buttons** in Herdr or:
 
-The bridge polls the native macOS frontmost app and window once per second.
-Layer claims live in Herdr's plugin config directory as `claims.json`:
+```sh
+npm run buttons
+```
+
+## Automatic layers
+
+`claims.json` maps macOS bundle IDs to layers:
 
 ```json
 [
   {
-    "id": "herdr",
+    "id": "terminal",
     "layer": 2,
     "process": "com.mitchellh.ghostty"
   },
@@ -94,17 +116,56 @@ Layer claims live in Herdr's plugin config directory as `claims.json`:
 ```
 
 An optional `titleIncludes` narrows a claim to matching window titles. The
-last matching rule wins. No match sends no command, preserving the last
-applicable layer.
+last matching rule wins. An unclaimed app sends no command, preserving the
+last applicable layer. Claims are reloaded while the bridge runs.
 
-One-time device setup binds synthetic AppSense identities to Layers 1 and 2:
+## Thinking effort
+
+Claude Code uses its native `/effort` picker. Pi needs the bundled extension:
 
 ```sh
-node src/micro-action.mjs stop
-node src/micro-setup-appsense.mjs
-node src/micro-start.mjs
+herdr plugin action invoke setup-pi-effort \
+  --plugin gjermundgaraba.herdr-micro
 ```
 
-The setup command refuses to run beside the bridge, Input, Codex, or ChatGPT,
-backs up `keymap.json`, writes only the two AppSense bindings, and verifies a
-full device read-back.
+Run `/reload` in existing Pi sessions.
+
+Codex needs two key bindings in `~/.codex/config.toml`:
+
+```toml
+[tui.keymap.chat]
+increase_reasoning_effort = "ctrl-shift-t"
+decrease_reasoning_effort = "ctrl-t"
+```
+
+Match them in the plugin's `effort.json`:
+
+```json
+{
+  "codex": {
+    "raise": "ctrl+shift+t",
+    "lower": "ctrl+t"
+  }
+}
+```
+
+## Operations
+
+```sh
+herdr plugin action invoke micro-status --plugin gjermundgaraba.herdr-micro
+herdr plugin action invoke micro-stop --plugin gjermundgaraba.herdr-micro
+herdr plugin log list --plugin gjermundgaraba.herdr-micro --limit 20
+```
+
+Only one process should own the vendor HID interface. Quit Input while using
+the bridge. The bridge yields to the frontmost Codex desktop app, stops after
+60 seconds without Herdr, and blanks the LEDs on a controlled shutdown.
+
+Design and compatibility details are in
+[`docs/micro-bridge.md`](docs/micro-bridge.md) and
+[`docs/effort-control.md`](docs/effort-control.md). Archived protocol research
+is in [`docs/research/`](docs/research/).
+
+## License
+
+MIT. See [third-party notices](THIRD_PARTY_NOTICES.md).

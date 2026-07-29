@@ -16,7 +16,7 @@ agent-specific plan, and sends every operation to that exact pane through
 
 | Agent | Mechanism | Readback |
 |---|---|---|
-| Codex | `chat.increase_reasoning_effort` / `chat.decrease_reasoning_effort` through the local `ctrl+shift+t` / `ctrl+t` bindings | Visible Codex status |
+| Codex | `chat.increase_reasoning_effort` / `chat.decrease_reasoning_effort` through user-configured key bindings | Visible Codex status |
 | Claude | Open the native `/effort` picker, move left/right, accept | Visible picker/status |
 | Pi | Extension-owned `Ctrl+Shift+Left/Right` shortcuts using `getThinkingLevel()` / `setThinkingLevel()` | Extension notification |
 
@@ -31,29 +31,27 @@ Tested through Herdr 0.7.5 on 2026-07-26:
 | Pi | 0.82.1 | `medium` → `high` → `medium` |
 
 The action runner targeted disposable pane IDs directly; it did not rely on the
-frontmost macOS window. The three Node tests cover operation selection, ordered
-delivery, and Pi's level boundaries.
+frontmost macOS window. The Node tests cover operation selection, ordered
+delivery, Pi's level boundaries, and extension installation.
 
 The final Codex Micro Layer 2 test physically confirmed the dial integration
 for Codex, Claude Code, and Pi.
 
 ## Boundary
 
-- Effort control does not install the Pi extension globally.
-- Codex shortcuts are intentionally local-machine-specific.
+- Codex shortcuts are intentionally user-configurable in `effort.json`.
 - Claude's picker saves the choice as its default for new sessions.
 - Invoke Claude effort changes from an empty prompt; its public interface has no
   direct relative-effort action, so the integration types `/effort`.
-- Pi's global `settings.json` must include
-  `integrations/pi/herdr-effort.js`. Pi 0.82.1 requires a restart when the
-  extension is newly configured; `/reload` only refreshed it in a pane that
-  had already loaded it.
+- The `setup-pi-effort` action installs the Pi extension in
+  `~/.pi/agent/extensions/herdr-micro-effort.ts`; existing sessions need
+  `/reload`.
 - The changed effort affects later provider calls, not a request already sent.
 
 Start Pi with the integration for a manual test:
 
 ```sh
-pi --extension ./integrations/pi/herdr-effort.js
+node src/setup-pi-effort.mjs
 ```
 
 ## Sources

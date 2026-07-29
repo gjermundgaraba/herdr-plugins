@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   buttonAction,
+  configuredPrompt,
   DEFAULT_BUTTONS,
   validateButtons,
 } from "../src/button-config.mjs";
@@ -10,8 +11,10 @@ import { fastModePlan } from "../src/fast-mode.mjs";
 import {
   claimIdentity,
   configureAppSense,
+  configureMicro,
   focusedAppForClaim,
   resolveLayerClaim,
+  validateLayerClaims,
 } from "../src/layer-claims.mjs";
 import {
   assignSlots,
@@ -21,7 +24,6 @@ import {
   Reassembler,
   slotLighting,
 } from "../src/micro-protocol.mjs";
-import { reviewPrompt } from "../src/review-prompt.mjs";
 import { submitArgs } from "../src/submit.mjs";
 
 const agent = (id, status, seq = 0) => ({
@@ -31,18 +33,18 @@ const agent = (id, status, seq = 0) => ({
 });
 
 test("maps readable button configuration to vendor events", () => {
-  assert.equal(buttonAction(DEFAULT_BUTTONS, "ACT06"), "review");
+  assert.equal(buttonAction(DEFAULT_BUTTONS, "ACT06"), null);
   assert.equal(buttonAction(DEFAULT_BUTTONS, "ACT09"), "copy");
   assert.equal(buttonAction(DEFAULT_BUTTONS, "ACT12"), "submit");
   assert.deepEqual(
     validateButtons({
-      4: { codex: "$my-skill", claude: "/my-skill", pi: "/skill:my-skill" },
+      1: { opencode: "/review", default: "Review this change" },
     }),
     {
-      4: { codex: "$my-skill", claude: "/my-skill", pi: "/skill:my-skill" },
+      1: { opencode: "/review", default: "Review this change" },
     },
   );
-  assert.throws(() => validateButtons({ 8: "review" }), /invalid button/);
+  assert.throws(() => validateButtons({ 8: "copy" }), /invalid button/);
   assert.throws(() => validateButtons({ 4: "unknown" }), /invalid action/);
 });
 
@@ -87,20 +89,14 @@ test("maps the physical dial direction to effort direction", () => {
   assert.equal(encoderEffortDirection("ENC_CC"), "raise");
 });
 
-test("translates the review skill syntax for each focused agent", () => {
-  assert.equal(
-    reviewPrompt("codex"),
-    "$deslop $ponytail:ponytail-review\nReview scope: uncomitted changes",
+test("uses an agent-specific prompt with a default fallback", () => {
+  const prompts = { codex: "$review", default: "Review this change" };
+  assert.equal(configuredPrompt(prompts, "codex"), "$review");
+  assert.equal(configuredPrompt(prompts, "opencode"), "Review this change");
+  assert.throws(
+    () => configuredPrompt({ codex: "$review" }, "pi"),
+    /no prompt configured/,
   );
-  assert.equal(
-    reviewPrompt("claude"),
-    "/deslop /ponytail:ponytail-review\nReview scope: uncomitted changes",
-  );
-  assert.equal(
-    reviewPrompt("pi"),
-    "/skill:deslop /skill:ponytail:ponytail-review\nReview scope: uncomitted changes",
-  );
-  assert.throws(() => reviewPrompt("other"), /unsupported focused agent/);
 });
 
 test("opens Hunk in the focused agent's repository", () => {
@@ -211,6 +207,59 @@ test("AppSense setup binds explicit default and claimed layers", () => {
       ],
     ],
   );
+});
+
+test("setup clones a blank target layer and preserves its metadata", () => {
+  const oaiKeys = [
+    "KV_OAI_AG00",
+    "KV_OAI_AG01",
+    "KV_OAI_AG02",
+    "KV_OAI_AG03",
+    "KV_OAI_AG04",
+    "KV_OAI_AG05",
+    "KV_OAI_ACT06",
+    "KV_OAI_ACT07",
+    "KV_OAI_ACT08",
+    "KV_OAI_ACT09",
+    "KV_OAI_ACT10",
+    "KV_OAI_ACT11",
+    "KV_OAI_ACT12",
+    "KV_OAI_ENC_CC",
+    "KV_OAI_ENC_CW",
+    "KV_OAI_ENC_CLK",
+  ];
+  const keymap = {
+    profiles: [
+      {
+        layers: [
+          { layout: { keymap: [oaiKeys] } },
+          {
+            name: "Herdr",
+            lights: { color: "blue" },
+            layout: { keymap: [["KC_NONE"]] },
+          },
+        ],
+      },
+    ],
+    linkedApps: [],
+  };
+  configureMicro(keymap);
+  assert.deepEqual(keymap.profiles[0].layers[1].layout, {
+    keymap: [oaiKeys],
+  });
+  assert.deepEqual(keymap.profiles[0].layers[1].lights, { color: "blue" });
+  assert.deepEqual(
+    keymap.profiles[0].layers.map(({ linkedAppId }) => linkedAppId),
+    [0, 1],
+  );
+
+  keymap.profiles[0].layers[1].layout = { keymap: [["KC_A"]] };
+  assert.throws(() => configureMicro(keymap), /not blank/);
+  assert.equal(
+    validateLayerClaims([{ id: "six", layer: 6, process: "app" }]).length,
+    1,
+  );
+  assert.throws(() => validateLayerClaims([null]), /valid array/);
 });
 
 test("unclaimed windows preserve the last applicable layer", () => {
