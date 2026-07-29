@@ -24,6 +24,10 @@ Work Louder Input and the Codex/ChatGPT host are closed. It:
 - blanks and releases the device on shutdown or when a known official owner
   starts.
 
+`buttons.json` in `HERDR_PLUGIN_CONFIG_DIR` maps physical buttons 1 through 7
+to `review`, `diff`, `fast`, `submit`, `null`, or an agent-specific prompt
+object. It is validated and reloaded on every button press.
+
 Layer 2 must retain `KV_OAI_AG00` through `KV_OAI_AG05` plus
 `KV_OAI_ENC_CW` and `KV_OAI_ENC_CC`. The same bridge can be tested on the
 already-proven OAI-enabled Layer 3.

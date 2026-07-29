@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import {
+  buttonAction,
+  DEFAULT_BUTTONS,
+  validateButtons,
+} from "../src/button-config.mjs";
 import { diffPaneArgs } from "../src/diff-pane.mjs";
 import { fastModePlan } from "../src/fast-mode.mjs";
 import {
@@ -23,6 +28,22 @@ const agent = (id, status, seq = 0) => ({
   terminal_id: id,
   agent_status: status,
   state_change_seq: seq,
+});
+
+test("maps readable button configuration to vendor events", () => {
+  assert.equal(buttonAction(DEFAULT_BUTTONS, "ACT06"), "review");
+  assert.equal(buttonAction(DEFAULT_BUTTONS, "ACT09"), null);
+  assert.equal(buttonAction(DEFAULT_BUTTONS, "ACT12"), "submit");
+  assert.deepEqual(
+    validateButtons({
+      4: { codex: "$my-skill", claude: "/my-skill", pi: "/skill:my-skill" },
+    }),
+    {
+      4: { codex: "$my-skill", claude: "/my-skill", pi: "/skill:my-skill" },
+    },
+  );
+  assert.throws(() => validateButtons({ 8: "review" }), /invalid button/);
+  assert.throws(() => validateButtons({ 4: "unknown" }), /invalid action/);
 });
 
 test("keeps slots sticky, admits urgent agents, and frames device messages", () => {

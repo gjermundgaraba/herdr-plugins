@@ -54,6 +54,11 @@ title = "Show Micro bridge status"
 command = ["node", "src/micro-action.mjs", "status"]
 
 [[actions]]
+id = "micro-configure-buttons"
+title = "Configure Micro buttons"
+command = ["node", "src/micro-configure-buttons.mjs"]
+
+[[actions]]
 id = "micro-stop"
 title = "Stop Micro bridge"
 command = ["node", "src/micro-action.mjs", "stop"]

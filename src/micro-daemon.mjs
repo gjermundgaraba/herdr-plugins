@@ -2,6 +2,11 @@ import { execFile } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import {
+  buttonAction,
+  ensureButtonConfig,
+  loadButtons,
+} from "./button-config.mjs";
 import { diffPaneArgs } from "./diff-pane.mjs";
 import { changeEffort } from "./effort.mjs";
 import { fastModePlan } from "./fast-mode.mjs";
@@ -25,6 +30,7 @@ import { submitArgs } from "./submit.mjs";
 const run = promisify(execFile);
 const herdrBin = process.env.HERDR_BIN_PATH ?? "herdr";
 const frontmostBin = fileURLToPath(new URL("../bin/frontmost", import.meta.url));
+const buttonConfigFile = ensureButtonConfig();
 const layerClaims = loadLayerClaims();
 
 let agents = [];
@@ -169,7 +175,7 @@ async function adjustEffort(direction) {
   }
 }
 
-async function submitReviewPrompt() {
+async function submitAgentPrompt(promptFor, label) {
   if (promptBusy) return;
   promptBusy = true;
   try {
@@ -182,14 +188,26 @@ async function submitReviewPrompt() {
       "agent",
       "prompt",
       current.pane_id,
-      reviewPrompt(current.agent),
+      promptFor(current.agent),
     ]);
-    log(`review prompt submitted: ${current.agent} in ${current.pane_id}`);
+    log(`${label} submitted: ${current.agent} in ${current.pane_id}`);
   } catch (error) {
-    log(`review prompt failed: ${error.message}`);
+    log(`${label} failed: ${error.message}`);
   } finally {
     promptBusy = false;
   }
+}
+
+function submitReviewPrompt() {
+  return submitAgentPrompt(reviewPrompt, "review prompt");
+}
+
+function submitConfiguredPrompt(prompts) {
+  return submitAgentPrompt((agent) => {
+    const prompt = prompts[agent];
+    if (!prompt) throw new Error(`no prompt configured for ${agent || "none"}`);
+    return prompt;
+  }, "custom prompt");
 }
 
 async function enableFastMode() {
@@ -240,6 +258,25 @@ async function submitFocusedAgent() {
   }
 }
 
+const buttonHandlers = {
+  review: submitReviewPrompt,
+  diff: openDiff,
+  fast: enableFastMode,
+  submit: submitFocusedAgent,
+};
+
+function pressConfiguredButton(eventKey) {
+  try {
+    const action = buttonAction(loadButtons(buttonConfigFile), eventKey);
+    if (!action) return;
+    void (typeof action === "object"
+      ? submitConfiguredPrompt(action)
+      : buttonHandlers[action]());
+  } catch (error) {
+    log(`button configuration failed: ${error.message}`);
+  }
+}
+
 function onDeviceEvent(event) {
   if (event.type !== "key") return;
   const match = /^AG0([0-5])$/.exec(event.key);
@@ -250,14 +287,8 @@ function onDeviceEvent(event) {
   } else if (event.action === 2) {
     const direction = encoderEffortDirection(event.key);
     if (direction) void adjustEffort(direction);
-  } else if (event.key === "ACT06" && event.action === 1) {
-    void submitReviewPrompt();
-  } else if (event.key === "ACT07" && event.action === 1) {
-    void openDiff();
-  } else if (event.key === "ACT08" && event.action === 1) {
-    void enableFastMode();
-  } else if (event.key === "ACT12" && event.action === 1) {
-    void submitFocusedAgent();
+  } else if (/^ACT(0[6-9]|1[0-2])$/.test(event.key) && event.action === 1) {
+    pressConfiguredButton(event.key);
   }
 }
 

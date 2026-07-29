@@ -47,6 +47,32 @@ Codex and Pi. See
 [`docs/micro-bridge.md`](docs/micro-bridge.md) for its process and safety
 boundaries.
 
+## Button configuration
+
+Run `npm run buttons` (or invoke the Herdr action **Configure Micro buttons**)
+to open the live configuration. Save the file and press a button; the bridge
+reloads it for every press.
+
+```json
+{
+  "1": "review",
+  "2": "diff",
+  "3": "fast",
+  "4": {
+    "codex": "$my-skill",
+    "claude": "/my-skill",
+    "pi": "/skill:my-skill"
+  },
+  "5": null,
+  "6": null,
+  "7": "submit"
+}
+```
+
+Built-in actions are `review`, `diff`, `fast`, and `submit`. `null` disables a
+button. An object submits the prompt matching the focused agent. Buttons
+mapped to ordinary keys such as F19 in Input bypass this file.
+
 ## Automatic Layer 2
 
 The bridge polls the native macOS frontmost app and window once per second.
