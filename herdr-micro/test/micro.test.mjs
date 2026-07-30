@@ -30,6 +30,7 @@ import {
   Reassembler,
   slotLighting,
 } from "../src/micro-protocol.mjs";
+import { scrollPlan } from "../src/scroll.mjs";
 import { promptArgs, submitArgs } from "../src/submit.mjs";
 
 const agent = (id, status, seq = 0) => ({
@@ -70,6 +71,53 @@ test("validates controls and resolves device and agent bindings", () => {
         dial: { press: { action: "prompt", prompt: "", submit: true } },
       }),
     /non-empty string/,
+  );
+  assert.equal(
+    validateControls({
+      ...DEFAULT_CONTROLS,
+      joystick: {
+        ...DEFAULT_CONTROLS.joystick,
+        up: { action: "scroll", direction: "up", percent: 50 },
+      },
+    }).joystick.up.percent,
+    50,
+  );
+  assert.throws(
+    () =>
+      validateControls({
+        ...DEFAULT_CONTROLS,
+        joystick: {
+          ...DEFAULT_CONTROLS.joystick,
+          up: { action: "scroll", direction: "up", percent: 0 },
+        },
+      }),
+    /percent/,
+  );
+});
+
+test("plans screen-relative scrolling without resizing the pane", () => {
+  const plan = scrollPlan(
+    { pane_id: "w1:p1", scroll: { viewport_rows: 71 } },
+    {
+      area: { x: 32, y: 1, width: 250, height: 73 },
+      panes: [
+        {
+          pane_id: "w1:p1",
+          rect: { x: 32, y: 1, width: 125, height: 73 },
+        },
+      ],
+    },
+    "up",
+    50,
+  );
+  assert.deepEqual(
+    plan,
+    {
+      paneId: "w1:p1",
+      notches: 12,
+      x: 94.5 / 282,
+      y: 37.5 / 74,
+    },
   );
 });
 

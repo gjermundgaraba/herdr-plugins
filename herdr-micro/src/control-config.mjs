@@ -103,6 +103,20 @@ function validateAction(value, label) {
         throw new Error(`${label}.direction must be up, down, left, or right`);
       }
       break;
+    case "scroll":
+      fields(value, ["action", "direction", "percent"], label);
+      if (!["up", "down"].includes(value.direction)) {
+        throw new Error(`${label}.direction must be up or down`);
+      }
+      if (
+        typeof value.percent !== "number" ||
+        !Number.isFinite(value.percent) ||
+        value.percent <= 0 ||
+        value.percent > 100
+      ) {
+        throw new Error(`${label}.percent must be greater than 0 and at most 100`);
+      }
+      break;
     default:
       throw new Error(`${label}.action is invalid`);
   }

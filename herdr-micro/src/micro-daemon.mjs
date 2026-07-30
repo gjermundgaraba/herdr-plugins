@@ -28,6 +28,7 @@ import {
   SLOT_COUNT,
   slotLighting,
 } from "./micro-protocol.mjs";
+import { scrollPlan } from "./scroll.mjs";
 import { promptArgs, submitArgs } from "./submit.mjs";
 
 const run = promisify(execFile);
@@ -234,6 +235,24 @@ async function focusAdjacentPane(direction) {
   log(`joystick focus ${direction}: ${paneId}`);
 }
 
+async function scrollPane(action) {
+  const [{ stdout: paneOutput }, { stdout: layoutOutput }] = await Promise.all([
+    run(herdrBin, ["pane", "current"], { env: liveHerdrEnv }),
+    run(herdrBin, ["pane", "layout"], { env: liveHerdrEnv }),
+  ]);
+  const pane = JSON.parse(paneOutput).result?.pane;
+  const layout = JSON.parse(layoutOutput).result?.layout;
+  const plan = scrollPlan(pane, layout, action.direction, action.percent);
+  await run(frontmostBin, [
+    "scroll",
+    String(plan.notches),
+    String(plan.x),
+    String(plan.y),
+    frontmost.process,
+  ]);
+  log(`scrolled ${action.direction} ${action.percent}% in ${plan.paneId}`);
+}
+
 async function executeAction(action, current) {
   switch (action.action) {
     case "prompt":
@@ -263,6 +282,9 @@ async function executeAction(action, current) {
       break;
     case "focus-pane":
       await focusAdjacentPane(action.direction);
+      break;
+    case "scroll":
+      await scrollPane(action);
       break;
   }
 }
