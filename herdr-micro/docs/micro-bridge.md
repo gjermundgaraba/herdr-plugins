@@ -49,7 +49,8 @@ action, so it never depends on the startup action's stale context.
 The joystick arrives as `v.oai.rad` with normalized angle and distance. The
 default config engages beyond `0.75`, releases below `0.3`, and fires again
 when the stick crosses into another quadrant. Both thresholds and all four
-direction actions are configurable.
+direction actions are configurable. By default, up/down scroll the focused
+pane by 50% of its visible rows and left/right focus the adjacent pane.
 
 `lighting.json` controls the per-state color, brightness, effect, and speed.
 The focused Agent key is raised to `focusedBrightness`. Optional aggregate
@@ -59,7 +60,10 @@ The focused Agent key is raised to `focusedBrightness`. Optional aggregate
 
 `bin/frontmost` is compiled from a small Swift source during the plugin build.
 It combines `NSWorkspace.frontmostApplication` with the top layer-zero
-CoreGraphics window for that process. This needs no Accessibility permission.
+CoreGraphics window for that process. Window discovery needs no Accessibility
+permission. The optional `scroll` action uses the same helper to post a
+temporary mouse move plus wheel events at the focused pane, then restores the
+original cursor; macOS requires post-event Accessibility permission.
 
 Claims are read from `HERDR_PLUGIN_CONFIG_DIR/claims.json`. Exact bundle ID and
 optional case-insensitive title substring are supported; the last matching
@@ -94,6 +98,10 @@ Claude Code are now all proven on the physical device.
 The user physically confirmed agent-specific prompts, the optional Hunk popup,
 `/fast`, `/copy`, submit, and an ordinary F19 mapping.
 
+The user physically confirmed 50% joystick scrolling in both directions
+without the terminal-controller resize snap-back. In a two-pane split, the
+synthetic mouse move correctly routed scrolling to whichever pane was focused.
+
 Automatic selection is also proven on the device. A no-match sample selected
 firmware `layer_index: 1`; a matching foreground Chrome sample selected
 `layer_index: 2`. The live configuration was then restored to Ghostty.
@@ -117,7 +125,8 @@ verified over both USB and BLE.
 - The explicit one-time setup action backs up `keymap.json`, clones the Layer
   1 OAI controls into a blank target layer, adds two AppSense bindings, then
   reads the full file back.
-- No global synthetic keyboard events.
+- No global synthetic keyboard events. The optional scroll action posts
+  targeted mouse-move and wheel events, then restores the cursor.
 - A running Input process always makes the bridge yield.
 - Codex/ChatGPT makes the bridge yield only while its bundle is frontmost;
   the tested non-exclusive HID handle can safely reclaim the device when
@@ -133,8 +142,7 @@ verified over both USB and BLE.
 - Mechanical-key release, hold, and double-tap actions. The firmware reports
   press and release, so the bridge can add these later. A true held macOS key
   would require synthetic input and Accessibility permission.
-- Custom joystick bindings, eight-way sectors, radial UI, and analog pointer
-  mode. The current four-way pane focus needs no additional permission.
+- Eight-way joystick sectors, radial UI, and analog pointer mode.
 - Per-action-key RGB. The known interface individually addresses only the six
   Agent keys; general key backlight and underglow are aggregate zones.
 - Agent-key synchronization flags for the aggregate key and ambient zones.

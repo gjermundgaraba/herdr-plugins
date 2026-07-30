@@ -41,6 +41,11 @@ const agent = (id, status, seq = 0) => ({
 
 test("validates controls and resolves device and agent bindings", () => {
   assert.equal(validateControls(DEFAULT_CONTROLS), DEFAULT_CONTROLS);
+  assert.deepEqual(DEFAULT_CONTROLS.joystick.up, {
+    action: "scroll",
+    direction: "up",
+    percent: 50,
+  });
   assert.deepEqual(keyBinding(DEFAULT_CONTROLS, "ACT09", 1), {
     action: "prompt",
     prompt: "/copy",

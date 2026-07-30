@@ -8,6 +8,17 @@ struct Frontmost: Codable {
     let title: String
 }
 
+if CommandLine.arguments.count == 2 &&
+    CommandLine.arguments[1] == "post-event-access"
+{
+    if CGPreflightPostEventAccess() {
+        print("granted")
+        exit(0)
+    }
+    fputs("macOS post-event access is denied\n", stderr)
+    exit(1)
+}
+
 guard let app = NSWorkspace.shared.frontmostApplication else {
     fputs("no frontmost application\n", stderr)
     exit(1)

@@ -51,6 +51,15 @@ for (const binary of ["frontmost", "micro-hid"]) {
     return "executable";
   });
 }
+try {
+  await run(path.join(root, "bin", "frontmost"), ["post-event-access"]);
+  report("ok", "Scroll event access");
+} catch {
+  report(
+    "warn",
+    "Scroll event access is denied; enable Accessibility for Herdr or its terminal host",
+  );
+}
 check("control configuration", () => {
   loadControls();
   return controlConfigPath();

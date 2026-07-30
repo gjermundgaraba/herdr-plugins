@@ -31,8 +31,8 @@ export const DEFAULT_CONTROLS = {
   joystick: {
     engageDistance: 0.75,
     releaseDistance: 0.3,
-    up: { action: "focus-pane", direction: "up" },
-    down: { action: "focus-pane", direction: "down" },
+    up: { action: "scroll", direction: "up", percent: 50 },
+    down: { action: "scroll", direction: "down", percent: 50 },
     left: { action: "focus-pane", direction: "left" },
     right: { action: "focus-pane", direction: "right" },
   },

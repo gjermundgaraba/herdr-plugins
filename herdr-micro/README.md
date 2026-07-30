@@ -12,6 +12,7 @@ break it.
 
 - macOS, Herdr 0.7.5 or newer, and Node.js 20 or newer
 - A Codex Micro and Xcode Command Line Tools (`swiftc`)
+- macOS Accessibility permission for the optional `scroll` action
 - Work Louder Input for the initial keyboard profile only
 - [Hunk](https://hunk.sh/) only if you map the optional `diff` action
 
@@ -101,8 +102,8 @@ validated and reloaded while the bridge runs:
   "joystick": {
     "engageDistance": 0.75,
     "releaseDistance": 0.3,
-    "up": { "action": "focus-pane", "direction": "up" },
-    "down": { "action": "focus-pane", "direction": "down" },
+    "up": { "action": "scroll", "direction": "up", "percent": 50 },
+    "down": { "action": "scroll", "direction": "down", "percent": 50 },
     "left": { "action": "focus-pane", "direction": "left" },
     "right": { "action": "focus-pane", "direction": "right" }
   }
@@ -113,12 +114,19 @@ Every control accepts a direct action, `null`, or a `byAgent` map. An exact
 focused-agent match wins, followed by `default`; missing and `null` actions do
 nothing. Agent entries are complete actions and do not merge with defaults.
 
-Actions are `prompt`, `diff`, `fast`, `submit`, `effort`, and `focus-pane`.
+Actions are `prompt`, `diff`, `fast`, `submit`, `effort`, `focus-pane`, and
+`scroll`.
 `prompt` requires a nonempty `prompt`; `submit` defaults to `true`, while
 `false` types without pressing Enter. `fast` supports Codex and Pi. Dial and
 joystick bindings can use any action, and the joystick distances are hardware
 calibration values between zero and one. Buttons mapped to ordinary keys such
 as F19 in Input bypass the plugin.
+
+`scroll` requires `direction` (`up` or `down`) and `percent` greater than zero
+and at most 100. It scrolls the focused pane by approximately that fraction of
+its visible rows. On macOS it briefly moves the event cursor to the pane,
+posts wheel events, and restores the original cursor position. Run the doctor
+if it does nothing; macOS event posting requires Accessibility permission.
 
 Use **Configure Micro controls** in Herdr or:
 

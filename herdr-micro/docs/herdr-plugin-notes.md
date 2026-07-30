@@ -1,6 +1,6 @@
 # Herdr plugin notes
 
-Checked on 2026-07-26 against the official Herdr documentation, Herdr source, and the installed `herdr 0.7.5` binary.
+Checked on 2026-07-30 against the official Herdr documentation, Herdr source, and the installed `herdr 0.7.5` binary.
 
 ## Minimal package contract
 
@@ -11,7 +11,7 @@ A minimal useful macOS manifest is:
 ```toml
 id = "gjermundgaraba.herdr-micro"
 name = "Herdr Micro"
-version = "0.4.0"
+version = "0.5.0"
 min_herdr_version = "0.7.5"
 description = "Control Herdr from a Work Louder Codex Micro."
 platforms = ["macos"]
