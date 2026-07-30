@@ -122,6 +122,38 @@ function validateAction(value, label) {
   }
 }
 
+function validateBinding(value, label) {
+  if (
+    !value ||
+    Array.isArray(value) ||
+    typeof value !== "object" ||
+    !["tap", "doubleTap", "hold", "release"].some((field) =>
+      Object.hasOwn(value, field),
+    )
+  ) {
+    validateAction(value, label);
+    return;
+  }
+  fields(
+    value,
+    ["tap", "doubleTap", "hold", "release", "holdMs", "doubleTapMs"],
+    label,
+  );
+  for (const gesture of ["tap", "doubleTap", "hold", "release"]) {
+    validateAction(value[gesture] ?? null, `${label}.${gesture}`);
+  }
+  for (const timing of ["holdMs", "doubleTapMs"]) {
+    if (
+      value[timing] !== undefined &&
+      (!Number.isInteger(value[timing]) ||
+        value[timing] < 50 ||
+        value[timing] > 5_000)
+    ) {
+      throw new Error(`${label}.${timing} must be an integer from 50 to 5000`);
+    }
+  }
+}
+
 export function validateControls(config) {
   object(config, "control configuration");
   fields(config, ["version", "buttons", "dial", "joystick"], "control");
@@ -131,14 +163,14 @@ export function validateControls(config) {
     object(config.buttons, "buttons"),
   )) {
     if (!/^[1-7]$/.test(button)) throw new Error(`invalid button: ${button}`);
-    validateAction(binding, `buttons.${button}`);
+    validateBinding(binding, `buttons.${button}`);
   }
 
   const dial = object(config.dial, "dial");
   fields(dial, ["clockwise", "counterclockwise", "press"], "dial");
-  for (const [input, binding] of Object.entries(dial)) {
-    validateAction(binding, `dial.${input}`);
-  }
+  validateAction(dial.clockwise ?? null, "dial.clockwise");
+  validateAction(dial.counterclockwise ?? null, "dial.counterclockwise");
+  validateBinding(dial.press ?? null, "dial.press");
 
   const joystick = object(config.joystick, "joystick");
   fields(
@@ -199,10 +231,12 @@ export function resolveBinding(binding, agent) {
 
 export function keyBinding(config, key, action) {
   const button = /^ACT(0[6-9]|1[0-2])$/.exec(key);
-  if (button && action === 1) {
+  if (button && [0, 1].includes(action)) {
     return config.buttons[String(Number(button[1]) - 5)] ?? null;
   }
-  if (action === 1 && key === "ENC_CLK") return config.dial.press ?? null;
+  if ([0, 1].includes(action) && key === "ENC_CLK") {
+    return config.dial.press ?? null;
+  }
   if (action !== 2) return null;
   if (key === "ENC_CC") return config.dial.clockwise ?? null;
   if (key === "ENC_CW") return config.dial.counterclockwise ?? null;

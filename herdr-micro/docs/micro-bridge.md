@@ -24,6 +24,10 @@ validated action objects. Every binding can use a direct action, `null`, or a
 `byAgent` map selected from the currently focused Herdr agent. The config is
 reloaded once per bridge poll.
 
+Buttons and dial press additionally support `tap`, `doubleTap`, `hold`, and
+`release` gesture bindings. Hold and double-tap timing is configurable; direct
+bindings retain their immediate press behavior.
+
 Layer 2 must retain `KV_OAI_AG00` through `KV_OAI_AG05` plus
 `KV_OAI_ENC_CW` and `KV_OAI_ENC_CC`. The same bridge can be tested on the
 already-proven OAI-enabled Layer 3.
@@ -98,6 +102,9 @@ Claude Code are now all proven on the physical device.
 The user physically confirmed agent-specific prompts, the optional Hunk popup,
 `/fast`, `/copy`, submit, and an ordinary F19 mapping.
 
+The user physically confirmed configurable tap, double-tap, and hold actions
+on button 4, after which its original direct `/copy` binding was restored.
+
 The user physically confirmed 50% joystick scrolling in both directions
 without the terminal-controller resize snap-back. In a two-pane split, the
 synthetic mouse move correctly routed scrolling to whichever pane was focused.
@@ -127,6 +134,8 @@ verified over both USB and BLE.
   reads the full file back.
 - No global synthetic keyboard events. The optional scroll action posts
   targeted mouse-move and wheel events, then restores the cursor.
+- Gesture actions are semantic plugin actions, not held macOS key events, and
+  require no additional Accessibility permission.
 - A running Input process always makes the bridge yield.
 - Codex/ChatGPT makes the bridge yield only while its bundle is frontmost;
   the tested non-exclusive HID handle can safely reclaim the device when
@@ -139,9 +148,8 @@ verified over both USB and BLE.
 
 ## Documented, not implemented
 
-- Mechanical-key release, hold, and double-tap actions. The firmware reports
-  press and release, so the bridge can add these later. A true held macOS key
-  would require synthetic input and Accessibility permission.
+- True held macOS keys. They require synthetic input and Accessibility
+  permission; the implemented gestures dispatch plugin actions instead.
 - Eight-way joystick sectors, radial UI, and analog pointer mode.
 - Per-action-key RGB. The known interface individually addresses only the six
   Agent keys; general key backlight and underglow are aggregate zones.

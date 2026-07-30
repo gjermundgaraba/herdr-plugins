@@ -113,6 +113,24 @@ validated and reloaded while the bridge runs:
 Every control accepts a direct action, `null`, or a `byAgent` map. An exact
 focused-agent match wins, followed by `default`; missing and `null` actions do
 nothing. Agent entries are complete actions and do not merge with defaults.
+Buttons and dial press also accept gesture bindings:
+
+```json
+{
+  "tap": { "action": "submit" },
+  "doubleTap": { "action": "diff" },
+  "hold": { "action": "prompt", "prompt": "/model", "submit": true },
+  "release": null,
+  "holdMs": 500,
+  "doubleTapMs": 250
+}
+```
+
+Each gesture accepts the same actions and `byAgent` maps. Direct bindings fire
+on press. A gesture `tap` fires on release, but waits for the double-tap window
+when `doubleTap` is configured. A successful hold suppresses tap and
+double-tap; `release`, when configured, fires after either. Timing defaults to
+500 ms for hold and 250 ms for double-tap and accepts 50–5000 ms.
 
 Actions are `prompt`, `diff`, `fast`, `submit`, `effort`, `focus-pane`, and
 `scroll`.

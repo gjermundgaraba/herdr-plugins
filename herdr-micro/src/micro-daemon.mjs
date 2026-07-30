@@ -12,6 +12,7 @@ import {
 import { diffPaneArgs } from "./diff-pane.mjs";
 import { changeEffort } from "./effort.mjs";
 import { fastModePlan } from "./fast-mode.mjs";
+import { GestureDispatcher } from "./gestures.mjs";
 import {
   focusedAppForClaim,
   loadLayerClaims,
@@ -65,6 +66,7 @@ let layerClaim = null;
 let lastJoystickSector = null;
 let controlQueue = Promise.resolve();
 let managedAggregateZones = new Set();
+const gestures = new GestureDispatcher(dispatchControl);
 
 function log(message) {
   console.log(`${new Date().toISOString()} ${message}`);
@@ -323,17 +325,24 @@ function onDeviceEvent(event) {
   }
   if (event.type !== "key") return;
   const match = /^AG0([0-5])$/.exec(event.key);
-  if (match && event.action === 1) {
-    void focusSlot(Number(match[1])).catch((error) =>
-      log(`agent focus failed: ${error.message}`),
-    );
-  } else {
-    const binding = keyBinding(controls, event.key, event.action);
+  if (match) {
+    if (event.action === 1) {
+      void focusSlot(Number(match[1])).catch((error) =>
+        log(`agent focus failed: ${error.message}`),
+      );
+    }
+    return;
+  }
+  const binding = keyBinding(controls, event.key, event.action);
+  if (event.action === 2) {
     if (binding) dispatchControl(binding, event.key);
+  } else if ([0, 1].includes(event.action)) {
+    gestures.handle(event.key, binding, event.action === 1);
   }
 }
 
 async function closeDevice(blank = true) {
+  gestures.clear();
   const current = device;
   device = null;
   lastLighting = "";

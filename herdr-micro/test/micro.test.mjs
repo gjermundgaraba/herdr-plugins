@@ -8,6 +8,7 @@ import {
 } from "../src/control-config.mjs";
 import { diffPaneArgs } from "../src/diff-pane.mjs";
 import { fastModePlan } from "../src/fast-mode.mjs";
+import { GestureDispatcher } from "../src/gestures.mjs";
 import {
   claimIdentity,
   configureAppSense,
@@ -47,6 +48,11 @@ test("validates controls and resolves device and agent bindings", () => {
     percent: 50,
   });
   assert.deepEqual(keyBinding(DEFAULT_CONTROLS, "ACT09", 1), {
+    action: "prompt",
+    prompt: "/copy",
+    submit: true,
+  });
+  assert.deepEqual(keyBinding(DEFAULT_CONTROLS, "ACT09", 0), {
     action: "prompt",
     prompt: "/copy",
     submit: true,
@@ -98,6 +104,89 @@ test("validates controls and resolves device and agent bindings", () => {
       }),
     /percent/,
   );
+  assert.equal(
+    validateControls({
+      ...DEFAULT_CONTROLS,
+      buttons: {
+        1: {
+          tap: { action: "submit" },
+          doubleTap: { action: "diff" },
+          hold: { action: "fast" },
+          release: null,
+          holdMs: 500,
+          doubleTapMs: 250,
+        },
+      },
+    }).buttons[1].holdMs,
+    500,
+  );
+  assert.throws(
+    () =>
+      validateControls({
+        ...DEFAULT_CONTROLS,
+        buttons: {
+          1: { tap: { action: "submit" }, holdMs: 10 },
+        },
+      }),
+    /holdMs/,
+  );
+});
+
+test("dispatches tap, double-tap, hold, release, and direct bindings", () => {
+  const tasks = [];
+  const fired = [];
+  const gestures = new GestureDispatcher(
+    (binding, source) => fired.push([binding.action, source]),
+    (run) => {
+      const task = { run, cancelled: false };
+      tasks.push(task);
+      return task;
+    },
+    (task) => {
+      task.cancelled = true;
+    },
+  );
+  const runNext = () => {
+    const task = tasks.find((candidate) => !candidate.cancelled);
+    if (!task) return;
+    task.cancelled = true;
+    task.run();
+  };
+  const binding = {
+    tap: { action: "submit" },
+    doubleTap: { action: "diff" },
+    hold: { action: "fast" },
+    release: { action: "effort" },
+  };
+
+  gestures.handle("direct", { action: "submit" }, true);
+  gestures.handle("direct", { action: "submit" }, false);
+  gestures.handle("tap", binding, true);
+  gestures.handle("tap", binding, false);
+  runNext();
+  assert.deepEqual(fired.splice(0), [
+    ["submit", "direct"],
+    ["effort", "tap release"],
+    ["submit", "tap tap"],
+  ]);
+
+  gestures.handle("double", binding, true);
+  gestures.handle("double", binding, false);
+  gestures.handle("double", binding, true);
+  gestures.handle("double", binding, false);
+  assert.deepEqual(fired.splice(0), [
+    ["effort", "double release"],
+    ["effort", "double release"],
+    ["diff", "double double-tap"],
+  ]);
+
+  gestures.handle("hold", binding, true);
+  runNext();
+  gestures.handle("hold", binding, false);
+  assert.deepEqual(fired, [
+    ["fast", "hold hold"],
+    ["effort", "hold release"],
+  ]);
 });
 
 test("plans screen-relative scrolling without resizing the pane", () => {
