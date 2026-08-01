@@ -162,6 +162,11 @@ fn shorten_home(path: &str, home: Option<&str>) -> String {
     }
 }
 
+fn explicit_tab_label(label: &str) -> Option<&str> {
+    // ponytail: Herdr 0.7.5 does not expose is_auto_named; use it when the API does.
+    (!label.is_empty() && !label.bytes().all(|byte| byte.is_ascii_digit())).then_some(label)
+}
+
 /// This is an agent picker: panes whose row would say "shell" are dropped,
 /// along with the tabs and workspaces left empty (they only matter for
 /// labels and the detail line).
@@ -293,6 +298,10 @@ impl Picker {
                 .get(pane.workspace_id.as_str())
                 .copied()
                 .unwrap_or("");
+            let tab_label = tab_labels.get(pane.tab_id.as_str()).copied().unwrap_or("");
+            let workspace = explicit_tab_label(tab_label)
+                .map(|tab_label| format!("{ws_label} · {tab_label}"))
+                .unwrap_or_else(|| ws_label.to_string());
             let agent = agents_by_pane.get(pane.pane_id.as_str()).copied();
             let agent_name = agent.and_then(|agent| agent.name.as_deref());
             let stripped_title = agent.and_then(|agent| agent.terminal_title_stripped.as_deref());
@@ -329,14 +338,13 @@ impl Picker {
                 .and_then(|agent| agent.foreground_cwd.as_deref().or(agent.cwd.as_deref()))
                 .map(|path| shorten_home(path, home.as_deref()))
                 .unwrap_or_default();
-            let search_text = format!("{ws_label} {label} {meta} {path}").to_lowercase();
+            let search_text = format!("{workspace} {label} {meta} {path}").to_lowercase();
 
             let mut detail_parts = vec![ws_label.to_string()];
             let multi_tab = tabs_per_ws
                 .get(pane.workspace_id.as_str())
                 .is_some_and(|count| *count > 1);
             if multi_tab {
-                let tab_label = tab_labels.get(pane.tab_id.as_str()).copied().unwrap_or("");
                 detail_parts.push(format!("tab: {tab_label}"));
             }
             detail_parts.push(format!("pane {pane_number}"));
@@ -355,7 +363,7 @@ impl Picker {
 
             rows.push(AgentRow {
                 pane_id: pane.pane_id.clone(),
-                workspace: ws_label.to_string(),
+                workspace,
                 label,
                 path,
                 meta,
@@ -620,10 +628,13 @@ mod tests {
         assert_eq!(rows[0].workspace, "web");
         assert_eq!(rows[0].label, "fix tests");
         assert_eq!(rows[0].meta, "claude · blocked");
+        // Explicit tab labels join the workspace; automatic numeric labels
+        // stay hidden.
+        assert_eq!(rows[1].workspace, "web · tests");
         // agent name beats agent kind; the agent drops out of the meta when
         // the label already is the agent; state_labels override the plain
         // word.
-        assert_eq!(rows[2].workspace, "api");
+        assert_eq!(rows[2].workspace, "api · main");
         assert_eq!(rows[2].label, "fixer");
         assert_eq!(rows[2].meta, "Done");
         // The stripped terminal title (live task summary) becomes the label
