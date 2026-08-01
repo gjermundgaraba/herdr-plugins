@@ -64,6 +64,7 @@ export async function changeEffort({
   direction,
   paneId,
   config,
+  env,
   run = runFile,
   wait = sleep,
 }) {
@@ -74,7 +75,7 @@ export async function changeEffort({
     config ?? (agent === "codex" ? loadEffortConfig() : {}),
   );
   for (const step of plan) {
-    await run(herdrBin, step.args);
+    await run(herdrBin, step.args, env ? { env } : undefined);
     if (step.waitAfterMs) await wait(step.waitAfterMs);
   }
   return { agent, direction, paneId };

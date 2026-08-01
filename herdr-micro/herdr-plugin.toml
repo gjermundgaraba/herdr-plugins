@@ -1,6 +1,6 @@
 id = "gjermundgaraba.herdr-micro"
 name = "Herdr Micro"
-version = "0.6.0"
+version = "0.7.0"
 min_herdr_version = "0.7.5"
 description = "Control Herdr from a Work Louder Codex Micro."
 platforms = ["macos"]
@@ -73,4 +73,4 @@ command = ["node", "src/micro-action.mjs", "stop"]
 [[actions]]
 id = "micro-setup"
 title = "Set up Micro Layer 2"
-command = ["node", "src/micro-setup.mjs", "2"]
+command = ["node", "src/micro-setup.mjs"]

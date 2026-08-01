@@ -8,10 +8,11 @@ The bridge is the sole owner of the Codex Micro vendor HID interface over USB
 or Bluetooth LE while
 Work Louder Input and the Codex/ChatGPT host are closed. It:
 
-- polls Herdr once per second and paints six sticky Agent slots;
-- polls the native macOS frontmost app and window once per second;
-- selects the layer claimed by the frontmost window and preserves the previous
-  applicable layer when no claim matches;
+- discovers running default and named Herdr sessions once per second;
+- paints six sticky Agent slots from only the last foreground Herdr session;
+- maps each session to a stable Ghostty terminal UUID in memory;
+- selects Layer 1 for Codex and Layer 2 for a mapped Ghostty terminal while
+  preserving the previous selection in unrelated applications;
 - focuses the pane assigned to `AG00` through `AG05`;
 - maps action buttons, dial turns and press, and joystick directions through
   one agent-aware control configuration;
@@ -39,6 +40,14 @@ Herdr's startup hook runs `src/micro-start.mjs`. It launches one detached
 single-instance lock and its status/stop control. Logs live beside that socket
 as `micro.log`.
 
+The daemon discovers running names through `herdr session list --json`. For
+each session it briefly sets a unique terminal title, reads the matching stable
+terminal UUID from Ghostty's AppleScript API, restores the original title, and
+retains the mapping only in memory. Every Herdr CLI call selects the captured
+name with `HERDR_SESSION` after clearing inherited pane, workspace, and plugin
+invocation context. Controls and delayed gestures capture that name before
+entering the single action queue.
+
 The daemon launches `bin/micro-hid`, a native direct-IOKit helper. It matches
 the Micro by VID/PID, prefers USB when both transports are present, and selects
 the required framing from IOKit's `Transport` property. USB sends the 63-byte
@@ -55,6 +64,9 @@ default config engages beyond `0.75`, releases below `0.3`, and fires again
 when the stick crosses into another quadrant. Both thresholds and all four
 direction actions are configurable. By default, up/down scroll the focused
 pane by 50% of its visible rows and left/right focus the adjacent pane.
+Scroll is a no-op unless the currently focused Ghostty terminal UUID maps to
+the selected Herdr session. Other actions continue targeting the sticky
+selected session.
 
 `lighting.json` controls the per-state color, brightness, effect, and speed.
 The focused Agent key is raised to `focusedBrightness`. Optional aggregate
@@ -63,17 +75,12 @@ The focused Agent key is raised to `focusedBrightness`. Optional aggregate
 `v.oai.thstatus`.
 
 `bin/frontmost` is compiled from a small Swift source during the plugin build.
-It combines `NSWorkspace.frontmostApplication` with the top layer-zero
-CoreGraphics window for that process. Window discovery needs no Accessibility
-permission. The optional `scroll` action uses the same helper to post a
-temporary mouse move plus wheel events at the focused pane, then restores the
-original cursor; macOS requires post-event Accessibility permission.
-
-Claims are read from `HERDR_PLUGIN_CONFIG_DIR/claims.json`. Exact bundle ID and
-optional case-insensitive title substring are supported; the last matching
-entry wins. The included local configuration claims Ghostty for Layer 2
-and Codex for Layer 1. Chrome and other unclaimed apps send no layer command.
-Ghostty has no title restriction because agent-driven titles are not stable.
+It uses `NSWorkspace.frontmostApplication` for Codex/Ghostty detection.
+Ghostty 1.3 or newer exposes window, tab, and terminal UUIDs through its native
+AppleScript API; Automation permission is required. The optional `scroll`
+action uses the Swift helper to post a temporary mouse move plus wheel events
+at the focused pane, then restores the original cursor; macOS requires
+post-event Accessibility permission.
 
 ## Software result
 
@@ -126,11 +133,18 @@ live statuses, focused the assigned pane from Agent key 1, and changed Codex
 effort in both directions. The single native transport is therefore physically
 verified over both USB and BLE.
 
+On 2026-07-31 active-session routing was added for default and named Herdr
+sessions. A later live probe established that Ghostty's AppleScript terminal
+name exposes Herdr's temporary title even when a custom visible tab title
+hides it. The daemon now uses that reversible title handshake to map stable
+terminal UUIDs to sessions without configuration. The user physically
+confirmed `default → werk → default` UUID focus detection.
+
 ## Safety boundary
 
 - The daemon performs no firmware or keymap writes.
 - The explicit one-time setup action backs up `keymap.json`, clones the Layer
-  1 OAI controls into a blank target layer, adds two AppSense bindings, then
+  1 OAI controls into blank Layer 2, adds two AppSense bindings, then
   reads the full file back.
 - No global synthetic keyboard events. The optional scroll action posts
   targeted mouse-move and wheel events, then restores the cursor.
@@ -140,7 +154,8 @@ verified over both USB and BLE.
 - Codex/ChatGPT makes the bridge yield only while its bundle is frontmost;
   the tested non-exclusive HID handle can safely reclaim the device when
   Ghostty becomes frontmost while Codex remains running.
-- Sixty seconds without Herdr blanks the LEDs and stops the bridge.
+- Sixty seconds with no running Herdr session blanks the LEDs and stops the
+  bridge. A selected-session failure does not silently fall back to another.
 - Unknown third-party HID writers cannot participate in that ownership check;
   do not run one beside this bridge.
 - Claude effort control requires an empty prompt.

@@ -1,15 +1,11 @@
 import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { ensureControlConfig } from "./control-config.mjs";
 import { ensureEffortConfig } from "./effort-config.mjs";
 import { ensureLightingConfig } from "./lighting-config.mjs";
-import {
-  configureMicro,
-  ensureLayerClaims,
-} from "./layer-claims.mjs";
+import { configureMicro } from "./layer-routing.mjs";
 import { MicroDevice } from "./micro-device.mjs";
 import {
   ensureStateDir,
@@ -18,11 +14,6 @@ import {
 } from "./micro-control.mjs";
 
 const run = promisify(execFile);
-const targetLayer = Number(process.argv[2] ?? 2);
-if (!Number.isInteger(targetLayer) || targetLayer < 2 || targetLayer > 6) {
-  throw new Error("target layer must be between 2 and 6");
-}
-const frontmostBin = fileURLToPath(new URL("../bin/frontmost", import.meta.url));
 const { stdout: processes } = await run("/bin/ps", ["-axo", "comm="]);
 const owner = processes
   .split("\n")
@@ -69,9 +60,9 @@ try {
   const before = await readKeymap(device);
   const keymap = JSON.parse(before);
   const canonicalBefore = JSON.stringify(keymap);
-  const after = JSON.stringify(configureMicro(keymap, targetLayer));
+  const after = JSON.stringify(configureMicro(keymap));
   if (after === canonicalBefore) {
-    console.log(`Layer ${targetLayer} is already configured`);
+    console.log("Layer 2 is already configured");
     process.exitCode = 0;
   } else {
     ensureStateDir();
@@ -95,32 +86,17 @@ try {
     }
     if (await readKeymap(device) !== after) throw new Error("keymap read-back failed");
     console.log(
-      `Cloned the OAI layout and bound AppSense Layer ${targetLayer}; backup: ${backupPath}`,
+      `Cloned the OAI layout and bound AppSense Layer 2; backup: ${backupPath}`,
     );
   }
 
-  const { stdout } = await run(frontmostBin, []);
-  const frontmost = JSON.parse(stdout);
   const controls = ensureControlConfig();
   const effort = ensureEffortConfig();
   const lighting = ensureLightingConfig();
-  const claims = ensureLayerClaims([
-    {
-      id: "herdr",
-      layer: targetLayer,
-      process: frontmost.process,
-    },
-    {
-      id: "codex",
-      layer: 1,
-      process: "com.openai.codex",
-    },
-  ]);
   console.log(`Firmware ${status.version}: compatible OAI keymap detected`);
   console.log(`Controls: ${controls}`);
   console.log(`Effort: ${effort}`);
   console.log(`Lighting: ${lighting}`);
-  console.log(`Layer claims: ${claims}`);
 } finally {
   await device.close();
 }

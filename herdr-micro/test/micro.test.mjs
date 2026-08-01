@@ -10,13 +10,12 @@ import { diffPaneArgs } from "../src/diff-pane.mjs";
 import { fastModePlan } from "../src/fast-mode.mjs";
 import { GestureDispatcher } from "../src/gestures.mjs";
 import {
-  claimIdentity,
-  configureAppSense,
+  automaticLayer,
+  CODEX_PROCESS,
   configureMicro,
-  focusedAppForClaim,
-  resolveLayerClaim,
-  validateLayerClaims,
-} from "../src/layer-claims.mjs";
+  GHOSTTY_PROCESS,
+  layerIdentity,
+} from "../src/layer-routing.mjs";
 import {
   DEFAULT_LIGHTING,
   validateLightingConfig,
@@ -136,7 +135,8 @@ test("dispatches tap, double-tap, hold, release, and direct bindings", () => {
   const tasks = [];
   const fired = [];
   const gestures = new GestureDispatcher(
-    (binding, source) => fired.push([binding.action, source]),
+    (binding, source, context) =>
+      fired.push([binding.action, source, context]),
     (run) => {
       const task = { run, cancelled: false };
       tasks.push(task);
@@ -159,33 +159,33 @@ test("dispatches tap, double-tap, hold, release, and direct bindings", () => {
     release: { action: "effort" },
   };
 
-  gestures.handle("direct", { action: "submit" }, true);
+  gestures.handle("direct", { action: "submit" }, true, "direct-session");
   gestures.handle("direct", { action: "submit" }, false);
-  gestures.handle("tap", binding, true);
+  gestures.handle("tap", binding, true, "tap-session");
   gestures.handle("tap", binding, false);
   runNext();
   assert.deepEqual(fired.splice(0), [
-    ["submit", "direct"],
-    ["effort", "tap release"],
-    ["submit", "tap tap"],
+    ["submit", "direct", "direct-session"],
+    ["effort", "tap release", "tap-session"],
+    ["submit", "tap tap", "tap-session"],
   ]);
 
-  gestures.handle("double", binding, true);
+  gestures.handle("double", binding, true, "first-session");
   gestures.handle("double", binding, false);
-  gestures.handle("double", binding, true);
+  gestures.handle("double", binding, true, "second-session");
   gestures.handle("double", binding, false);
   assert.deepEqual(fired.splice(0), [
-    ["effort", "double release"],
-    ["effort", "double release"],
-    ["diff", "double double-tap"],
+    ["effort", "double release", "first-session"],
+    ["effort", "double release", "first-session"],
+    ["diff", "double double-tap", "first-session"],
   ]);
 
-  gestures.handle("hold", binding, true);
+  gestures.handle("hold", binding, true, "hold-session");
   runNext();
   gestures.handle("hold", binding, false);
   assert.deepEqual(fired, [
-    ["fast", "hold hold"],
-    ["effort", "hold release"],
+    ["fast", "hold hold", "hold-session"],
+    ["effort", "hold release", "hold-session"],
   ]);
 });
 
@@ -393,66 +393,21 @@ test("Codex owns the device only while it is frontmost", () => {
   assert.equal(deviceOwner(codex, "com.mitchellh.ghostty"), null);
 });
 
-test("the last matching frontmost-window claim wins", () => {
-  const claims = [
-    { id: "terminal", layer: 3, process: "dev.ghostty" },
-    {
-      id: "herdr",
-      layer: 2,
-      process: "dev.ghostty",
-      titleIncludes: "herdr",
-    },
-  ];
-  assert.deepEqual(
-    resolveLayerClaim(claims, {
-      process: "dev.ghostty",
-      title: "Herdr workspace",
-    }),
-    claims[1],
-  );
+test("automatic layers recognize Codex and routed Ghostty terminals", () => {
+  assert.equal(automaticLayer({ process: CODEX_PROCESS }, null), 1);
+  assert.equal(automaticLayer({ process: GHOSTTY_PROCESS }, "werk"), 2);
+  assert.equal(automaticLayer({ process: GHOSTTY_PROCESS }, null), null);
   assert.equal(
-    resolveLayerClaim(claims, { process: "com.apple.Safari", title: "" }),
+    automaticLayer({ process: "com.apple.Safari" }, "werk"),
     null,
   );
-  assert.deepEqual(claimIdentity(claims[1]), {
+  assert.deepEqual(layerIdentity(2), {
     appName: "Herdr Micro Layer 2",
     process: "gjermundgaraba.herdr-micro.layer-2",
   });
 });
 
-test("AppSense setup binds explicit default and claimed layers", () => {
-  const keymap = {
-    profiles: [
-      {
-        layers: [
-          { id: 0, layout: { keymap: [["KV_OAI_AG05"]] } },
-          { id: 1, layout: {} },
-        ],
-      },
-    ],
-    linkedApps: [],
-  };
-  configureAppSense(keymap);
-  assert.deepEqual(
-    keymap.profiles[0].layers.map(({ linkedAppId }) => linkedAppId),
-    [0, 1],
-  );
-  assert.deepEqual(
-    keymap.linkedApps.map(({ name, process }) => [name, process]),
-    [
-      [
-        "Herdr Micro Layer 1",
-        "gjermundgaraba.herdr-micro.layer-1",
-      ],
-      [
-        "Herdr Micro Layer 2",
-        "gjermundgaraba.herdr-micro.layer-2",
-      ],
-    ],
-  );
-});
-
-test("setup clones a blank target layer and preserves its metadata", () => {
+test("setup clones Layer 1 to Layer 2 and binds both AppSense identities", () => {
   const oaiKeys = [
     "KV_OAI_AG00",
     "KV_OAI_AG01",
@@ -498,33 +453,4 @@ test("setup clones a blank target layer and preserves its metadata", () => {
 
   keymap.profiles[0].layers[1].layout = { keymap: [["KC_A"]] };
   assert.throws(() => configureMicro(keymap), /not blank/);
-  assert.equal(
-    validateLayerClaims([{ id: "six", layer: 6, process: "app" }]).length,
-    1,
-  );
-  assert.throws(() => validateLayerClaims([null]), /valid array/);
-});
-
-test("unclaimed windows preserve the last applicable layer", () => {
-  const claims = [
-    { id: "herdr", layer: 2, process: "com.mitchellh.ghostty" },
-    { id: "codex", layer: 1, process: "com.openai.codex" },
-  ];
-  const commands = [
-    { process: "com.mitchellh.ghostty", title: "" },
-    { process: "com.google.Chrome", title: "" },
-    { process: "com.openai.codex", title: "" },
-    { process: "com.google.Chrome", title: "" },
-  ].map((frontmost) =>
-    focusedAppForClaim(resolveLayerClaim(claims, frontmost)),
-  );
-  assert.deepEqual(
-    commands.map((command) => command?.process ?? null),
-    [
-      "gjermundgaraba.herdr-micro.layer-2",
-      null,
-      "gjermundgaraba.herdr-micro.layer-1",
-      null,
-    ],
-  );
 });

@@ -42,21 +42,23 @@ test("plans the native operation for each agent", () => {
 
 test("executes a frozen plan in order", async () => {
   const calls = [];
+  const env = { HERDR_SOCKET_PATH: "/tmp/werk.sock" };
   await changeEffort({
     herdrBin: "/bin/herdr",
     agent: "claude",
     direction: "raise",
     paneId: "p2",
-    run: async (bin, args) => calls.push([bin, args]),
+    env,
+    run: async (bin, args, options) => calls.push([bin, args, options]),
     wait: async (ms) => calls.push(["wait", ms]),
   });
   assert.deepEqual(calls, [
-    ["/bin/herdr", ["pane", "send-text", "p2", "/effort"]],
-    ["/bin/herdr", ["pane", "send-keys", "p2", "enter"]],
+    ["/bin/herdr", ["pane", "send-text", "p2", "/effort"], { env }],
+    ["/bin/herdr", ["pane", "send-keys", "p2", "enter"], { env }],
     ["wait", 150],
-    ["/bin/herdr", ["pane", "send-keys", "p2", "right"]],
+    ["/bin/herdr", ["pane", "send-keys", "p2", "right"], { env }],
     ["wait", 100],
-    ["/bin/herdr", ["pane", "send-keys", "p2", "enter"]],
+    ["/bin/herdr", ["pane", "send-keys", "p2", "enter"], { env }],
   ]);
 });
 

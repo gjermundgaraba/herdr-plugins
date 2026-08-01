@@ -10,8 +10,9 @@ break it.
 
 ## Requirements
 
-- macOS, Herdr 0.7.5 or newer, and Node.js 20 or newer
+- macOS, Ghostty 1.3 or newer, Herdr 0.7.5 or newer, and Node.js 20 or newer
 - A Codex Micro and Xcode Command Line Tools (`swiftc`)
+- macOS Automation permission for Herdr or its terminal host to inspect Ghostty
 - macOS Accessibility permission for the optional `scroll` action
 - Work Louder Input for the initial keyboard profile only
 - [Hunk](https://hunk.sh/) only if you map the optional `diff` action
@@ -54,15 +55,14 @@ herdr plugin link . --enabled
    herdr plugin action invoke doctor --plugin gjermundgaraba.herdr-micro
    ```
 
-4. Edit `controls.json`, `claims.json`, `effort.json`, and `lighting.json` in:
+4. Edit `controls.json`, `effort.json`, and `lighting.json` in:
 
    ```sh
    herdr plugin config-dir gjermundgaraba.herdr-micro
    ```
 
-The setup refuses to overwrite a nonblank target layer or run while another
-known device owner is active. Pass layers 2–6 when running the script directly:
-`node src/micro-setup.mjs 3`.
+The setup refuses to overwrite a nonblank Layer 2 or run while another known
+device owner is active.
 
 ## Controls
 
@@ -152,28 +152,31 @@ Use **Configure Micro controls** in Herdr or:
 npm run controls
 ```
 
-## Automatic layers
+## Automatic layers and Herdr sessions
 
-`claims.json` maps macOS bundle IDs to layers:
+There is no layer or session routing configuration. The bridge selects:
 
-```json
-[
-  {
-    "id": "terminal",
-    "layer": 2,
-    "process": "com.mitchellh.ghostty"
-  },
-  {
-    "id": "codex",
-    "layer": 1,
-    "process": "com.openai.codex"
-  }
-]
-```
+- Layer 1 while the Codex desktop app is frontmost;
+- Layer 2 when the focused Ghostty terminal belongs to a running Herdr
+  session; and
+- no new layer or session for unrelated applications, preserving the last
+  applicable selection.
 
-An optional `titleIncludes` narrows a claim to matching window titles. The
-last matching rule wins. An unclaimed app sends no command, preserving the
-last applicable layer. Claims are reloaded while the bridge runs.
+One global bridge discovers the default and named Herdr sessions. It briefly
+sets a unique title through each named session, reads Ghostty's stable
+terminal UUID through its AppleScript API, and restores the original title.
+The resulting UUID-to-session map stays in memory and is rebuilt when sessions
+or terminal clients change. User-visible tab titles are not used.
+
+All six Agent slots, RGB, buttons, dial, joystick, and popups route through
+the focused terminal's session via Herdr's `HERDR_SESSION` selector; agents
+from sessions are never mixed. `scroll` rechecks that same UUID immediately
+before posting wheel events, preventing input from reaching Chrome or another
+terminal.
+
+`micro-status` reports the active layer, selected session, terminal UUID, and
+in-memory mappings. Run `npm run probe:sessions -- --watch` to inspect focus
+switches without starting the hardware bridge.
 
 ## Thinking effort
 
@@ -240,7 +243,8 @@ herdr plugin log list --plugin gjermundgaraba.herdr-micro --limit 20
 
 Only one process should own the vendor HID interface. Quit Input while using
 the bridge. The bridge yields to the frontmost Codex desktop app, stops after
-60 seconds without Herdr, and blanks the LEDs on a controlled shutdown.
+60 seconds without a running Herdr session, and blanks the LEDs on a
+controlled shutdown.
 
 Design and compatibility details are in
 [`docs/micro-bridge.md`](docs/micro-bridge.md) and

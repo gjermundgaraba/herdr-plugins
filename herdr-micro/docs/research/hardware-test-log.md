@@ -206,9 +206,9 @@ are proven on the hardware.
 
 On 2026-07-26, `herdr-micro` added a permission-free native macOS foreground
 probe. It reports the frontmost bundle ID and the top layer-zero window title.
-The bridge evaluates `claims.json` once per second; the last matching rule
-wins. It sends synthetic `host.focused_app` identities so firmware AppSense,
-not simulated key presses, performs the layer change.
+The original bridge evaluated a configurable window matcher once per second.
+It sends synthetic `host.focused_app` identities so firmware AppSense, not
+simulated key presses, performs the layer change.
 
 The device now contains these explicit bindings:
 

@@ -12,10 +12,7 @@ import {
   effortConfigPath,
   loadEffortConfig,
 } from "./effort-config.mjs";
-import {
-  layerClaimsPath,
-  loadLayerClaims,
-} from "./layer-claims.mjs";
+import { inspectGhostty } from "./ghostty-routing.mjs";
 import {
   lightingConfigPath,
   loadLightingConfig,
@@ -60,6 +57,22 @@ try {
     "Scroll event access is denied; enable Accessibility for Herdr or its terminal host",
   );
 }
+try {
+  const { stdout } = await run(path.join(root, "bin", "frontmost"), []);
+  const current = JSON.parse(stdout);
+  report("ok", `Frontmost application: ${current.appName}`);
+} catch (error) {
+  report("warn", `Frontmost application could not be inspected: ${error.message}`);
+}
+try {
+  const ghostty = await inspectGhostty();
+  report(
+    "ok",
+    `Ghostty Automation: ${ghostty.terminals.length} terminal(s) visible`,
+  );
+} catch (error) {
+  report("fail", `Ghostty Automation: ${error.message}`);
+}
 check("control configuration", () => {
   loadControls();
   return controlConfigPath();
@@ -73,14 +86,6 @@ check("lighting configuration", () => {
   loadLightingConfig();
   return lightingConfigPath();
 });
-check("layer claims", () => {
-  const claims = loadLayerClaims();
-  if (claims.length === 0) {
-    report("warn", `no automatic layer claims in ${layerClaimsPath()}`);
-  }
-  return `${claims.length} configured`;
-});
-
 try {
   const status = await requestDaemon("status", 750);
   if (status.device === "connected") {
