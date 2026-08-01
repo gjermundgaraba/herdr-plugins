@@ -133,6 +133,11 @@ live statuses, focused the assigned pane from Agent key 1, and changed Codex
 effort in both directions. The single native transport is therefore physically
 verified over both USB and BLE.
 
+That BLE verification used firmware `v0.4.1`. A 2026-08-01 retest after Input
+0.18.0 installed official firmware `v0.6.1` found that USB still works, while
+the new firmware rejects macOS BLE HID output reports. See the
+[wireless compatibility evidence](./research/wireless-bridge-evidence.md).
+
 On 2026-07-31 active-session routing was added for default and named Herdr
 sessions. A later live probe established that Ghostty's AppleScript terminal
 name exposes Herdr's temporary title even when a custom visible tab title
@@ -166,8 +171,11 @@ confirmed `default → werk → default` UUID focus detection.
 - True held macOS keys. They require synthetic input and Accessibility
   permission; the implemented gestures dispatch plugin actions instead.
 - Eight-way joystick sectors, radial UI, and analog pointer mode.
-- Per-action-key RGB. The known interface individually addresses only the six
-  Agent keys; general key backlight and underglow are aggregate zones.
+- Per-action-key RGB. A 2026-08-01 hardware test on this exact Codex Micro
+  `v0.4.1` set IDs `0`–`5` green and IDs `6`–`12` to seven distinct colors;
+  only the six Agent keys lit. General key backlight and underglow remain
+  aggregate zones. See the
+  [lighting capability audit](./research/lighting-capability-audit.md).
 - Agent-key synchronization flags for the aggregate key and ambient zones.
   They exist in the protocol but remain hardware-unverified here.
 

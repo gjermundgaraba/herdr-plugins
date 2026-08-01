@@ -1,21 +1,86 @@
 # Codex Micro wireless bridge evidence
 
 Research date: 2026-07-26  
-Updated: 2026-07-27  
+Updated: 2026-08-01
 Scope: Bluetooth LE versus a possible 2.4 GHz receiver, vendor HID/RGB parity,
 and the current `herdr-micro` transport assumptions.
 
 ## Conclusion
 
-**The Codex Micro hardware and vendor protocol work over Bluetooth LE. The
-Herdr Micro bridge now uses direct IOKit, detects USB versus BLE, and is
-physically verified on both transports.**
+**The Codex Micro hardware and vendor protocol work over Bluetooth LE on
+firmware v0.4.1 and v0.6.1. The Herdr Micro bridge uses direct IOKit and is
+physically verified on USB and both firmware versions over BLE. Updating to
+v0.6.1 can leave an existing macOS BLE identity with stale GATT handles; a
+fresh BLE host slot restores the complete input and RGB channel.**
 
 There is no first-party evidence of a 2.4 GHz dongle mode. Work Louder
 documents only Bluetooth and USB-C, describes three **BLE** host channels plus
 wired mode, and lists only a USB-C cable in the box. This establishes that no
 dongle is documented or supplied; it does not prove the radio silicon could
 never support another mode.
+
+## Firmware v0.6.1 compatibility and recovery
+
+Input 0.18.0 successfully installed official firmware v0.6.1 on the tested
+Codex Micro. The existing keymap and ordinary button input survived. USB still
+enumerated as `0x303A:0x8360`; the bridge completed `device.status`, selected
+Layer 2, accepted an action key, and controlled lighting normally.
+
+The existing BLE2 pairing failed after the update:
+
+- the Device Information PnP ID contains the ASCII prefix of `Work Louder`
+  instead of a valid seven-byte PnP ID, causing macOS to derive the nonsensical
+  runtime identity `0x726F:0x206B` and product `Codex Micro #2`;
+- the HID report map still exposes vendor Report ID 6 and its output
+  characteristic advertises both writes and responseless writes;
+- macOS sends a write with response to that characteristic, and the device
+  returns ATT error `0x03` (`Write Not Permitted`); and
+- raw `IOHIDDeviceSetReport`, the lower-level HID plug-in interface with both
+  report option variants, element writes, and feature reports all fail. Public
+  CoreBluetooth cannot select the advertised responseless-write path because
+  macOS restricts direct access to HID service handles.
+
+This initially looked like a firmware-wide output-report regression. A clean
+pairing on the previously unused BLE3 slot disproved that conclusion:
+
+- BLE3 appeared as `Codex Micro #3` with the correct `0x303A:0x8360` identity;
+- the unchanged bridge completed `device.status` and selected Layer 2;
+- the same direct-IOKit output path accepted solid magenta for all six Agent
+  keys plus the aggregate key and ambient zones; and
+- restarting the normal bridge restored live per-agent lighting and controls.
+
+Firmware v0.6.x added per-slot BLE identities and explicit GATT Service Changed
+handling. The slot-specific result establishes that the old BLE2 identity had
+stale attribute metadata after the firmware changed its service layout; it was
+not a Herdr routing, report-framing, or general v0.6.1 BLE defect.
+
+**Verified recovery:** pair an unused BLE host slot. If all three slots are
+already occupied, forget the affected `Codex Micro #N` pairing in macOS and
+force pairing again by holding a key in that slot's Comms Mode column. That
+same-slot reset follows Work Louder's documented replacement flow but was not
+needed or physically retested here. USB remains the safe recovery transport.
+
+### Input and firmware artifact inspection
+
+Input 0.18.0 bundles `@worklouder/wl-device-kit` 0.1.29 with source maps. Its
+update code maps both Codex Micro and Creator Micro 2 to the public
+[`cm-v2-fw-releases`](https://github.com/worklouder/cm-v2-fw-releases), takes
+the newest stable `.bin`, and flashes the merged image at address zero through
+the ESP32-S3 serial bootloader. It contains no alternate CoreBluetooth writer
+that the bridge could reuse and no stock firmware version picker.
+
+The released firmware is a stripped binary, not source. Strings in v0.6.1
+identify proprietary `wl_ble_device.cpp` code for per-slot identities, GATT
+stamps, and Service Changed signalling. This aligns with the observed
+slot-specific cache failure but is not enough to assign the missed invalidation
+to either macOS or the device implementation.
+
+The tested official v0.6.1 merged image has SHA-256
+`c0d288d5e709cbd7c3f5e4e11e57e26dd1e07e6d83c513e84a9f19d08039794b`.
+The factory v0.4.1 image is neither retained by Input nor published in Work
+Louder's release repository. Do not flash the available v0.4.0 image as a
+guessed rollback; obtain an exact Codex Micro recovery image and instructions
+from Work Louder if rollback is ever required.
 
 ## Evidence
 

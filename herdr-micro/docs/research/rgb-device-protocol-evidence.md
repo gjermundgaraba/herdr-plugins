@@ -396,7 +396,10 @@ No live HID writes were made during this research.
 - Whether macOS distributes or duplicates input reports across non-exclusive handles.
 - Whether Windows HID opening is exclusive in practice.
 - Whether USB and Bluetooth have identical RPC behavior and maximum throughput.
-- The firmware's guaranteed range and persistence rules for thread slot IDs.
+- The vendor-guaranteed range and persistence rules for thread slot IDs. A
+  later physical test established that this Codex Micro `v0.4.1` lights only
+  IDs `0`–`5`; IDs `6`–`12` remained dark. See the
+  [lighting capability audit](./lighting-capability-audit.md).
 - Exact semantics of `syncKeysLighting`, `syncAmbientLighting`, and the `m` field for every effect.
 - Whether a supported local Codex IPC exists for submitting third-party agent status without opening HID.
 - Whether Codex Micro has a vendor-supported recovery image distinct from Creator Micro v2.

@@ -1,12 +1,21 @@
 # Codex Micro layer 2 for Herdr
 
-Research snapshot: **2026-07-25**
+Research snapshot: **2026-07-25**; lighting capability audit updated
+**2026-08-01**.
 
-> **Current implementation (2026-07-27):** the standalone plugin at
-> The [herdr-micro implementation](../..) is physically verified on Layer 2 over USB
-> and BLE. It provides per-agent RGB, Agent-key focus, Codex/Claude/Pi effort
+> **Current implementation (2026-07-27):** [herdr-micro](../..) is physically
+> verified on Layer 2 over USB and on firmware `v0.4.1` and `v0.6.1` over BLE.
+> Existing BLE pairings can retain stale GATT handles after the `v0.6.1`
+> update; pairing a fresh host slot restores the channel. See the
+> [wireless evidence](./wireless-bridge-evidence.md). It provides per-agent
+> RGB, Agent-key focus, Codex/Claude/Pi effort
 > control, sticky app-driven layer switching, and reconnect/sleep recovery.
 > The dated documents in this folder preserve the research that led there.
+
+The fresh [lighting capability audit](./lighting-capability-audit.md) records
+every known lighting surface, current application and firmware artifacts, and
+a physical negative test proving that Codex Micro firmware `v0.4.1` does not
+individually address the seven lower Command keys.
 
 ## Recommendation
 
@@ -39,11 +48,19 @@ The local bridge always yields to Input, yields to Codex only while its window i
 
 ### Creator Micro 2 Agent Mode
 
-Creator Micro 2 **does** provide the same six-key live RGB experience in its new Agent Mode, but the published implementation is still specifically a **Codex** integration. Firmware `v0.6.0-rc.6` scopes Codex commands and live Codex lighting to a Codex-enabled layer; Work Louder does not document a third-party status-provider API for Herdr, Claude Code, or Pi.
+Creator Micro 2 **does** provide the same six-key live RGB experience in its new Agent Mode, but the published implementation is still specifically a **Codex** integration. Firmware `v0.6.1` scopes Codex commands and live Codex lighting to a Codex-enabled layer; Work Louder does not document a third-party status-provider API for Herdr, Claude Code, or Pi.
 
-This proves the Creator Micro 2 firmware can isolate dynamic agent lighting to a designated layer. It does **not** prove that another application can publish the six states. The current public docs also do not explain whether users can create more than one agent-status layer or provision one as an additional Codex Micro Layer 2.
+As of 2026-08-01, Creator Micro 2 firmware `v0.6.1` is stable. A community
+hardware test on `v0.6.0-rc.10` also found that its thread IDs `0`–`12` can
+light all 13 keys individually. The exact Codex Micro `v0.4.1` test produced a
+different result: only IDs `0`–`5` lit. Treat this as a model/firmware
+difference, not a portable protocol guarantee. See the
+[fresh lighting audit](./lighting-capability-audit.md).
 
-Creator Micro 2 therefore does not improve the Herdr route today. Current community integrations primarily hard-code the Codex Micro PID `0x8360`; there is no independent end-to-end validation of Herdr Agent Mode on Creator Micro 2. See [Creator Micro 2 Agent Mode evidence](./creator-micro-2-agent-mode-evidence.md).
+This proves the Creator Micro 2 firmware can isolate dynamic agent lighting to
+a designated layer and may expose broader per-key lighting. It still does
+**not** provide a supported third-party status-provider API. See
+[Creator Micro 2 Agent Mode evidence](./creator-micro-2-agent-mode-evidence.md).
 
 ## Supported-input fallback
 
@@ -107,7 +124,7 @@ Layer 2 should therefore use ordinary HID key chords. Do not flash QMK/VIA firmw
 - no official QMK, VIA, or Vial source/definition exists for Codex Micro;
 - generic firmware could remove the vendor actions and the layer-1 lighting/control path.
 
-The public firmware release that adds Codex support describes assignable Codex commands and live lighting, but it publishes binaries rather than source or a public protocol. See [Work Louder firmware v0.6.0-rc.6](https://github.com/worklouder/cm-v2-fw-releases/releases/tag/v0.6.0-rc.6).
+The public firmware release that adds Codex support describes assignable Codex commands and live lighting, but it publishes binaries rather than source or a public protocol. See [Work Louder firmware v0.6.1](https://github.com/worklouder/cm-v2-fw-releases/releases/tag/v0.6.1).
 
 ## What Herdr provides
 

@@ -1,14 +1,21 @@
 # Creator Micro 2 “Agent Mode”: evidence and implications
 
-**Research date:** 2026-07-25  
+**Research date:** 2026-07-25; release-status update 2026-08-01
 **Scope:** Creator Micro 2 Agent Mode, its Codex integration, RGB/status ownership, and whether it offers a supported route for Herdr, Claude Code, Pi, or another status provider.
+
+> **2026-08-01 update:** Creator Micro 2 firmware `v0.6.1` is now stable and
+> includes the Codex integration described below. A community hardware test on
+> `v0.6.0-rc.10` reports individual lighting across thread IDs `0`–`12`. The
+> tested Codex Micro `v0.4.1` still lights only IDs `0`–`5`; see the
+> [fresh lighting capability audit](./lighting-capability-audit.md). This does
+> not create a supported Herdr or generic status-provider API.
 
 ## Answer at a glance
 
 | Question | Finding |
 |---|---|
 | What is Agent Mode? | A **Codex-enabled keymap layer** on Creator Micro 2. It is not a provider-neutral agent mode. |
-| How is it enabled? | The only public implementation is prerelease firmware **v0.6.0-rc.6** plus the corresponding Codex host update. Work Louder has not documented how the Codex-enabled layer is provisioned. |
+| How is it enabled? | Stable firmware **v0.6.1** includes Codex integration; the Codex host configures its commands and status. Work Louder has not documented a generic status-provider interface. |
 | Where is it configured? | Thread slots, Codex commands, joystick skills, dial behavior, and lighting preferences are configured in the Codex desktop app. Input manages ordinary Creator layers; its role in provisioning the Codex-enabled layer is undocumented. |
 | Which agents supply status? | Codex/ChatGPT desktop threads only. No official source or current artifact exposes a Claude Code, Pi, Herdr, or generic status-provider selector. |
 | Can Herdr use the controls? | Yes, through ordinary Input shortcuts/macros and a host-side bridge. Smart Actions are a possible command-trigger route, but are not enabled in the inspected stable Input 0.17.2 build. This is Creator Mode functionality, not Agent Mode’s native status path. |
@@ -44,11 +51,15 @@ The “agents” exposed in the current Codex configuration UI are Codex/ChatGPT
 
 ### Public release state
 
-The latest stable Creator Micro 2 firmware is **v0.4.0**, released 2026-06-21. Its notes cover communications, charging, battery, sleep, and reliability; they do not include Codex. [Creator Micro v2 firmware v0.4.0](https://github.com/worklouder/cm-v2-fw-releases/releases/tag/v0.4.0)
+At the original 2026-07-25 snapshot, stable firmware was `v0.4.0` and Codex
+support had first appeared in `v0.6.0-rc.6`. Work Louder then released stable
+`v0.6.1` on 2026-08-01. Its notes retain Codex-enabled-layer isolation and add
+lighting, connection, and power-management improvements.
+[Creator Micro v2 firmware v0.6.1](https://github.com/worklouder/cm-v2-fw-releases/releases/tag/v0.6.1)
 
-Codex support first appears in the current public **v0.6.0-rc.6 prerelease**, released 2026-07-23. Its notes say the firmware adds support for the upcoming Codex integration and requires the corresponding Codex host update. [Creator Micro v2 firmware v0.6.0-rc.6](https://github.com/worklouder/cm-v2-fw-releases/releases/tag/v0.6.0-rc.6)
-
-Work Louder separately announced that existing Creator Micro 2 and Framer Micro owners would receive this as a free, optional public update on **2026-08-01**, with beta access beginning 2026-07-23. Therefore the code is downloadable but the general rollout is still future-dated and prerelease as of 2026-07-25. Work Louder has not published an exact firmware/Input/Codex compatibility matrix. [Work Louder update announcement](https://www.youtube.com/shorts/t63MSgObnQU)
+The stable release changes the availability status, not the integration
+boundary: Agent Mode remains a Codex host integration rather than a public
+provider-neutral agent or RGB API.
 
 ### What current public artifacts verify
 
@@ -186,7 +197,7 @@ The defensible design remains:
 
 Creator Micro 2’s new Codex layer does not materially change that architecture.
 
-## Artifact baseline and confidence
+## Original artifact baseline and confidence
 
 Local artifact inspection was used to verify behavior not yet documented on a public setup page:
 
@@ -199,4 +210,6 @@ Local artifact inspection was used to verify behavior not yet documented on a pu
 
 **Unknown:** the exact user-facing provisioning flow for the Creator Micro 2 Codex-enabled layer. Neither current public documentation nor inspected Input 0.17.2 provides a reproducible creation procedure or complete version matrix.
 
-**Unknown:** whether Work Louder will later expose the private status/RGB transport, broaden Agent Mode to other providers, or make firmware 0.6.0 stable without changing the flow.
+Stable `v0.6.1` retained the same Codex-specific integration boundary.
+It remains **unknown** whether Work Louder will expose the private status/RGB
+transport or broaden Agent Mode to other providers.
