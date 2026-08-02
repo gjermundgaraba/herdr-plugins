@@ -60,17 +60,8 @@ impl Report {
 
 fn check(report: &mut Report, label: &str, f: impl FnOnce() -> Result<String>) {
     match f() {
-        Ok(detail) => report.push(
-            Level::Ok,
-            format!(
-                "{label}{sep}",
-                sep = if detail.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {detail}")
-                }
-            ),
-        ),
+        Ok(detail) if detail.is_empty() => report.push(Level::Ok, label),
+        Ok(detail) => report.push(Level::Ok, format!("{label}: {detail}")),
         Err(error) => report.push(Level::Fail, format!("{label}: {error}")),
     }
 }

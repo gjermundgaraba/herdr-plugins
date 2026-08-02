@@ -13,14 +13,6 @@ pub const MAX_PAYLOAD: usize = 61;
 pub const MAX_REASSEMBLED: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct SlotLight {
-    pub id: usize,
-    pub c: u32,
-    pub b: f64,
-    pub e: u8,
-    pub s: f64,
-}
-#[derive(Clone, Debug, PartialEq)]
 pub struct JoystickEvent {
     pub sector: Option<u8>,
     pub direction: Option<&'static str>,
@@ -111,14 +103,12 @@ pub fn slot_lighting(
     slots: &[Option<String>],
     agents: &[Agent],
     config: &LightingConfig,
-) -> Vec<SlotLight> {
+) -> Vec<Light> {
     let by_id: HashMap<_, _> = agents.iter().map(|a| (a.terminal_id.as_str(), a)).collect();
     slots
         .iter()
-        .enumerate()
-        .map(|(id, slot)| {
-            let light = slot
-                .as_ref()
+        .map(|slot| {
+            slot.as_ref()
                 .and_then(|id| by_id.get(id.as_str()))
                 .map(|a| {
                     let mut l = config.light(a.agent_status);
@@ -132,14 +122,7 @@ pub fn slot_lighting(
                     b: 0.0,
                     e: 0,
                     s: 0.0,
-                });
-            SlotLight {
-                id,
-                c: light.c,
-                b: light.b,
-                e: light.e,
-                s: light.s,
-            }
+                })
         })
         .collect()
 }

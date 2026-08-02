@@ -42,39 +42,39 @@ pub fn parse_agents(value: &Value) -> Result<Vec<Agent>> {
     agents
         .iter()
         .map(|raw| {
-            let string = |key| raw.get(key).map(string_value).unwrap_or_default();
-            let terminal_id = string("terminal_id");
-            let pane_id = string("pane_id");
-            if terminal_id.is_empty() || pane_id.is_empty() {
-                bail!("Herdr returned invalid agent list");
-            }
+            let terminal_id = string_field(raw, "terminal_id")?
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("Herdr returned invalid agent list"))?;
+            let pane_id = string_field(raw, "pane_id")?
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("Herdr returned invalid agent list"))?;
+            let agent = string_field(raw, "agent")?.unwrap_or_default();
+            let agent_status = string_field(raw, "agent_status")?;
+            let cwd = string_field(raw, "foreground_cwd")?
+                .filter(|value| !value.is_empty())
+                .or(string_field(raw, "cwd")?)
+                .unwrap_or_default();
             Ok(Agent {
-                terminal_id,
-                pane_id,
-                agent: string("agent"),
-                agent_status: normalize_agent_status(
-                    raw.get("agent_status").and_then(Value::as_str),
-                ),
+                terminal_id: terminal_id.into(),
+                pane_id: pane_id.into(),
+                agent: agent.into(),
+                agent_status: normalize_agent_status(agent_status),
                 state_change_seq: raw
                     .get("state_change_seq")
                     .and_then(Value::as_u64)
                     .unwrap_or(0),
                 focused: raw.get("focused").and_then(Value::as_bool) == Some(true),
-                cwd: raw
-                    .get("foreground_cwd")
-                    .or_else(|| raw.get("cwd"))
-                    .map(string_value)
-                    .unwrap_or_default(),
+                cwd: cwd.into(),
             })
         })
         .collect()
 }
 
-fn string_value(value: &Value) -> String {
-    match value {
-        Value::String(value) => value.clone(),
-        Value::Null => "null".into(),
-        other => other.to_string(),
+fn string_field<'a>(value: &'a Value, key: &str) -> Result<Option<&'a str>> {
+    match value.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(_) => bail!("Herdr returned non-string {key}"),
     }
 }
 
@@ -143,21 +143,6 @@ pub fn fast_mode_plan(agent: &Agent) -> Result<Vec<Vec<String>>> {
             .map(|args| args.into_iter().map(str::to_owned).collect())
             .collect()
     })
-}
-
-pub fn focus_pane_args(direction: &str, pane_id: &str) -> Result<Vec<String>> {
-    if pane_id.is_empty() {
-        bail!("no focused Herdr pane");
-    }
-    if !matches!(direction, "left" | "right" | "up" | "down") {
-        bail!("invalid pane focus direction: {direction}");
-    }
-    Ok(
-        vec!["pane", "focus", "--direction", direction, "--pane", pane_id]
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
-    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -364,6 +349,14 @@ mod tests {
             vec!["pane", "send-keys", "p2", "left"]
         );
         assert!(plan_effort_change("codex", "raise", "p1", &default_effort()).is_err());
+    }
+    #[test]
+    fn rejects_non_string_agent_fields() {
+        assert!(parse_agents(&json!({"result":{"agents":[{
+            "terminal_id": 7,
+            "pane_id": "p1"
+        }]}}))
+        .is_err());
     }
     #[test]
     fn computes_scroll_geometry() {

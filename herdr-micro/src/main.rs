@@ -204,10 +204,8 @@ fn probe_sessions(args: &[OsString]) -> Result<i32> {
     if !args.is_empty() && !watch {
         bail!("usage: herdr-micro probe-sessions [--watch]");
     }
-    let mappings = probe_session_terminals(
-        &discover_sessions(&current_environment())?,
-        &current_environment(),
-    )?;
+    let environment = current_environment();
+    let mappings = probe_session_terminals(&discover_sessions(&environment)?, &environment)?;
     let state = inspect_ghostty()?;
     let mut previous = focused_session(&mappings, &state);
     println!(

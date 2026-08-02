@@ -28,9 +28,9 @@ pub struct GhosttyTerminal {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GhosttyState {
     pub frontmost: bool,
-    #[serde(rename = "focusedTerminalId")]
     pub focused_terminal_id: Option<String>,
     pub terminals: Vec<GhosttyTerminal>,
 }
@@ -105,10 +105,9 @@ where
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionTerminalMapping {
-    #[serde(rename = "sessionName")]
     pub session_name: String,
-    #[serde(rename = "terminalId")]
     pub terminal_id: String,
 }
 
@@ -144,16 +143,10 @@ where
             .iter()
             .any(|mapping: &SessionTerminalMapping| mapping.terminal_id == terminal.id);
 
-        // Once a token is visible, always restore it before reporting a later
-        // mapping error.  This is the safety boundary for user tab titles.
-        let mapping = SessionTerminalMapping {
-            session_name: session_name.clone(),
-            terminal_id: terminal.id.clone(),
-        };
-        let restore_result = set_title(session_name, &original);
-        restore_result?;
-        let restored = inspect()?;
-        if restored
+        // After identifying a terminal, restore and verify its title before
+        // reporting a duplicate mapping.
+        set_title(session_name, &original)?;
+        if inspect()?
             .terminals
             .iter()
             .find(|candidate| candidate.id == terminal.id)
@@ -168,7 +161,10 @@ where
                 terminal.id
             );
         }
-        mappings.push(mapping);
+        mappings.push(SessionTerminalMapping {
+            session_name: session_name.clone(),
+            terminal_id: terminal.id,
+        });
     }
     Ok(mappings)
 }

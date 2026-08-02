@@ -343,7 +343,7 @@ pub fn setup_micro() -> Result<SetupReport> {
         bail!("stop the Micro bridge first");
     }
     let (event_tx, _events) = mpsc::channel::<DeviceEvent>();
-    let (mut device, _) = MicroDevice::open(event_tx)?;
+    let mut device = MicroDevice::open(event_tx)?;
     let result = (|| {
         let status = device.request("device.status", None, DEFAULT_REQUEST_TIMEOUT)?;
         let firmware = status

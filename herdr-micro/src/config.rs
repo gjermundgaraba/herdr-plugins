@@ -71,14 +71,8 @@ pub struct GestureBinding {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Binding {
     Action(Action),
-    ByAgent(ByAgent),
+    ByAgent(std::collections::BTreeMap<String, Option<Action>>),
     Gesture(GestureBinding),
-}
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ByAgent {
-    #[serde(rename = "byAgent")]
-    pub by_agent: std::collections::BTreeMap<String, Option<Action>>,
 }
 
 impl Binding {
@@ -86,19 +80,11 @@ impl Binding {
         match self {
             Self::Action(action) => Some(action.clone()),
             Self::ByAgent(variants) => variants
-                .by_agent
                 .get(agent)
-                .or_else(|| variants.by_agent.get("default"))
+                .or_else(|| variants.get("default"))
                 .cloned()
                 .flatten(),
             Self::Gesture(_) => None,
-        }
-    }
-    pub fn gesture(&self) -> Option<&GestureBinding> {
-        if let Self::Gesture(binding) = self {
-            Some(binding)
-        } else {
-            None
         }
     }
 }
@@ -127,7 +113,6 @@ pub fn key_binding(config: &Controls, key: &str, action: i64) -> Option<Binding>
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Controls {
-    pub version: u8,
     pub buttons: std::collections::BTreeMap<u8, Option<Binding>>,
     pub dial: Dial,
     pub joystick: Joystick,
@@ -191,7 +176,6 @@ pub fn parse_controls(value: &Value) -> Result<Controls, String> {
         );
     }
     Ok(Controls {
-        version: 1,
         buttons: parsed_buttons,
         dial: Dial {
             clockwise: parse_action_or_null(
@@ -251,7 +235,7 @@ fn parse_binding(value: &Value, label: &str) -> Result<Option<Binding>, String> 
                 parse_action_or_null(action, &format!("{label}.byAgent.{agent}"))?,
             );
         }
-        return Ok(Some(Binding::ByAgent(ByAgent { by_agent })));
+        return Ok(Some(Binding::ByAgent(by_agent)));
     }
     if ["tap", "doubleTap", "hold", "release"]
         .iter()
@@ -505,10 +489,7 @@ pub fn ensure_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
         let json = serde_json::to_string_pretty(value).unwrap() + "\n";
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true).mode(0o600);
-        match std::io::Write::write_all(&mut options.open(path)?, json.as_bytes()) {
-            Ok(()) => {}
-            Err(e) => return Err(e),
-        };
+        std::io::Write::write_all(&mut options.open(path)?, json.as_bytes())?;
     }
     fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
 }

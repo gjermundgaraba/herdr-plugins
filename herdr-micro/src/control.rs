@@ -64,19 +64,15 @@ impl Command {
     }
 }
 
-/// Send exactly one newline-delimited JSON request and read exactly one response.
-pub fn request_daemon(command: Command, timeout: Duration) -> Result<Value> {
-    request_at(&control_socket(), command, timeout)
-}
-
 pub fn request_status(timeout: Duration) -> Result<Value> {
-    request_daemon(Command::Status, timeout)
+    request_at(&control_socket(), Command::Status, timeout)
 }
 
 pub fn request_stop(timeout: Duration) -> Result<Value> {
-    request_daemon(Command::Stop, timeout)
+    request_at(&control_socket(), Command::Stop, timeout)
 }
 
+/// Send exactly one newline-delimited JSON request and read exactly one response.
 pub fn request_at(path: &Path, command: Command, timeout: Duration) -> Result<Value> {
     let started = Instant::now();
     let stream =
@@ -147,8 +143,8 @@ fn identity(path: &Path) -> Result<Option<SocketIdentity>> {
     }
 }
 
-/// A bound server. Call [`ControlServer::run`] from the daemon thread; every
-/// connection is served on its own short-lived thread so status calls overlap.
+/// A bound server. Every connection is served on its own short-lived thread so
+/// status calls overlap.
 pub struct ControlServer {
     listener: Option<UnixListener>,
     path: PathBuf,
@@ -159,12 +155,6 @@ pub struct ControlServer {
 }
 
 impl ControlServer {
-    /// Serve until a `stop` request arrives. The stop callback is invoked once,
-    /// after that request's response has been written.
-    pub fn run(&self) -> Result<()> {
-        self.run_until(None)
-    }
-
     /// The synchronous daemon-loop variant for callers that already have a
     /// shutdown channel. Disconnecting the channel also ends the loop.
     pub fn run_with_shutdown(&self, shutdown: &Receiver<()>) -> Result<()> {
@@ -220,7 +210,6 @@ impl ControlServer {
 
 impl Drop for ControlServer {
     fn drop(&mut self) {
-        drop(self.listener.take());
         let _ = self.close();
     }
 }
@@ -282,36 +271,30 @@ fn handle_connection(
 ) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     let request = read_line(&mut stream)?;
-    let response = match serde_json::from_slice::<Value>(&request) {
-        Err(_) | Ok(Value::Null) => json!({ "error": "invalid request" }),
-        Ok(Value::Object(object)) => match object.get("command").and_then(Value::as_str) {
-            Some("status") => status(),
-            Some("stop") => json!({ "stopping": true }),
-            _ => json!({ "error": "unknown command" }),
-        },
-        Ok(_) => json!({ "error": "unknown command" }),
+    let parsed = serde_json::from_slice::<Value>(&request);
+    let command = parsed
+        .as_ref()
+        .ok()
+        .and_then(|value| value.get("command"))
+        .and_then(Value::as_str)
+        .and_then(|name| match name {
+            "status" => Some(Command::Status),
+            "stop" => Some(Command::Stop),
+            _ => None,
+        });
+    let response = match (&parsed, command) {
+        (Err(_) | Ok(Value::Null), _) => json!({ "error": "invalid request" }),
+        (_, Some(Command::Status)) => status(),
+        (_, Some(Command::Stop)) => json!({ "stopping": true }),
+        _ => json!({ "error": "unknown command" }),
     };
-    let stop_requested = request_is_stop(&request);
     stream.write_all(response.to_string().as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()?;
-    if stop_requested && !stopping.swap(true, Ordering::AcqRel) {
+    if command == Some(Command::Stop) && !stopping.swap(true, Ordering::AcqRel) {
         stop();
     }
     Ok(())
-}
-
-fn request_is_stop(request: &[u8]) -> bool {
-    serde_json::from_slice::<Value>(request)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("command")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .as_deref()
-        == Some("stop")
 }
 
 fn read_line(stream: &mut UnixStream) -> Result<Vec<u8>> {
@@ -348,7 +331,7 @@ mod tests {
     fn start_test_server(
         path: PathBuf,
         stops: Arc<AtomicUsize>,
-    ) -> (Arc<ControlServer>, thread::JoinHandle<()>) {
+    ) -> (Arc<ControlServer>, mpsc::Sender<()>, thread::JoinHandle<()>) {
         let server = Arc::new(
             listen_for_control_at(
                 path,
@@ -359,16 +342,18 @@ mod tests {
             )
             .unwrap(),
         );
+        let (shutdown, shutdown_rx) = mpsc::channel();
         let runner = Arc::clone(&server);
-        let thread = thread::spawn(move || runner.run().unwrap());
-        (server, thread)
+        let thread = thread::spawn(move || runner.run_with_shutdown(&shutdown_rx).unwrap());
+        (server, shutdown, thread)
     }
 
     #[test]
     fn rust_client_and_server() {
         let dir = temp_dir("rust");
         let path = dir.join(SOCKET_NAME);
-        let (server, runner) = start_test_server(path.clone(), Arc::new(AtomicUsize::new(0)));
+        let (server, _shutdown, runner) =
+            start_test_server(path.clone(), Arc::new(AtomicUsize::new(0)));
         assert_eq!(
             request_at(&path, Command::Status, Duration::from_secs(1)).unwrap(),
             json!({ "running": true })
@@ -403,7 +388,7 @@ mod tests {
         let dir = temp_dir("protocol-client");
         let path = dir.join(SOCKET_NAME);
         let stops = Arc::new(AtomicUsize::new(0));
-        let (server, runner) = start_test_server(path.clone(), stops);
+        let (server, _shutdown, runner) = start_test_server(path.clone(), stops);
         let mut client = UnixStream::connect(&path).unwrap();
         client.write_all(b"{\"command\":\"status\"}\n").unwrap();
         assert_eq!(
@@ -420,7 +405,8 @@ mod tests {
     fn malformed_and_unknown_requests_return_errors() {
         let dir = temp_dir("errors");
         let path = dir.join(SOCKET_NAME);
-        let (server, runner) = start_test_server(path.clone(), Arc::new(AtomicUsize::new(0)));
+        let (server, _shutdown, runner) =
+            start_test_server(path.clone(), Arc::new(AtomicUsize::new(0)));
         for (request, expected) in [
             (
                 b"not json\n".as_slice(),
@@ -448,7 +434,8 @@ mod tests {
     fn duplicate_start_detects_live_daemon() {
         let dir = temp_dir("duplicate");
         let path = dir.join(SOCKET_NAME);
-        let (server, runner) = start_test_server(path.clone(), Arc::new(AtomicUsize::new(0)));
+        let (server, _shutdown, runner) =
+            start_test_server(path.clone(), Arc::new(AtomicUsize::new(0)));
         let error = match listen_for_control_at(path.clone(), || json!({}), || {}) {
             Ok(_) => panic!("duplicate bind succeeded"),
             Err(error) => error,
@@ -478,7 +465,7 @@ mod tests {
         let dir = temp_dir("stop");
         let path = dir.join(SOCKET_NAME);
         let stops = Arc::new(AtomicUsize::new(0));
-        let (server, runner) = start_test_server(path.clone(), Arc::clone(&stops));
+        let (server, _shutdown, runner) = start_test_server(path.clone(), Arc::clone(&stops));
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
@@ -502,15 +489,15 @@ mod tests {
         let result = start_daemon_at(
             &path,
             move || {
-                let (server, runner) =
+                let (server, shutdown, runner) =
                     start_test_server(launch_path, Arc::new(AtomicUsize::new(0)));
-                ready_tx.send((server, runner)).unwrap();
+                ready_tx.send((server, shutdown, runner)).unwrap();
                 Ok(())
             },
             Duration::from_secs(1),
         );
         assert_eq!(result.unwrap(), json!({ "running": true }));
-        let (server, runner) = ready_rx.recv().unwrap();
+        let (server, _shutdown, runner) = ready_rx.recv().unwrap();
         request_at(&path, Command::Stop, Duration::from_secs(1)).unwrap();
         drop(server);
         runner.join().unwrap();

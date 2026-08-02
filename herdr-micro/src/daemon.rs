@@ -17,9 +17,8 @@ use std::{
 
 use crate::{
     actions::{
-        automatic_layer, diff_pane_args, execute_effort_plan, fast_mode_plan, focus_pane_args,
-        layer_identity, parse_agents, plan_effort_change, prompt_args, scroll_plan, submit_args,
-        Agent,
+        automatic_layer, diff_pane_args, execute_effort_plan, fast_mode_plan, layer_identity,
+        parse_agents, plan_effort_change, prompt_args, scroll_plan, submit_args, Agent,
     },
     config::{
         config_path, default_controls, key_binding, load_controls, load_effort, load_lighting,
@@ -318,7 +317,13 @@ fn execute_action(
                 Direction::Right => "right",
             };
             let pane = current_pane(session, base)?;
-            run_herdr(focus_pane_args(direction, &pane)?, session, base)?;
+            run_herdr(
+                ["pane", "focus", "--direction", direction, "--pane", &pane]
+                    .map(str::to_owned)
+                    .into(),
+                session,
+                base,
+            )?;
             log(format!("joystick focus {direction}: {session}/{pane}"));
         }
         Action::Scroll { direction, percent } => {
@@ -500,12 +505,7 @@ fn handle_device_event(
     }
 }
 
-fn send_lighting(
-    device: &MicroDevice,
-    slots: &[Option<String>],
-    agents: &[Agent],
-    state: &mut State,
-) -> Result<()> {
+fn send_lighting(device: &MicroDevice, state: &mut State) -> Result<()> {
     let config = match load_lighting(&config_path("lighting.json")) {
         Ok(config) => {
             state.last_lighting_error.clear();
@@ -519,11 +519,12 @@ fn send_lighting(
             return Ok(());
         }
     };
-    let slots_value: Vec<_> = slot_lighting(slots, agents, &config)
+    let slots_value: Vec<_> = slot_lighting(&state.slots, &state.agents, &config)
         .into_iter()
-        .map(|light| json!({"id":light.id,"c":light.c,"b":light.b,"e":light.e,"s":light.s}))
+        .enumerate()
+        .map(|(id, light)| json!({"id":id,"c":light.c,"b":light.b,"e":light.e,"s":light.s}))
         .collect();
-    let mut aggregate = aggregate_lighting(slots, agents, &config);
+    let mut aggregate = aggregate_lighting(&state.slots, &state.agents, &config);
     let next_zones: HashSet<_> = aggregate.keys().cloned().collect();
     for zone in &state.managed_aggregate_zones {
         if !next_zones.contains(zone) {
@@ -629,7 +630,7 @@ fn select_session(
     state.slots.fill(None);
     state.last_lighting.clear();
     if let Some(device) = device {
-        send_lighting(device, &state.slots.clone(), &state.agents.clone(), state)?;
+        send_lighting(device, state)?;
     }
     log(state
         .selected_session
@@ -794,7 +795,7 @@ fn refresh_agents(
             state.routing_ready = true;
             state.last_herdr_error.clear();
             if let Some(device) = device {
-                send_lighting(device, &state.slots.clone(), &state.agents.clone(), state)?;
+                send_lighting(device, state)?;
             }
         }
         Err(error) => {
@@ -810,7 +811,7 @@ fn refresh_agents(
             if had_state {
                 state.last_lighting.clear();
                 if let Some(device) = device {
-                    send_lighting(device, &state.slots.clone(), &state.agents.clone(), state)?;
+                    send_lighting(device, state)?;
                 }
             }
             if state.last_herdr_error != error.to_string() {
@@ -877,14 +878,14 @@ fn open_device(
         return Ok(());
     }
     match MicroDevice::open(event_tx.clone()) {
-        Ok((opened, _transport)) => {
+        Ok(opened) => {
             *device = Some(opened);
             state.device_state = "connected".into();
             state.last_open_error.clear();
             state.last_lighting.clear();
             log("device connected");
             if let Some(device) = device.as_ref() {
-                send_lighting(device, &state.slots.clone(), &state.agents.clone(), state)?;
+                send_lighting(device, state)?;
             }
         }
         Err(error) => {

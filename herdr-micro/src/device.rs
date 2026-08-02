@@ -26,12 +26,10 @@ use objc2_io_kit::{
 };
 use serde_json::Value;
 
-use crate::protocol::{encode_message, Reassembler};
+use crate::protocol::{encode_message, Reassembler, REPORT_ID, REPORT_SIZE};
 
 pub const MICRO_VENDOR_ID: i32 = 0x303A;
 pub const MICRO_PRODUCT_ID: i32 = 0x8360;
-pub const REPORT_ID: u8 = 6;
-pub const REPORT_SIZE: usize = 64;
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,14 +45,6 @@ impl Transport {
             "USB" => Self::Usb,
             "Bluetooth Low Energy" => Self::BluetoothLowEnergy,
             _ => Self::Other,
-        }
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Usb => "USB",
-            Self::BluetoothLowEnergy => "Bluetooth Low Energy",
-            Self::Other => "unknown",
         }
     }
 }
@@ -107,7 +97,7 @@ pub struct MicroDevice {
 impl MicroDevice {
     /// Opens the best available Micro and does the required `device.status`
     /// round trip before returning it.
-    pub fn open(event_tx: Sender<DeviceEvent>) -> Result<(Self, Transport)> {
+    pub fn open(event_tx: Sender<DeviceEvent>) -> Result<Self> {
         let (command_tx, command_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let closed = Arc::new(AtomicBool::new(false));
@@ -117,15 +107,12 @@ impl MicroDevice {
             .spawn(move || owner_main(command_rx, event_tx, ready_tx, owner_closed))?;
 
         match ready_rx.recv_timeout(DEFAULT_REQUEST_TIMEOUT + Duration::from_secs(1)) {
-            Ok(Ok(transport)) => Ok((
-                Self {
-                    command_tx,
-                    next_request_id: AtomicU64::new(1),
-                    closed,
-                    owner: Some(owner),
-                },
-                transport,
-            )),
+            Ok(Ok(())) => Ok(Self {
+                command_tx,
+                next_request_id: AtomicU64::new(1),
+                closed,
+                owner: Some(owner),
+            }),
             Ok(Err(error)) => {
                 let _ = owner.join();
                 Err(anyhow!(error))
@@ -208,17 +195,16 @@ impl Drop for MicroDevice {
 fn owner_main(
     command_rx: Receiver<Command>,
     event_tx: Sender<DeviceEvent>,
-    ready_tx: SyncSender<std::result::Result<Transport, String>>,
+    ready_tx: SyncSender<std::result::Result<(), String>>,
     closed: Arc<AtomicBool>,
 ) {
     let result = (|| {
         let mut owner = Owner::open(command_rx, event_tx, closed)?;
-        let transport = owner.transport;
         if let Err(error) = owner.handshake() {
             owner.teardown();
             return Err(error);
         }
-        if ready_tx.send(Ok(transport)).is_err() {
+        if ready_tx.send(Ok(())).is_err() {
             owner.teardown();
             bail!("opener dropped")
         }
@@ -490,8 +476,6 @@ impl Owner {
     }
 }
 
-/// Compile-proven objc2 callback signature. It only copies bytes into Rust
-/// ownership and enqueues them; parsing and IOKit work stay on the owner loop.
 unsafe extern "C-unwind" fn input_report_callback(
     context: *mut c_void,
     _result: IOReturn,
@@ -512,8 +496,6 @@ unsafe extern "C-unwind" fn input_report_callback(
     let _ = context.callback_tx.send(CallbackEvent::Report(bytes));
 }
 
-/// Compile-proven objc2 callback signature. It sends no IOKit work back from
-/// the callback, so removal cannot race teardown on another thread.
 unsafe extern "C-unwind" fn removal_callback(
     context: *mut c_void,
     _result: IOReturn,
@@ -587,11 +569,8 @@ fn output_wire(report: &mut [u8; REPORT_SIZE], transport: Transport) -> Result<&
 }
 
 fn parse_event(envelope: &Value) -> Option<DeviceEvent> {
-    let method = envelope
-        .get("m")
-        .or_else(|| envelope.get("method"))?
-        .as_str()?;
-    let params = envelope.get("p").or_else(|| envelope.get("params"))?;
+    let method = envelope.get("m")?.as_str()?;
+    let params = envelope.get("p")?;
     match method {
         "v.oai.hid" => Some(DeviceEvent::Key {
             key: params.get("k")?.as_str()?.to_owned(),
@@ -647,6 +626,10 @@ mod tests {
     #[test]
     fn malformed_or_unrelated_event_is_ignored() {
         assert_eq!(parse_event(&json!({"m": "v.oai.hid", "p": {"k": 4}})), None);
+        assert_eq!(
+            parse_event(&json!({"method": "v.oai.hid", "params": {"k": "x", "act": 1}})),
+            None
+        );
         assert_eq!(parse_event(&json!({"m": "other", "p": {}})), None);
         assert_eq!(
             parse_event(&json!({"m": "v.oai.rad", "p": {"a": 1.5, "d": 0.75}})),

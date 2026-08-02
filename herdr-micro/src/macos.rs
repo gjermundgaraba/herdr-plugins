@@ -16,10 +16,7 @@ use objc2_core_graphics::{
 };
 use serde::Serialize;
 
-pub const POST_EVENT_ACCESS_DENIED: &str = "macOS post-event access is denied";
-pub const NO_FRONTMOST_APPLICATION: &str = "no frontmost application";
-pub const SCROLL_TARGET_UNAVAILABLE: &str = "frontmost scroll target unavailable";
-pub const SCROLL_EVENT_UNAVAILABLE: &str = "could not create scroll event";
+const SCROLL_TARGET_UNAVAILABLE: &str = "frontmost scroll target unavailable";
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct Frontmost {
@@ -40,12 +37,12 @@ pub fn post_event_access() -> Result<()> {
     if CGPreflightPostEventAccess() {
         Ok(())
     } else {
-        bail!(POST_EVENT_ACCESS_DENIED)
+        bail!("macOS post-event access is denied")
     }
 }
 
 pub fn frontmost() -> Result<Frontmost> {
-    let (app, window) = frontmost_window().ok_or_else(|| anyhow!(NO_FRONTMOST_APPLICATION))?;
+    let (app, window) = frontmost_window().ok_or_else(|| anyhow!("no frontmost application"))?;
     let process = app
         .bundleIdentifier()
         .map_or_else(String::new, |value| value.to_string());
@@ -93,7 +90,7 @@ pub fn scroll(notches: i32, x: f64, y: f64, expected_bundle: &str) -> Result<()>
             0,
             0,
         )
-        .ok_or_else(|| anyhow!(SCROLL_EVENT_UNAVAILABLE))?;
+        .ok_or_else(|| anyhow!("could not create scroll event"))?;
         CGEvent::set_location(Some(&event), location);
         CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
     }
