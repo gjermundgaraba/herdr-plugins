@@ -4,14 +4,16 @@ Unofficial [Herdr](https://herdr.dev/) plugin for the Work Louder Codex
 Micro. It shows six agent states on the RGB keys and controls focused Codex,
 Claude Code, and Pi agents.
 
-Tested on macOS with Codex Micro firmware `v0.4.1` over USB and Bluetooth LE.
-The plugin talks directly to the vendor HID interface, so firmware changes may
-break it.
+Historical Node/Swift builds were physically tested on macOS with Codex Micro
+firmware `v0.4.1` over USB and Bluetooth LE. The Rust binary's connected-device
+canary mapped `default` and `werk`, discovered 23 agents, and selected Layer 2.
+It is not a physical USB/BLE transport matrix; firmware changes may break HID
+access.
 
 ## Requirements
 
-- macOS, Ghostty 1.3 or newer, Herdr 0.7.5 or newer, and Node.js 20 or newer
-- A Codex Micro and Xcode Command Line Tools (`swiftc`)
+- macOS, Ghostty 1.3 or newer, Herdr 0.7.5 or newer, and Rust 1.71 or newer
+- A Codex Micro
 - macOS Automation permission for Herdr or its terminal host to inspect Ghostty
 - macOS Accessibility permission for the optional `scroll` action
 - Work Louder Input for the initial keyboard profile only
@@ -31,9 +33,10 @@ For local development:
 ```sh
 git clone https://github.com/gjermundgaraba/herdr-plugins.git
 cd herdr-plugins/herdr-micro
+cargo build --release --locked
 mkdir -p bin
-/usr/bin/swiftc native/frontmost.swift -o bin/frontmost
-/usr/bin/swiftc native/micro-hid.swift -o bin/micro-hid -framework IOKit
+install -m 750 target/release/herdr-micro bin/.herdr-micro.new
+mv -f bin/.herdr-micro.new bin/herdr-micro
 herdr plugin link . --enabled
 ```
 
@@ -149,7 +152,7 @@ if it does nothing; macOS event posting requires Accessibility permission.
 Use **Configure Micro controls** in Herdr or:
 
 ```sh
-npm run controls
+bin/herdr-micro configure-controls
 ```
 
 ## Automatic layers and Herdr sessions
@@ -175,8 +178,8 @@ before posting wheel events, preventing input from reaching Chrome or another
 terminal.
 
 `micro-status` reports the active layer, selected session, terminal UUID, and
-in-memory mappings. Run `npm run probe:sessions -- --watch` to inspect focus
-switches without starting the hardware bridge.
+in-memory mappings. Run `bin/herdr-micro probe-sessions --watch` to inspect
+focus switches without starting the hardware bridge.
 
 ## Thinking effort
 

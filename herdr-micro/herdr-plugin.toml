@@ -1,21 +1,24 @@
 id = "gjermundgaraba.herdr-micro"
 name = "Herdr Micro"
-version = "0.7.0"
+version = "0.8.0"
 min_herdr_version = "0.7.5"
 description = "Control Herdr from a Work Louder Codex Micro."
 platforms = ["macos"]
 
 [[build]]
+command = ["cargo", "build", "--release", "--locked"]
+
+[[build]]
 command = ["mkdir", "-p", "bin"]
 
 [[build]]
-command = ["/usr/bin/swiftc", "native/frontmost.swift", "-o", "bin/frontmost"]
+command = ["install", "-m", "750", "target/release/herdr-micro", "bin/.herdr-micro.new"]
 
 [[build]]
-command = ["/usr/bin/swiftc", "native/micro-hid.swift", "-o", "bin/micro-hid", "-framework", "IOKit"]
+command = ["mv", "-f", "bin/.herdr-micro.new", "bin/herdr-micro"]
 
 [[startup]]
-command = ["node", "src/micro-start.mjs"]
+command = ["bin/herdr-micro", "start"]
 
 [[panes]]
 id = "diff"
@@ -28,49 +31,49 @@ command = ["hunk", "diff", "--watch"]
 [[actions]]
 id = "status"
 title = "Show Herdr status"
-command = ["node", "src/status.mjs"]
+command = ["bin/herdr-micro", "herdr-status"]
 
 [[actions]]
 id = "doctor"
 title = "Check Herdr Micro setup"
-command = ["node", "src/doctor.mjs"]
+command = ["bin/herdr-micro", "doctor"]
 
 [[actions]]
 id = "effort-raise"
 title = "Raise focused agent effort"
-command = ["node", "src/effort-action.mjs", "raise"]
+command = ["bin/herdr-micro", "effort", "raise"]
 
 [[actions]]
 id = "effort-lower"
 title = "Lower focused agent effort"
-command = ["node", "src/effort-action.mjs", "lower"]
+command = ["bin/herdr-micro", "effort", "lower"]
 
 [[actions]]
 id = "micro-start"
 title = "Start Micro bridge"
-command = ["node", "src/micro-start.mjs"]
+command = ["bin/herdr-micro", "start"]
 
 [[actions]]
 id = "micro-status"
 title = "Show Micro bridge status"
-command = ["node", "src/micro-action.mjs", "status"]
+command = ["bin/herdr-micro", "status"]
 
 [[actions]]
 id = "micro-configure-controls"
 title = "Configure Micro controls"
-command = ["node", "src/micro-configure-controls.mjs"]
+command = ["bin/herdr-micro", "configure-controls"]
 
 [[actions]]
 id = "setup-pi-effort"
 title = "Install Pi effort controls"
-command = ["node", "src/setup-pi-effort.mjs"]
+command = ["bin/herdr-micro", "setup-pi-effort"]
 
 [[actions]]
 id = "micro-stop"
 title = "Stop Micro bridge"
-command = ["node", "src/micro-action.mjs", "stop"]
+command = ["bin/herdr-micro", "stop"]
 
 [[actions]]
 id = "micro-setup"
 title = "Set up Micro Layer 2"
-command = ["node", "src/micro-setup.mjs"]
+command = ["bin/herdr-micro", "setup"]

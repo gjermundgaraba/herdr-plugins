@@ -1,6 +1,9 @@
 # Codex Micro bridge
 
-Status: implemented and physically verified over USB and Bluetooth LE.
+Status: Rust implementation complete. Its connected-device canary mapped
+`default` and `werk`, discovered 23 agents, and selected Layer 2. Earlier
+Node/Swift builds were physically verified over USB and Bluetooth LE; the Rust
+canary does not establish that transport matrix.
 
 ## Scope
 
@@ -35,10 +38,13 @@ already-proven OAI-enabled Layer 3.
 
 ## Process model
 
-Herdr's startup hook runs `src/micro-start.mjs`. It launches one detached
-`src/micro-daemon.mjs`; a Unix socket in `HERDR_PLUGIN_STATE_DIR` is both its
+Herdr's startup hook runs `bin/herdr-micro start`. It launches one detached
+`bin/herdr-micro daemon`; a Unix socket in `HERDR_PLUGIN_STATE_DIR` is both its
 single-instance lock and its status/stop control. Logs live beside that socket
-as `micro.log`.
+as `micro.log`. The start command exits after ensuring the daemon exists because
+Herdr startup hooks are one-shot initialization, not process supervision;
+disabling or unlinking the plugin does not stop the daemon, so use the explicit
+stop action.
 
 The daemon discovers running names through `herdr session list --json`. For
 each session it briefly sets a unique terminal title, reads the matching stable
@@ -48,16 +54,15 @@ name with `HERDR_SESSION` after clearing inherited pane, workspace, and plugin
 invocation context. Controls and delayed gestures capture that name before
 entering the single action queue.
 
-The daemon launches `bin/micro-hid`, a native direct-IOKit helper. It matches
-the Micro by VID/PID, prefers USB when both transports are present, and selects
-the required framing from IOKit's `Transport` property. USB sends the 63-byte
-payload after the Report ID; BLE sends the full 64-byte Report-ID-prefixed
-payload. A successful `device.status` round trip is required before the daemon
-reports the device connected.
+The Rust daemon uses direct `objc2` IOKit HID bindings. It matches the Micro by
+VID/PID, prefers USB when both transports are present, and selects framing from
+IOKit's `Transport` property. USB sends the 63-byte payload after the Report
+ID; BLE sends the full 64-byte Report-ID-prefixed payload. A successful
+`device.status` round trip is required before the daemon reports connected.
 
-The daemon shares `src/effort.mjs` with the manifest actions. It resolves the
-currently focused Herdr agent immediately before each configured control
-action, so it never depends on the startup action's stale context.
+The daemon and manifest actions share Rust effort planning. It resolves the
+currently focused Herdr agent immediately before each configured control action,
+so it never depends on the startup action's stale context.
 
 The joystick arrives as `v.oai.rad` with normalized angle and distance. The
 default config engages beyond `0.75`, releases below `0.3`, and fires again
@@ -74,13 +79,14 @@ The focused Agent key is raised to `focusedBrightness`. Optional aggregate
 `v.oai.rgbcfg`; the six per-agent keys are then applied through
 `v.oai.thstatus`.
 
-`bin/frontmost` is compiled from a small Swift source during the plugin build.
-It uses `NSWorkspace.frontmostApplication` for Codex/Ghostty detection.
+The Rust binary uses AppKit `NSWorkspace.frontmostApplication` for
+Codex/Ghostty detection and CoreGraphics for optional scrolling.
 Ghostty 1.3 or newer exposes window, tab, and terminal UUIDs through its native
 AppleScript API; Automation permission is required. The optional `scroll`
-action uses the Swift helper to post a temporary mouse move plus wheel events
-at the focused pane, then restores the original cursor; macOS requires
-post-event Accessibility permission.
+action posts a temporary mouse move plus wheel events at the focused pane, then
+restores the original cursor; macOS requires post-event Accessibility
+permission. Regrant Accessibility after upgrading if macOS treats the new
+binary as a new trusted executable.
 
 ## Software result
 
@@ -182,15 +188,16 @@ confirmed `default → werk → default` UUID focus detection.
 ## Commands
 
 ```sh
+cargo build --release --locked
 mkdir -p bin
-/usr/bin/swiftc native/frontmost.swift -o bin/frontmost
-/usr/bin/swiftc native/micro-hid.swift -o bin/micro-hid -framework IOKit
-node src/micro-setup.mjs
-node src/setup-pi-effort.mjs
-node src/doctor.mjs
-node src/micro-start.mjs
-node src/micro-action.mjs status
-node src/micro-action.mjs stop
+install -m 750 target/release/herdr-micro bin/.herdr-micro.new
+mv -f bin/.herdr-micro.new bin/herdr-micro
+bin/herdr-micro setup
+bin/herdr-micro setup-pi-effort
+bin/herdr-micro doctor
+bin/herdr-micro start
+bin/herdr-micro status
+bin/herdr-micro stop
 ```
 
 ## Source basis

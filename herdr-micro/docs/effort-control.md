@@ -31,8 +31,7 @@ Tested through Herdr 0.7.5 on 2026-07-26:
 | Pi | 0.82.1 | `medium` → `high` → `medium` |
 
 The action runner targeted disposable pane IDs directly; it did not rely on the
-frontmost macOS window. The Node tests cover operation selection, ordered
-delivery, Pi's level boundaries, and extension installation.
+frontmost macOS window. Rust tests cover the planner and installer.
 
 The final Codex Micro Layer 2 test physically confirmed the dial integration
 for Codex, Claude Code, and Pi.
@@ -48,10 +47,11 @@ for Codex, Claude Code, and Pi.
   `/reload`.
 - The changed effort affects later provider calls, not a request already sent.
 
-Start Pi with the integration for a manual test:
+Install the bundled JavaScript extension for a manual test; Pi loads it
+directly:
 
 ```sh
-node src/setup-pi-effort.mjs
+bin/herdr-micro setup-pi-effort
 ```
 
 ## Sources
