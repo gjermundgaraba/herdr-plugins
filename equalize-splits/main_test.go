@@ -64,6 +64,23 @@ func TestSkipsStaleCreationEventAfterPaneWasSplitAgain(t *testing.T) {
 	}
 }
 
+func TestEqualizesAfterMiddlePaneCloses(t *testing.T) {
+	root := split(
+		"down",
+		splitWithRatio("right", pane("a"), pane("c"), 1.0/3.0),
+		pane("d"),
+	)
+
+	got, err := fullEqualizationPlan(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []ratioUpdate{{Path: []bool{false}, Ratio: 0.5}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("updates = %#v, want %#v", got, want)
+	}
+}
+
 func TestHerdrWireFixtures(t *testing.T) {
 	var response struct {
 		Layout herdr.LayoutDescription `json:"layout"`
@@ -99,7 +116,7 @@ func TestHerdrWireFixtures(t *testing.T) {
 		t.Fatalf("updates = %#v, want root update", updates)
 	}
 
-	paneID, err := eventPaneID(json.RawMessage(`{"pane":{"pane_id":"w1:p3"}}`))
+	paneID, err := createdPaneID(json.RawMessage(`{"pane":{"pane_id":"w1:p3"}}`))
 	if err != nil {
 		t.Fatal(err)
 	}

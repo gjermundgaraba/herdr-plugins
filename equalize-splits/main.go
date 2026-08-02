@@ -42,11 +42,18 @@ func run() error {
 		return nil
 	}
 
-	paneID, err := eventPaneID(environment.Event.Data)
-	if err != nil {
-		return err
-	}
-	if paneID == "" {
+	var paneID string
+	switch environment.EventName {
+	case "pane.created":
+		paneID, err = createdPaneID(environment.Event.Data)
+		if err != nil {
+			return err
+		}
+		if paneID == "" {
+			return nil
+		}
+	case "pane.closed", "pane.exited":
+	default:
 		return nil
 	}
 
@@ -62,16 +69,37 @@ func run() error {
 	}
 	client.Timeout = socketTimeout
 
-	layout, err := client.ExportLayout(
-		context.Background(),
-		herdr.LayoutExportParams{PaneID: paneID},
-	)
+	ctx := context.Background()
+	params := herdr.LayoutExportParams{PaneID: paneID}
+	if environment.EventName != "pane.created" {
+		// ponytail: pane lifecycle events lack a tab id; UI closes target the
+		// workspace's active tab. Cache layouts if background API closes need support.
+		workspaces, err := client.Workspaces(ctx)
+		if err != nil {
+			return fmt.Errorf("list workspaces: %w", err)
+		}
+		for _, workspace := range workspaces {
+			if workspace.WorkspaceID == environment.WorkspaceID {
+				params = herdr.LayoutExportParams{TabID: workspace.ActiveTabID}
+				break
+			}
+		}
+		if params.TabID == "" {
+			return nil // Closing the last pane may also close its workspace.
+		}
+	}
+	layout, err := client.ExportLayout(ctx, params)
 	if err != nil {
 		return fmt.Errorf("export layout: %w", err)
 	}
 
 	for range maxRatioUpdates {
-		updates, err := equalizationPlan(layout.Root, paneID)
+		var updates []ratioUpdate
+		if environment.EventName == "pane.created" {
+			updates, err = equalizationPlan(layout.Root, paneID)
+		} else {
+			updates, err = fullEqualizationPlan(layout.Root)
+		}
 		if err != nil {
 			return err
 		}
@@ -94,7 +122,7 @@ func run() error {
 	return errors.New("layout kept changing while equalizing")
 }
 
-func eventPaneID(data json.RawMessage) (string, error) {
+func createdPaneID(data json.RawMessage) (string, error) {
 	var event struct {
 		Pane struct {
 			PaneID string `json:"pane_id"`
@@ -169,6 +197,38 @@ func equalizationPlan(root *herdr.LayoutNode, paneID string) ([]ratioUpdate, err
 		return nil, err
 	}
 	return updates, nil
+}
+
+func fullEqualizationPlan(root *herdr.LayoutNode) ([]ratioUpdate, error) {
+	var updates []ratioUpdate
+	if err := collectRegions(root, nil, "", &updates); err != nil {
+		return nil, err
+	}
+	return updates, nil
+}
+
+func collectRegions(node *herdr.LayoutNode, path []bool, parentDirection string, updates *[]ratioUpdate) error {
+	if node == nil {
+		return errors.New("invalid layout: missing node")
+	}
+	if node.Type == "pane" {
+		return nil
+	}
+	if node.Type != "split" || node.Direction == "" {
+		return fmt.Errorf("invalid layout node type %q", node.Type)
+	}
+
+	direction := parentDirection
+	if node.Direction != parentDirection {
+		if _, err := collectEqualizations(node, node.Direction, path, updates); err != nil {
+			return err
+		}
+		direction = node.Direction
+	}
+	if err := collectRegions(node.First, appendPath(path, false), direction, updates); err != nil {
+		return err
+	}
+	return collectRegions(node.Second, appendPath(path, true), direction, updates)
 }
 
 func findPanePath(node *herdr.LayoutNode, paneID string, path []bool) ([]bool, bool, error) {

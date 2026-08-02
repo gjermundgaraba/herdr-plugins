@@ -1,8 +1,8 @@
 id = "gjermundgaraba.herdr-equalize-splits"
 name = "Equalize Splits"
-version = "0.1.0"
+version = "0.2.1"
 min_herdr_version = "0.7.5"
-description = "Automatically equalize pane sizes after a split"
+description = "Automatically equalize pane sizes after splits and closes"
 platforms = ["macos", "linux"]
 
 [[build]]
@@ -10,4 +10,12 @@ command = ["go", "build", "-trimpath", "-ldflags=-s -w", "-o", "equalize-splits"
 
 [[events]]
 on = "pane.created"
+command = ["./equalize-splits"]
+
+[[events]]
+on = "pane.closed"
+command = ["./equalize-splits"]
+
+[[events]]
+on = "pane.exited"
 command = ["./equalize-splits"]
