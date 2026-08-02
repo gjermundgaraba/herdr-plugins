@@ -1,6 +1,6 @@
-use std::{collections::HashMap, path::PathBuf, process::Command};
+use std::{cmp::Reverse, collections::HashMap, path::PathBuf, process::Command};
 
-use herdr_client::{Client, PluginInvocationContext, SessionSnapshot};
+use herdr_client::{AgentStatus, Client, PluginInvocationContext, SessionSnapshot};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
@@ -61,6 +61,7 @@ fn native_actions(
             let dispatch = native_dispatch(&binding.action, snapshot, context)?;
             Some(Item {
                 kind: Kind::NativeAction,
+                agent_status: None,
                 title: humanize(&binding.action),
                 subtitle: "Herdr native action".into(),
                 detail: binding.action,
@@ -87,6 +88,7 @@ fn plugin_actions(
             let qualified = format!("{}.{}", action.plugin_id, action.action_id);
             Item {
                 kind: Kind::PluginAction,
+                agent_status: None,
                 title: action.title,
                 subtitle: action
                     .description
@@ -112,6 +114,7 @@ fn workspaces(snapshot: &SessionSnapshot) -> Vec<Item> {
         .into_iter()
         .map(|workspace| Item {
             kind: Kind::Workspace,
+            agent_status: None,
             title: workspace.label.clone(),
             subtitle: format!(
                 "{} tabs · {} panes · {}",
@@ -153,6 +156,7 @@ fn tabs(snapshot: &SessionSnapshot) -> Vec<Item> {
                 .unwrap_or(tab.workspace_id.as_str());
             Item {
                 kind: Kind::Tab,
+                agent_status: None,
                 title: tab.label.clone(),
                 subtitle: format!(
                     "{workspace} · {} panes · {}",
@@ -177,7 +181,6 @@ fn panes(snapshot: &SessionSnapshot) -> Vec<Item> {
         .iter()
         .map(|tab| (tab.tab_id.as_str(), tab.label.as_str()))
         .collect();
-
     snapshot
         .panes
         .iter()
@@ -205,6 +208,7 @@ fn panes(snapshot: &SessionSnapshot) -> Vec<Item> {
                 .unwrap_or("");
             Item {
                 kind: Kind::Pane,
+                agent_status: None,
                 title: title.into(),
                 subtitle: format!("{workspace} · {tab} · {}", pane.agent_status),
                 detail: format!("{} · {} · {cwd}", pane.pane_id, pane.terminal_id),
@@ -226,10 +230,18 @@ fn agents(snapshot: &SessionSnapshot) -> Vec<Item> {
         .iter()
         .map(|tab| (tab.tab_id.as_str(), tab.label.as_str()))
         .collect();
+    let explicit_tab_labels = explicit_tab_labels(snapshot);
 
-    snapshot
-        .agents
-        .iter()
+    let mut agents: Vec<_> = snapshot.agents.iter().collect();
+    agents.sort_by_key(|agent| {
+        (
+            agent_status_priority(&agent.agent_status),
+            Reverse(agent.state_change_seq),
+        )
+    });
+
+    agents
+        .into_iter()
         .map(|agent| {
             let workspace = workspace_labels
                 .get(agent.workspace_id.as_str())
@@ -239,32 +251,84 @@ fn agents(snapshot: &SessionSnapshot) -> Vec<Item> {
                 .get(agent.tab_id.as_str())
                 .copied()
                 .unwrap_or(agent.tab_id.as_str());
-            let title = agent
-                .name
-                .as_deref()
-                .or(agent.display_agent.as_deref())
-                .or(agent.agent.as_deref())
-                .unwrap_or(agent.terminal_id.as_str());
-            let task = agent
-                .title
-                .as_deref()
-                .or(agent.terminal_title_stripped.as_deref())
+            let explicit_tab = explicit_tab_labels.get(agent.tab_id.as_str()).copied();
+            let stripped_terminal_title = nonempty(agent.terminal_title_stripped.as_deref());
+            let terminal_title = nonempty(agent.terminal_title.as_deref());
+            let base_title = [
+                nonempty(agent.name.as_deref()),
+                explicit_tab,
+                stripped_terminal_title,
+                terminal_title,
+                Some(agent.terminal_id.as_str()),
+            ]
+            .into_iter()
+            .flatten()
+            .find(|candidate| *candidate != workspace);
+            let title = base_title
+                .map(|base_title| format!("{workspace}: {base_title}"))
+                .unwrap_or_else(|| workspace.into());
+            let cwd = nonempty(agent.foreground_cwd.as_deref())
+                .or_else(|| nonempty(agent.cwd.as_deref()))
                 .unwrap_or("");
-            let cwd = agent
-                .foreground_cwd
-                .as_deref()
-                .or(agent.cwd.as_deref())
-                .unwrap_or("");
+            let subtitle = match (nonempty(Some(cwd)), nonempty(agent.agent.as_deref())) {
+                (Some(path), Some(kind)) => format!("{path} · {kind}"),
+                (Some(path), None) => path.into(),
+                (None, Some(kind)) => kind.into(),
+                (None, None) => String::new(),
+            };
             Item {
                 kind: Kind::Agent,
-                title: title.into(),
-                subtitle: format!("{workspace} · {tab} · {}", agent.agent_status),
-                detail: format!("{task} · {cwd} · {}", agent.terminal_id),
+                agent_status: Some(agent.agent_status.clone()),
+                title,
+                subtitle,
+                detail: [
+                    agent.name.as_deref().unwrap_or(""),
+                    agent.agent.as_deref().unwrap_or(""),
+                    workspace,
+                    tab,
+                    agent.title.as_deref().unwrap_or(""),
+                    stripped_terminal_title.or(terminal_title).unwrap_or(""),
+                    cwd,
+                    agent.agent_status.as_str(),
+                    agent.terminal_id.as_str(),
+                ]
+                .into_iter()
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+                .join(" · "),
                 keys: Vec::new(),
-                dispatch: Dispatch::new("agent.focus", json!({ "target": agent.terminal_id })),
+                dispatch: Dispatch::new("agent.focus", json!({ "target": agent.pane_id })),
             }
         })
         .collect()
+}
+
+fn explicit_tab_labels(snapshot: &SessionSnapshot) -> HashMap<&str, &str> {
+    let mut positions = HashMap::new();
+    snapshot
+        .tabs
+        .iter()
+        .filter_map(|tab| {
+            let position = positions.entry(tab.workspace_id.as_str()).or_insert(0usize);
+            *position += 1;
+            (!tab.label.trim().is_empty() && tab.label != position.to_string())
+                .then_some((tab.tab_id.as_str(), tab.label.as_str()))
+        })
+        .collect()
+}
+
+fn nonempty(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.trim().is_empty())
+}
+
+fn agent_status_priority(status: &AgentStatus) -> u8 {
+    match status.as_str() {
+        AgentStatus::BLOCKED => 0,
+        AgentStatus::DONE => 1,
+        AgentStatus::WORKING => 2,
+        AgentStatus::IDLE => 3,
+        _ => 4,
+    }
 }
 
 fn native_dispatch(
@@ -394,7 +458,7 @@ fn neighbor_agent(snapshot: &SessionSnapshot, pane_id: &str, delta: isize) -> Op
     let target = &snapshot.agents[neighbor_index(index, snapshot.agents.len(), delta)];
     Some(Dispatch::new(
         "agent.focus",
-        json!({ "target": target.terminal_id }),
+        json!({ "target": target.pane_id }),
     ))
 }
 
@@ -539,6 +603,75 @@ fn humanize(action: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use herdr_client::{AgentInfo, TabInfo, WorkspaceInfo};
+
+    fn agent(pane_id: &str, status: &str, state_change_seq: u64) -> AgentInfo {
+        AgentInfo {
+            terminal_id: format!("terminal-{pane_id}"),
+            name: Some(pane_id.into()),
+            agent: None,
+            title: None,
+            terminal_title: None,
+            terminal_title_stripped: None,
+            display_agent: None,
+            agent_status: status.into(),
+            screen_detection_skipped: false,
+            state_labels: HashMap::new(),
+            tokens: HashMap::new(),
+            agent_session: None,
+            workspace_id: "workspace-1".into(),
+            tab_id: "tab-1".into(),
+            pane_id: pane_id.into(),
+            focused: false,
+            launch_pending: false,
+            interactive_ready: true,
+            state_change_seq,
+            cwd: None,
+            foreground_cwd: None,
+            revision: 0,
+        }
+    }
+
+    fn snapshot(agents: Vec<AgentInfo>) -> SessionSnapshot {
+        SessionSnapshot {
+            version: "0.7.5".into(),
+            protocol: 17,
+            focused_workspace_id: None,
+            focused_tab_id: None,
+            focused_pane_id: None,
+            workspaces: Vec::new(),
+            tabs: Vec::new(),
+            panes: Vec::new(),
+            layouts: Vec::new(),
+            agents,
+        }
+    }
+
+    fn snapshot_with_tab(info: AgentInfo, label: &str, number: usize) -> SessionSnapshot {
+        let mut snapshot = snapshot(vec![info]);
+        snapshot.workspaces.push(WorkspaceInfo {
+            workspace_id: "workspace-1".into(),
+            number: 1,
+            label: "project".into(),
+            focused: false,
+            pane_count: 1,
+            tab_count: 1,
+            active_tab_id: "tab-1".into(),
+            agent_status: "idle".into(),
+            tokens: HashMap::new(),
+            worktree: None,
+        });
+        snapshot.tabs.push(TabInfo {
+            tab_id: "tab-1".into(),
+            workspace_id: "workspace-1".into(),
+            number,
+            label: label.into(),
+            focused: false,
+            pane_count: 1,
+            agent_status: "idle".into(),
+        });
+        snapshot
+    }
 
     #[test]
     fn default_config_discovery_keeps_empty_and_multiple_bindings() {
@@ -585,5 +718,161 @@ mod tests {
             json!({ "pane_id": "pane-1", "direction": "left" })
         );
         assert!(native_dispatch("close_pane", &snapshot, None).is_none());
+    }
+
+    #[test]
+    fn agents_prioritize_attention_and_recency_and_focus_panes() {
+        let snapshot = snapshot(vec![
+            agent("idle", "idle", 1),
+            agent("blocked-old", "blocked", 2),
+            agent("unknown", "future", 99),
+            agent("working", "working", 4),
+            agent("done", "done", 3),
+            agent("blocked-new", "blocked", 5),
+        ]);
+
+        let items = agents(&snapshot);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.title.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "workspace-1: blocked-new",
+                "workspace-1: blocked-old",
+                "workspace-1: done",
+                "workspace-1: working",
+                "workspace-1: idle",
+                "workspace-1: unknown"
+            ]
+        );
+        assert_eq!(items[0].dispatch.params, json!({ "target": "blocked-new" }));
+
+        let dispatch = neighbor_agent(&snapshot, "blocked-old", 1).unwrap();
+        assert_eq!(dispatch.params, json!({ "target": "unknown" }));
+    }
+
+    #[test]
+    fn agent_titles_prefix_the_workspace_and_prefer_name_then_tab_then_terminal_then_id() {
+        let mut info = agent("pane-1", "idle", 1);
+        info.name = Some("reviewer".into());
+        info.agent = Some("codex".into());
+        info.terminal_title_stripped = Some("Fix login".into());
+        assert_eq!(
+            agents(&snapshot_with_tab(info, "agents", 99))[0].title,
+            "project: reviewer"
+        );
+
+        let mut info = agent("pane-1", "idle", 1);
+        info.name = None;
+        info.terminal_title_stripped = Some("Fix login".into());
+        assert_eq!(
+            agents(&snapshot_with_tab(info, "agents", 99))[0].title,
+            "project: agents"
+        );
+
+        let mut info = agent("pane-1", "idle", 1);
+        info.name = None;
+        info.terminal_title_stripped = Some("Fix login".into());
+        assert_eq!(
+            agents(&snapshot_with_tab(info, "1", 99))[0].title,
+            "project: Fix login"
+        );
+
+        let mut info = agent("pane-1", "idle", 1);
+        info.name = None;
+        info.terminal_title_stripped = Some("Fix login".into());
+        assert_eq!(
+            agents(&snapshot_with_tab(info, "   ", 99))[0].title,
+            "project: Fix login"
+        );
+
+        let mut info = agent("pane-1", "idle", 1);
+        info.name = None;
+        info.terminal_title = Some("Raw terminal title".into());
+        assert_eq!(
+            agents(&snapshot_with_tab(info, "1", 99))[0].title,
+            "project: Raw terminal title"
+        );
+
+        let mut info = agent("pane-1", "idle", 1);
+        info.name = None;
+        assert_eq!(
+            agents(&snapshot_with_tab(info, "1", 99))[0].title,
+            "project: terminal-pane-1"
+        );
+    }
+
+    #[test]
+    fn agent_titles_skip_workspace_equal_candidates() {
+        let mut info = agent("pane-1", "idle", 1);
+        info.name = Some("project".into());
+        info.terminal_title_stripped = Some("project".into());
+        info.terminal_title = Some("Fix login".into());
+
+        assert_eq!(
+            agents(&snapshot_with_tab(info, "project", 99))[0].title,
+            "project: Fix login"
+        );
+
+        let mut info = agent("pane-1", "idle", 1);
+        info.name = Some("project".into());
+        info.terminal_title_stripped = Some("project".into());
+        info.terminal_title = Some("project".into());
+        assert_eq!(
+            agents(&snapshot_with_tab(info, "project", 99))[0].title,
+            "project: terminal-pane-1"
+        );
+
+        let mut info = agent("pane-1", "idle", 1);
+        info.terminal_id = "project".into();
+        info.name = Some("project".into());
+        info.terminal_title_stripped = Some("project".into());
+        info.terminal_title = Some("project".into());
+        assert_eq!(
+            agents(&snapshot_with_tab(info, "project", 99))[0].title,
+            "project"
+        );
+    }
+
+    #[test]
+    fn agents_put_path_and_kind_in_subtitle() {
+        let mut info = agent("pane-1", "blocked", 1);
+        info.name = None;
+        info.agent = Some("codex".into());
+        info.title = Some("Review the diff".into());
+        info.cwd = Some("/project".into());
+        info.foreground_cwd = Some("/foreground-project".into());
+        let item = agents(&snapshot_with_tab(info, "agents", 1)).pop().unwrap();
+
+        assert_eq!(item.title, "project: agents");
+        assert_eq!(item.subtitle, "/foreground-project · codex");
+        assert_eq!(item.agent_status, Some("blocked".into()));
+        assert!(item.detail.contains("Review the diff"));
+
+        let mut info = agent("pane-1", "blocked", 1);
+        info.name = None;
+        info.agent = Some("codex".into());
+        info.cwd = Some("/project".into());
+        info.foreground_cwd = Some("  ".into());
+        let item = agents(&snapshot_with_tab(info, "agents", 1)).pop().unwrap();
+        assert_eq!(item.subtitle, "/project · codex");
+
+        let mut info = agent("pane-1", "blocked", 1);
+        info.name = None;
+        info.agent = Some("codex".into());
+        let item = agents(&snapshot_with_tab(info, "agents", 1)).pop().unwrap();
+        assert_eq!(item.subtitle, "codex");
+
+        let mut info = agent("pane-1", "blocked", 1);
+        info.name = None;
+        info.cwd = Some("/project".into());
+        let item = agents(&snapshot_with_tab(info, "agents", 1)).pop().unwrap();
+        assert_eq!(item.subtitle, "/project");
+
+        let mut info = agent("pane-1", "blocked", 1);
+        info.name = None;
+        let item = agents(&snapshot_with_tab(info, "agents", 1)).pop().unwrap();
+        assert!(item.subtitle.is_empty());
     }
 }

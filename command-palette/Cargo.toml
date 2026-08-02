@@ -1,6 +1,6 @@
 [package]
 name = "herdr-command-palette"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Fuzzy command and navigation palette for Herdr"
@@ -20,4 +20,3 @@ unicode-width = "0.2"
 [profile.release]
 lto = true
 strip = true
-

@@ -1,3 +1,4 @@
+use herdr_client::AgentStatus;
 use nucleo_matcher::{
     pattern::{CaseMatching, Normalization, Pattern},
     Config, Matcher, Utf32Str,
@@ -39,6 +40,22 @@ impl Filter {
         let index = Self::ALL.iter().position(|item| *item == self).unwrap_or(0);
         let len = Self::ALL.len() as isize;
         Self::ALL[(index as isize + delta).rem_euclid(len) as usize]
+    }
+}
+
+impl std::str::FromStr for Filter {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "all" => Ok(Self::All),
+            "actions" => Ok(Self::Actions),
+            "workspaces" => Ok(Self::Workspaces),
+            "tabs" => Ok(Self::Tabs),
+            "panes" => Ok(Self::Panes),
+            "agents" => Ok(Self::Agents),
+            _ => Err("expected all, actions, workspaces, tabs, panes, or agents"),
+        }
     }
 }
 
@@ -93,6 +110,7 @@ impl Dispatch {
 #[derive(Debug, Clone)]
 pub struct Item {
     pub kind: Kind,
+    pub agent_status: Option<AgentStatus>,
     pub title: String,
     pub subtitle: String,
     pub detail: String,
@@ -223,6 +241,7 @@ mod tests {
     fn item(kind: Kind, title: &str) -> Item {
         Item {
             kind,
+            agent_status: None,
             title: title.into(),
             subtitle: String::new(),
             detail: String::new(),
@@ -250,5 +269,11 @@ mod tests {
         picker.query = "api".into();
         picker.refilter();
         assert_eq!(picker.rows()[0].title, "api");
+    }
+
+    #[test]
+    fn parses_filter_labels() {
+        assert_eq!("workspaces".parse(), Ok(Filter::Workspaces));
+        assert!("workspace".parse::<Filter>().is_err());
     }
 }

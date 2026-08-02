@@ -8,7 +8,11 @@ use ratatui::{
 use unicode_truncate::UnicodeTruncateStr;
 use unicode_width::UnicodeWidthStr;
 
-use crate::model::{Item, Kind, Picker};
+use crate::{
+    model::{Filter, Item, Kind, Picker},
+    Mode,
+};
+use herdr_client::AgentStatus;
 
 pub const ROW_HEIGHT: u16 = 2;
 
@@ -44,33 +48,33 @@ pub fn rects(area: Rect) -> Rects {
     }
 }
 
-pub fn render(picker: &mut Picker, frame: &mut Frame) {
+pub fn render(picker: &mut Picker, mode: Mode, spinner_frame: usize, frame: &mut Frame) {
     let area = frame.area();
     let rects = rects(area);
     picker.visible_rows = (rects.body.height / ROW_HEIGHT) as usize;
     picker.ensure_selection_visible();
 
-    render_header(picker, frame, rects.header);
+    render_header(picker, mode, frame, rects.header);
     render_separator(frame, Rect::new(area.x, area.y + 1, area.width, 1));
-    render_rows(picker, frame, rects.body);
+    render_rows(picker, spinner_frame, frame, rects.body);
     render_separator(frame, rects.detail);
     render_detail(picker, frame, rects.detail);
-    render_footer(frame, rects.footer);
+    render_footer(mode, frame, rects.footer);
 }
 
-fn render_header(picker: &Picker, frame: &mut Frame, area: Rect) {
+fn render_header(picker: &Picker, mode: Mode, frame: &mut Frame, area: Rect) {
     let rows = picker.rows();
-    let query = if picker.query.is_empty() {
-        "type to search".to_string()
-    } else {
-        format!("{}▏", picker.query)
+    let query = match (mode, picker.query.is_empty()) {
+        (Mode::Direct, true) => "/ type to search".into(),
+        (Mode::VimNormal, true) => "/ to search".into(),
+        (Mode::VimNormal, false) => format!("/ {}", picker.query),
+        _ => format!("/ {}▏", picker.query),
     };
-    let left = format!(" / {query}  [{}]", picker.filter.label());
+    let left = format!(" {query}  [{}]", picker.filter.label());
     let count = format!("{} results ", rows.len());
-    let gap = area
-        .width
-        .saturating_sub(width(&left) as u16)
-        .saturating_sub(width(&count) as u16) as usize;
+    let gap = (area.width as usize)
+        .saturating_sub(width(&left))
+        .saturating_sub(width(&count));
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -86,7 +90,7 @@ fn render_header(picker: &Picker, frame: &mut Frame, area: Rect) {
     );
 }
 
-fn render_rows(picker: &Picker, frame: &mut Frame, area: Rect) {
+fn render_rows(picker: &Picker, spinner_frame: usize, frame: &mut Frame, area: Rect) {
     let rows = picker.rows();
     if rows.is_empty() {
         frame.render_widget(
@@ -101,6 +105,8 @@ fn render_rows(picker: &Picker, frame: &mut Frame, area: Rect) {
         render_row(
             rows[index],
             index == picker.selected,
+            matches!(picker.filter, Filter::All | Filter::Actions),
+            spinner_frame,
             frame,
             Rect::new(
                 area.x,
@@ -112,7 +118,14 @@ fn render_rows(picker: &Picker, frame: &mut Frame, area: Rect) {
     }
 }
 
-fn render_row(item: &Item, selected: bool, frame: &mut Frame, area: Rect) {
+fn render_row(
+    item: &Item,
+    selected: bool,
+    show_badge: bool,
+    spinner_frame: usize,
+    frame: &mut Frame,
+    area: Rect,
+) {
     let style = if selected {
         Style::default().bg(Color::Blue).fg(Color::White)
     } else {
@@ -120,18 +133,24 @@ fn render_row(item: &Item, selected: bool, frame: &mut Frame, area: Rect) {
     };
     frame.render_widget(Block::default().style(style), area);
 
-    let badge = format!(" {:9} ", item.kind.label());
+    let badge = show_badge.then(|| format!(" {:9} ", item.kind.label()));
+    let glyph = (item.kind == Kind::Agent)
+        .then(|| agent_status_glyph(item.agent_status.as_ref(), spinner_frame));
+    let left_padding = usize::from(!show_badge);
+    let prefix_width = left_padding
+        + badge.as_deref().map_or(0, width)
+        + glyph.map_or(0, |(glyph, _)| width(glyph) + 1);
     let keys = item.keys.join(", ");
     let key_width = width(&keys).min((area.width / 3) as usize);
     let title_budget = area
         .width
-        .saturating_sub(width(&badge) as u16)
+        .saturating_sub(prefix_width as u16)
         .saturating_sub(key_width as u16)
         .saturating_sub(2) as usize;
     let title = truncate_end(&item.title, title_budget);
     let gap = area
         .width
-        .saturating_sub(width(&badge) as u16)
+        .saturating_sub(prefix_width as u16)
         .saturating_sub(width(&title) as u16)
         .saturating_sub(key_width as u16)
         .saturating_sub(1) as usize;
@@ -149,7 +168,21 @@ fn render_row(item: &Item, selected: bool, frame: &mut Frame, area: Rect) {
     };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(badge, badge_style),
+            Span::raw(" ".repeat(left_padding)),
+            Span::styled(badge.unwrap_or_default(), badge_style),
+            glyph.map_or_else(
+                || Span::raw(""),
+                |(glyph, color)| {
+                    Span::styled(
+                        format!("{glyph} "),
+                        if selected {
+                            style.fg(color)
+                        } else {
+                            Style::default().fg(color)
+                        },
+                    )
+                },
+            ),
             Span::styled(title, style.add_modifier(Modifier::BOLD)),
             Span::styled(" ".repeat(gap), style),
             Span::styled(truncate_start(&keys, key_width), style),
@@ -161,8 +194,12 @@ fn render_row(item: &Item, selected: bool, frame: &mut Frame, area: Rect) {
 
     frame.render_widget(
         Paragraph::new(format!(
-            "            {}",
-            truncate_end(&item.subtitle, area.width.saturating_sub(13) as usize)
+            "{}{}",
+            " ".repeat(prefix_width),
+            truncate_end(
+                &item.subtitle,
+                area.width.saturating_sub(prefix_width as u16) as usize
+            )
         ))
         .style(if selected {
             style
@@ -171,6 +208,19 @@ fn render_row(item: &Item, selected: bool, frame: &mut Frame, area: Rect) {
         }),
         Rect::new(area.x, area.y + 1, area.width, 1),
     );
+}
+
+fn agent_status_glyph(status: Option<&AgentStatus>, spinner_frame: usize) -> (&'static str, Color) {
+    match status.map(AgentStatus::as_str) {
+        Some(AgentStatus::BLOCKED) => ("◉", Color::Red),
+        Some(AgentStatus::DONE) => ("●", Color::Cyan),
+        Some(AgentStatus::WORKING) => (
+            ["⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "⠋", "⠙", "⠹", "⠸"][spinner_frame % 10],
+            Color::Yellow,
+        ),
+        Some(AgentStatus::IDLE) => ("✓", Color::Green),
+        _ => ("○", Color::DarkGray),
+    }
 }
 
 fn render_detail(picker: &Picker, frame: &mut Frame, area: Rect) {
@@ -188,19 +238,29 @@ fn render_detail(picker: &Picker, frame: &mut Frame, area: Rect) {
     );
 }
 
-fn render_footer(frame: &mut Frame, area: Rect) {
+fn render_footer(mode: Mode, frame: &mut Frame, area: Rect) {
+    let movement = if mode == Mode::VimNormal {
+        "j/k"
+    } else {
+        "↑↓"
+    };
+    let escape = if mode == Mode::VimSearch {
+        " normal"
+    } else {
+        " close"
+    };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             key(" enter"),
             label(" open  "),
-            key("tab"),
-            label(" type  "),
+            key(if mode == Mode::VimNormal { "/" } else { "type" }),
+            label(" search  "),
             key("^A/^W/^T/⌥P/^G"),
             label(" filter  "),
-            key("↑↓"),
+            key(movement),
             label(" move  "),
             key("esc"),
-            label(" close"),
+            label(escape),
         ])),
         area,
     );
@@ -256,11 +316,65 @@ fn truncate_start(value: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Dispatch;
+    use ratatui::{backend::TestBackend, Terminal};
+    use serde_json::json;
 
     #[test]
     fn truncation_preserves_graphemes_and_width_budget() {
         assert_eq!(truncate_end("👩‍💻abc", 3), "👩‍💻…");
         assert_eq!(truncate_start("abc👩‍💻", 3), "…👩‍💻");
         assert_eq!(truncate_end("anything", 0), "");
+    }
+
+    #[test]
+    fn agent_status_glyphs_cover_known_and_future_statuses() {
+        assert_eq!(
+            agent_status_glyph(Some(&"blocked".into()), 1),
+            ("◉", Color::Red)
+        );
+        assert_eq!(
+            agent_status_glyph(Some(&"done".into()), 1),
+            ("●", Color::Cyan)
+        );
+        assert_eq!(
+            agent_status_glyph(Some(&"working".into()), 0),
+            ("⠼", Color::Yellow)
+        );
+        assert_eq!(
+            agent_status_glyph(Some(&"working".into()), 1),
+            ("⠴", Color::Yellow)
+        );
+        assert_eq!(
+            agent_status_glyph(Some(&"idle".into()), 1),
+            ("✓", Color::Green)
+        );
+        assert_eq!(
+            agent_status_glyph(Some(&"future".into()), 1),
+            ("○", Color::DarkGray)
+        );
+    }
+
+    #[test]
+    fn scoped_agent_rows_pad_before_the_status_glyph() {
+        let item = Item {
+            kind: Kind::Agent,
+            agent_status: Some("done".into()),
+            title: "title".into(),
+            subtitle: "subtitle".into(),
+            detail: String::new(),
+            keys: Vec::new(),
+            dispatch: Dispatch::new("test", json!({})),
+        };
+        let mut terminal = Terminal::new(TestBackend::new(20, ROW_HEIGHT)).unwrap();
+        terminal
+            .draw(|frame| render_row(&item, false, false, 0, frame, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(buffer.cell((0, 0)).unwrap().symbol(), " ");
+        assert_eq!(buffer.cell((1, 0)).unwrap().symbol(), "●");
+        assert_eq!(buffer.cell((3, 0)).unwrap().symbol(), "t");
+        assert_eq!(buffer.cell((3, 1)).unwrap().symbol(), "s");
     }
 }

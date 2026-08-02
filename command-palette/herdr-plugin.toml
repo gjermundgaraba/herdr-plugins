@@ -1,6 +1,6 @@
 id = "gjermundgaraba.herdr-command-palette"
 name = "command-palette"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.7.5"
 description = "Fuzzy command and navigation palette with effective Herdr keybindings"
 platforms = ["linux", "macos"]
@@ -12,7 +12,19 @@ command = ["cargo", "build", "--release", "--locked"]
 id = "open"
 title = "Command palette"
 description = "Search actions, workspaces, tabs, panes, and agents"
-command = ["sh", "open.sh"]
+command = ["./target/release/herdr-command-palette"]
+
+[[actions]]
+id = "agents"
+title = "Agents"
+description = "Attention-ranked agent palette"
+command = ["./target/release/herdr-command-palette"]
+
+[[actions]]
+id = "workspaces"
+title = "Workspaces"
+description = "Workspace palette"
+command = ["./target/release/herdr-command-palette"]
 
 [[panes]]
 id = "palette"
@@ -21,4 +33,3 @@ placement = "popup"
 width = "88%"
 height = "80%"
 command = ["./target/release/herdr-command-palette"]
-
