@@ -1,0 +1,13 @@
+[package]
+name = "popup-terminal"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.85"
+
+[dependencies]
+herdr-client = { path = "../sdk/rust" }
+serde = { version = "1", features = ["derive"] }
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+
+[profile.release]
+strip = true

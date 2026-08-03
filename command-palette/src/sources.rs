@@ -1,6 +1,8 @@
-use std::{cmp::Reverse, collections::HashMap, path::PathBuf, process::Command};
+use std::{cmp::Reverse, collections::HashMap, process::Command};
 
-use herdr_client::{AgentStatus, Client, PluginInvocationContext, SessionSnapshot};
+use herdr_client::{
+    herdr_config_path, AgentStatus, Client, PluginInvocationContext, SessionSnapshot,
+};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
@@ -566,14 +568,7 @@ fn load_plugin_keybindings() -> HashMap<String, Vec<String>> {
 }
 
 fn host_keys_table() -> Option<Map<String, Value>> {
-    let path = std::env::var_os("HERDR_CONFIG_PATH")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join(".config/herdr/config.toml"))
-        })?;
-    let raw = std::fs::read_to_string(path).ok()?;
+    let raw = std::fs::read_to_string(herdr_config_path()).ok()?;
     let value: Value = toml::from_str(&raw).ok()?;
     value.get("keys")?.as_object().cloned()
 }

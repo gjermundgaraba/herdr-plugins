@@ -48,6 +48,52 @@ impl Environment {
     }
 }
 
+pub fn herdr_config_path() -> PathBuf {
+    resolve_config_path(
+        std::env::var("HERDR_CONFIG_PATH").ok(),
+        std::env::var("XDG_CONFIG_HOME").ok(),
+        platform_config_dir(),
+    )
+}
+
+fn resolve_config_path(
+    explicit: Option<String>,
+    xdg_config_home: Option<String>,
+    platform_dir: PathBuf,
+) -> PathBuf {
+    explicit.map(PathBuf::from).unwrap_or_else(|| {
+        xdg_config_home
+            .map(PathBuf::from)
+            .unwrap_or(platform_dir)
+            .join("herdr/config.toml")
+    })
+}
+
+#[cfg(windows)]
+fn platform_config_dir() -> PathBuf {
+    std::env::var("APPDATA")
+        .map(PathBuf::from)
+        .or_else(|_| {
+            std::env::var("USERPROFILE")
+                .map(PathBuf::from)
+                .map(|profile| profile.join("AppData/Roaming"))
+        })
+        .or_else(|_| {
+            std::env::var("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".config"))
+        })
+        .unwrap_or_else(|_| std::env::temp_dir())
+}
+
+#[cfg(not(windows))]
+fn platform_config_dir() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".config"))
+        .unwrap_or_else(|_| std::env::temp_dir())
+}
+
 #[derive(Debug)]
 pub struct EnvironmentError {
     pub variable: &'static str,
@@ -89,4 +135,30 @@ fn json_var<T: serde::de::DeserializeOwned>(
             })
         })
         .transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_config_path_precedence() {
+        let platform = PathBuf::from("/platform");
+        assert_eq!(
+            resolve_config_path(
+                Some("/explicit".into()),
+                Some("/xdg".into()),
+                platform.clone()
+            ),
+            PathBuf::from("/explicit")
+        );
+        assert_eq!(
+            resolve_config_path(None, Some("/xdg".into()), platform.clone()),
+            PathBuf::from("/xdg/herdr/config.toml")
+        );
+        assert_eq!(
+            resolve_config_path(None, None, platform),
+            PathBuf::from("/platform/herdr/config.toml")
+        );
+    }
 }

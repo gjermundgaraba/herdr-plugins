@@ -9,7 +9,7 @@ mod env;
 mod types;
 
 pub use client::{ApiError, Client, Error, Subscription};
-pub use env::{Environment, EnvironmentError};
+pub use env::{herdr_config_path, Environment, EnvironmentError};
 pub use types::*;
 
 /// Stable Herdr release used to validate the typed models.

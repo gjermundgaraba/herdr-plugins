@@ -6,17 +6,17 @@ description = "Open a native popup shell in the focused pane's working directory
 platforms = ["linux", "macos"]
 
 [[build]]
-command = ["go", "build", "-trimpath", "-ldflags=-s -w", "-o", "popup-terminal", "."]
+command = ["cargo", "build", "--release", "--locked"]
 
 [[actions]]
 id = "open"
 title = "Open popup terminal"
 description = "Open a shell in the focused pane's working directory"
 contexts = ["pane"]
-command = ["sh", "-c", "exec \"${HERDR_BIN_PATH:-herdr}\" plugin pane open --plugin gjermundgaraba.herdr-popup-terminal --entrypoint terminal"]
+command = ["sh", "-c", "exec \"$HERDR_BIN_PATH\" plugin pane open --plugin gjermundgaraba.herdr-popup-terminal --entrypoint terminal"]
 
 [[panes]]
 id = "terminal"
 title = "terminal"
 placement = "popup"
-command = ["./popup-terminal"]
+command = ["./target/release/popup-terminal"]
