@@ -7,12 +7,16 @@
 use std::{
     collections::HashMap,
     ffi::{c_void, CStr},
+    fs::{File, OpenOptions},
+    io,
+    os::unix::{fs::OpenOptionsExt, io::AsRawFd},
+    path::Path,
     pin::Pin,
     ptr::NonNull,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender, SyncSender, TryRecvError},
-        Arc,
+        Arc, Mutex,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -21,8 +25,9 @@ use std::{
 use anyhow::{anyhow, bail, Result};
 use objc2_core_foundation::{kCFRunLoopDefaultMode, CFDictionary, CFNumber, CFRunLoop, CFString};
 use objc2_io_kit::{
-    kIOHIDProductIDKey, kIOHIDTransportKey, kIOHIDVendorIDKey, kIOReturnSuccess, IOHIDDevice,
-    IOHIDManager, IOHIDReportType, IOOptionBits, IOReturn,
+    kIOHIDLocationIDKey, kIOHIDProductIDKey, kIOHIDSerialNumberKey, kIOHIDTransportKey,
+    kIOHIDVendorIDKey, kIOReturnSuccess, IOHIDAccessType, IOHIDCheckAccess, IOHIDDevice,
+    IOHIDManager, IOHIDReportType, IOHIDRequestType, IOOptionBits, IOReturn,
 };
 use serde_json::Value;
 
@@ -31,6 +36,25 @@ use crate::protocol::{encode_message, Reassembler, REPORT_ID, REPORT_SIZE};
 pub const MICRO_VENDOR_ID: i32 = 0x303A;
 pub const MICRO_PRODUCT_ID: i32 = 0x8360;
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InputMonitoringAccess {
+    Granted,
+    Denied,
+    Unknown,
+}
+
+pub fn input_monitoring_access() -> InputMonitoringAccess {
+    classify_input_monitoring(IOHIDCheckAccess(IOHIDRequestType::ListenEvent))
+}
+
+fn classify_input_monitoring(access: IOHIDAccessType) -> InputMonitoringAccess {
+    match access {
+        IOHIDAccessType::Granted => InputMonitoringAccess::Granted,
+        IOHIDAccessType::Denied => InputMonitoringAccess::Denied,
+        _ => InputMonitoringAccess::Unknown,
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Transport {
@@ -92,12 +116,17 @@ pub struct MicroDevice {
     next_request_id: AtomicU64,
     closed: Arc<AtomicBool>,
     owner: Option<JoinHandle<()>>,
+    lock: Option<DeviceLock>,
 }
 
 impl MicroDevice {
     /// Opens the best available Micro and does the required `device.status`
     /// round trip before returning it.
     pub fn open(event_tx: Sender<DeviceEvent>) -> Result<Self> {
+        if input_monitoring_access() == InputMonitoringAccess::Denied {
+            bail!("Input Monitoring access is denied")
+        }
+        let lock = DeviceLock::acquire()?;
         let (command_tx, command_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let closed = Arc::new(AtomicBool::new(false));
@@ -112,6 +141,7 @@ impl MicroDevice {
                 next_request_id: AtomicU64::new(1),
                 closed,
                 owner: Some(owner),
+                lock: Some(lock),
             }),
             Ok(Err(error)) => {
                 let _ = owner.join();
@@ -135,10 +165,7 @@ impl MicroDevice {
                 reply: reply_tx,
             })
             .map_err(|_| anyhow!("device disconnected"))?;
-        reply_rx
-            .recv()
-            .map_err(|_| anyhow!("device disconnected"))?
-            .map_err(|error| anyhow!(error))
+        await_send_reply(reply_rx, DEFAULT_REQUEST_TIMEOUT)
     }
 
     pub fn request(
@@ -166,15 +193,17 @@ impl MicroDevice {
     }
 
     pub fn close(&mut self) -> Result<()> {
-        if self.closed.swap(true, Ordering::AcqRel) {
-            return Ok(());
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            let _ = self.command_tx.send(Command::Close);
         }
-        let _ = self.command_tx.send(Command::Close);
-        if let Some(owner) = self.owner.take() {
-            owner
-                .join()
-                .map_err(|_| anyhow!("Micro HID owner thread panicked"))?;
-        }
+        let joined = self
+            .owner
+            .take()
+            .map(|owner| owner.join())
+            .transpose()
+            .map_err(|_| anyhow!("Micro HID owner thread panicked"));
+        self.lock.take();
+        joined?;
         Ok(())
     }
 
@@ -183,6 +212,51 @@ impl MicroDevice {
             bail!("device disconnected")
         }
         Ok(())
+    }
+}
+
+fn await_send_reply(
+    reply_rx: Receiver<std::result::Result<(), String>>,
+    timeout: Duration,
+) -> Result<()> {
+    reply_rx
+        .recv_timeout(timeout)
+        .map_err(|_| anyhow!("device write timed out"))?
+        .map_err(|error| anyhow!(error))
+}
+
+struct DeviceLock(File);
+
+impl DeviceLock {
+    fn acquire() -> Result<Self> {
+        let uid = unsafe { libc::getuid() };
+        Self::acquire_at(&std::env::temp_dir().join(format!("herdr-micro-{uid}.lock")))
+    }
+
+    fn acquire_at(path: &Path) -> Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)?;
+        // SAFETY: flock only operates on this live file descriptor.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                bail!("another herdr-micro process owns the Codex Micro")
+            }
+            return Err(error.into());
+        }
+        Ok(Self(file))
+    }
+}
+
+impl Drop for DeviceLock {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor remains valid until this destructor returns.
+        let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 
@@ -199,13 +273,9 @@ fn owner_main(
     closed: Arc<AtomicBool>,
 ) {
     let result = (|| {
-        let mut owner = Owner::open(command_rx, event_tx, closed)?;
-        if let Err(error) = owner.handshake() {
-            owner.teardown();
-            return Err(error);
-        }
+        let mut owner = Owner::open(Arc::new(Mutex::new(command_rx)), event_tx, closed)?;
         if ready_tx.send(Ok(())).is_err() {
-            owner.teardown();
+            owner.teardown(true);
             bail!("opener dropped")
         }
         owner.run();
@@ -226,7 +296,7 @@ struct Owner {
     #[allow(dead_code)] // Kept pinned solely for the foreign callback pointer.
     context: Pin<Box<CallbackContext>>,
     callback_rx: Receiver<CallbackEvent>,
-    command_rx: Receiver<Command>,
+    command_rx: Arc<Mutex<Receiver<Command>>>,
     event_tx: Sender<DeviceEvent>,
     reassembler: Reassembler,
     pending: HashMap<u64, Pending>,
@@ -235,7 +305,7 @@ struct Owner {
 
 impl Owner {
     fn open(
-        command_rx: Receiver<Command>,
+        command_rx: Arc<Mutex<Receiver<Command>>>,
         event_tx: Sender<DeviceEvent>,
         closed: Arc<AtomicBool>,
     ) -> Result<Self> {
@@ -255,17 +325,49 @@ impl Owner {
             bail!("Codex Micro not found or unavailable")
         }
 
-        let (device, transport) = choose_device(&manager)?;
-        if device.open(0) != kIOReturnSuccess {
-            let _ = manager.close(0);
-            bail!("Codex Micro not found or unavailable")
+        let candidates = choose_devices(&manager)?;
+        let mut last_error = None;
+        for candidate in candidates {
+            match Self::open_candidate(
+                manager.clone(),
+                candidate,
+                Arc::clone(&command_rx),
+                event_tx.clone(),
+                Arc::clone(&closed),
+            ) {
+                Ok(mut owner) => match owner.handshake() {
+                    Ok(()) => return Ok(owner),
+                    Err(error) => {
+                        owner.teardown(false);
+                        closed.store(false, Ordering::Release);
+                        last_error = Some(error);
+                    }
+                },
+                Err(error) => last_error = Some(error),
+            }
         }
+        let _ = manager.close(0);
+        Err(last_error.unwrap_or_else(|| anyhow!("Codex Micro not found or unavailable")))
+    }
 
+    fn open_candidate(
+        manager: objc2_core_foundation::CFRetained<IOHIDManager>,
+        candidate: DeviceCandidate,
+        command_rx: Arc<Mutex<Receiver<Command>>>,
+        event_tx: Sender<DeviceEvent>,
+        closed: Arc<AtomicBool>,
+    ) -> Result<Self> {
+        let DeviceCandidate {
+            device, transport, ..
+        } = candidate;
         let run_loop =
             CFRunLoop::current().ok_or_else(|| anyhow!("no Core Foundation run loop"))?;
         // kCFRunLoopDefaultMode is supplied by CoreFoundation for the process lifetime.
         let run_loop_mode = unsafe { kCFRunLoopDefaultMode }
             .ok_or_else(|| anyhow!("no Core Foundation default run loop mode"))?;
+        if device.open(0) != kIOReturnSuccess {
+            bail!("Codex Micro is unavailable")
+        }
         let (callback_tx, callback_rx) = mpsc::channel();
         let context = Box::pin(CallbackContext { callback_tx });
         let mut input_buffer = Box::new([0; REPORT_SIZE]);
@@ -326,7 +428,11 @@ impl Owner {
     fn run(&mut self) {
         loop {
             self.pump();
-            match self.command_rx.try_recv() {
+            let command = match self.command_rx.lock() {
+                Ok(receiver) => receiver.try_recv(),
+                Err(_) => break,
+            };
+            match command {
                 Ok(Command::Close) | Err(TryRecvError::Disconnected) => break,
                 Ok(Command::Send {
                     method,
@@ -353,7 +459,7 @@ impl Owner {
                 break;
             }
         }
-        self.teardown();
+        self.teardown(true);
     }
 
     fn pump(&mut self) {
@@ -389,11 +495,11 @@ impl Owner {
         deadline: Instant,
         reply: SyncSender<std::result::Result<Value, String>>,
     ) -> Result<()> {
+        self.pending.insert(id, Pending { deadline, reply });
         if let Err(error) = self.write(method, params, Some(id)) {
-            send_request_error(reply, &error);
+            self.fail_pending(id, error.to_string());
             return Err(error);
         }
-        self.pending.insert(id, Pending { deadline, reply });
         Ok(())
     }
 
@@ -454,7 +560,7 @@ impl Owner {
         }
     }
 
-    fn teardown(&mut self) {
+    fn teardown(&mut self, close_manager: bool) {
         self.closed.store(true, Ordering::Release);
         self.fail_all("device disconnected");
         // SAFETY: This is the same owner thread that registered and scheduled
@@ -472,28 +578,28 @@ impl Owner {
                 .unschedule_from_run_loop(&self.run_loop, self.run_loop_mode);
         }
         let _ = self.device.close(0);
-        let _ = self.manager.close(0);
+        if close_manager {
+            let _ = self.manager.close(0);
+        }
         // `context` drops only after IOKit no longer has a callback registration.
     }
 }
 
-fn send_request_error(
-    reply: SyncSender<std::result::Result<Value, String>>,
-    error: &anyhow::Error,
-) {
-    let _ = reply.send(Err(error.to_string()));
-}
-
 unsafe extern "C-unwind" fn input_report_callback(
     context: *mut c_void,
-    _result: IOReturn,
+    result: IOReturn,
     _sender: *mut c_void,
-    _report_type: IOHIDReportType,
-    _report_id: u32,
+    report_type: IOHIDReportType,
+    report_id: u32,
     report: NonNull<u8>,
     length: isize,
 ) {
-    if context.is_null() || length <= 0 {
+    if context.is_null()
+        || result != kIOReturnSuccess
+        || report_type != IOHIDReportType::Input
+        || report_id != REPORT_ID as u32
+        || length <= 0
+    {
         return;
     }
     let length = usize::try_from(length).unwrap_or(0).min(REPORT_SIZE);
@@ -517,9 +623,36 @@ unsafe extern "C-unwind" fn removal_callback(
     let _ = context.callback_tx.send(CallbackEvent::Removed);
 }
 
-fn choose_device(
-    manager: &IOHIDManager,
-) -> Result<(objc2_core_foundation::CFRetained<IOHIDDevice>, Transport)> {
+struct DeviceCandidate {
+    device: objc2_core_foundation::CFRetained<IOHIDDevice>,
+    transport: Transport,
+    location: Option<i64>,
+    serial: String,
+}
+
+impl DeviceCandidate {
+    fn sort_key(&self) -> (u8, Option<i64>, &str) {
+        candidate_key(self.transport, self.location, &self.serial)
+    }
+}
+
+fn candidate_key(
+    transport: Transport,
+    location: Option<i64>,
+    serial: &str,
+) -> (u8, Option<i64>, &str) {
+    (transport_rank(transport), location, serial)
+}
+
+fn transport_rank(transport: Transport) -> u8 {
+    match transport {
+        Transport::Usb => 0,
+        Transport::BluetoothLowEnergy => 1,
+        Transport::Other => 2,
+    }
+}
+
+fn choose_devices(manager: &IOHIDManager) -> Result<Vec<DeviceCandidate>> {
     let devices = manager
         .devices()
         .ok_or_else(|| anyhow!("Codex Micro not found or unavailable"))?;
@@ -531,7 +664,9 @@ fn choose_device(
     // SAFETY: `pointers` has one entry per CFSet member; IOHIDManager returns
     // only IOHIDDevice objects for this set, which are retained before return.
     unsafe { devices.values(pointers.as_mut_ptr()) };
-    let mut chosen = None;
+    let location_key = cf_string(kIOHIDLocationIDKey);
+    let serial_key = cf_string(kIOHIDSerialNumberKey);
+    let mut candidates = Vec::new();
     for pointer in pointers {
         let Some(pointer) = NonNull::new(pointer.cast_mut()) else {
             continue;
@@ -540,15 +675,31 @@ fn choose_device(
         // remains retained while this newly retained device handle is created.
         let device =
             unsafe { objc2_core_foundation::CFRetained::retain(pointer.cast::<IOHIDDevice>()) };
-        let transport = device_transport(&device);
-        if chosen.is_none() || transport == Transport::Usb {
-            chosen = Some((device, transport));
-            if transport == Transport::Usb {
-                break;
-            }
-        }
+        let location = device
+            .property(&location_key)
+            .and_then(|value| value.downcast_ref::<CFNumber>().and_then(CFNumber::as_i64));
+        let serial = device
+            .property(&serial_key)
+            .and_then(|value| value.downcast_ref::<CFString>().map(ToString::to_string))
+            .unwrap_or_default();
+        candidates.push(DeviceCandidate {
+            transport: device_transport(&device),
+            device,
+            location,
+            serial,
+        });
     }
-    chosen.ok_or_else(|| anyhow!("Codex Micro not found or unavailable"))
+    candidates.sort_by(|left, right| left.sort_key().cmp(&right.sort_key()));
+    if candidates
+        .windows(2)
+        .any(|pair| pair[0].sort_key() == pair[1].sort_key())
+    {
+        bail!("multiple Codex Micro devices have the same stable identity")
+    }
+    if candidates.is_empty() {
+        bail!("Codex Micro not found or unavailable")
+    }
+    Ok(candidates)
 }
 
 fn device_transport(device: &IOHIDDevice) -> Transport {
@@ -650,8 +801,74 @@ mod tests {
 
     #[test]
     fn request_write_error_reaches_caller() {
-        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        send_request_error(reply_tx, &anyhow!("encode failed"));
-        assert_eq!(reply_rx.recv().unwrap(), Err("encode failed".into()));
+        let (_reply_tx, reply_rx) = mpsc::sync_channel(1);
+        assert!(await_send_reply(reply_rx, Duration::from_millis(1)).is_err());
+    }
+
+    #[test]
+    fn lock_excludes_another_micro_owner() {
+        let path =
+            std::env::temp_dir().join(format!("herdr-micro-lock-test-{}", std::process::id()));
+        let first = DeviceLock::acquire_at(&path).unwrap();
+        assert!(DeviceLock::acquire_at(&path).is_err());
+        drop(first);
+        assert!(DeviceLock::acquire_at(&path).is_ok());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn close_joins_an_owner_after_removal() {
+        let path =
+            std::env::temp_dir().join(format!("herdr-micro-close-test-{}", std::process::id()));
+        let (command_tx, _command_rx) = mpsc::channel();
+        let joined = Arc::new(AtomicBool::new(false));
+        let owner_joined = Arc::clone(&joined);
+        let mut device = MicroDevice {
+            command_tx,
+            next_request_id: AtomicU64::new(1),
+            closed: Arc::new(AtomicBool::new(true)),
+            owner: Some(thread::spawn(move || {
+                thread::sleep(Duration::from_millis(20));
+                owner_joined.store(true, Ordering::Release);
+            })),
+            lock: Some(DeviceLock::acquire_at(&path).unwrap()),
+        };
+        device.close().unwrap();
+        assert!(joined.load(Ordering::Acquire));
+        assert!(device.owner.is_none());
+        assert!(device.lock.is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn candidate_order_prefers_usb_then_stable_identity() {
+        assert!(
+            candidate_key(Transport::Usb, Some(2), "b")
+                < candidate_key(Transport::BluetoothLowEnergy, Some(1), "a")
+        );
+        assert!(
+            candidate_key(Transport::Usb, Some(1), "b")
+                < candidate_key(Transport::Usb, Some(2), "a")
+        );
+        assert!(
+            candidate_key(Transport::Usb, Some(1), "a")
+                < candidate_key(Transport::Usb, Some(1), "b")
+        );
+    }
+
+    #[test]
+    fn input_monitoring_access_is_classified() {
+        assert_eq!(
+            classify_input_monitoring(IOHIDAccessType::Granted),
+            InputMonitoringAccess::Granted
+        );
+        assert_eq!(
+            classify_input_monitoring(IOHIDAccessType::Denied),
+            InputMonitoringAccess::Denied
+        );
+        assert_eq!(
+            classify_input_monitoring(IOHIDAccessType::Unknown),
+            InputMonitoringAccess::Unknown
+        );
     }
 }

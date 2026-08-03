@@ -101,6 +101,67 @@ where
     start_daemon_at(&control_socket(), launch, ready_timeout)
 }
 
+/// Return a compatible daemon when one is live; otherwise stop the old one
+/// before starting this executable.
+pub fn start_daemon_versioned<F>(
+    version: &str,
+    protocol: u32,
+    launch: F,
+    ready_timeout: Duration,
+) -> Result<Value>
+where
+    F: FnOnce() -> Result<()>,
+{
+    start_daemon_versioned_at(&control_socket(), version, protocol, launch, ready_timeout)
+}
+
+fn start_daemon_versioned_at<F>(
+    path: &Path,
+    version: &str,
+    protocol: u32,
+    launch: F,
+    ready_timeout: Duration,
+) -> Result<Value>
+where
+    F: FnOnce() -> Result<()>,
+{
+    let old_socket = identity(path)?;
+    if let Ok(status) = request_at(path, Command::Status, Duration::from_millis(500)) {
+        if status.get("version").and_then(Value::as_str) == Some(version)
+            && status.get("protocol").and_then(Value::as_u64) == Some(u64::from(protocol))
+        {
+            return Ok(status);
+        }
+        request_at(path, Command::Stop, Duration::from_secs(2))
+            .context("stop incompatible Micro bridge")?;
+        let deadline = Instant::now() + ready_timeout;
+        while identity(path)? == old_socket {
+            if Instant::now() >= deadline {
+                bail!(
+                    "incompatible Micro bridge did not stop; see {}",
+                    log_file().display()
+                );
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+    launch()?;
+    let deadline = Instant::now() + ready_timeout;
+    loop {
+        if let Ok(status) = request_at(path, Command::Status, Duration::from_millis(250)) {
+            if status.get("version").and_then(Value::as_str) == Some(version)
+                && status.get("protocol").and_then(Value::as_u64) == Some(u64::from(protocol))
+            {
+                return Ok(status);
+            }
+        }
+        if Instant::now() >= deadline {
+            bail!("Micro bridge did not start; see {}", log_file().display());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 pub fn start_daemon_at<F>(path: &Path, launch: F, ready_timeout: Duration) -> Result<Value>
 where
     F: FnOnce() -> Result<()>,
@@ -163,7 +224,7 @@ impl ControlServer {
             .as_ref()
             .ok_or_else(|| anyhow!("Micro bridge server is closed"))?;
         listener.set_nonblocking(true)?;
-        while !self.stopping.load(Ordering::Acquire) {
+        loop {
             if !matches!(
                 shutdown.try_recv(),
                 Err(std::sync::mpsc::TryRecvError::Empty)
@@ -346,13 +407,14 @@ mod tests {
     fn rust_client_and_server() {
         let dir = temp_dir("rust");
         let path = dir.join(SOCKET_NAME);
-        let (server, _shutdown, runner) =
+        let (server, shutdown, runner) =
             start_test_server(path.clone(), Arc::new(AtomicUsize::new(0)));
         assert_eq!(
             request_at(&path, Command::Status, Duration::from_secs(1)).unwrap(),
             json!({ "running": true })
         );
         request_at(&path, Command::Stop, Duration::from_secs(1)).unwrap();
+        shutdown.send(()).unwrap();
         drop(server);
         runner.join().unwrap();
         fs::remove_dir_all(dir).unwrap();
@@ -382,7 +444,7 @@ mod tests {
         let dir = temp_dir("protocol-client");
         let path = dir.join(SOCKET_NAME);
         let stops = Arc::new(AtomicUsize::new(0));
-        let (server, _shutdown, runner) = start_test_server(path.clone(), stops);
+        let (server, shutdown, runner) = start_test_server(path.clone(), stops);
         let mut client = UnixStream::connect(&path).unwrap();
         client.write_all(b"{\"command\":\"status\"}\n").unwrap();
         assert_eq!(
@@ -390,6 +452,7 @@ mod tests {
             json!({ "running": true })
         );
         request_at(&path, Command::Stop, Duration::from_secs(1)).unwrap();
+        shutdown.send(()).unwrap();
         drop(server);
         runner.join().unwrap();
         fs::remove_dir_all(dir).unwrap();
@@ -399,7 +462,7 @@ mod tests {
     fn malformed_and_unknown_requests_return_errors() {
         let dir = temp_dir("errors");
         let path = dir.join(SOCKET_NAME);
-        let (server, _shutdown, runner) =
+        let (server, shutdown, runner) =
             start_test_server(path.clone(), Arc::new(AtomicUsize::new(0)));
         for (request, expected) in [
             (
@@ -419,6 +482,7 @@ mod tests {
             );
         }
         request_at(&path, Command::Stop, Duration::from_secs(1)).unwrap();
+        shutdown.send(()).unwrap();
         drop(server);
         runner.join().unwrap();
         fs::remove_dir_all(dir).unwrap();
@@ -428,7 +492,7 @@ mod tests {
     fn duplicate_start_detects_live_daemon() {
         let dir = temp_dir("duplicate");
         let path = dir.join(SOCKET_NAME);
-        let (server, _shutdown, runner) =
+        let (server, shutdown, runner) =
             start_test_server(path.clone(), Arc::new(AtomicUsize::new(0)));
         let error = match listen_for_control_at(path.clone(), || json!({}), || {}) {
             Ok(_) => panic!("duplicate bind succeeded"),
@@ -436,6 +500,7 @@ mod tests {
         };
         assert!(error.to_string().contains("already running"));
         request_at(&path, Command::Stop, Duration::from_secs(1)).unwrap();
+        shutdown.send(()).unwrap();
         drop(server);
         runner.join().unwrap();
         fs::remove_dir_all(dir).unwrap();
@@ -459,7 +524,7 @@ mod tests {
         let dir = temp_dir("stop");
         let path = dir.join(SOCKET_NAME);
         let stops = Arc::new(AtomicUsize::new(0));
-        let (server, _shutdown, runner) = start_test_server(path.clone(), Arc::clone(&stops));
+        let (server, shutdown, runner) = start_test_server(path.clone(), Arc::clone(&stops));
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
@@ -468,6 +533,7 @@ mod tests {
             request_at(&path, Command::Stop, Duration::from_secs(1)).unwrap(),
             json!({ "stopping": true })
         );
+        shutdown.send(()).unwrap();
         runner.join().unwrap();
         assert_eq!(stops.load(Ordering::Relaxed), 1);
         drop(server);
@@ -491,10 +557,65 @@ mod tests {
             Duration::from_secs(1),
         );
         assert_eq!(result.unwrap(), json!({ "running": true }));
-        let (server, _shutdown, runner) = ready_rx.recv().unwrap();
+        let (server, shutdown, runner) = ready_rx.recv().unwrap();
         request_at(&path, Command::Stop, Duration::from_secs(1)).unwrap();
+        shutdown.send(()).unwrap();
         drop(server);
         runner.join().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn version_mismatch_stops_and_relaunches() {
+        let dir = temp_dir("versioned-start");
+        let path = dir.join(SOCKET_NAME);
+        let old_listener = UnixListener::bind(&path).unwrap();
+        let old_path = path.clone();
+        let old_runner = thread::spawn(move || {
+            for (command, response) in [
+                (Command::Status, json!({"version":"0.8.0", "protocol":1})),
+                (Command::Stop, json!({"stopping":true})),
+            ] {
+                let (mut stream, _) = old_listener.accept().unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&read_line(&mut stream).unwrap()).unwrap(),
+                    json!({"command":command.name()})
+                );
+                writeln!(stream, "{response}").unwrap();
+            }
+            drop(old_listener);
+            fs::remove_file(old_path).unwrap();
+        });
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let launched = Arc::new(AtomicBool::new(false));
+        let launch_path = path.clone();
+        let launched_by_start = Arc::clone(&launched);
+        let status = start_daemon_versioned_at(
+            &path,
+            "0.9.0",
+            1,
+            move || {
+                launched_by_start.store(true, Ordering::Relaxed);
+                let listener = UnixListener::bind(&launch_path).unwrap();
+                let runner = thread::spawn(move || {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    assert_eq!(
+                        serde_json::from_slice::<Value>(&read_line(&mut stream).unwrap()).unwrap(),
+                        json!({"command":"status"})
+                    );
+                    writeln!(stream, "{}", json!({"version":"0.9.0", "protocol":1})).unwrap();
+                });
+                ready_tx.send(runner).unwrap();
+                Ok(())
+            },
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert!(launched.load(Ordering::Relaxed));
+        assert_eq!(status["version"], "0.9.0");
+        ready_rx.recv().unwrap().join().unwrap();
+        old_runner.join().unwrap();
+        fs::remove_file(&path).unwrap();
         fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -23,7 +23,7 @@ agent-specific plan, and sends every operation to that exact pane through
 ## Boundary
 
 - Codex shortcuts are intentionally user-configurable in `effort.json`.
-- Claude's picker saves the choice as its default for new sessions.
+- Claude persists `low` through `xhigh`; `max` is session-only.
 - Invoke Claude effort changes from an empty prompt; its public interface has no
   direct relative-effort action, so the integration types `/effort`.
 - The `setup-pi-effort` action installs the Pi extension in

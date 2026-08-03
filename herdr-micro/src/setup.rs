@@ -7,8 +7,8 @@ use std::{
     env,
     ffi::OsString,
     fs::{self, OpenOptions},
-    io::Write,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    io::{Read, Write},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     process::Command,
     sync::mpsc,
@@ -17,7 +17,10 @@ use std::{
 
 use crate::{
     actions::{layer_identity, HERDR_LAYER},
-    config::{config_path, load_controls, load_effort, load_lighting},
+    config::{
+        config_path, load_controls, load_effort, load_lighting, provision_controls,
+        provision_effort, provision_lighting,
+    },
     control::{ensure_state_dir, request_status},
     device::{DeviceEvent, MicroDevice, DEFAULT_REQUEST_TIMEOUT},
 };
@@ -198,12 +201,23 @@ fn layout_codes(layout: &Value) -> Vec<&Value> {
 }
 
 fn is_blank_layer(layer: &Value) -> bool {
-    let Some(layout) = layer.get("layout") else {
-        return true;
-    };
-    layout_codes(layout)
-        .iter()
-        .all(|code| matches!(code.as_str(), Some("KC_NONE" | "KI_X")))
+    layer.get("layout")
+        == Some(&json!({
+            "keymap": [
+                ["KC_NONE", "KC_NONE"],
+                ["KC_NONE", "KC_NONE", "KC_NONE", "KC_NONE"],
+                ["KC_NONE", "KC_NONE", "KC_NONE", "KC_NONE"],
+                ["KC_NONE", "KC_NONE", "KC_NONE"]
+            ],
+            "encoders": [["KC_NONE", "KC_NONE", "KC_NONE"]],
+            "joystick": {
+                "type": "RADIAL",
+                "sectors": [
+                    {"k": "KI_X", "a1": 0.1875, "a2": 0.3125},
+                    {"k": "KC_NONE", "a1": 0.3125, "a2": 0.1875}
+                ]
+            }
+        }))
 }
 
 /// Copies the compatible Layer 1 layout into blank Layer 2 and binds both layers.
@@ -329,7 +343,69 @@ fn backup_keymap(bytes: &[u8]) -> Result<PathBuf> {
         .open(&path)
         .with_context(|| format!("create {}", path.display()))?;
     file.write_all(bytes)?;
+    file.sync_all()?;
+    fs::File::open(&dir)?.sync_all()?;
     Ok(path)
+}
+
+fn update_keymap_with<B, R, W>(
+    before: &[u8],
+    after: &[u8],
+    backup: B,
+    mut read: R,
+    mut write: W,
+) -> Result<Option<PathBuf>>
+where
+    B: FnOnce(&[u8]) -> Result<PathBuf>,
+    R: FnMut() -> Result<Vec<u8>>,
+    W: FnMut(&[u8]) -> Result<()>,
+{
+    if before == after {
+        return Ok(None);
+    }
+    let backup = backup(before)?;
+    let updated = write(after).and_then(|()| {
+        if read()? == after {
+            Ok(())
+        } else {
+            bail!("keymap read-back failed")
+        }
+    });
+    if let Err(error) = updated {
+        let restored = write(before).and_then(|()| {
+            if read()? == before {
+                Ok(())
+            } else {
+                bail!("restored keymap read-back failed")
+            }
+        });
+        return match restored {
+            Ok(()) => Err(error).with_context(|| {
+                format!(
+                    "keymap update failed; original keymap was restored; backup: {}",
+                    backup.display()
+                )
+            }),
+            Err(recovery) => Err(anyhow!(
+                "keymap update failed: {error}; automatic restore failed: {recovery}; recover from backup: {}",
+                backup.display()
+            )),
+        };
+    }
+    Ok(Some(backup))
+}
+
+fn provision_and_validate_configs() -> Result<(PathBuf, PathBuf, PathBuf)> {
+    let controls = config_path("controls.json");
+    let effort = config_path("effort.json");
+    let lighting = config_path("lighting.json");
+    provision_controls(&controls).map_err(|error| anyhow!(error))?;
+    provision_effort(&effort).map_err(|error| anyhow!(error))?;
+    provision_lighting(&lighting).map_err(|error| anyhow!(error))?;
+    load_controls(&controls).map_err(|error| anyhow!(error))?;
+    load_effort(&effort).map_err(|error| anyhow!(error))?;
+    load_lighting(&lighting).map_err(|error| anyhow!(error))?;
+    Ok((controls, effort, lighting))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -342,6 +418,7 @@ pub struct SetupReport {
 }
 
 pub fn setup_micro() -> Result<SetupReport> {
+    let (controls, effort, lighting) = provision_and_validate_configs()?;
     if let Some(owner) = active_owner()? {
         bail!("quit {owner} first");
     }
@@ -366,19 +443,14 @@ pub fn setup_micro() -> Result<SetupReport> {
         let backup = if after == canonical_before {
             None
         } else {
-            let backup = backup_keymap(&before)?;
-            write_keymap(&device, &after)?;
-            if read_keymap(&device)? != after {
-                bail!("keymap read-back failed");
-            }
-            Some(backup)
+            update_keymap_with(
+                &before,
+                &after,
+                backup_keymap,
+                || read_keymap(&device),
+                |bytes| write_keymap(&device, bytes),
+            )?
         };
-        let controls = config_path("controls.json");
-        let effort = config_path("effort.json");
-        let lighting = config_path("lighting.json");
-        load_controls(&controls).map_err(|error| anyhow!(error))?;
-        load_effort(&effort).map_err(|error| anyhow!(error))?;
-        load_lighting(&lighting).map_err(|error| anyhow!(error))?;
         Ok(SetupReport {
             firmware,
             backup,
@@ -391,12 +463,21 @@ pub fn setup_micro() -> Result<SetupReport> {
     match (result, close) {
         (Ok(report), Ok(())) => Ok(report),
         (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
+        (Ok(report), Err(error)) => match report.backup {
+            Some(backup) => Err(error).with_context(|| {
+                format!(
+                    "device close failed after the verified keymap update; backup: {}",
+                    backup.display()
+                )
+            }),
+            None => Err(error),
+        },
     }
 }
 
 pub fn configure_controls() -> Result<PathBuf> {
     let path = config_path("controls.json");
+    provision_controls(&path).map_err(|error| anyhow!(error))?;
     load_controls(&path).map_err(|error| anyhow!(error))?;
     let status = Command::new("/usr/bin/open")
         .args(["-t", path.to_string_lossy().as_ref()])
@@ -415,13 +496,34 @@ pub struct PiInstall {
     pub unchanged: bool,
 }
 
+fn read_pi_target(target: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::symlink_metadata(target) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!("refusing to replace symlink {}", target.display())
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", target.display())),
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(target)
+        .with_context(|| format!("read {}", target.display()))?;
+    if !file.metadata()?.is_file() {
+        bail!(
+            "Pi extension target is not a regular file: {}",
+            target.display()
+        );
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
+}
+
 pub fn install_pi_effort(source: &Path, target: &Path, timestamp: u128) -> Result<PiInstall> {
     let bundled = fs::read(source).with_context(|| format!("read {}", source.display()))?;
-    let current = match fs::read(target) {
-        Ok(bytes) => Some(bytes),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error).with_context(|| format!("read {}", target.display())),
-    };
+    let current = read_pi_target(target)?;
     if current.as_deref() == Some(&bundled) {
         return Ok(PiInstall {
             target: target.into(),
@@ -441,18 +543,32 @@ pub fn install_pi_effort(source: &Path, target: &Path, timestamp: u128) -> Resul
             .mode(0o644)
             .open(&backup)?;
         file.write_all(&bytes)?;
+        file.sync_all()?;
         Some(backup)
     } else {
         None
     };
+    let name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("Pi extension target has no file name"))?;
+    let temporary = parent.join(format!(".{name}.tmp-{}-{timestamp}", std::process::id()));
     let mut file = OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o644)
-        .open(target)?;
-    file.write_all(&bundled)?;
-    fs::set_permissions(target, fs::Permissions::from_mode(0o644))?;
+        .open(&temporary)?;
+    let written = (|| -> Result<()> {
+        file.write_all(&bundled)?;
+        file.sync_all()?;
+        fs::rename(&temporary, target)?;
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    written?;
     Ok(PiInstall {
         target: target.into(),
         backup,
@@ -490,6 +606,27 @@ mod tests {
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    fn blank_layer() -> Value {
+        json!({
+            "layout": {
+                "keymap": [
+                    ["KC_NONE", "KC_NONE"],
+                    ["KC_NONE", "KC_NONE", "KC_NONE", "KC_NONE"],
+                    ["KC_NONE", "KC_NONE", "KC_NONE", "KC_NONE"],
+                    ["KC_NONE", "KC_NONE", "KC_NONE"]
+                ],
+                "encoders": [["KC_NONE", "KC_NONE", "KC_NONE"]],
+                "joystick": {
+                    "type": "RADIAL",
+                    "sectors": [
+                        { "k": "KI_X", "a1": 0.1875, "a2": 0.3125 },
+                        { "k": "KC_NONE", "a1": 0.3125, "a2": 0.1875 }
+                    ]
+                }
+            }
+        })
     }
 
     #[test]
@@ -538,7 +675,7 @@ mod tests {
         let mut keymap = json!({
             "profiles": [{ "layers": [
                 { "layout": { "keymap": [REQUIRED_OAI_CODES] } },
-                { "layout": { "keymap": [["KC_NONE"]], "encoders": [], "joystick": { "sectors": [] } } }
+                blank_layer()
             ] }]
         });
         configure_micro(&mut keymap).unwrap();
@@ -554,6 +691,26 @@ mod tests {
             keymap.pointer("/profiles/0/layers/0/layout"),
             keymap.pointer("/profiles/0/layers/1/layout")
         );
+    }
+
+    #[test]
+    fn refuses_unknown_or_missing_layer_two_layouts() {
+        for layer in [
+            json!({}),
+            json!({ "layout": { "keymap": [["KC_NONE"]] } }),
+            json!({ "layout": { "keymap": [["KC_NONE"]], "encoders": [], "joystick": { "type": "RADIAL", "sectors": [] }, "extra": true } }),
+            json!({ "layout": { "keymap": [], "encoders": [], "joystick": { "type": "RADIAL", "sectors": [] } } }),
+            json!({ "layout": { "keymap": [["KC_NONE"]], "encoders": [["KC_NONE", "KC_NONE", "KC_NONE"]], "joystick": { "type": "RADIAL", "sectors": [{ "k": "KI_X", "a1": 0.1875, "a2": 0.3125 }] } } }),
+            json!({ "layout": { "keymap": [["KC_NONE"]], "encoders": [], "joystick": { "type": "RADIAL", "sectors": [{ "k": "KI_X", "a1": "bad", "a2": 0.25 }] } } }),
+        ] {
+            let mut keymap = json!({
+                "profiles": [{ "layers": [
+                    { "layout": { "keymap": [REQUIRED_OAI_CODES] } },
+                    layer
+                ] }]
+            });
+            assert!(configure_micro(&mut keymap).is_err());
+        }
     }
 
     #[test]
@@ -590,5 +747,82 @@ mod tests {
         assert_eq!(fs::read(changed.backup.unwrap()).unwrap(), b"one");
         assert_eq!(fs::read(&target).unwrap(), b"two");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pi_install_refuses_symlinks_without_touching_their_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp("pi-symlink");
+        let source = root.join("source.js");
+        let outside = root.join("outside.ts");
+        let target = root.join("extension.ts");
+        fs::write(&source, b"new").unwrap();
+        fs::write(&outside, b"old").unwrap();
+        symlink(&outside, &target).unwrap();
+        assert!(install_pi_effort(&source, &target, 10).is_err());
+        assert_eq!(fs::read(&outside).unwrap(), b"old");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pi_install_failure_leaves_live_extension_unchanged() {
+        let root = temp("pi-failure");
+        let source = root.join("source.js");
+        let target = root.join("extension.ts");
+        fs::write(&source, b"new").unwrap();
+        fs::write(&target, b"old").unwrap();
+        fs::write(
+            root.join(format!(".extension.ts.tmp-{}-10", std::process::id())),
+            b"occupied",
+        )
+        .unwrap();
+        assert!(install_pi_effort(&source, &target, 10).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"old");
+        assert_eq!(fs::read(root.join("extension.ts.bak-10")).unwrap(), b"old");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn keymap_failure_restores_original_and_names_backup() {
+        let backup = PathBuf::from("/tmp/keymap-backup.json");
+        let mut writes = Vec::new();
+        let mut reads = [b"wrong".to_vec(), b"before".to_vec()].into_iter();
+        let error = update_keymap_with(
+            b"before",
+            b"after",
+            |_| Ok(backup.clone()),
+            || Ok(reads.next().unwrap()),
+            |bytes| {
+                writes.push(bytes.to_vec());
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(writes, vec![b"after".to_vec(), b"before".to_vec()]);
+        assert!(error.to_string().contains("/tmp/keymap-backup.json"));
+        assert!(error.to_string().contains("restored"));
+    }
+
+    #[test]
+    fn failed_restore_still_names_backup() {
+        let backup = PathBuf::from("/tmp/keymap-backup.json");
+        let mut writes = 0;
+        let error = update_keymap_with(
+            b"before",
+            b"after",
+            |_| Ok(backup.clone()),
+            || Ok(b"wrong".to_vec()),
+            |_| {
+                writes += 1;
+                if writes == 2 {
+                    bail!("device disappeared")
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("automatic restore failed"));
+        assert!(error.to_string().contains("/tmp/keymap-backup.json"));
     }
 }

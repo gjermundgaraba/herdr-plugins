@@ -1,17 +1,12 @@
 //! Non-destructive installation checks for the Micro plugin.
 
-use anyhow::{ensure, Result};
-use std::{
-    env, fs,
-    os::unix::fs::PermissionsExt,
-    path::PathBuf,
-    process::{Command, Output},
-    time::Duration,
-};
+use anyhow::Result;
+use std::{env, fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Command, time::Duration};
 
 use crate::{
     config::{config_path, load_controls, load_effort, load_lighting},
     control::request_status,
+    device::{input_monitoring_access, InputMonitoringAccess},
     ghostty::inspect_ghostty,
     macos::{frontmost, post_event_access},
     setup::plugin_root,
@@ -94,6 +89,17 @@ pub fn doctor() -> Report {
             "Scroll event access is denied; enable Accessibility for Herdr or its terminal host",
         ),
     }
+    match input_monitoring_access() {
+        InputMonitoringAccess::Granted => report.push(Level::Ok, "Input Monitoring access"),
+        InputMonitoringAccess::Denied => report.push(
+            Level::Fail,
+            "Input Monitoring is denied; enable it for Herdr or its terminal host",
+        ),
+        InputMonitoringAccess::Unknown => report.push(
+            Level::Warn,
+            "Input Monitoring access could not be determined; Micro connection failures may be permission-related",
+        ),
+    }
     match frontmost() {
         Ok(current) => report.push(
             Level::Ok,
@@ -171,49 +177,7 @@ pub fn doctor() -> Report {
             "Hunk is not installed; the diff button is unavailable",
         ),
     }
-    match secure_input() {
-        Ok(Some(owner)) => report.push(Level::Warn, format!("Secure Input is held by {owner}")),
-        Ok(None) => report.push(Level::Ok, "Secure Input is off"),
-        Err(_) => report.push(Level::Warn, "Secure Input status could not be read"),
-    }
     report
-}
-
-fn secure_input() -> Result<Option<String>> {
-    let output = require_success(
-        Command::new("/usr/sbin/ioreg")
-            .args(["-l", "-d", "1", "-w", "0"])
-            .output()?,
-        "ioreg",
-    )?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    let pid = text
-        .lines()
-        .find_map(|line| line.split_once("kCGSSessionSecureInputPID"))
-        .and_then(|(_, rest)| rest.split('=').nth(1))
-        .map(str::trim)
-        .and_then(|pid| pid.parse::<u32>().ok())
-        .filter(|pid| *pid != 0);
-    let Some(pid) = pid else {
-        return Ok(None);
-    };
-    let output = require_success(
-        Command::new("/bin/ps")
-            .args(["-p", &pid.to_string(), "-o", "command="])
-            .output()?,
-        "ps",
-    )?;
-    let command = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    Ok(Some(if command.is_empty() {
-        format!("PID {pid}")
-    } else {
-        command
-    }))
-}
-
-fn require_success(output: Output, inspection: &str) -> Result<Output> {
-    ensure!(output.status.success(), "{inspection} inspection failed");
-    Ok(output)
 }
 
 pub fn run_doctor() -> i32 {
@@ -238,11 +202,5 @@ mod tests {
         report.push(Level::Fail, "three");
         assert!(report.failed());
         assert_eq!(report.render(), "[ok] one\n[warn] two\n[fail] three");
-    }
-
-    #[test]
-    fn failed_inspection_command_is_an_error() {
-        let output = Command::new("/usr/bin/false").output().unwrap();
-        assert!(require_success(output, "test").is_err());
     }
 }

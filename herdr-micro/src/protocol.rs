@@ -18,25 +18,51 @@ pub struct JoystickEvent {
     pub direction: Option<&'static str>,
 }
 
-pub fn device_owner(processes: &[String], frontmost_process: Option<&str>) -> Option<&'static str> {
-    const OWNERS: [(&str, Option<&str>); 3] = [
-        ("/Applications/input.app/Contents/MacOS/input", None),
-        (
-            "/Applications/Codex.app/Contents/MacOS/ChatGPT",
-            Some("com.openai.codex"),
-        ),
-        (
-            "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
-            Some("com.openai.codex"),
-        ),
-    ];
-    OWNERS
+pub fn device_owner(processes: &[String], frontmost_bundle: Option<&str>) -> Option<&'static str> {
+    let native_frontmost = ["com.openai.codex", "com.openai.chat"]
         .into_iter()
-        .find(|(path, process)| {
-            processes.iter().any(|p| p == path)
-                && (process.is_none() || *process == frontmost_process)
-        })
-        .map(|(path, _)| path)
+        .find(|bundle| crate::macos::frontmost_bundle_is(bundle));
+    device_owner_with_bundles(
+        &crate::macos::running_bundle_ids(),
+        processes,
+        native_frontmost.or(frontmost_bundle),
+    )
+}
+
+pub fn device_owner_with_bundles(
+    running_bundles: &[String],
+    processes: &[String],
+    frontmost_bundle: Option<&str>,
+) -> Option<&'static str> {
+    let input_running = bundle_is_running(running_bundles, "it.focusense.input-app")
+        || has_process(processes, "input", "input");
+    if input_running {
+        return Some("Input");
+    }
+
+    let frontmost_openai = matches!(
+        frontmost_bundle,
+        Some("com.openai.codex" | "com.openai.chat")
+    );
+    let chatgpt_running = bundle_is_running(running_bundles, "com.openai.codex")
+        || bundle_is_running(running_bundles, "com.openai.chat")
+        || has_process(processes, "ChatGPT", "ChatGPT")
+        || has_process(processes, "Codex", "ChatGPT");
+    (frontmost_openai && chatgpt_running).then_some("ChatGPT")
+}
+
+fn bundle_is_running(bundles: &[String], expected: &str) -> bool {
+    bundles.iter().any(|bundle| bundle == expected)
+}
+
+fn has_process(processes: &[String], app: &str, executable: &str) -> bool {
+    let suffix = format!("/{app}.app/Contents/MacOS/{executable}");
+    processes.iter().any(|command| {
+        command
+            .split_ascii_whitespace()
+            .next()
+            .is_some_and(|path| path.ends_with(&suffix))
+    })
 }
 fn priority(status: AgentStatus) -> u8 {
     match status {
@@ -289,16 +315,36 @@ mod tests {
         );
     }
     #[test]
-    fn chatgpt_owns_the_device_only_while_frontmost() {
-        let process = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT".to_owned();
+    fn device_owners_use_bundle_identity_with_relocated_process_fallback() {
+        let input = "/Users/me/Applications/input.app/Contents/MacOS/input --background".to_owned();
         assert_eq!(
-            device_owner(std::slice::from_ref(&process), Some("com.openai.codex")),
-            Some(process.as_str())
+            device_owner_with_bundles(&[], &[input], None),
+            Some("Input")
+        );
+
+        let chatgpt = "/Volumes/Tools/ChatGPT.app/Contents/MacOS/ChatGPT --launch".to_owned();
+        assert_eq!(
+            device_owner_with_bundles(&["com.openai.codex".into()], &[], Some("com.openai.codex")),
+            Some("ChatGPT")
         );
         assert_eq!(
-            device_owner(std::slice::from_ref(&process), Some("com.openai.chat")),
+            device_owner_with_bundles(&[], &[chatgpt], Some("com.openai.codex")),
+            Some("ChatGPT")
+        );
+        assert_eq!(
+            device_owner_with_bundles(&["com.openai.codex".into()], &[], Some("com.example.other")),
             None
         );
+    }
+
+    #[test]
+    fn joystick_changes_direction_at_an_angular_boundary() {
+        let first = joystick_event(0.124, 0.9, None, 0.75, 0.3);
+        assert_eq!(first.direction, Some("right"));
+        let across = joystick_event(0.126, 0.9, first.sector, 0.75, 0.3);
+        assert_eq!(across.direction, Some("down"));
+        let back = joystick_event(0.124, 0.9, across.sector, 0.75, 0.3);
+        assert_eq!(back.direction, Some("right"));
     }
     #[test]
     fn accepts_report_id_variants_and_rejects_bad_reports() {

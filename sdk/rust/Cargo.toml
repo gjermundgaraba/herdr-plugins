@@ -2,6 +2,7 @@
 name = "herdr-client"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.75"
 license = "Apache-2.0"
 description = "Typed, synchronous client for the Herdr plugin socket API"
 

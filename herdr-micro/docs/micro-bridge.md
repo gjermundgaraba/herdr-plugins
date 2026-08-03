@@ -32,7 +32,7 @@ Layer routing is fixed:
 |---|---|
 | Codex desktop app | Yield device ownership; select Layer 1 |
 | Ghostty terminal mapped to a running Herdr session | Own device; select Layer 2 and that session |
-| Unrelated application | Preserve the last applicable layer; dispatch nothing unsafe |
+| Unrelated application | Preserve the last applicable layer; dispatch nothing |
 
 Layer 2 must retain `KV_OAI_AG00` through `KV_OAI_AG05` and the OAI encoder
 actions created by `micro-setup`.
@@ -55,8 +55,9 @@ the affected `Codex Micro #N`. USB remains the recovery transport.
 
 ## Ownership and safety
 
-- Do not run Work Louder Input or another third-party HID writer beside the
-  bridge. The daemon yields when Input is running and while Codex is frontmost.
+- Direct HID access requires macOS Input Monitoring permission. Do not run Work
+  Louder Input or another Input Monitoring/HID client beside the bridge. The
+  daemon yields when Input is running and while Codex is frontmost.
 - The daemon never writes firmware or keymaps. Only the explicit `micro-setup`
   action changes the keymap; it requires a blank Layer 2, creates a backup, and
   verifies the full read-back.
@@ -74,7 +75,8 @@ the affected `Codex Micro #N`. USB remains the recovery transport.
   Work Louder publishes firmware binaries, not a third-party SDK or protocol
   contract. Firmware or host-app changes may break the bridge.
 - Only the six Agent keys are independently addressable on the tested Codex
-  Micro. The seven lower keys and perimeter lighting are aggregate zones.
+  Micro. The stock double-width lower key actuates ACT10 and ACT11 as one
+  logical action key; perimeter lighting is an aggregate zone.
 - Aggregate-zone synchronization flags exist in the protocol but have not been
   physically verified.
 - True held macOS keys, voice control, eight-way joystick sectors, and analog
@@ -87,3 +89,9 @@ the affected `Codex Micro #N`. USB remains the recovery transport.
 
 The [research record](research/README.md) preserves tested versions, results,
 hardware evidence, caveats, and source links.
+
+## Lifecycle
+
+Herdr v1 startup hooks are not supervised services and have no teardown hook.
+Run `micro-stop` before disabling, uninstalling, unlinking, or updating the
+plugin. `micro-start` replaces a daemon from a different plugin version.

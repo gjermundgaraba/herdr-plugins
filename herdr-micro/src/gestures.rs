@@ -5,38 +5,38 @@ use std::{
 };
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct Fired<C> {
+pub struct Fired {
     pub action: Action,
     pub source: String,
-    pub context: C,
+    pub context: Option<String>,
 }
 #[derive(Clone)]
-struct Pending<C> {
+struct Pending {
     binding: GestureBinding,
-    context: C,
+    context: Option<String>,
     due: Instant,
 }
 #[derive(Clone)]
-struct State<C> {
+struct State {
     down: bool,
     binding: GestureBinding,
-    context: C,
+    context: Option<String>,
     held: bool,
     double_tap: Option<Action>,
     hold_due: Option<Instant>,
-    pending: Option<Pending<C>>,
+    pending: Option<Pending>,
 }
-pub struct GestureDispatcher<C> {
-    states: HashMap<String, State<C>>,
+pub struct GestureDispatcher {
+    states: HashMap<String, State>,
     hold_default: Duration,
     double_tap_default: Duration,
 }
-impl<C: Clone> Default for GestureDispatcher<C> {
+impl Default for GestureDispatcher {
     fn default() -> Self {
         Self::new()
     }
 }
-impl<C: Clone> GestureDispatcher<C> {
+impl GestureDispatcher {
     pub fn new() -> Self {
         Self {
             states: HashMap::new(),
@@ -49,9 +49,9 @@ impl<C: Clone> GestureDispatcher<C> {
         key: impl Into<String>,
         binding: Option<&Binding>,
         pressed: bool,
-        context: C,
+        context: Option<String>,
         now: Instant,
-    ) -> Vec<Fired<C>> {
+    ) -> Vec<Fired> {
         let key = key.into();
         if !pressed {
             return self.release(&key, now);
@@ -66,7 +66,7 @@ impl<C: Clone> GestureDispatcher<C> {
             _ => vec![],
         }
     }
-    pub fn drain_due(&mut self, now: Instant) -> Vec<Fired<C>> {
+    pub fn drain_due(&mut self, now: Instant) -> Vec<Fired> {
         let mut fired = Vec::new();
         let keys: Vec<_> = self.states.keys().cloned().collect();
         for key in keys {
@@ -124,9 +124,9 @@ impl<C: Clone> GestureDispatcher<C> {
         &mut self,
         key: String,
         binding: GestureBinding,
-        context: C,
+        context: Option<String>,
         now: Instant,
-    ) -> Vec<Fired<C>> {
+    ) -> Vec<Fired> {
         let state = self.states.entry(key).or_insert_with(|| State {
             down: false,
             binding: binding.clone(),
@@ -157,7 +157,7 @@ impl<C: Clone> GestureDispatcher<C> {
         });
         vec![]
     }
-    fn release(&mut self, key: &str, now: Instant) -> Vec<Fired<C>> {
+    fn release(&mut self, key: &str, now: Instant) -> Vec<Fired> {
         let Some(state) = self.states.get_mut(key) else {
             return vec![];
         };
@@ -224,15 +224,15 @@ mod tests {
         });
         let now = Instant::now();
         assert!(dispatcher
-            .handle("key", Some(&binding), true, "first", now)
+            .handle("key", Some(&binding), true, Some("first".into()), now)
             .is_empty());
         assert!(dispatcher
-            .handle("key", Some(&binding), false, "first", now)
+            .handle("key", Some(&binding), false, Some("first".into()), now)
             .is_empty());
-        let fired = dispatcher.handle("key", Some(&binding), true, "second", now);
+        let fired = dispatcher.handle("key", Some(&binding), true, Some("second".into()), now);
         assert!(fired.is_empty());
-        let fired = dispatcher.handle("key", Some(&binding), false, "second", now);
+        let fired = dispatcher.handle("key", Some(&binding), false, Some("second".into()), now);
         assert_eq!(fired[0].action, Action::Diff);
-        assert_eq!(fired[0].context, "first");
+        assert_eq!(fired[0].context.as_deref(), Some("first"));
     }
 }

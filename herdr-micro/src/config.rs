@@ -2,8 +2,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     env, fs, io,
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
+
+#[cfg(test)]
+use std::os::unix::fs::PermissionsExt;
 
 use crate::PLUGIN_ID;
 
@@ -93,16 +97,21 @@ impl Binding {
 pub fn key_binding(config: &Controls, key: &str, action: i64) -> Option<Binding> {
     if matches!(action, 0 | 1) {
         if let Some(number) = key.strip_prefix("ACT").and_then(|n| n.parse::<u8>().ok()) {
-            if (6..=12).contains(&number) {
-                return config.buttons.get(&(number - 5)).cloned().flatten();
+            let button = match number {
+                6..=10 => number - 5,
+                // The stock wide cap presses ACT10 and ACT11 together. ACT10
+                // is its one logical button; ACT11 must never dispatch again.
+                11 => return None,
+                12 => 6,
+                _ => return None,
+            };
+            if let Some(binding) = config.buttons.get(&button) {
+                return binding.clone();
             }
         }
         if key == "ENC_CLK" {
             return config.dial.press.clone();
         }
-    }
-    if action != 2 {
-        return None;
     }
     match key {
         "ENC_CC" => config.dial.clockwise.clone().map(Binding::Action),
@@ -149,7 +158,7 @@ pub fn parse_controls(value: &Value) -> Result<Controls, String> {
         let id = key
             .parse::<u8>()
             .ok()
-            .filter(|n| (1..=7).contains(n))
+            .filter(|n| (1..=6).contains(n))
             .ok_or_else(|| format!("invalid button: {key}"))?;
         parsed_buttons.insert(id, parse_binding(binding, &format!("buttons.{key}"))?);
     }
@@ -480,33 +489,38 @@ pub fn config_path(name: &str) -> PathBuf {
         })
         .join(name)
 }
-pub fn ensure_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
+fn ensure_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     if !path.exists() {
-        use std::os::unix::fs::OpenOptionsExt;
         let json = serde_json::to_string_pretty(value).unwrap() + "\n";
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true).mode(0o600);
         std::io::Write::write_all(&mut options.open(path)?, json.as_bytes())?;
     }
-    fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+    Ok(())
+}
+pub fn provision_controls(path: &Path) -> Result<(), String> {
+    ensure_json(path, &controls_json()).map_err(|error| error.to_string())
+}
+pub fn provision_effort(path: &Path) -> Result<(), String> {
+    ensure_json(path, &default_effort()).map_err(|error| error.to_string())
+}
+pub fn provision_lighting(path: &Path) -> Result<(), String> {
+    ensure_json(path, &default_lighting()).map_err(|error| error.to_string())
 }
 pub fn load_controls(path: &Path) -> Result<Controls, String> {
-    ensure_json(path, &controls_json()).map_err(|e| e.to_string())?;
     parse_controls(&read_json(path)?)
 }
 pub fn load_effort(path: &Path) -> Result<EffortConfig, String> {
-    ensure_json(path, &default_effort()).map_err(|e| e.to_string())?;
     parse_effort(read_json(path)?)
 }
 pub fn load_lighting(path: &Path) -> Result<LightingConfig, String> {
-    ensure_json(path, &default_lighting()).map_err(|e| e.to_string())?;
     parse_lighting(read_json(path)?)
 }
 fn controls_json() -> Value {
-    serde_json::json!({"version":1,"buttons":{"1":null,"2":null,"3":{"byAgent":{"codex":{"action":"fast"},"pi":{"action":"fast"},"default":null}},"4":{"action":"prompt","prompt":"/copy","submit":true},"5":null,"6":null,"7":{"action":"submit"}},"dial":{"clockwise":{"action":"effort","direction":"raise"},"counterclockwise":{"action":"effort","direction":"lower"},"press":{"action":"prompt","prompt":"/model","submit":true}},"joystick":{"engageDistance":0.75,"releaseDistance":0.3,"up":{"action":"scroll","direction":"up","percent":50},"down":{"action":"scroll","direction":"down","percent":50},"left":{"action":"focus-pane","direction":"left"},"right":{"action":"focus-pane","direction":"right"}}})
+    serde_json::json!({"version":1,"buttons":{"1":null,"2":null,"3":{"byAgent":{"codex":{"action":"fast"},"pi":{"action":"fast"},"default":null}},"4":{"action":"prompt","prompt":"/copy","submit":true},"5":null,"6":{"action":"submit"}},"dial":{"clockwise":{"action":"effort","direction":"raise"},"counterclockwise":{"action":"effort","direction":"lower"},"press":{"action":"prompt","prompt":"/model","submit":true}},"joystick":{"engageDistance":0.75,"releaseDistance":0.3,"up":{"action":"scroll","direction":"up","percent":50},"down":{"action":"scroll","direction":"down","percent":50},"left":{"action":"focus-pane","direction":"left"},"right":{"action":"focus-pane","direction":"right"}}})
 }
 fn read_json(path: &Path) -> Result<Value, String> {
     serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
@@ -518,14 +532,25 @@ mod tests {
     #[test]
     fn controls_reject_unknown_fields_and_map_reversed_dial_labels() {
         let controls = default_controls();
-        assert!(matches!(
-            key_binding(&controls, "ENC_CC", 2),
-            Some(Binding::Action(Action::Effort {
-                direction: EffortDirection::Raise
-            }))
-        ));
+        for action in [-1, 0, 1, 2, 3] {
+            assert!(matches!(
+                key_binding(&controls, "ENC_CC", action),
+                Some(Binding::Action(Action::Effort {
+                    direction: EffortDirection::Raise
+                }))
+            ));
+        }
+        assert!(key_binding(&controls, "ACT11", 1).is_none());
+        assert_eq!(
+            key_binding(&controls, "ACT10", 1),
+            controls.buttons[&5].clone()
+        );
+        assert_eq!(
+            key_binding(&controls, "ACT12", 1),
+            controls.buttons[&6].clone()
+        );
         assert!(parse_controls(&serde_json::json!({"version":1,"buttons":{},"dial":{"clockwise":null,"counterclockwise":null,"press":null,"extra":true},"joystick":{"engageDistance":0.75,"releaseDistance":0.3}})).is_err());
-        assert!(parse_controls(&serde_json::json!({"version":1,"buttons":{"8":null},"dial":{"clockwise":null,"counterclockwise":null,"press":null},"joystick":{"engageDistance":0.75,"releaseDistance":0.3}})).is_err());
+        assert!(parse_controls(&serde_json::json!({"version":1,"buttons":{"7":null},"dial":{"clockwise":null,"counterclockwise":null,"press":null},"joystick":{"engageDistance":0.75,"releaseDistance":0.3}})).is_err());
     }
     #[test]
     fn validates_effort_and_lighting() {
@@ -537,5 +562,25 @@ mod tests {
             serde_json::json!({"states":{},"focusedBrightness":1,"ambient":"status","keys":null})
         )
         .is_err());
+    }
+    #[test]
+    fn loading_is_pure_and_provisioning_creates_private_defaults() {
+        let root = env::temp_dir().join(format!("herdr-micro-config-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let path = root.join("controls.json");
+        assert!(load_controls(&path).is_err());
+        assert!(!path.exists());
+        provision_controls(&path).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        load_controls(&path).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

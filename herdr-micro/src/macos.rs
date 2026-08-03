@@ -1,13 +1,14 @@
 //! Small AppKit/CoreGraphics helpers used by the daemon and doctor.
 //!
-//! This intentionally uses the normal on-screen window list only.  It does
-//! not inspect accessibility objects or post global keyboard input.
+//! AppKit identifies the foreground application; Core Graphics supplies that
+//! application's visible normal window. It does not inspect accessibility
+//! objects or post global keyboard input.
 
 use std::{ptr::NonNull, thread, time::Duration};
 
 use anyhow::{anyhow, bail, Result};
 use objc2::rc::Retained;
-use objc2_app_kit::NSRunningApplication;
+use objc2_app_kit::{NSRunningApplication, NSWorkspace};
 use objc2_core_foundation::{CFDictionary, CFNumber, CFString, CFType, CGPoint};
 use objc2_core_graphics::{
     kCGNullWindowID, kCGWindowBounds, kCGWindowLayer, kCGWindowName, kCGWindowOwnerPID, CGEvent,
@@ -22,6 +23,7 @@ const SCROLL_TARGET_UNAVAILABLE: &str = "frontmost scroll target unavailable";
 pub struct Frontmost {
     pub app_name: String,
     pub process: String,
+    pub pid: i32,
     pub title: String,
 }
 
@@ -42,7 +44,8 @@ pub fn post_event_access() -> Result<()> {
 }
 
 pub fn frontmost() -> Result<Frontmost> {
-    let (app, window) = frontmost_window().ok_or_else(|| anyhow!("no frontmost application"))?;
+    let (app, window) = frontmost_window()
+        .ok_or_else(|| anyhow!("frontmost application has no visible normal window"))?;
     let process = app
         .bundleIdentifier()
         .map_or_else(String::new, |value| value.to_string());
@@ -53,26 +56,40 @@ pub fn frontmost() -> Result<Frontmost> {
     Ok(Frontmost {
         app_name,
         process,
+        pid: app.processIdentifier(),
         title,
     })
+}
+
+pub fn frontmost_bundle_is(expected: &str) -> bool {
+    frontmost_application()
+        .and_then(|app| app.bundleIdentifier())
+        .is_some_and(|bundle| bundle.to_string() == expected)
+}
+
+pub fn running_bundle_ids() -> Vec<String> {
+    let applications = NSWorkspace::sharedWorkspace().runningApplications();
+    applications
+        .to_vec()
+        .into_iter()
+        .filter_map(|app| app.bundleIdentifier().map(|bundle| bundle.to_string()))
+        .collect()
 }
 
 /// Routes line scroll events through the visible normal-layer window after
 /// confirming that the expected bundle still owns the foreground.
 pub fn scroll(notches: i32, x: f64, y: f64, expected_bundle: &str) -> Result<()> {
     post_event_access()?;
-    let (app, window) = frontmost_window().ok_or_else(|| anyhow!(SCROLL_TARGET_UNAVAILABLE))?;
-    if app
-        .bundleIdentifier()
-        .map(|value| value.to_string())
-        .as_deref()
-        != Some(expected_bundle)
-    {
+    let (_, window) = frontmost_window().ok_or_else(|| anyhow!(SCROLL_TARGET_UNAVAILABLE))?;
+    if !frontmost_bundle_is(expected_bundle) {
         bail!(SCROLL_TARGET_UNAVAILABLE)
     }
     let bounds = window_bounds(&window).ok_or_else(|| anyhow!(SCROLL_TARGET_UNAVAILABLE))?;
     let location = point_in_bounds(bounds, x, y);
     let original = CGEvent::new(None).map(|event| CGEvent::location(Some(&event)));
+    if !frontmost_bundle_is(expected_bundle) {
+        bail!(SCROLL_TARGET_UNAVAILABLE)
+    }
     let _ = CGWarpMouseCursorPosition(location);
     if let Some(event) =
         CGEvent::new_mouse_event(None, CGEventType::MouseMoved, location, CGMouseButton::Left)
@@ -82,6 +99,9 @@ pub fn scroll(notches: i32, x: f64, y: f64, expected_bundle: &str) -> Result<()>
     let _restore = CursorRestore { original };
     thread::sleep(Duration::from_millis(50));
     for _ in 0..notches.unsigned_abs() {
+        if !frontmost_bundle_is(expected_bundle) {
+            bail!(SCROLL_TARGET_UNAVAILABLE)
+        }
         let event = CGEvent::new_scroll_wheel_event2(
             None,
             CGScrollEventUnit::Line,
@@ -120,6 +140,11 @@ fn frontmost_window() -> Option<(
     Retained<NSRunningApplication>,
     objc2_core_foundation::CFRetained<CFDictionary>,
 )> {
+    let app = frontmost_application()?;
+    let pid = app.processIdentifier();
+    if pid < 0 {
+        return None;
+    }
     let windows = CGWindowListCopyWindowInfo(
         CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements,
         kCGNullWindowID,
@@ -133,15 +158,11 @@ fn frontmost_window() -> Option<(
         // CFDictionary at each position in this window-info array.
         let window = unsafe { windows.get_unchecked(index as isize) };
         let typed = unsafe { window.cast_unchecked::<CFString, CFType>() };
-        if number(typed, unsafe { kCGWindowLayer }) == Some(0.0) {
-            let Some(pid) = number(typed, unsafe { kCGWindowOwnerPID }) else {
-                continue;
-            };
-            let Some(app) =
-                NSRunningApplication::runningApplicationWithProcessIdentifier(pid as i32)
-            else {
-                continue;
-            };
+        if usable_window_for(
+            pid,
+            number(typed, unsafe { kCGWindowLayer }),
+            number(typed, unsafe { kCGWindowOwnerPID }),
+        ) {
             // SAFETY: the CFArray retains this record. Retaining it gives the
             // returned handle independent ownership after the array is dropped.
             let window =
@@ -150,6 +171,14 @@ fn frontmost_window() -> Option<(
         }
     }
     None
+}
+
+fn frontmost_application() -> Option<Retained<NSRunningApplication>> {
+    NSWorkspace::sharedWorkspace().frontmostApplication()
+}
+
+fn usable_window_for(pid: i32, layer: Option<f64>, owner_pid: Option<f64>) -> bool {
+    layer == Some(0.0) && owner_pid == Some(f64::from(pid))
 }
 
 fn window_title(window: &CFDictionary) -> Option<String> {
@@ -204,5 +233,13 @@ mod tests {
             0.25,
         );
         assert_eq!(point, CGPoint { x: 60.0, y: 70.0 });
+    }
+
+    #[test]
+    fn only_a_normal_window_owned_by_the_active_pid_is_usable() {
+        assert!(usable_window_for(42, Some(0.0), Some(42.0)));
+        assert!(!usable_window_for(42, Some(1.0), Some(42.0)));
+        assert!(!usable_window_for(42, Some(0.0), Some(7.0)));
+        assert!(!usable_window_for(42, None, Some(42.0)));
     }
 }

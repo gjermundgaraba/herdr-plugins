@@ -18,3 +18,10 @@ fn config_rejects_extra_gesture_fields() {
     })))
     .is_err());
 }
+
+#[test]
+fn controls_expose_six_logical_stock_buttons() {
+    let mut config = controls(serde_json::Value::Null);
+    config["buttons"]["7"] = serde_json::Value::Null;
+    assert!(parse_controls(&config).is_err());
+}

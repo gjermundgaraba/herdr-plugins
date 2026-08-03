@@ -287,8 +287,8 @@ pub fn scroll_plan(
     Ok(ScrollPlan {
         pane_id: pane_id.into(),
         notches: if direction == "up" { notches } else { -notches },
-        x: (x + width / 2.0) / (area_x + area_width),
-        y: (y + height / 2.0) / (area_y + area_height),
+        x: (x + width / 2.0 - area_x) / area_width,
+        y: (y + height / 2.0 - area_y) / area_height,
     })
 }
 
@@ -362,7 +362,7 @@ mod tests {
     fn computes_scroll_geometry() {
         let plan = scroll_plan(&json!({"pane_id":"w1:p1","scroll":{"viewport_rows":71}}), &json!({"area":{"x":32,"y":1,"width":250,"height":73},"panes":[{"pane_id":"w1:p1","rect":{"x":32,"y":1,"width":125,"height":73}}]}), "up", 50.0).unwrap();
         assert_eq!(plan.notches, 12);
-        assert_eq!(plan.x, 94.5 / 282.0);
-        assert_eq!(plan.y, 37.5 / 74.0);
+        assert_eq!(plan.x, 0.25);
+        assert_eq!(plan.y, 0.5);
     }
 }

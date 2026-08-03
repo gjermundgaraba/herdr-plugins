@@ -87,7 +87,10 @@ fn status_stop_and_start_use_the_newline_json_socket_without_spawning() {
         for (expected, response) in [
             ("{\"command\":\"status\"}\n", "{\"fixture\":\"status\"}\n"),
             ("{\"command\":\"stop\"}\n", "{\"stopping\":true}\n"),
-            ("{\"command\":\"status\"}\n", "{\"fixture\":\"live\"}\n"),
+            (
+                "{\"command\":\"status\"}\n",
+                "{\"fixture\":\"live\",\"version\":\"0.9.0\",\"protocol\":1}\n",
+            ),
         ] {
             let (mut stream, _) = listener.accept().unwrap();
             assert_eq!(read_request(&mut stream), expected);
@@ -98,7 +101,10 @@ fn status_stop_and_start_use_the_newline_json_socket_without_spawning() {
     for (args, expected) in [
         (vec!["status"], "{\n  \"fixture\": \"status\"\n}\n"),
         (vec!["stop"], "{\n  \"stopping\": true\n}\n"),
-        (vec!["start"], "{\"fixture\":\"live\"}\n"),
+        (
+            vec!["start"],
+            "{\"fixture\":\"live\",\"protocol\":1,\"version\":\"0.9.0\"}\n",
+        ),
     ] {
         let result = command(&args)
             .env("HERDR_PLUGIN_STATE_DIR", &state)

@@ -5,7 +5,7 @@ The device protocol was independently verified against the MIT-licensed
 [house-of-herdr](https://github.com/alasano/house-of-herdr) projects. Their
 source is not bundled here.
 
-[Hunk](https://hunk.sh/) is an optional external diff viewer and is not
+[Hunk](https://www.hunk.dev/) is an optional external diff viewer and is not
 bundled.
 
 The Rust binary directly depends on `anyhow`, `base64`, `libc`, `serde`,

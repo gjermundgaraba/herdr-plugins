@@ -2,10 +2,9 @@ use anyhow::{bail, Context, Result};
 use herdr_micro::{
     actions::{execute_effort_plan, plan_effort_change},
     config::{config_path, default_effort, load_effort},
-    control::{ensure_state_dir, log_file, request_status, request_stop, start_daemon},
+    control::{ensure_state_dir, log_file, request_status, request_stop, start_daemon_versioned},
     daemon, doctor,
-    ghostty::{focused_session, inspect_ghostty, probe_session_terminals},
-    herdr::{current_environment, discover_sessions, herdr_bin, run_command},
+    herdr::{herdr_bin, run_command},
     setup,
 };
 use serde_json::{json, Value};
@@ -16,11 +15,10 @@ use std::{
     io,
     os::unix::{fs::OpenOptionsExt, process::CommandExt},
     process::{Command, ExitCode, Stdio},
-    thread,
     time::Duration,
 };
 
-const USAGE: &str = "usage: herdr-micro <start|herdr-status|doctor|effort raise|lower|status|configure-controls|setup-pi-effort|stop|setup|probe-sessions [--watch]>";
+const USAGE: &str = "usage: herdr-micro <start|herdr-status|doctor|effort raise|lower|status|configure-controls|setup-pi-effort|stop|setup>";
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
@@ -56,7 +54,6 @@ fn run(args: Vec<OsString>) -> Result<i32> {
         "setup-pi-effort" if rest.is_empty() => setup_pi_effort(),
         "stop" if rest.is_empty() => stop(),
         "setup" if rest.is_empty() => setup_micro(),
-        "probe-sessions" => probe_sessions(rest),
         _ => bail!(USAGE),
     }
 }
@@ -64,7 +61,9 @@ fn run(args: Vec<OsString>) -> Result<i32> {
 fn start() -> Result<i32> {
     let root = setup::plugin_root()?;
     let executable = env::current_exe()?;
-    let status = start_daemon(
+    let status = start_daemon_versioned(
+        env!("CARGO_PKG_VERSION"),
+        daemon::DAEMON_PROTOCOL_VERSION,
         || {
             ensure_state_dir()?;
             let log = OpenOptions::new()
@@ -184,40 +183,5 @@ fn setup_micro() -> Result<i32> {
     println!("Controls: {}", report.controls.display());
     println!("Effort: {}", report.effort.display());
     println!("Lighting: {}", report.lighting.display());
-    Ok(0)
-}
-
-fn probe_sessions(args: &[OsString]) -> Result<i32> {
-    let watch = matches!(args, [flag] if flag == "--watch");
-    if !args.is_empty() && !watch {
-        bail!("usage: herdr-micro probe-sessions [--watch]");
-    }
-    let environment = current_environment();
-    let mappings = probe_session_terminals(&discover_sessions(&environment)?, &environment)?;
-    let state = inspect_ghostty()?;
-    let mut previous = focused_session(&mappings, &state);
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json!({
-            "mappings": mappings,
-            "focusedSession": previous,
-            "focusedTerminalId": state.focused_terminal_id,
-        }))?
-    );
-    if watch {
-        println!("watching; press Ctrl-C to stop");
-        loop {
-            let next = focused_session(&mappings, &inspect_ghostty()?);
-            if next != previous {
-                println!(
-                    "{} -> {}",
-                    previous.as_deref().unwrap_or("none"),
-                    next.as_deref().unwrap_or("none")
-                );
-                previous = next;
-            }
-            thread::sleep(Duration::from_millis(250));
-        }
-    }
     Ok(0)
 }

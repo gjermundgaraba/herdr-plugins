@@ -11,9 +11,10 @@ dial, and joystick to the focused Codex, Claude Code, or Pi agent.
 - Ghostty 1.3 or newer
 - Rust 1.71 or newer when building from source
 - Work Louder Input for the one-time Layer 2 setup
+- macOS Input Monitoring permission for direct HID access
 - macOS Automation permission for Ghostty inspection
 - macOS Accessibility permission only for the optional `scroll` action
-- [Hunk](https://hunk.sh/) only for the optional `diff` action
+- [Hunk](https://www.hunk.dev/) only for the optional `diff` action
 
 The bridge uses an unsupported proprietary device protocol. See the
 [compatibility and safety notes](docs/micro-bridge.md) before setup.
@@ -62,7 +63,7 @@ herdr plugin link . --enabled
    herdr plugin config-dir gjermundgaraba.herdr-micro
    ```
 
-   - `controls.json`: seven buttons, dial, joystick, gestures, and per-agent actions
+   - `controls.json`: six logical action keys, dial, joystick, gestures, and per-agent actions
    - `lighting.json`: state colors/effects and aggregate lighting zones
    - `effort.json`: user-configured Codex effort shortcuts
 
@@ -87,9 +88,15 @@ increase_reasoning_effort = "ctrl-shift-t"
 decrease_reasoning_effort = "ctrl-t"
 ```
 
-Match those shortcuts in the plugin's `effort.json`. Claude Code uses its
-native `/effort` picker. See [effort control](docs/effort-control.md) for the
-tested agent versions and boundaries.
+Match those shortcuts in the plugin's `effort.json`; it uses `+`, not Codex's
+`-` syntax:
+
+```json
+{"codex":{"raise":"ctrl+shift+t","lower":"ctrl+t"}}
+```
+
+Claude Code uses its native `/effort` picker. See [effort control](docs/effort-control.md)
+for operational boundaries.
 
 ## Routing and operation
 
@@ -99,7 +106,7 @@ through the focused mapped session.
 
 - Codex desktop frontmost: Layer 1 and device ownership yielded to Codex
 - Mapped Ghostty terminal frontmost: Layer 2 and the matching Herdr session
-- Other app frontmost: preserve the last applicable layer
+- Other app frontmost: preserve the last applicable layer; dispatch nothing
 
 Useful actions:
 
@@ -109,9 +116,14 @@ herdr plugin action invoke micro-stop --plugin gjermundgaraba.herdr-micro
 herdr plugin log list --plugin gjermundgaraba.herdr-micro --limit 20
 ```
 
-Quit Work Louder Input while the bridge runs. Only one process may own the
-vendor HID interface. The bridge blanks the LEDs on controlled shutdown and
-stops after 60 seconds without a running Herdr session.
+Quit Work Louder Input while the bridge runs. Other Input Monitoring clients
+can also contend with direct HID access. Only one process may own the vendor
+HID interface. The bridge blanks the LEDs on controlled shutdown and stops
+after 60 seconds without a running Herdr session.
+
+Herdr v1 has no plugin teardown hook. Run `micro-stop` before disabling,
+uninstalling, unlinking, or updating the plugin. The next `micro-start`
+replaces a daemon from a different plugin version.
 
 Current architecture, compatibility, ownership, and limitations are in
 [the bridge guide](docs/micro-bridge.md). Durable hardware and version evidence

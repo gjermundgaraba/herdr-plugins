@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::thread;
 use std::time::Duration;
 
-use crate::herdr::{herdr_bin, run_json, session_environment, Environment};
+use crate::herdr::{herdr_bin, run_command, run_json, session_environment, Environment};
 
 pub const GHOSTTY_STATE_SCRIPT: &str = r#"
 const app = Application("Ghostty");
@@ -49,17 +49,10 @@ pub fn parse_ghostty_state(stdout: &str) -> Result<GhosttyState> {
 }
 
 pub fn inspect_ghostty() -> Result<GhosttyState> {
-    let output = std::process::Command::new("/usr/bin/osascript")
-        .args(["-l", "JavaScript", "-e", GHOSTTY_STATE_SCRIPT])
-        .output()
-        .context("failed to inspect Ghostty")?;
-    if !output.status.success() {
-        bail!(
-            "Ghostty inspection failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    parse_ghostty_state(&String::from_utf8_lossy(&output.stdout))
+    let args: Vec<String> = ["-l", "JavaScript", "-e", GHOSTTY_STATE_SCRIPT]
+        .map(str::to_owned)
+        .into();
+    parse_ghostty_state(&run_command("/usr/bin/osascript", &args, None)?)
 }
 
 fn set_session_title(session_name: &str, title: Option<&str>, base: &Environment) -> Result<()> {
@@ -130,7 +123,10 @@ where
             .map(|terminal| (terminal.id.clone(), terminal.name.clone()))
             .collect();
         let token = create_token(session_name);
-        set_title(session_name, Some(&token))?;
+        if let Err(error) = set_title(session_name, Some(&token)) {
+            let _ = set_title(session_name, None);
+            return Err(error);
+        }
 
         let mut restored = false;
         let probed = (|| {
@@ -151,6 +147,7 @@ where
                 .map(|candidate| &candidate.name)
                 != Some(original)
             {
+                let _ = set_title(session_name, None);
                 bail!("failed to restore {session_name} terminal title");
             }
             Ok((terminal, duplicate))
