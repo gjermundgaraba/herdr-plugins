@@ -47,9 +47,7 @@ actions created by `micro-setup`.
 | Build toolchain | Rust 1.71 or newer |
 | Codex Micro firmware 0.4.1 | USB and BLE physically verified |
 | Codex Micro firmware 0.6.1 | USB and BLE physically verified; a fresh BLE host pairing may be required after upgrade |
-| Codex CLI 0.145.0 | Effort raise/lower physically verified |
-| Claude Code 2.1.220 | Effort raise/lower physically verified |
-| Pi 0.82.1 | Effort raise/lower physically verified with the bundled extension |
+| Effort control | Codex CLI, Claude Code, and Pi with the bundled extension |
 
 Firmware 0.6.1 can leave an existing macOS BLE pairing with stale GATT
 metadata. Pair an unused BLE host slot; if none is free, forget and re-pair
@@ -87,5 +85,5 @@ the affected `Codex Micro #N`. USB remains the recovery transport.
   `/reload` after installing the extension. Effort changes affect later model
   requests, not a request already in flight.
 
-The compact [research record](research/README.md) preserves the physical facts,
-version boundaries, caveat, and source links behind these claims.
+The [research record](research/README.md) preserves tested versions, results,
+hardware evidence, caveats, and source links.

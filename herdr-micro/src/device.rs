@@ -345,9 +345,7 @@ impl Owner {
                     deadline,
                     reply,
                 }) => {
-                    if let Err(error) = self.start_request(id, method, params, deadline, reply) {
-                        self.fail_pending(id, error.to_string());
-                    }
+                    let _ = self.start_request(id, method, params, deadline, reply);
                 }
                 Err(TryRecvError::Empty) => {}
             }
@@ -391,7 +389,10 @@ impl Owner {
         deadline: Instant,
         reply: SyncSender<std::result::Result<Value, String>>,
     ) -> Result<()> {
-        self.write(method, params, Some(id))?;
+        if let Err(error) = self.write(method, params, Some(id)) {
+            send_request_error(reply, &error);
+            return Err(error);
+        }
         self.pending.insert(id, Pending { deadline, reply });
         Ok(())
     }
@@ -474,6 +475,13 @@ impl Owner {
         let _ = self.manager.close(0);
         // `context` drops only after IOKit no longer has a callback registration.
     }
+}
+
+fn send_request_error(
+    reply: SyncSender<std::result::Result<Value, String>>,
+    error: &anyhow::Error,
+) {
+    let _ = reply.send(Err(error.to_string()));
 }
 
 unsafe extern "C-unwind" fn input_report_callback(
@@ -638,5 +646,12 @@ mod tests {
                 distance: 0.75
             })
         );
+    }
+
+    #[test]
+    fn request_write_error_reaches_caller() {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        send_request_error(reply_tx, &anyhow!("encode failed"));
+        assert_eq!(reply_rx.recv().unwrap(), Err("encode failed".into()));
     }
 }

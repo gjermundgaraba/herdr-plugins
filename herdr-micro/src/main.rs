@@ -15,7 +15,6 @@ use std::{
     fs::OpenOptions,
     io,
     os::unix::{fs::OpenOptionsExt, process::CommandExt},
-    path::PathBuf,
     process::{Command, ExitCode, Stdio},
     thread,
     time::Duration,
@@ -62,19 +61,8 @@ fn run(args: Vec<OsString>) -> Result<i32> {
     }
 }
 
-fn plugin_root() -> Result<PathBuf> {
-    if let Some(root) = env::var_os("HERDR_PLUGIN_ROOT").filter(|root| !root.is_empty()) {
-        return Ok(PathBuf::from(root));
-    }
-    let executable = env::current_exe()?;
-    if executable.parent().and_then(|path| path.file_name()) == Some("bin".as_ref()) {
-        return setup::plugin_root_from(None, &executable);
-    }
-    Ok(PathBuf::from(env!("CARGO_MANIFEST_DIR")))
-}
-
 fn start() -> Result<i32> {
-    let root = plugin_root()?;
+    let root = setup::plugin_root()?;
     let executable = env::current_exe()?;
     let status = start_daemon(
         || {

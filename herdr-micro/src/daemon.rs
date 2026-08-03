@@ -843,12 +843,7 @@ fn refresh_owner(
     gestures: &mut GestureDispatcher<Option<String>>,
 ) -> Result<()> {
     let output = run_command("/bin/ps", &["-axo".into(), "command=".into()], None)?;
-    let processes: Vec<_> = output
-        .stdout
-        .lines()
-        .map(str::trim)
-        .map(str::to_owned)
-        .collect();
+    let processes: Vec<_> = output.lines().map(str::trim).map(str::to_owned).collect();
     let owner = device_owner(
         &processes,
         state
@@ -925,9 +920,8 @@ pub fn run_daemon() -> Result<()> {
     let stopping = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(SIGINT, Arc::clone(&stopping))?;
     signal_hook::flag::register(SIGTERM, Arc::clone(&stopping))?;
-    let status = Arc::new(Mutex::new(
-        json!({"device":"starting","owner":null,"session":null,"routing":"none","sessions":[],"sessionMappings":[],"layer":null,"agents":0,"frontmost":null,"focusedTerminal":null,"slots":[null,null,null,null,null,null]}),
-    ));
+    let mut state = State::new();
+    let status = Arc::new(Mutex::new(state.status()));
     let server = listen_for_control(
         {
             let status = Arc::clone(&status);
@@ -947,8 +941,6 @@ pub fn run_daemon() -> Result<()> {
     let control_thread = thread::spawn(move || {
         let _ = server.run_with_shutdown(&shutdown_rx);
     });
-
-    let mut state = State::new();
     let mut controls = default_controls();
     let mut device = None;
     let mut gestures = GestureDispatcher::new();

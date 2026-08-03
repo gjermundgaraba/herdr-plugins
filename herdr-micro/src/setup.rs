@@ -25,6 +25,24 @@ use crate::{
 const READ_CHUNK: usize = 512;
 const WRITE_CHUNK: usize = 384;
 const PI_EXTENSION: &str = ".pi/agent/extensions/herdr-micro-effort.ts";
+const REQUIRED_OAI_CODES: [&str; 16] = [
+    "KV_OAI_AG00",
+    "KV_OAI_AG01",
+    "KV_OAI_AG02",
+    "KV_OAI_AG03",
+    "KV_OAI_AG04",
+    "KV_OAI_AG05",
+    "KV_OAI_ACT06",
+    "KV_OAI_ACT07",
+    "KV_OAI_ACT08",
+    "KV_OAI_ACT09",
+    "KV_OAI_ACT10",
+    "KV_OAI_ACT11",
+    "KV_OAI_ACT12",
+    "KV_OAI_ENC_CC",
+    "KV_OAI_ENC_CW",
+    "KV_OAI_ENC_CLK",
+];
 
 /// Resolve the plugin directory without depending on the action's current
 /// directory. The installed executable lives at `<plugin>/bin/herdr-micro`.
@@ -32,11 +50,14 @@ pub fn plugin_root_from(plugin_root: Option<OsString>, executable: &Path) -> Res
     if let Some(root) = plugin_root.filter(|root| !root.is_empty()) {
         return Ok(PathBuf::from(root));
     }
-    executable
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .ok_or_else(|| anyhow!("cannot derive plugin root from {}", executable.display()))
+    if executable.parent().and_then(Path::file_name) == Some("bin".as_ref()) {
+        return executable
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .ok_or_else(|| anyhow!("cannot derive plugin root from {}", executable.display()));
+    }
+    Ok(PathBuf::from(env!("CARGO_MANIFEST_DIR")))
 }
 
 pub fn plugin_root() -> Result<PathBuf> {
@@ -133,10 +154,11 @@ fn oai_profile(keymap: &mut Value) -> Result<&mut serde_json::Map<String, Value>
         .iter()
         .enumerate()
         .filter(|(_, profile)| {
-            profile
-                .pointer("/layers/0/layout")
-                .map(ToString::to_string)
-                .is_some_and(|layout| layout.contains("KV_OAI_AG05"))
+            profile.pointer("/layers/0/layout").is_some_and(|layout| {
+                layout_codes(layout)
+                    .iter()
+                    .any(|code| code.as_str() == Some("KV_OAI_AG05"))
+            })
         })
         .map(|(index, _)| index)
         .collect();
@@ -148,63 +170,44 @@ fn oai_profile(keymap: &mut Value) -> Result<&mut serde_json::Map<String, Value>
         .ok_or_else(|| anyhow!("OAI profile must be an object"))
 }
 
+fn layout_codes(layout: &Value) -> Vec<&Value> {
+    fn collect<'a>(value: &'a Value, codes: &mut Vec<&'a Value>) {
+        match value {
+            Value::Array(values) => values.iter().for_each(|value| collect(value, codes)),
+            value => codes.push(value),
+        }
+    }
+
+    let mut codes = Vec::new();
+    if let Some(keymap) = layout.get("keymap") {
+        collect(keymap, &mut codes);
+    }
+    if let Some(encoders) = layout.get("encoders") {
+        collect(encoders, &mut codes);
+    }
+    if let Some(sectors) = layout
+        .pointer("/joystick/sectors")
+        .and_then(Value::as_array)
+    {
+        sectors
+            .iter()
+            .filter_map(|sector| sector.get("k"))
+            .for_each(|code| collect(code, &mut codes));
+    }
+    codes
+}
+
 fn is_blank_layer(layer: &Value) -> bool {
     let Some(layout) = layer.get("layout") else {
         return true;
     };
-    let mut codes = layout
-        .get("keymap")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .flat_map(|row| {
-            row.as_array()
-                .map(|codes| codes.iter().collect::<Vec<_>>())
-                .unwrap_or_else(|| vec![row])
-        })
-        .chain(
-            layout
-                .get("encoders")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .flat_map(|row| {
-                    row.as_array()
-                        .map(|codes| codes.iter().collect::<Vec<_>>())
-                        .unwrap_or_else(|| vec![row])
-                }),
-        )
-        .chain(
-            layout
-                .pointer("/joystick/sectors")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|sector| sector.get("k")),
-        );
-    codes.all(|code| matches!(code.as_str(), Some("KC_NONE" | "KI_X")))
+    layout_codes(layout)
+        .iter()
+        .all(|code| matches!(code.as_str(), Some("KC_NONE" | "KI_X")))
 }
 
 /// Copies the compatible Layer 1 layout into blank Layer 2 and binds both layers.
 pub fn configure_micro(keymap: &mut Value) -> Result<()> {
-    const REQUIRED: [&str; 16] = [
-        "KV_OAI_AG00",
-        "KV_OAI_AG01",
-        "KV_OAI_AG02",
-        "KV_OAI_AG03",
-        "KV_OAI_AG04",
-        "KV_OAI_AG05",
-        "KV_OAI_ACT06",
-        "KV_OAI_ACT07",
-        "KV_OAI_ACT08",
-        "KV_OAI_ACT09",
-        "KV_OAI_ACT10",
-        "KV_OAI_ACT11",
-        "KV_OAI_ACT12",
-        "KV_OAI_ENC_CC",
-        "KV_OAI_ENC_CW",
-        "KV_OAI_ENC_CLK",
-    ];
     {
         let profile = oai_profile(keymap)?;
         let layers = profile
@@ -218,8 +221,11 @@ pub fn configure_micro(keymap: &mut Value) -> Result<()> {
             .get("layout")
             .cloned()
             .unwrap_or(Value::Object(Default::default()));
-        let source_text = source_layout.to_string();
-        if !REQUIRED.iter().all(|key| source_text.contains(key)) {
+        let source_codes = layout_codes(&source_layout);
+        if !REQUIRED_OAI_CODES
+            .iter()
+            .all(|key| source_codes.iter().any(|code| code.as_str() == Some(key)))
+        {
             bail!("Layer 1 is not a compatible Codex Micro OAI layout");
         }
         if layers[HERDR_LAYER - 1].get("layout") != Some(&source_layout) {
@@ -500,6 +506,10 @@ mod tests {
             .unwrap(),
             PathBuf::from("/override")
         );
+        assert_eq!(
+            plugin_root_from(None, Path::new("/project/target/debug/herdr-micro")).unwrap(),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        );
     }
 
     #[test]
@@ -525,27 +535,9 @@ mod tests {
 
     #[test]
     fn configures_only_a_blank_layer_two() {
-        let required = [
-            "KV_OAI_AG00",
-            "KV_OAI_AG01",
-            "KV_OAI_AG02",
-            "KV_OAI_AG03",
-            "KV_OAI_AG04",
-            "KV_OAI_AG05",
-            "KV_OAI_ACT06",
-            "KV_OAI_ACT07",
-            "KV_OAI_ACT08",
-            "KV_OAI_ACT09",
-            "KV_OAI_ACT10",
-            "KV_OAI_ACT11",
-            "KV_OAI_ACT12",
-            "KV_OAI_ENC_CC",
-            "KV_OAI_ENC_CW",
-            "KV_OAI_ENC_CLK",
-        ];
         let mut keymap = json!({
             "profiles": [{ "layers": [
-                { "layout": { "keymap": [required] } },
+                { "layout": { "keymap": [REQUIRED_OAI_CODES] } },
                 { "layout": { "keymap": [["KC_NONE"]], "encoders": [], "joystick": { "sectors": [] } } }
             ] }]
         });
@@ -561,6 +553,25 @@ mod tests {
         assert_eq!(
             keymap.pointer("/profiles/0/layers/0/layout"),
             keymap.pointer("/profiles/0/layers/1/layout")
+        );
+    }
+
+    #[test]
+    fn rejects_metadata_and_partial_layout_code_matches() {
+        let mut required = REQUIRED_OAI_CODES;
+        required[5] = "KV_OAI_AG05-extra";
+        let mut keymap = json!({
+            "profiles": [{ "layers": [
+                {
+                    "layout": { "keymap": [required], "metadata": "KV_OAI_AG05" },
+                    "description": "KV_OAI_AG05"
+                },
+                { "layout": { "keymap": [["KC_NONE"]] } }
+            ] }]
+        });
+        assert_eq!(
+            configure_micro(&mut keymap).unwrap_err().to_string(),
+            "expected one OAI profile, found 0"
         );
     }
 

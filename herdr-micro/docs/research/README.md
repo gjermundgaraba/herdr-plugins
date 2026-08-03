@@ -35,6 +35,10 @@ superseded option surveys, experiment plans, and implementation diary.
 | Claude Code 2.1.220 | `xhigh → high → xhigh` passed |
 | Pi 0.82.1 | `medium → high → medium` passed with the bundled extension |
 
+The effort-control rows were exercised through Herdr on 2026-07-26. The
+action runner targeted pane IDs directly rather than the frontmost macOS
+window; the final Layer 2 test confirmed the physical dial integration.
+
 After the 0.6.1 firmware update, an existing BLE host pairing retained stale
 GATT metadata and rejected output reports. Pairing an unused BLE slot restored
 the full vendor channel. If every slot is occupied, forget and re-pair the

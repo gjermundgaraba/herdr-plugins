@@ -158,22 +158,16 @@ impl ControlServer {
     /// The synchronous daemon-loop variant for callers that already have a
     /// shutdown channel. Disconnecting the channel also ends the loop.
     pub fn run_with_shutdown(&self, shutdown: &Receiver<()>) -> Result<()> {
-        self.run_until(Some(shutdown))
-    }
-
-    fn run_until(&self, shutdown: Option<&Receiver<()>>) -> Result<()> {
         let listener = self
             .listener
             .as_ref()
             .ok_or_else(|| anyhow!("Micro bridge server is closed"))?;
         listener.set_nonblocking(true)?;
         while !self.stopping.load(Ordering::Acquire) {
-            if shutdown.is_some_and(|receiver| {
-                !matches!(
-                    receiver.try_recv(),
-                    Err(std::sync::mpsc::TryRecvError::Empty)
-                )
-            }) {
+            if !matches!(
+                shutdown.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ) {
                 break;
             }
             match listener.accept() {

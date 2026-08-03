@@ -20,22 +20,6 @@ agent-specific plan, and sends every operation to that exact pane through
 | Claude | Open the native `/effort` picker, move left/right, accept | Visible picker/status |
 | Pi | Extension-owned `Ctrl+Shift+Left/Right` shortcuts using `getThinkingLevel()` / `setThinkingLevel()` | Extension notification |
 
-## Live result
-
-Tested through Herdr 0.7.5 on 2026-07-26:
-
-| Agent | Version | Proven change |
-|---|---:|---|
-| Codex | 0.145.0 | `high` → `xhigh` → `high` |
-| Claude Code | 2.1.220 | `xhigh` → `high` → `xhigh` |
-| Pi | 0.82.1 | `medium` → `high` → `medium` |
-
-The action runner targeted disposable pane IDs directly; it did not rely on the
-frontmost macOS window. Rust tests cover the planner and installer.
-
-The final Codex Micro Layer 2 test physically confirmed the dial integration
-for Codex, Claude Code, and Pi.
-
 ## Boundary
 
 - Codex shortcuts are intentionally user-configurable in `effort.json`.
@@ -46,6 +30,9 @@ for Codex, Claude Code, and Pi.
   `~/.pi/agent/extensions/herdr-micro-effort.ts`; existing sessions need
   `/reload`.
 - The changed effort affects later provider calls, not a request already sent.
+
+The [research record](research/README.md) contains the dated physical test
+results and tested agent versions. Rust tests cover the planner and installer.
 
 Install the bundled JavaScript extension for a manual test; Pi loads it
 directly:

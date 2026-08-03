@@ -134,8 +134,14 @@ fn frontmost_window() -> Option<(
         let window = unsafe { windows.get_unchecked(index as isize) };
         let typed = unsafe { window.cast_unchecked::<CFString, CFType>() };
         if number(typed, unsafe { kCGWindowLayer }) == Some(0.0) {
-            let pid = number(typed, unsafe { kCGWindowOwnerPID })? as i32;
-            let app = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)?;
+            let Some(pid) = number(typed, unsafe { kCGWindowOwnerPID }) else {
+                continue;
+            };
+            let Some(app) =
+                NSRunningApplication::runningApplicationWithProcessIdentifier(pid as i32)
+            else {
+                continue;
+            };
             // SAFETY: the CFArray retains this record. Retaining it gives the
             // returned handle independent ownership after the array is dropped.
             let window =

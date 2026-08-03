@@ -62,13 +62,12 @@ pub fn inspect_ghostty() -> Result<GhosttyState> {
     parse_ghostty_state(&String::from_utf8_lossy(&output.stdout))
 }
 
-fn set_session_title(session_name: &str, title: &str, base: &Environment) -> Result<()> {
-    let args = vec![
-        "terminal".into(),
-        "title".into(),
-        "set".into(),
-        title.into(),
-    ];
+fn set_session_title(session_name: &str, title: Option<&str>, base: &Environment) -> Result<()> {
+    let mut args = vec!["terminal".into(), "title".into()];
+    match title {
+        Some(title) => args.extend(["set".into(), title.into()]),
+        None => args.push("clear".into()),
+    }
     let value = run_json(
         &herdr_bin(),
         &args,
@@ -119,7 +118,7 @@ pub fn probe_session_terminals_with<I, S, T>(
 ) -> Result<Vec<SessionTerminalMapping>>
 where
     I: FnMut() -> Result<GhosttyState>,
-    S: FnMut(&str, &str) -> Result<()>,
+    S: FnMut(&str, Option<&str>) -> Result<()>,
     T: FnMut(&str) -> String,
 {
     let mut mappings = Vec::new();
@@ -131,30 +130,40 @@ where
             .map(|terminal| (terminal.id.clone(), terminal.name.clone()))
             .collect();
         let token = create_token(session_name);
-        set_title(session_name, &token)?;
+        set_title(session_name, Some(&token))?;
 
-        let terminal = find_token(&mut inspect, &token)?
-            .ok_or_else(|| anyhow!("Herdr session {session_name} did not appear in Ghostty"))?;
-        let original = originals
-            .get(&terminal.id)
-            .ok_or_else(|| anyhow!("Ghostty topology changed while probing {session_name}"))?
-            .clone();
-        let duplicate = mappings
-            .iter()
-            .any(|mapping: &SessionTerminalMapping| mapping.terminal_id == terminal.id);
-
-        // After identifying a terminal, restore and verify its title before
-        // reporting a duplicate mapping.
-        set_title(session_name, &original)?;
-        if inspect()?
-            .terminals
-            .iter()
-            .find(|candidate| candidate.id == terminal.id)
-            .map(|candidate| &candidate.name)
-            != Some(&original)
-        {
-            bail!("failed to restore {session_name} terminal title");
-        }
+        let mut restored = false;
+        let probed = (|| {
+            let terminal = find_token(&mut inspect, &token)?
+                .ok_or_else(|| anyhow!("Herdr session {session_name} did not appear in Ghostty"))?;
+            let original = originals
+                .get(&terminal.id)
+                .ok_or_else(|| anyhow!("Ghostty topology changed while probing {session_name}"))?;
+            let duplicate = mappings
+                .iter()
+                .any(|mapping: &SessionTerminalMapping| mapping.terminal_id == terminal.id);
+            set_title(session_name, Some(original))?;
+            restored = true;
+            if inspect()?
+                .terminals
+                .iter()
+                .find(|candidate| candidate.id == terminal.id)
+                .map(|candidate| &candidate.name)
+                != Some(original)
+            {
+                bail!("failed to restore {session_name} terminal title");
+            }
+            Ok((terminal, duplicate))
+        })();
+        let (terminal, duplicate) = match probed {
+            Ok(result) => result,
+            Err(error) => {
+                if !restored {
+                    let _ = set_title(session_name, None);
+                }
+                return Err(error);
+            }
+        };
         if duplicate {
             bail!(
                 "multiple Herdr sessions targeted Ghostty terminal {}",
@@ -229,8 +238,8 @@ mod tests {
     #[test]
     fn probes_named_sessions_and_restores_titles() {
         let terminals = RefCell::new(vec![
-            ("personal-terminal".to_owned(), "pers @ herdr".to_owned()),
-            ("work-terminal".to_owned(), "werk @ herdr".to_owned()),
+            ("personal-terminal".to_owned(), "custom personal".to_owned()),
+            ("work-terminal".to_owned(), "custom work".to_owned()),
         ]);
         let sessions = vec!["default".into(), "werk".into()];
         let mappings = probe_session_terminals_with(
@@ -255,7 +264,7 @@ mod tests {
                     .iter_mut()
                     .find(|(candidate, _)| candidate == id)
                     .unwrap()
-                    .1 = title.into();
+                    .1 = title.unwrap_or("Ghostty default").into();
                 Ok(())
             },
             |session| format!("probe-{session}"),
@@ -274,7 +283,46 @@ mod tests {
                 }
             ]
         );
-        assert_eq!(terminals.into_inner()[0].1, "pers @ herdr");
+        assert_eq!(
+            terminals.into_inner(),
+            [
+                ("personal-terminal".into(), "custom personal".into()),
+                ("work-terminal".into(), "custom work".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn clears_probe_title_after_inspection_failure() {
+        let calls = RefCell::new(Vec::new());
+        let mut inspections = 0;
+        let error = probe_session_terminals_with(
+            &["default".into()],
+            || {
+                inspections += 1;
+                if inspections == 1 {
+                    Ok(state(vec![("terminal", "original")]))
+                } else {
+                    Err(anyhow!("inspection failed"))
+                }
+            },
+            |session, title| {
+                calls
+                    .borrow_mut()
+                    .push((session.to_owned(), title.map(str::to_owned)));
+                title.map(|_| ()).ok_or_else(|| anyhow!("cleanup failed"))
+            },
+            |_| "probe".into(),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "inspection failed");
+        assert_eq!(
+            calls.into_inner(),
+            [
+                ("default".into(), Some("probe".into())),
+                ("default".into(), None)
+            ]
+        );
     }
 
     #[test]

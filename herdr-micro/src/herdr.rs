@@ -46,12 +46,7 @@ pub fn session_environment(session: &str, base: &Environment) -> Environment {
     result
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProcessOutput {
-    pub stdout: String,
-}
-
-pub fn run_command(bin: &str, args: &[String], env: Option<&Environment>) -> Result<ProcessOutput> {
+pub fn run_command(bin: &str, args: &[String], env: Option<&Environment>) -> Result<String> {
     let mut command = Command::new(bin);
     command.args(args);
     if let Some(env) = env {
@@ -74,26 +69,20 @@ pub fn run_command(bin: &str, args: &[String], env: Option<&Environment>) -> Res
             }
         );
     }
-    Ok(ProcessOutput {
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-    })
-}
-
-pub fn parse_json(output: &ProcessOutput) -> Result<Value> {
-    serde_json::from_str(&output.stdout).context("Herdr returned invalid JSON")
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 pub fn run_json(bin: &str, args: &[String], env: Option<&Environment>) -> Result<Value> {
-    parse_json(&run_command(bin, args, env)?)
+    serde_json::from_str(&run_command(bin, args, env)?).context("Herdr returned invalid JSON")
 }
 
 pub fn discover_sessions_with<F>(base: &Environment, mut run: F) -> Result<Vec<String>>
 where
-    F: FnMut(&str, &[String], Option<&Environment>) -> Result<ProcessOutput>,
+    F: FnMut(&str, &[String], Option<&Environment>) -> Result<String>,
 {
     let args = vec!["session".into(), "list".into(), "--json".into()];
     let output = run(&herdr_bin(), &args, Some(&discovery_environment(base)))?;
-    let value = parse_json(&output)?;
+    let value = serde_json::from_str(&output).context("Herdr returned invalid JSON")?;
     #[derive(Deserialize)]
     struct Session {
         name: String,
@@ -151,9 +140,7 @@ mod tests {
         let base = Environment::new();
         let result = discover_sessions_with(&base, |_bin, _args, env| {
             assert!(!env.unwrap().contains_key("HERDR_SESSION"));
-            Ok(ProcessOutput {
-                stdout: r#"{"sessions":[{"name":"default","running":true},{"name":"old","running":false}]}"#.into(),
-            })
+            Ok(r#"{"sessions":[{"name":"default","running":true},{"name":"old","running":false}]}"#.into())
         })
         .unwrap();
         assert_eq!(result, ["default"]);

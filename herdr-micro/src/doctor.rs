@@ -1,7 +1,13 @@
 //! Non-destructive installation checks for the Micro plugin.
 
-use anyhow::Result;
-use std::{env, fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Command, time::Duration};
+use anyhow::{ensure, Result};
+use std::{
+    env, fs,
+    os::unix::fs::PermissionsExt,
+    path::PathBuf,
+    process::{Command, Output},
+    time::Duration,
+};
 
 use crate::{
     config::{config_path, load_controls, load_effort, load_lighting},
@@ -174,9 +180,12 @@ pub fn doctor() -> Report {
 }
 
 fn secure_input() -> Result<Option<String>> {
-    let output = Command::new("/usr/sbin/ioreg")
-        .args(["-l", "-d", "1", "-w", "0"])
-        .output()?;
+    let output = require_success(
+        Command::new("/usr/sbin/ioreg")
+            .args(["-l", "-d", "1", "-w", "0"])
+            .output()?,
+        "ioreg",
+    )?;
     let text = String::from_utf8_lossy(&output.stdout);
     let pid = text
         .lines()
@@ -188,15 +197,23 @@ fn secure_input() -> Result<Option<String>> {
     let Some(pid) = pid else {
         return Ok(None);
     };
-    let output = Command::new("/bin/ps")
-        .args(["-p", &pid.to_string(), "-o", "command="])
-        .output()?;
+    let output = require_success(
+        Command::new("/bin/ps")
+            .args(["-p", &pid.to_string(), "-o", "command="])
+            .output()?,
+        "ps",
+    )?;
     let command = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     Ok(Some(if command.is_empty() {
         format!("PID {pid}")
     } else {
         command
     }))
+}
+
+fn require_success(output: Output, inspection: &str) -> Result<Output> {
+    ensure!(output.status.success(), "{inspection} inspection failed");
+    Ok(output)
 }
 
 pub fn run_doctor() -> i32 {
@@ -221,5 +238,11 @@ mod tests {
         report.push(Level::Fail, "three");
         assert!(report.failed());
         assert_eq!(report.render(), "[ok] one\n[warn] two\n[fail] three");
+    }
+
+    #[test]
+    fn failed_inspection_command_is_an_error() {
+        let output = Command::new("/usr/bin/false").output().unwrap();
+        assert!(require_success(output, "test").is_err());
     }
 }
