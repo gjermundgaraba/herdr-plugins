@@ -97,7 +97,7 @@ pub fn doctor() -> Report {
         ),
         InputMonitoringAccess::Unknown => report.push(
             Level::Warn,
-            "Input Monitoring access could not be determined; Micro connection failures may be permission-related",
+            "Input Monitoring access could not be determined; standard HID key events may be withheld",
         ),
     }
     match frontmost() {

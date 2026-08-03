@@ -43,8 +43,9 @@ herdr plugin link . --enabled
 1. In Work Louder Input, create a blank Layer 2. Connect by USB, then quit
    Input and the Codex desktop app.
 
-2. Clone the device's OAI controls into Layer 2. The guarded setup refuses a
-   nonblank layer, backs up the keymap, and verifies the write.
+2. Clone the device's OAI controls into Layer 2. The guarded setup accepts only
+   a blank or previously managed layer, backs up the keymap, and verifies the
+   write.
 
    ```sh
    herdr plugin action invoke micro-setup --plugin gjermundgaraba.herdr-micro
@@ -63,12 +64,24 @@ herdr plugin link . --enabled
    herdr plugin config-dir gjermundgaraba.herdr-micro
    ```
 
-   - `controls.json`: six logical action keys, dial, joystick, gestures, and per-agent actions
+   - `controls.json`: HID keys, six logical action keys, dial, joystick, gestures, and per-agent actions
    - `lighting.json`: state colors/effects and aggregate lighting zones
    - `effort.json`: user-configured Codex effort shortcuts
 
-Run **Configure Micro controls** in Herdr to open `controls.json`. Configuration
-changes are validated and reloaded while the bridge runs.
+Run **Configure Micro controls** in Herdr to open `controls.json`. Action
+changes are validated and reloaded while the bridge runs. `hidKeys` maps a
+logical button to a unique `F13` through `F24` key; omitted buttons retain their
+stock OAI codes. It is empty by default:
+
+```json
+"hidKeys": { "5": "F17" }
+```
+
+These are ordinary system-wide keyboard keys, so select keys that are not bound
+by macOS or another application. HID-key changes are held pending by the running
+bridge because they also alter the device keymap. Stop the bridge, run **Set up
+Micro Layer 2** again, then restart the bridge. Every changed keymap is backed
+up and verified before setup succeeds.
 
 ## Effort controls
 

@@ -1,0 +1,17 @@
+[package]
+name = "codex-micro"
+version = "0.10.0"
+edition = "2021"
+rust-version = "1.71"
+license = "MIT"
+description = "Device library for the Work Louder Codex Micro"
+repository = "https://github.com/gjermundgaraba/herdr-plugins"
+publish = false
+
+[dependencies]
+anyhow = "1.0.104"
+base64 = "0.23.0"
+libc = "0.2.183"
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["CFArray", "CFDictionary", "CFNumber", "CFRunLoop", "CFSet", "CFString"] }
+objc2-io-kit = { version = "0.3.2", default-features = false, features = ["hid", "hidsystem", "objc2", "std"] }
+serde_json = "1.0.151"

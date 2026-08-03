@@ -170,7 +170,7 @@ fn setup_micro() -> Result<i32> {
     let report = setup::setup_micro()?;
     if let Some(backup) = report.backup {
         println!(
-            "Cloned the OAI layout and bound AppSense Layer 2; backup: {}",
+            "Configured AppSense Layer 2 and HID keys; backup: {}",
             backup.display()
         );
     } else {

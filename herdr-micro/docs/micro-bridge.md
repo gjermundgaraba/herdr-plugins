@@ -3,9 +3,12 @@
 ## Current architecture
 
 `herdr-micro` is one detached Rust daemon and the sole owner of the Codex
-Micro vendor HID interface. A Unix socket in `HERDR_PLUGIN_STATE_DIR` provides
-the single-instance lock plus status and stop control; `micro.log` is stored
-beside it.
+Micro vendor HID interface. The workspace's `codex-micro` library contains
+only HID transport, device framing, raw events, and keymap I/O; Herdr routing
+and behavior stay in the `herdr-micro` crate and link into the same process.
+There is no second daemon or IPC boundary. A Unix socket in
+`HERDR_PLUGIN_STATE_DIR` provides status and stop control; `micro.log` is
+stored beside it, and a process lock protects hardware ownership.
 
 ```text
 Codex Micro over USB or BLE
@@ -34,8 +37,9 @@ Layer routing is fixed:
 | Ghostty terminal mapped to a running Herdr session | Own device; select Layer 2 and that session |
 | Unrelated application | Preserve the last applicable layer; dispatch nothing |
 
-Layer 2 must retain `KV_OAI_AG00` through `KV_OAI_AG05` and the OAI encoder
-actions created by `micro-setup`.
+Layer 2 retains `KV_OAI_AG00` through `KV_OAI_AG05` and the OAI encoder actions.
+Logical action buttons may instead use unique `F13` through `F24` codes selected
+by `controls.json`; `micro-setup` applies and verifies that managed keymap.
 
 ## Compatibility
 
@@ -59,13 +63,14 @@ the affected `Codex Micro #N`. USB remains the recovery transport.
   Louder Input or another Input Monitoring/HID client beside the bridge. The
   daemon yields when Input is running and while Codex is frontmost.
 - The daemon never writes firmware or keymaps. Only the explicit `micro-setup`
-  action changes the keymap; it requires a blank Layer 2, creates a backup, and
-  verifies the full read-back.
+  action changes the keymap; it requires a blank or previously managed Layer 2,
+  creates a backup, and verifies the full read-back.
 - Controls target the captured Herdr session and pane. `scroll` additionally
   rechecks the focused Ghostty UUID before posting wheel events.
 - `scroll` uses targeted CoreGraphics mouse/wheel events, restores the cursor,
-  and requires Accessibility permission. Other controls do not synthesize
-  global keyboard events.
+  and requires Accessibility permission. Configured F13–F24 controls are
+  ordinary system-wide keys emitted by the hardware and must otherwise be
+  unbound; other controls do not synthesize global keyboard events.
 - A selected-session failure does not fall back to another session. Controlled
   shutdown and 60 seconds without any Herdr session blank the LEDs.
 

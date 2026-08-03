@@ -1,7 +1,6 @@
 //! One-shot setup and small action helpers for the Micro plugin.
 
 use anyhow::{anyhow, bail, Context, Result};
-use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
 use std::{
     env,
@@ -18,15 +17,16 @@ use std::{
 use crate::{
     actions::{layer_identity, HERDR_LAYER},
     config::{
-        config_path, load_controls, load_effort, load_lighting, provision_controls,
-        provision_effort, provision_lighting,
+        config_path, function_key_number, load_controls, load_effort, load_lighting,
+        provision_controls, provision_effort, provision_lighting, Controls,
     },
     control::{ensure_state_dir, request_status},
-    device::{DeviceEvent, MicroDevice, DEFAULT_REQUEST_TIMEOUT},
+    device::{
+        keymap::{read_keymap, update_keymap_with, write_keymap},
+        DeviceEvent, MicroDevice, DEFAULT_REQUEST_TIMEOUT,
+    },
 };
 
-const READ_CHUNK: usize = 512;
-const WRITE_CHUNK: usize = 384;
 const PI_EXTENSION: &str = ".pi/agent/extensions/herdr-micro-effort.ts";
 const REQUIRED_OAI_CODES: [&str; 16] = [
     "KV_OAI_AG00",
@@ -45,6 +45,14 @@ const REQUIRED_OAI_CODES: [&str; 16] = [
     "KV_OAI_ENC_CC",
     "KV_OAI_ENC_CW",
     "KV_OAI_ENC_CLK",
+];
+const BUTTON_KEY_SLOTS: [(u8, &str, &str); 6] = [
+    (1, "/keymap/2/0", "KV_OAI_ACT06"),
+    (2, "/keymap/2/1", "KV_OAI_ACT07"),
+    (3, "/keymap/2/2", "KV_OAI_ACT08"),
+    (4, "/keymap/2/3", "KV_OAI_ACT09"),
+    (5, "/keymap/3/0", "KV_OAI_ACT10"),
+    (6, "/keymap/3/2", "KV_OAI_ACT12"),
 ];
 
 /// Resolve the plugin directory without depending on the action's current
@@ -65,87 +73,6 @@ pub fn plugin_root_from(plugin_root: Option<OsString>, executable: &Path) -> Res
 
 pub fn plugin_root() -> Result<PathBuf> {
     plugin_root_from(env::var_os("HERDR_PLUGIN_ROOT"), &env::current_exe()?)
-}
-
-fn keymap_chunk(value: Value) -> Result<(Vec<u8>, usize)> {
-    let data = value
-        .get("data")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("keymap response is missing data"))?;
-    let total = value
-        .get("total_size")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| anyhow!("keymap response is missing total_size"))?
-        .try_into()
-        .map_err(|_| anyhow!("keymap is too large"))?;
-    Ok((STANDARD.decode(data).context("invalid keymap data")?, total))
-}
-
-pub fn read_keymap_with<F>(mut read: F) -> Result<Vec<u8>>
-where
-    F: FnMut(usize) -> Result<Value>,
-{
-    let mut offset = 0;
-    let mut body = Vec::new();
-    loop {
-        let (chunk, total) = keymap_chunk(read(offset)?)?;
-        if chunk.is_empty() {
-            bail!("empty keymap chunk");
-        }
-        if offset
-            .checked_add(chunk.len())
-            .map_or(true, |end| end > total)
-        {
-            bail!("invalid keymap chunk size");
-        }
-        offset += chunk.len();
-        body.extend(chunk);
-        if offset >= total {
-            return Ok(body);
-        }
-    }
-}
-
-fn read_keymap(device: &MicroDevice) -> Result<Vec<u8>> {
-    read_keymap_with(|offset| {
-        device.request(
-            "fs.readbin",
-            Some(json!({ "file": "keymap.json", "offset": offset, "len": READ_CHUNK })),
-            DEFAULT_REQUEST_TIMEOUT,
-        )
-    })
-}
-
-pub fn write_keymap_chunks_with<F>(bytes: &[u8], mut write: F) -> Result<()>
-where
-    F: FnMut(usize, &[u8], bool) -> Result<()>,
-{
-    if bytes.is_empty() {
-        bail!("keymap is empty");
-    }
-    for (offset, chunk) in bytes.chunks(WRITE_CHUNK).enumerate() {
-        let offset = offset * WRITE_CHUNK;
-        write(offset, chunk, offset + chunk.len() == bytes.len())?;
-    }
-    Ok(())
-}
-
-fn write_keymap(device: &MicroDevice, bytes: &[u8]) -> Result<()> {
-    write_keymap_chunks_with(bytes, |offset, data, completed| {
-        device
-            .request(
-                "fs.writebin",
-                Some(json!({
-                    "file": "keymap.json",
-                    "offset": offset,
-                    "data": STANDARD.encode(data),
-                    "append": true,
-                    "completed": completed,
-                })),
-                DEFAULT_REQUEST_TIMEOUT,
-            )
-            .map(|_| ())
-    })
 }
 
 fn oai_profile(keymap: &mut Value) -> Result<&mut serde_json::Map<String, Value>> {
@@ -220,8 +147,25 @@ fn is_blank_layer(layer: &Value) -> bool {
         }))
 }
 
-/// Copies the compatible Layer 1 layout into blank Layer 2 and binds both layers.
+/// Copies the compatible Layer 1 layout into blank or previously managed Layer 2.
 pub fn configure_micro(keymap: &mut Value) -> Result<()> {
+    configure_micro_with_hid(keymap, &Default::default())
+}
+
+fn configure_micro_with_hid(
+    keymap: &mut Value,
+    hid_keys: &std::collections::BTreeMap<u8, String>,
+) -> Result<()> {
+    let managed_process = layer_identity(HERDR_LAYER).process;
+    let mut managed_ids: Vec<Value> = keymap
+        .get("linkedApps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|app| app.get("process").and_then(Value::as_str) == Some(&managed_process))
+        .filter_map(|app| app.get("id").cloned())
+        .collect();
+    let managed_link_id = (managed_ids.len() == 1).then(|| managed_ids.pop().unwrap());
     {
         let profile = oai_profile(keymap)?;
         let layers = profile
@@ -242,15 +186,34 @@ pub fn configure_micro(keymap: &mut Value) -> Result<()> {
         {
             bail!("Layer 1 is not a compatible Codex Micro OAI layout");
         }
+        validate_button_slots(&source_layout)?;
+        let target_is_managed = managed_link_id
+            .as_ref()
+            .is_some_and(|id| layers[HERDR_LAYER - 1].get("linkedAppId") == Some(id));
         if layers[HERDR_LAYER - 1].get("layout") != Some(&source_layout) {
             if !is_blank_layer(&layers[HERDR_LAYER - 1]) {
-                bail!("Layer {HERDR_LAYER} is not blank; refusing to overwrite it");
+                if !target_is_managed {
+                    bail!("Layer {HERDR_LAYER} is not blank or managed; refusing to overwrite it");
+                }
+                let mut normalized = layers[HERDR_LAYER - 1]
+                    .get("layout")
+                    .cloned()
+                    .ok_or_else(|| anyhow!("Layer {HERDR_LAYER} layout is missing"))?;
+                set_hid_codes(&mut normalized, &Default::default())?;
+                if normalized != source_layout {
+                    bail!("Layer {HERDR_LAYER} is not blank or managed; refusing to overwrite it");
+                }
+            } else {
+                layers[HERDR_LAYER - 1]
+                    .as_object_mut()
+                    .ok_or_else(|| anyhow!("Layer {HERDR_LAYER} must be an object"))?
+                    .insert("layout".into(), source_layout);
             }
-            layers[HERDR_LAYER - 1]
-                .as_object_mut()
-                .ok_or_else(|| anyhow!("Layer {HERDR_LAYER} must be an object"))?
-                .insert("layout".into(), source_layout);
         }
+        let target = layers[HERDR_LAYER - 1]
+            .get_mut("layout")
+            .ok_or_else(|| anyhow!("Layer {HERDR_LAYER} layout is missing"))?;
+        set_hid_codes(target, hid_keys)?;
     }
 
     let linked = keymap
@@ -320,6 +283,44 @@ pub fn configure_micro(keymap: &mut Value) -> Result<()> {
     Ok(())
 }
 
+fn validate_button_slots(layout: &Value) -> Result<()> {
+    for (button, pointer, stock) in BUTTON_KEY_SLOTS {
+        if layout.pointer(pointer).and_then(Value::as_str) != Some(stock) {
+            bail!("Layer 1 button {button} must use {stock}");
+        }
+    }
+    Ok(())
+}
+
+fn set_hid_codes(
+    layout: &mut Value,
+    hid_keys: &std::collections::BTreeMap<u8, String>,
+) -> Result<()> {
+    for (button, pointer, stock) in BUTTON_KEY_SLOTS {
+        let slot = layout
+            .pointer_mut(pointer)
+            .ok_or_else(|| anyhow!("Layer 2 button {button} is missing"))?;
+        let current = slot
+            .as_str()
+            .ok_or_else(|| anyhow!("Layer 2 button {button} must be a key code"))?;
+        if current != stock
+            && current
+                .strip_prefix("KC_")
+                .and_then(function_key_number)
+                .is_none()
+        {
+            bail!("Layer 2 button {button} has unexpected code {current}");
+        }
+        *slot = Value::String(
+            hid_keys
+                .get(&button)
+                .map(|key| format!("KC_{key}"))
+                .unwrap_or_else(|| stock.into()),
+        );
+    }
+    Ok(())
+}
+
 fn active_owner() -> Result<Option<String>> {
     let output = Command::new("/bin/ps").args(["-axo", "comm="]).output()?;
     if !output.status.success() {
@@ -345,67 +346,23 @@ fn backup_keymap(bytes: &[u8]) -> Result<PathBuf> {
     file.write_all(bytes)?;
     file.sync_all()?;
     fs::File::open(&dir)?.sync_all()?;
+    if fs::read(&path)? != bytes {
+        bail!("keymap backup verification failed: {}", path.display());
+    }
     Ok(path)
 }
 
-fn update_keymap_with<B, R, W>(
-    before: &[u8],
-    after: &[u8],
-    backup: B,
-    mut read: R,
-    mut write: W,
-) -> Result<Option<PathBuf>>
-where
-    B: FnOnce(&[u8]) -> Result<PathBuf>,
-    R: FnMut() -> Result<Vec<u8>>,
-    W: FnMut(&[u8]) -> Result<()>,
-{
-    if before == after {
-        return Ok(None);
-    }
-    let backup = backup(before)?;
-    let updated = write(after).and_then(|()| {
-        if read()? == after {
-            Ok(())
-        } else {
-            bail!("keymap read-back failed")
-        }
-    });
-    if let Err(error) = updated {
-        let restored = write(before).and_then(|()| {
-            if read()? == before {
-                Ok(())
-            } else {
-                bail!("restored keymap read-back failed")
-            }
-        });
-        return match restored {
-            Ok(()) => Err(error).with_context(|| {
-                format!(
-                    "keymap update failed; original keymap was restored; backup: {}",
-                    backup.display()
-                )
-            }),
-            Err(recovery) => Err(anyhow!(
-                "keymap update failed: {error}; automatic restore failed: {recovery}; recover from backup: {}",
-                backup.display()
-            )),
-        };
-    }
-    Ok(Some(backup))
-}
-
-fn provision_and_validate_configs() -> Result<(PathBuf, PathBuf, PathBuf)> {
+fn provision_and_validate_configs() -> Result<(PathBuf, PathBuf, PathBuf, Controls)> {
     let controls = config_path("controls.json");
     let effort = config_path("effort.json");
     let lighting = config_path("lighting.json");
     provision_controls(&controls).map_err(|error| anyhow!(error))?;
     provision_effort(&effort).map_err(|error| anyhow!(error))?;
     provision_lighting(&lighting).map_err(|error| anyhow!(error))?;
-    load_controls(&controls).map_err(|error| anyhow!(error))?;
+    let parsed_controls = load_controls(&controls).map_err(|error| anyhow!(error))?;
     load_effort(&effort).map_err(|error| anyhow!(error))?;
     load_lighting(&lighting).map_err(|error| anyhow!(error))?;
-    Ok((controls, effort, lighting))
+    Ok((controls, effort, lighting, parsed_controls))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -418,7 +375,7 @@ pub struct SetupReport {
 }
 
 pub fn setup_micro() -> Result<SetupReport> {
-    let (controls, effort, lighting) = provision_and_validate_configs()?;
+    let (controls, effort, lighting, parsed_controls) = provision_and_validate_configs()?;
     if let Some(owner) = active_owner()? {
         bail!("quit {owner} first");
     }
@@ -438,7 +395,7 @@ pub fn setup_micro() -> Result<SetupReport> {
         let before = read_keymap(&device)?;
         let mut keymap: Value = serde_json::from_slice(&before).context("invalid keymap JSON")?;
         let canonical_before = serde_json::to_vec(&keymap)?;
-        configure_micro(&mut keymap)?;
+        configure_micro_with_hid(&mut keymap, &parsed_controls.hid_keys)?;
         let after = serde_json::to_vec(&keymap)?;
         let backup = if after == canonical_before {
             None
@@ -629,6 +586,19 @@ mod tests {
         })
     }
 
+    fn oai_layout() -> Value {
+        json!({
+            "keymap": [
+                ["KV_OAI_AG00", "KV_OAI_AG01"],
+                ["KV_OAI_AG02", "KV_OAI_AG03", "KV_OAI_AG04", "KV_OAI_AG05"],
+                ["KV_OAI_ACT06", "KV_OAI_ACT07", "KV_OAI_ACT08", "KV_OAI_ACT09"],
+                ["KV_OAI_ACT10", "KV_OAI_ACT11", "KV_OAI_ACT12"]
+            ],
+            "encoders": [["KV_OAI_ENC_CC", "KV_OAI_ENC_CW", "KV_OAI_ENC_CLK"]],
+            "joystick": { "type": "VENDOR", "sectors": [] }
+        })
+    }
+
     #[test]
     fn derives_plugin_root_without_cwd() {
         assert_eq!(
@@ -650,31 +620,11 @@ mod tests {
     }
 
     #[test]
-    fn reads_and_writes_exact_chunks() {
-        let bytes = b"abcdef".to_vec();
-        let read = read_keymap_with(|offset| {
-            let chunk = &bytes[offset..bytes.len().min(offset + 2)];
-            Ok(json!({ "data": STANDARD.encode(chunk), "total_size": bytes.len() }))
-        })
-        .unwrap();
-        assert_eq!(read, bytes);
-        let mut chunks = Vec::new();
-        write_keymap_chunks_with(&vec![1; 800], |offset, data, completed| {
-            chunks.push((offset, data.len(), completed));
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(
-            chunks,
-            [(0, 384, false), (384, 384, false), (768, 32, true)]
-        );
-    }
-
-    #[test]
     fn configures_only_a_blank_layer_two() {
+        let source = oai_layout();
         let mut keymap = json!({
             "profiles": [{ "layers": [
-                { "layout": { "keymap": [REQUIRED_OAI_CODES] } },
+                { "layout": source },
                 blank_layer()
             ] }]
         });
@@ -691,6 +641,49 @@ mod tests {
             keymap.pointer("/profiles/0/layers/0/layout"),
             keymap.pointer("/profiles/0/layers/1/layout")
         );
+    }
+
+    #[test]
+    fn configured_hid_keys_change_only_managed_layer_two_buttons() {
+        let source = oai_layout();
+        let mut keymap = json!({
+            "profiles": [{ "layers": [
+                { "layout": source },
+                blank_layer()
+            ] }]
+        });
+        configure_micro_with_hid(
+            &mut keymap,
+            &std::collections::BTreeMap::from([(5, "F19".into())]),
+        )
+        .unwrap();
+        let hid_keys = std::collections::BTreeMap::from([(2, "F16".into()), (5, "F17".into())]);
+        configure_micro_with_hid(&mut keymap, &hid_keys).unwrap();
+        assert_eq!(
+            keymap.pointer("/profiles/0/layers/1/layout/keymap/3/0"),
+            Some(&json!("KC_F17"))
+        );
+        assert_eq!(
+            keymap.pointer("/profiles/0/layers/1/layout/keymap/2/1"),
+            Some(&json!("KC_F16"))
+        );
+    }
+
+    #[test]
+    fn refuses_an_unmarked_layer_with_function_keys() {
+        let source = oai_layout();
+        let mut target = source.clone();
+        *target.pointer_mut("/keymap/3/0").unwrap() = json!("KC_F19");
+        let mut keymap = json!({
+            "profiles": [{ "layers": [
+                { "layout": source },
+                { "layout": target }
+            ] }]
+        });
+        assert!(configure_micro(&mut keymap)
+            .unwrap_err()
+            .to_string()
+            .contains("not blank or managed"));
     }
 
     #[test]
@@ -781,48 +774,5 @@ mod tests {
         assert_eq!(fs::read(&target).unwrap(), b"old");
         assert_eq!(fs::read(root.join("extension.ts.bak-10")).unwrap(), b"old");
         fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn keymap_failure_restores_original_and_names_backup() {
-        let backup = PathBuf::from("/tmp/keymap-backup.json");
-        let mut writes = Vec::new();
-        let mut reads = [b"wrong".to_vec(), b"before".to_vec()].into_iter();
-        let error = update_keymap_with(
-            b"before",
-            b"after",
-            |_| Ok(backup.clone()),
-            || Ok(reads.next().unwrap()),
-            |bytes| {
-                writes.push(bytes.to_vec());
-                Ok(())
-            },
-        )
-        .unwrap_err();
-        assert_eq!(writes, vec![b"after".to_vec(), b"before".to_vec()]);
-        assert!(error.to_string().contains("/tmp/keymap-backup.json"));
-        assert!(error.to_string().contains("restored"));
-    }
-
-    #[test]
-    fn failed_restore_still_names_backup() {
-        let backup = PathBuf::from("/tmp/keymap-backup.json");
-        let mut writes = 0;
-        let error = update_keymap_with(
-            b"before",
-            b"after",
-            |_| Ok(backup.clone()),
-            || Ok(b"wrong".to_vec()),
-            |_| {
-                writes += 1;
-                if writes == 2 {
-                    bail!("device disappeared")
-                }
-                Ok(())
-            },
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("automatic restore failed"));
-        assert!(error.to_string().contains("/tmp/keymap-backup.json"));
     }
 }

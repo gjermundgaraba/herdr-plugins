@@ -5,7 +5,7 @@
 //! reconnect from leaving callbacks pointed at a moved or dropped context.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     ffi::{c_void, CStr},
     fs::{File, OpenOptions},
     io,
@@ -31,11 +31,14 @@ use objc2_io_kit::{
 };
 use serde_json::Value;
 
-use crate::protocol::{encode_message, Reassembler, REPORT_ID, REPORT_SIZE};
+use crate::wire::{encode_message, Reassembler, REPORT_ID, REPORT_SIZE};
 
 pub const MICRO_VENDOR_ID: i32 = 0x303A;
 pub const MICRO_PRODUCT_ID: i32 = 0x8360;
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+const KEYBOARD_REPORT_ID: u32 = 1;
+const F13_USAGE: u8 = 0x68;
+const F24_USAGE: u8 = 0x73;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputMonitoringAccess {
@@ -81,7 +84,7 @@ pub enum DeviceEvent {
 }
 
 enum CallbackEvent {
-    Report(Vec<u8>),
+    Report { id: u32, bytes: Vec<u8> },
     Removed,
 }
 
@@ -132,7 +135,7 @@ impl MicroDevice {
         let closed = Arc::new(AtomicBool::new(false));
         let owner_closed = Arc::clone(&closed);
         let owner = thread::Builder::new()
-            .name("herdr-micro-hid".into())
+            .name("codex-micro-hid".into())
             .spawn(move || owner_main(command_rx, event_tx, ready_tx, owner_closed))?;
 
         match ready_rx.recv_timeout(DEFAULT_REQUEST_TIMEOUT + Duration::from_secs(1)) {
@@ -230,6 +233,7 @@ struct DeviceLock(File);
 impl DeviceLock {
     fn acquire() -> Result<Self> {
         let uid = unsafe { libc::getuid() };
+        // Stable across pre-extraction builds so upgrades cannot acquire two locks.
         Self::acquire_at(&std::env::temp_dir().join(format!("herdr-micro-{uid}.lock")))
     }
 
@@ -245,7 +249,7 @@ impl DeviceLock {
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             let error = io::Error::last_os_error();
             if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
-                bail!("another herdr-micro process owns the Codex Micro")
+                bail!("another process owns the Codex Micro")
             }
             return Err(error.into());
         }
@@ -299,6 +303,7 @@ struct Owner {
     command_rx: Arc<Mutex<Receiver<Command>>>,
     event_tx: Sender<DeviceEvent>,
     reassembler: Reassembler,
+    function_keys_down: BTreeSet<u8>,
     pending: HashMap<u64, Pending>,
     closed: Arc<AtomicBool>,
 }
@@ -398,6 +403,7 @@ impl Owner {
             command_rx,
             event_tx,
             reassembler: Reassembler::default(),
+            function_keys_down: BTreeSet::new(),
             pending: HashMap::new(),
             closed,
         })
@@ -468,7 +474,7 @@ impl Owner {
         let _ = CFRunLoop::run_in_mode(Some(self.run_loop_mode), 0.01, true);
         while let Ok(event) = self.callback_rx.try_recv() {
             match event {
-                CallbackEvent::Report(report) => self.handle_report(&report),
+                CallbackEvent::Report { id, bytes } => self.handle_report(id, &bytes),
                 CallbackEvent::Removed => {
                     self.closed.store(true, Ordering::Release);
                     let _ = self.event_tx.send(DeviceEvent::Disconnected);
@@ -524,7 +530,25 @@ impl Owner {
         Ok(())
     }
 
-    fn handle_report(&mut self, report: &[u8]) {
+    fn handle_report(&mut self, report_id: u32, report: &[u8]) {
+        if report_id == KEYBOARD_REPORT_ID {
+            if let Some(next) = function_keys(report) {
+                for usage in self.function_keys_down.difference(&next) {
+                    let _ = self.event_tx.send(DeviceEvent::Key {
+                        key: function_key_name(*usage),
+                        action: 0,
+                    });
+                }
+                for usage in next.difference(&self.function_keys_down) {
+                    let _ = self.event_tx.send(DeviceEvent::Key {
+                        key: function_key_name(*usage),
+                        action: 1,
+                    });
+                }
+                self.function_keys_down = next;
+            }
+            return;
+        }
         for envelope in self.reassembler.push(report) {
             let Ok(envelope) = envelope else { continue };
             if let Some(id) = envelope.get("id").and_then(Value::as_u64) {
@@ -597,7 +621,7 @@ unsafe extern "C-unwind" fn input_report_callback(
     if context.is_null()
         || result != kIOReturnSuccess
         || report_type != IOHIDReportType::Input
-        || report_id != REPORT_ID as u32
+        || (report_id != KEYBOARD_REPORT_ID && report_id != REPORT_ID as u32)
         || length <= 0
     {
         return;
@@ -607,7 +631,29 @@ unsafe extern "C-unwind" fn input_report_callback(
     // this callback; `context` stays pinned until callbacks are unregistered.
     let context = unsafe { &*(context.cast::<CallbackContext>()) };
     let bytes = unsafe { std::slice::from_raw_parts(report.as_ptr(), length) }.to_vec();
-    let _ = context.callback_tx.send(CallbackEvent::Report(bytes));
+    let _ = context.callback_tx.send(CallbackEvent::Report {
+        id: report_id,
+        bytes,
+    });
+}
+
+fn function_keys(report: &[u8]) -> Option<BTreeSet<u8>> {
+    let report = match report {
+        [id, payload @ ..] if *id == KEYBOARD_REPORT_ID as u8 && payload.len() >= 8 => payload,
+        payload if payload.len() >= 8 => payload,
+        _ => return None,
+    };
+    Some(
+        report[2..8]
+            .iter()
+            .copied()
+            .filter(|usage| (F13_USAGE..=F24_USAGE).contains(usage))
+            .collect(),
+    )
+}
+
+fn function_key_name(usage: u8) -> String {
+    format!("F{}", usage - F13_USAGE + 13)
 }
 
 unsafe extern "C-unwind" fn removal_callback(
@@ -800,6 +846,37 @@ mod tests {
     }
 
     #[test]
+    fn reads_function_keys_from_keyboard_reports_with_or_without_report_id() {
+        let expected = BTreeSet::from([F13_USAGE, F24_USAGE]);
+        assert_eq!(
+            function_keys(&[0, 0, F13_USAGE, F24_USAGE, 0, 0, 0, 0]),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            function_keys(&[
+                KEYBOARD_REPORT_ID as u8,
+                0,
+                0,
+                F13_USAGE,
+                F24_USAGE,
+                0,
+                0,
+                0,
+                0
+            ]),
+            Some(expected)
+        );
+        assert_eq!(
+            function_keys(&[1, 0, F13_USAGE, 0, 0, 0, 0, 0]),
+            Some(BTreeSet::from([F13_USAGE]))
+        );
+        assert_eq!(function_keys(&[0; 8]), Some(BTreeSet::new()));
+        assert_eq!(function_keys(&[0; 7]), None);
+        assert_eq!(function_key_name(F13_USAGE), "F13");
+        assert_eq!(function_key_name(F24_USAGE), "F24");
+    }
+
+    #[test]
     fn request_write_error_reaches_caller() {
         let (_reply_tx, reply_rx) = mpsc::sync_channel(1);
         assert!(await_send_reply(reply_rx, Duration::from_millis(1)).is_err());
@@ -808,7 +885,7 @@ mod tests {
     #[test]
     fn lock_excludes_another_micro_owner() {
         let path =
-            std::env::temp_dir().join(format!("herdr-micro-lock-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("codex-micro-lock-test-{}", std::process::id()));
         let first = DeviceLock::acquire_at(&path).unwrap();
         assert!(DeviceLock::acquire_at(&path).is_err());
         drop(first);
@@ -819,7 +896,7 @@ mod tests {
     #[test]
     fn close_joins_an_owner_after_removal() {
         let path =
-            std::env::temp_dir().join(format!("herdr-micro-close-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("codex-micro-close-test-{}", std::process::id()));
         let (command_tx, _command_rx) = mpsc::channel();
         let joined = Arc::new(AtomicBool::new(false));
         let owner_joined = Arc::clone(&joined);

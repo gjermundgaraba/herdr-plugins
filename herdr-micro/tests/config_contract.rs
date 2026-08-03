@@ -3,8 +3,9 @@ use serde_json::json;
 
 fn controls(button: serde_json::Value) -> serde_json::Value {
     json!({
-        "version": 1,
+        "version": 2,
         "buttons": { "1": button },
+        "hidKeys": {},
         "dial": { "clockwise": null, "counterclockwise": null, "press": null },
         "joystick": { "engageDistance": 0.75, "releaseDistance": 0.3 }
     })

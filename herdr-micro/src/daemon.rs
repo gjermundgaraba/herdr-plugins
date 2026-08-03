@@ -5,7 +5,7 @@ use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError},
@@ -21,9 +21,9 @@ use crate::{
         parse_agents, plan_effort_change, prompt_args, scroll_plan, submit_args, Agent,
     },
     config::{
-        config_path, default_controls, key_binding, load_controls, load_effort, load_lighting,
-        provision_controls, provision_effort, provision_lighting, Action, AgentStatus, Binding,
-        Controls, Direction, EffortDirection, VerticalDirection,
+        config_path, key_binding, load_controls, load_effort, load_lighting, provision_controls,
+        provision_effort, provision_lighting, Action, AgentStatus, Binding, Controls, Direction,
+        EffortDirection, VerticalDirection,
     },
     control::listen_for_control,
     device::{DeviceEvent, MicroDevice},
@@ -47,6 +47,17 @@ const NO_SESSIONS_SHUTDOWN: Duration = Duration::from_secs(60);
 const MAPPING_REPROBE: Duration = Duration::from_secs(30);
 const WORK_QUEUE_CAPACITY: usize = 16;
 pub const DAEMON_PROTOCOL_VERSION: u32 = 1;
+
+fn runtime_controls(
+    active_hid_keys: &BTreeMap<u8, String>,
+    mut next: Controls,
+) -> (Controls, bool) {
+    let pending = next.hid_keys != *active_hid_keys;
+    if pending {
+        next.hid_keys.clone_from(active_hid_keys);
+    }
+    (next, pending)
+}
 
 fn log(message: impl AsRef<str>) {
     eprintln!(
@@ -1108,6 +1119,8 @@ pub fn run_daemon() -> Result<()> {
     provision_controls(&controls_path).map_err(|error| anyhow!(error))?;
     provision_effort(&config_path("effort.json")).map_err(|error| anyhow!(error))?;
     provision_lighting(&config_path("lighting.json")).map_err(|error| anyhow!(error))?;
+    let mut controls = load_controls(&controls_path).map_err(|error| anyhow!(error))?;
+    let active_hid_keys = controls.hid_keys.clone();
     let (device_tx, device_rx) = mpsc::channel();
     let (work_tx, work_rx) = mpsc::sync_channel(WORK_QUEUE_CAPACITY);
     let mappings = Arc::new(Mutex::new(Vec::new()));
@@ -1142,7 +1155,6 @@ pub fn run_daemon() -> Result<()> {
     let control_thread = thread::spawn(move || {
         let _ = server.run_with_shutdown(&shutdown_rx);
     });
-    let mut controls = default_controls();
     let mut device = None;
     let mut gestures = GestureDispatcher::new();
     let mut refresh_due = Instant::now();
@@ -1154,11 +1166,20 @@ pub fn run_daemon() -> Result<()> {
             let routing_generation = state.routing_generation();
             match load_controls(&controls_path) {
                 Ok(next) => {
+                    let (next, hid_keys_pending) = runtime_controls(&active_hid_keys, next);
                     if controls != next {
                         gestures.clear();
                     }
                     controls = next;
-                    state.last_controls_error.clear();
+                    if hid_keys_pending {
+                        let pending = "HID key changes require micro-setup and a bridge restart";
+                        if state.last_controls_error != pending {
+                            log(format!("control configuration pending: {pending}"));
+                        }
+                        state.last_controls_error = pending.into();
+                    } else {
+                        state.last_controls_error.clear();
+                    }
                 }
                 Err(error) if state.last_controls_error != error => {
                     state.last_controls_error = error.clone();
@@ -1325,7 +1346,7 @@ mod tests {
             focused: true,
             cwd: "/tmp".into(),
         });
-        let controls = default_controls();
+        let controls = crate::config::default_controls();
         let mut gestures = GestureDispatcher::new();
         assert!(!handle_device_event(
             DeviceEvent::Key {
@@ -1358,5 +1379,16 @@ mod tests {
         let queued = state.routing_generation();
         state.revoke_routing();
         assert_ne!(queued, state.routing_generation());
+    }
+
+    #[test]
+    fn hid_key_reload_waits_for_a_restart() {
+        let initial = crate::config::default_controls();
+        let active = initial.hid_keys.clone();
+        let mut changed = initial.clone();
+        changed.hid_keys.insert(5, "F17".into());
+        let (runtime, pending) = runtime_controls(&active, changed);
+        assert!(pending);
+        assert_eq!(runtime.hid_keys, initial.hid_keys);
     }
 }
