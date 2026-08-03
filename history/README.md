@@ -17,6 +17,7 @@ herdr plugin install gjermundgaraba/herdr-plugins/history
 Or for local development:
 
 ```sh
+cargo build --release --locked
 herdr plugin link /path/to/herdr-plugins/history
 ```
 
@@ -40,7 +41,8 @@ command = "gjermundgaraba.herdr-history.forward"
 description = "History forward"
 ```
 
-Reload with `herdr server reload-config`. Requires Herdr >= 0.7.5 and `node` on PATH.
+Reload with `herdr server reload-config`. Requires Herdr >= 0.7.5 and Rust >= 1.89
+to install. The installed plugin has no runtime language dependency.
 
 ## How it works
 
@@ -54,7 +56,8 @@ server socket identity changes, because pane ids recycle across server restarts.
 ## Development
 
 ```sh
-node --test                                                # pure history logic
+cargo test                                                 # pure history logic
+cargo build --release --locked                             # linked executable
 herdr plugin log list --plugin gjermundgaraba.herdr-history  # per-invocation logs
 ```
 
