@@ -9,7 +9,7 @@ use crate::{
     PLUGIN_ID,
 };
 
-pub const CODEX_PROCESS: &str = "com.openai.codex";
+pub const CHATGPT_BUNDLE_IDS: [&str; 2] = ["com.openai.codex", "com.openai.chat"];
 pub const GHOSTTY_PROCESS: &str = "com.mitchellh.ghostty";
 pub const HERDR_LAYER: usize = 2;
 
@@ -309,7 +309,7 @@ pub fn automatic_layer(
     frontmost_process: Option<&str>,
     focused_herdr_session: Option<&str>,
 ) -> Option<usize> {
-    if frontmost_process == Some(CODEX_PROCESS) {
+    if frontmost_process.is_some_and(|process| CHATGPT_BUNDLE_IDS.contains(&process)) {
         Some(1)
     } else if frontmost_process == Some(GHOSTTY_PROCESS) && focused_herdr_session.is_some() {
         Some(HERDR_LAYER)
@@ -349,6 +349,12 @@ mod tests {
             vec!["pane", "send-keys", "p2", "left"]
         );
         assert!(plan_effort_change("codex", "raise", "p1", &default_effort()).is_err());
+    }
+    #[test]
+    fn known_chatgpt_bundles_select_layer_one() {
+        for process in CHATGPT_BUNDLE_IDS {
+            assert_eq!(automatic_layer(Some(process), None), Some(1));
+        }
     }
     #[test]
     fn rejects_non_string_agent_fields() {

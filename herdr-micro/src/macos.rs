@@ -9,7 +9,9 @@ use std::{ptr::NonNull, thread, time::Duration};
 use anyhow::{anyhow, bail, Result};
 use objc2::rc::Retained;
 use objc2_app_kit::{NSRunningApplication, NSWorkspace};
-use objc2_core_foundation::{CFDictionary, CFNumber, CFString, CFType, CGPoint};
+use objc2_core_foundation::{
+    kCFRunLoopDefaultMode, CFDictionary, CFNumber, CFRunLoop, CFString, CFType, CGPoint,
+};
 use objc2_core_graphics::{
     kCGNullWindowID, kCGWindowBounds, kCGWindowLayer, kCGWindowName, kCGWindowOwnerPID, CGEvent,
     CGEventTapLocation, CGEventType, CGMouseButton, CGPreflightPostEventAccess, CGScrollEventUnit,
@@ -44,15 +46,17 @@ pub fn post_event_access() -> Result<()> {
 }
 
 pub fn frontmost() -> Result<Frontmost> {
-    let (app, window) = frontmost_window()
-        .ok_or_else(|| anyhow!("frontmost application has no visible normal window"))?;
+    let app =
+        frontmost_application().ok_or_else(|| anyhow!("frontmost application unavailable"))?;
     let process = app
         .bundleIdentifier()
         .map_or_else(String::new, |value| value.to_string());
     let app_name = app
         .localizedName()
         .map_or_else(String::new, |value| value.to_string());
-    let title = window_title(&window).unwrap_or_default();
+    let title = normal_window_for(&app)
+        .and_then(|window| window_title(&window))
+        .unwrap_or_default();
     Ok(Frontmost {
         app_name,
         process,
@@ -141,6 +145,13 @@ fn frontmost_window() -> Option<(
     objc2_core_foundation::CFRetained<CFDictionary>,
 )> {
     let app = frontmost_application()?;
+    let window = normal_window_for(&app)?;
+    Some((app, window))
+}
+
+fn normal_window_for(
+    app: &NSRunningApplication,
+) -> Option<objc2_core_foundation::CFRetained<CFDictionary>> {
     let pid = app.processIdentifier();
     if pid < 0 {
         return None;
@@ -167,13 +178,16 @@ fn frontmost_window() -> Option<(
             // returned handle independent ownership after the array is dropped.
             let window =
                 unsafe { objc2_core_foundation::CFRetained::retain(NonNull::from(window)) };
-            return Some((app, window));
+            return Some(window);
         }
     }
     None
 }
 
 fn frontmost_application() -> Option<Retained<NSRunningApplication>> {
+    if let Some(mode) = unsafe { kCFRunLoopDefaultMode } {
+        let _ = CFRunLoop::run_in_mode(Some(mode), 0.0, true);
+    }
     NSWorkspace::sharedWorkspace().frontmostApplication()
 }
 

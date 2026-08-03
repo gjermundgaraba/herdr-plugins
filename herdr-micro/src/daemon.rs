@@ -1021,17 +1021,27 @@ fn refresh_owner(
     let frontmost = state
         .frontmost
         .as_ref()
-        .map(|frontmost| frontmost.process.as_str());
-    let owner = match device_owner(&[], frontmost) {
+        .map(|frontmost| frontmost.process.clone());
+    let owner = match device_owner(&[], frontmost.as_deref()) {
         Some(owner) => Some(owner),
         None => {
             let output = run_command("/bin/ps", &["-axo".into(), "command=".into()], None)?;
             let processes: Vec<_> = output.lines().map(str::trim).map(str::to_owned).collect();
-            device_owner(&processes, frontmost)
+            device_owner(&processes, frontmost.as_deref())
         }
     }
     .map(str::to_owned);
     if owner != state.owner {
+        let handoff_error = if owner.as_deref() == Some("ChatGPT") {
+            select_layer(
+                device.as_ref(),
+                state,
+                automatic_layer(frontmost.as_deref(), None),
+            )
+            .err()
+        } else {
+            None
+        };
         state.owner = owner;
         if let Some(owner) = &state.owner {
             log(format!("yielding to {owner}"));
@@ -1039,6 +1049,9 @@ fn refresh_owner(
             close_device(device, state, gestures, false);
         } else {
             log("device owner cleared");
+        }
+        if let Some(error) = handoff_error {
+            return Err(error);
         }
     }
     Ok(())

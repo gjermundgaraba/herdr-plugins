@@ -1,5 +1,5 @@
 use crate::{
-    actions::Agent,
+    actions::{Agent, CHATGPT_BUNDLE_IDS},
     config::{AgentStatus, Light, LightingConfig},
 };
 use serde_json::Value;
@@ -19,7 +19,7 @@ pub struct JoystickEvent {
 }
 
 pub fn device_owner(processes: &[String], frontmost_bundle: Option<&str>) -> Option<&'static str> {
-    let native_frontmost = ["com.openai.codex", "com.openai.chat"]
+    let native_frontmost = CHATGPT_BUNDLE_IDS
         .into_iter()
         .find(|bundle| crate::macos::frontmost_bundle_is(bundle));
     device_owner_with_bundles(
@@ -40,12 +40,11 @@ pub fn device_owner_with_bundles(
         return Some("Input");
     }
 
-    let frontmost_openai = matches!(
-        frontmost_bundle,
-        Some("com.openai.codex" | "com.openai.chat")
-    );
-    let chatgpt_running = bundle_is_running(running_bundles, "com.openai.codex")
-        || bundle_is_running(running_bundles, "com.openai.chat")
+    let frontmost_openai =
+        frontmost_bundle.is_some_and(|bundle| CHATGPT_BUNDLE_IDS.contains(&bundle));
+    let chatgpt_running = CHATGPT_BUNDLE_IDS
+        .iter()
+        .any(|bundle| bundle_is_running(running_bundles, bundle))
         || has_process(processes, "ChatGPT", "ChatGPT")
         || has_process(processes, "Codex", "ChatGPT");
     (frontmost_openai && chatgpt_running).then_some("ChatGPT")
@@ -325,6 +324,10 @@ mod tests {
         let chatgpt = "/Volumes/Tools/ChatGPT.app/Contents/MacOS/ChatGPT --launch".to_owned();
         assert_eq!(
             device_owner_with_bundles(&["com.openai.codex".into()], &[], Some("com.openai.codex")),
+            Some("ChatGPT")
+        );
+        assert_eq!(
+            device_owner_with_bundles(&["com.openai.chat".into()], &[], Some("com.openai.chat")),
             Some("ChatGPT")
         );
         assert_eq!(
