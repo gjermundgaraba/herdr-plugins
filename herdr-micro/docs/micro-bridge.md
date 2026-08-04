@@ -38,8 +38,9 @@ Layer routing is fixed:
 | Unrelated application | Preserve the last applicable layer; dispatch nothing |
 
 Layer 2 retains `KV_OAI_AG00` through `KV_OAI_AG05` and the OAI encoder actions.
-Logical action buttons may instead use unique `F13` through `F24` codes selected
-by `controls.json`; `micro-setup` applies and verifies that managed keymap.
+Each of the seven action switches may instead use a unique `F13` through `F24`
+code or be disabled by `controls.json`; `micro-setup` applies and verifies that
+managed keymap.
 
 ## Compatibility
 
@@ -61,7 +62,7 @@ the affected `Codex Micro #N`. USB remains the recovery transport.
 
 - Direct HID access requires macOS Input Monitoring permission. Do not run Work
   Louder Input or another Input Monitoring/HID client beside the bridge. The
-  daemon yields when Input is running and while Codex is frontmost.
+  daemon yields when Input is running and while ChatGPT/Codex is frontmost.
 - The daemon never writes firmware or keymaps. Only the explicit `micro-setup`
   action changes the keymap; it requires a blank or previously managed Layer 2,
   creates a backup, and verifies the full read-back.
@@ -80,8 +81,8 @@ the affected `Codex Micro #N`. USB remains the recovery transport.
   Work Louder publishes firmware binaries, not a third-party SDK or protocol
   contract. Firmware or host-app changes may break the bridge.
 - Only the six Agent keys are independently addressable on the tested Codex
-  Micro. The stock double-width lower key actuates ACT10 and ACT11 as one
-  logical action key; perimeter lighting is an aggregate zone.
+  Micro. The seven action switches are configurable; the stock double-width
+  lower keycap spans switches 5 and 6. Perimeter lighting is an aggregate zone.
 - Aggregate-zone synchronization flags exist in the protocol but have not been
   physically verified.
 - True held macOS keys, voice control, eight-way joystick sectors, and analog

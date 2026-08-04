@@ -64,17 +64,19 @@ herdr plugin link . --enabled
    herdr plugin config-dir gjermundgaraba.herdr-micro
    ```
 
-   - `controls.json`: HID keys, six logical action keys, dial, joystick, gestures, and per-agent actions
+   - `controls.json`: HID keys, seven action switches, dial, joystick, gestures, and per-agent actions
    - `lighting.json`: state colors/effects and aggregate lighting zones
    - `effort.json`: user-configured Codex effort shortcuts
 
 Run **Configure Micro controls** in Herdr to open `controls.json`. Action
-changes are validated and reloaded while the bridge runs. `hidKeys` maps a
-logical button to a unique `F13` through `F24` key; omitted buttons retain their
-stock OAI codes. It is empty by default:
+changes are validated and reloaded while the bridge runs. `hidKeys` maps the
+seven action switches to unique `F13` through `F24` keys, `null` disables a
+switch, and an omitted switch retains its stock OAI code. It is empty by
+default. For example, the stock wide keycap spans action switches 5 and 6, so
+this emits one F19:
 
 ```json
-"hidKeys": { "5": "F17" }
+"hidKeys": { "5": "F19", "6": null }
 ```
 
 These are ordinary system-wide keyboard keys, so select keys that are not bound

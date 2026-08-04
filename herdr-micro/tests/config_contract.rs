@@ -3,7 +3,7 @@ use serde_json::json;
 
 fn controls(button: serde_json::Value) -> serde_json::Value {
     json!({
-        "version": 2,
+        "version": 3,
         "buttons": { "1": button },
         "hidKeys": {},
         "dial": { "clockwise": null, "counterclockwise": null, "press": null },
@@ -21,8 +21,10 @@ fn config_rejects_extra_gesture_fields() {
 }
 
 #[test]
-fn controls_expose_six_logical_stock_buttons() {
+fn controls_expose_seven_physical_buttons() {
     let mut config = controls(serde_json::Value::Null);
     config["buttons"]["7"] = serde_json::Value::Null;
+    assert!(parse_controls(&config).is_ok());
+    config["buttons"]["8"] = serde_json::Value::Null;
     assert!(parse_controls(&config).is_err());
 }

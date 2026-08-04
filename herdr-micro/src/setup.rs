@@ -46,13 +46,14 @@ const REQUIRED_OAI_CODES: [&str; 16] = [
     "KV_OAI_ENC_CW",
     "KV_OAI_ENC_CLK",
 ];
-const BUTTON_KEY_SLOTS: [(u8, &str, &str); 6] = [
+const BUTTON_KEY_SLOTS: [(u8, &str, &str); 7] = [
     (1, "/keymap/2/0", "KV_OAI_ACT06"),
     (2, "/keymap/2/1", "KV_OAI_ACT07"),
     (3, "/keymap/2/2", "KV_OAI_ACT08"),
     (4, "/keymap/2/3", "KV_OAI_ACT09"),
     (5, "/keymap/3/0", "KV_OAI_ACT10"),
-    (6, "/keymap/3/2", "KV_OAI_ACT12"),
+    (6, "/keymap/3/1", "KV_OAI_ACT11"),
+    (7, "/keymap/3/2", "KV_OAI_ACT12"),
 ];
 
 /// Resolve the plugin directory without depending on the action's current
@@ -154,7 +155,7 @@ pub fn configure_micro(keymap: &mut Value) -> Result<()> {
 
 fn configure_micro_with_hid(
     keymap: &mut Value,
-    hid_keys: &std::collections::BTreeMap<u8, String>,
+    hid_keys: &std::collections::BTreeMap<u8, Option<String>>,
 ) -> Result<()> {
     let managed_process = layer_identity(HERDR_LAYER).process;
     let mut managed_ids: Vec<Value> = keymap
@@ -294,7 +295,7 @@ fn validate_button_slots(layout: &Value) -> Result<()> {
 
 fn set_hid_codes(
     layout: &mut Value,
-    hid_keys: &std::collections::BTreeMap<u8, String>,
+    hid_keys: &std::collections::BTreeMap<u8, Option<String>>,
 ) -> Result<()> {
     for (button, pointer, stock) in BUTTON_KEY_SLOTS {
         let slot = layout
@@ -304,6 +305,7 @@ fn set_hid_codes(
             .as_str()
             .ok_or_else(|| anyhow!("Layer 2 button {button} must be a key code"))?;
         if current != stock
+            && current != "KC_NONE"
             && current
                 .strip_prefix("KC_")
                 .and_then(function_key_number)
@@ -311,12 +313,11 @@ fn set_hid_codes(
         {
             bail!("Layer 2 button {button} has unexpected code {current}");
         }
-        *slot = Value::String(
-            hid_keys
-                .get(&button)
-                .map(|key| format!("KC_{key}"))
-                .unwrap_or_else(|| stock.into()),
-        );
+        *slot = Value::String(match hid_keys.get(&button) {
+            Some(Some(key)) => format!("KC_{key}"),
+            Some(None) => "KC_NONE".into(),
+            None => stock.into(),
+        });
     }
     Ok(())
 }
@@ -644,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_hid_keys_change_only_managed_layer_two_buttons() {
+    fn configured_hid_keys_change_only_managed_layer_two_switches() {
         let source = oai_layout();
         let mut keymap = json!({
             "profiles": [{ "layers": [
@@ -654,10 +655,14 @@ mod tests {
         });
         configure_micro_with_hid(
             &mut keymap,
-            &std::collections::BTreeMap::from([(5, "F19".into())]),
+            &std::collections::BTreeMap::from([(5, Some("F19".into()))]),
         )
         .unwrap();
-        let hid_keys = std::collections::BTreeMap::from([(2, "F16".into()), (5, "F17".into())]);
+        let hid_keys = std::collections::BTreeMap::from([
+            (2, Some("F16".into())),
+            (5, Some("F17".into())),
+            (6, None),
+        ]);
         configure_micro_with_hid(&mut keymap, &hid_keys).unwrap();
         assert_eq!(
             keymap.pointer("/profiles/0/layers/1/layout/keymap/3/0"),
@@ -666,6 +671,15 @@ mod tests {
         assert_eq!(
             keymap.pointer("/profiles/0/layers/1/layout/keymap/2/1"),
             Some(&json!("KC_F16"))
+        );
+        assert_eq!(
+            keymap.pointer("/profiles/0/layers/1/layout/keymap/3/1"),
+            Some(&json!("KC_NONE"))
+        );
+        configure_micro_with_hid(&mut keymap, &Default::default()).unwrap();
+        assert_eq!(
+            keymap.pointer("/profiles/0/layers/1/layout/keymap/3/1"),
+            Some(&json!("KV_OAI_ACT11"))
         );
     }
 

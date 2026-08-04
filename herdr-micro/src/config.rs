@@ -96,19 +96,19 @@ impl Binding {
 /// Firmware labels are reversed: `ENC_CC` means clockwise and `ENC_CW` means counterclockwise.
 pub fn key_binding(config: &Controls, key: &str, action: i64) -> Option<Binding> {
     if matches!(action, 0 | 1) {
-        if let Some((button, _)) = config.hid_keys.iter().find(|(_, hid_key)| *hid_key == key) {
+        if let Some(button) = config
+            .hid_keys
+            .iter()
+            .find_map(|(button, hid_key)| (hid_key.as_deref() == Some(key)).then_some(button))
+        {
             return config.buttons.get(button).cloned().flatten();
         }
         if let Some(number) = key.strip_prefix("ACT").and_then(|n| n.parse::<u8>().ok()) {
-            let button = match number {
-                6..=10 => number - 5,
-                // The stock wide cap presses ACT10 and ACT11 together. ACT10
-                // is its one logical button; ACT11 must never dispatch again.
-                11 => return None,
-                12 => 6,
-                _ => return None,
-            };
-            if let Some(binding) = config.buttons.get(&button) {
+            if let Some(binding) = number
+                .checked_sub(5)
+                .filter(|button| (1..=7).contains(button))
+                .and_then(|button| config.buttons.get(&button))
+            {
                 return binding.clone();
             }
         }
@@ -126,7 +126,7 @@ pub fn key_binding(config: &Controls, key: &str, action: i64) -> Option<Binding>
 #[derive(Clone, Debug, PartialEq)]
 pub struct Controls {
     pub buttons: std::collections::BTreeMap<u8, Option<Binding>>,
-    pub hid_keys: std::collections::BTreeMap<u8, String>,
+    pub hid_keys: std::collections::BTreeMap<u8, Option<String>>,
     pub dial: Dial,
     pub joystick: Joystick,
 }
@@ -157,8 +157,8 @@ pub fn parse_controls(value: &Value) -> Result<Controls, String> {
         &["version", "buttons", "hidKeys", "dial", "joystick"],
         "control",
     )?;
-    if root.get("version") != Some(&Value::from(2)) {
-        return Err("version must be 2".into());
+    if root.get("version") != Some(&Value::from(3)) {
+        return Err("version must be 3".into());
     }
     let buttons = object(req(root, "buttons")?, "buttons")?;
     let mut parsed_buttons = std::collections::BTreeMap::new();
@@ -166,7 +166,7 @@ pub fn parse_controls(value: &Value) -> Result<Controls, String> {
         let id = key
             .parse::<u8>()
             .ok()
-            .filter(|n| (1..=6).contains(n))
+            .filter(|n| (1..=7).contains(n))
             .ok_or_else(|| format!("invalid button: {key}"))?;
         parsed_buttons.insert(id, parse_binding(binding, &format!("buttons.{key}"))?);
     }
@@ -177,16 +177,19 @@ pub fn parse_controls(value: &Value) -> Result<Controls, String> {
         let button = button
             .parse::<u8>()
             .ok()
-            .filter(|button| (1..=6).contains(button))
+            .filter(|button| (1..=7).contains(button))
             .ok_or_else(|| format!("invalid HID button: {button}"))?;
-        let key = key
-            .as_str()
-            .filter(|key| function_key_number(key).is_some())
-            .ok_or_else(|| format!("hidKeys.{button} must be F13 through F24"))?;
-        if !used_hid_keys.insert(key) {
-            return Err(format!("duplicate HID key: {key}"));
+        let key = match key {
+            Value::Null => None,
+            Value::String(key) if function_key_number(key).is_some() => Some(key.clone()),
+            _ => return Err(format!("hidKeys.{button} must be null or F13 through F24")),
+        };
+        if let Some(key) = &key {
+            if !used_hid_keys.insert(key.clone()) {
+                return Err(format!("duplicate HID key: {key}"));
+            }
         }
-        parsed_hid_keys.insert(button, key.to_owned());
+        parsed_hid_keys.insert(button, key);
     }
     let dial_v = object(req(root, "dial")?, "dial")?;
     fields(dial_v, &["clockwise", "counterclockwise", "press"], "dial")?;
@@ -552,7 +555,7 @@ pub fn load_lighting(path: &Path) -> Result<LightingConfig, String> {
     parse_lighting(read_json(path)?)
 }
 fn controls_json() -> Value {
-    serde_json::json!({"version":2,"buttons":{"1":null,"2":null,"3":{"byAgent":{"codex":{"action":"fast"},"pi":{"action":"fast"},"default":null}},"4":{"action":"prompt","prompt":"/copy","submit":true},"5":null,"6":{"action":"submit"}},"hidKeys":{},"dial":{"clockwise":{"action":"effort","direction":"raise"},"counterclockwise":{"action":"effort","direction":"lower"},"press":{"action":"prompt","prompt":"/model","submit":true}},"joystick":{"engageDistance":0.75,"releaseDistance":0.3,"up":{"action":"scroll","direction":"up","percent":50},"down":{"action":"scroll","direction":"down","percent":50},"left":{"action":"focus-pane","direction":"left"},"right":{"action":"focus-pane","direction":"right"}}})
+    serde_json::json!({"version":3,"buttons":{"1":null,"2":null,"3":{"byAgent":{"codex":{"action":"fast"},"pi":{"action":"fast"},"default":null}},"4":{"action":"prompt","prompt":"/copy","submit":true},"5":null,"6":null,"7":{"action":"submit"}},"hidKeys":{},"dial":{"clockwise":{"action":"effort","direction":"raise"},"counterclockwise":{"action":"effort","direction":"lower"},"press":{"action":"prompt","prompt":"/model","submit":true}},"joystick":{"engageDistance":0.75,"releaseDistance":0.3,"up":{"action":"scroll","direction":"up","percent":50},"down":{"action":"scroll","direction":"down","percent":50},"left":{"action":"focus-pane","direction":"left"},"right":{"action":"focus-pane","direction":"right"}}})
 }
 fn read_json(path: &Path) -> Result<Value, String> {
     serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
@@ -573,28 +576,32 @@ mod tests {
                 }))
             ));
         }
-        assert!(key_binding(&controls, "ACT11", 1).is_none());
+        assert_eq!(
+            key_binding(&controls, "ACT11", 1),
+            controls.buttons[&6].clone()
+        );
         assert_eq!(
             key_binding(&controls, "ACT10", 1),
             controls.buttons[&5].clone()
         );
         assert!(key_binding(&controls, "F17", 1).is_none());
         let mut remapped = controls_json();
-        remapped["hidKeys"] = serde_json::json!({"3":"F17"});
+        remapped["hidKeys"] = serde_json::json!({"3":"F17","6":null});
         let remapped = parse_controls(&remapped).unwrap();
         assert!(key_binding(&remapped, "F17", 1).is_some());
         assert_eq!(
             key_binding(&remapped, "F17", 1),
             remapped.buttons[&3].clone()
         );
-        assert!(parse_controls(&serde_json::json!({"version":2,"buttons":{},"hidKeys":{"1":"F17","2":"F17"},"dial":{},"joystick":{"engageDistance":0.75,"releaseDistance":0.3}})).is_err());
-        assert!(parse_controls(&serde_json::json!({"version":2,"buttons":{},"hidKeys":{"1":"F013"},"dial":{},"joystick":{"engageDistance":0.75,"releaseDistance":0.3}})).is_err());
+        assert_eq!(remapped.hid_keys[&6], None);
+        assert!(parse_controls(&serde_json::json!({"version":3,"buttons":{},"hidKeys":{"1":"F17","2":"F17"},"dial":{},"joystick":{"engageDistance":0.75,"releaseDistance":0.3}})).is_err());
+        assert!(parse_controls(&serde_json::json!({"version":3,"buttons":{},"hidKeys":{"1":"F013"},"dial":{},"joystick":{"engageDistance":0.75,"releaseDistance":0.3}})).is_err());
         assert_eq!(
             key_binding(&controls, "ACT12", 1),
-            controls.buttons[&6].clone()
+            controls.buttons[&7].clone()
         );
-        assert!(parse_controls(&serde_json::json!({"version":2,"buttons":{},"hidKeys":{},"dial":{"clockwise":null,"counterclockwise":null,"press":null,"extra":true},"joystick":{"engageDistance":0.75,"releaseDistance":0.3}})).is_err());
-        assert!(parse_controls(&serde_json::json!({"version":2,"buttons":{"7":null},"hidKeys":{},"dial":{"clockwise":null,"counterclockwise":null,"press":null},"joystick":{"engageDistance":0.75,"releaseDistance":0.3}})).is_err());
+        assert!(parse_controls(&serde_json::json!({"version":3,"buttons":{},"hidKeys":{},"dial":{"clockwise":null,"counterclockwise":null,"press":null,"extra":true},"joystick":{"engageDistance":0.75,"releaseDistance":0.3}})).is_err());
+        assert!(parse_controls(&serde_json::json!({"version":3,"buttons":{"8":null},"hidKeys":{},"dial":{"clockwise":null,"counterclockwise":null,"press":null},"joystick":{"engageDistance":0.75,"releaseDistance":0.3}})).is_err());
     }
     #[test]
     fn validates_effort_and_lighting() {

@@ -49,7 +49,7 @@ const WORK_QUEUE_CAPACITY: usize = 16;
 pub const DAEMON_PROTOCOL_VERSION: u32 = 1;
 
 fn runtime_controls(
-    active_hid_keys: &BTreeMap<u8, String>,
+    active_hid_keys: &BTreeMap<u8, Option<String>>,
     mut next: Controls,
 ) -> (Controls, bool) {
     let pending = next.hid_keys != *active_hid_keys;
@@ -1386,7 +1386,7 @@ mod tests {
         let initial = crate::config::default_controls();
         let active = initial.hid_keys.clone();
         let mut changed = initial.clone();
-        changed.hid_keys.insert(5, "F17".into());
+        changed.hid_keys.insert(5, Some("F17".into()));
         let (runtime, pending) = runtime_controls(&active, changed);
         assert!(pending);
         assert_eq!(runtime.hid_keys, initial.hid_keys);
