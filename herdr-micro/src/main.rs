@@ -3,7 +3,7 @@ use herdr_micro::{
     actions::{execute_effort_plan, plan_effort_change},
     config::{config_path, default_effort, load_effort},
     control::{ensure_state_dir, log_file, request_status, request_stop, start_daemon_versioned},
-    daemon, doctor,
+    daemon, doctor, helper_install,
     herdr::{herdr_bin, run_command},
     setup,
 };
@@ -18,7 +18,7 @@ use std::{
     time::Duration,
 };
 
-const USAGE: &str = "usage: herdr-micro <start|herdr-status|doctor|effort raise|lower|status|configure-controls|setup-pi-effort|stop|setup>";
+const USAGE: &str = "usage: herdr-micro <start|herdr-status|doctor|effort raise|lower|status|configure-controls|setup-pi-effort|stop|setup|install-helper|uninstall-helper>";
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
@@ -54,6 +54,16 @@ fn run(args: Vec<OsString>) -> Result<i32> {
         "setup-pi-effort" if rest.is_empty() => setup_pi_effort(),
         "stop" if rest.is_empty() => stop(),
         "setup" if rest.is_empty() => setup_micro(),
+        "install-helper" if rest.is_empty() => {
+            helper_install::install()?;
+            println!("Installed privileged Codex Micro USB helper");
+            Ok(0)
+        }
+        "uninstall-helper" if rest.is_empty() => {
+            helper_install::uninstall()?;
+            println!("Uninstalled privileged Codex Micro USB helper");
+            Ok(0)
+        }
         _ => bail!(USAGE),
     }
 }
@@ -65,6 +75,7 @@ fn start() -> Result<i32> {
         env!("CARGO_PKG_VERSION"),
         daemon::DAEMON_PROTOCOL_VERSION,
         || {
+            helper_install::verify_installed()?;
             ensure_state_dir()?;
             let log = OpenOptions::new()
                 .append(true)
@@ -138,7 +149,7 @@ fn effort(args: &[OsString]) -> Result<i32> {
     } else {
         default_effort()
     };
-    let plan = plan_effort_change(agent, direction, pane_id, &config)?;
+    let plan = plan_effort_change(agent, direction, pane_id, &config, 1)?;
     execute_effort_plan(&herdr_bin(), &plan, |bin, args| {
         run_command(bin, args, None).map(|_| ())
     })?;

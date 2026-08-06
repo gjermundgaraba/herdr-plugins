@@ -156,6 +156,7 @@ pub fn plan_effort_change(
     direction: &str,
     pane_id: &str,
     config: &EffortConfig,
+    count: usize,
 ) -> Result<Vec<EffortStep>> {
     if !matches!(direction, "raise" | "lower") {
         bail!("direction must be raise or lower, got {direction}");
@@ -163,9 +164,17 @@ pub fn plan_effort_change(
     if pane_id.is_empty() {
         bail!("focused Herdr pane is required");
     }
+    if count == 0 {
+        bail!("effort change count must be nonzero");
+    }
     let step = |args: Vec<&str>, wait_after_ms| EffortStep {
         args: args.into_iter().map(str::to_owned).collect(),
         wait_after_ms,
+    };
+    let repeated_keys = |key: &str| {
+        let mut args = vec!["pane".into(), "send-keys".into(), pane_id.into()];
+        args.extend(std::iter::repeat(key.to_owned()).take(count));
+        args
     };
     match agent {
         "codex" => {
@@ -175,39 +184,32 @@ pub fn plan_effort_change(
             }
             .filter(|key| !key.trim().is_empty())
             .ok_or_else(|| anyhow!("Codex {direction} effort shortcut is not configured"))?;
-            Ok(vec![step(vec!["pane", "send-keys", pane_id, key], None)])
+            Ok(vec![EffortStep {
+                args: repeated_keys(key),
+                wait_after_ms: None,
+            }])
         }
         "claude" => Ok(vec![
             step(vec!["pane", "send-text", pane_id, "/effort"], None),
             step(vec!["pane", "send-keys", pane_id, "enter"], Some(150)),
-            step(
-                vec![
-                    "pane",
-                    "send-keys",
-                    pane_id,
-                    if direction == "raise" {
-                        "right"
-                    } else {
-                        "left"
-                    },
-                ],
-                Some(100),
-            ),
+            EffortStep {
+                args: repeated_keys(if direction == "raise" {
+                    "right"
+                } else {
+                    "left"
+                }),
+                wait_after_ms: Some(100),
+            },
             step(vec!["pane", "send-keys", pane_id, "enter"], None),
         ]),
-        "pi" => Ok(vec![step(
-            vec![
-                "pane",
-                "send-keys",
-                pane_id,
-                if direction == "raise" {
-                    "ctrl+shift+right"
-                } else {
-                    "ctrl+shift+left"
-                },
-            ],
-            None,
-        )]),
+        "pi" => Ok(vec![EffortStep {
+            args: repeated_keys(if direction == "raise" {
+                "ctrl+shift+right"
+            } else {
+                "ctrl+shift+left"
+            }),
+            wait_after_ms: None,
+        }]),
         other => bail!(
             "unsupported focused agent: {}",
             if other.is_empty() { "none" } else { other }
@@ -320,7 +322,7 @@ pub fn automatic_layer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::default_effort;
+    use crate::config::{default_effort, EffortConfig, EffortKeys};
     use serde_json::json;
 
     fn agent(kind: &str) -> Agent {
@@ -344,11 +346,38 @@ mod tests {
             fast_mode_plan(&agent("pi")).unwrap()[1],
             vec!["agent", "send-keys", "p1", "enter"]
         );
+        let effort = EffortConfig {
+            codex: EffortKeys {
+                raise: Some("ctrl+shift+right".into()),
+                lower: Some("ctrl+shift+left".into()),
+            },
+        };
         assert_eq!(
-            plan_effort_change("claude", "lower", "p2", &default_effort()).unwrap()[2].args,
-            vec!["pane", "send-keys", "p2", "left"]
+            plan_effort_change("claude", "lower", "p2", &effort, 3).unwrap()[2].args,
+            vec!["pane", "send-keys", "p2", "left", "left", "left"]
         );
-        assert!(plan_effort_change("codex", "raise", "p1", &default_effort()).is_err());
+        assert_eq!(
+            plan_effort_change("pi", "raise", "p2", &effort, 2).unwrap()[0].args,
+            vec![
+                "pane",
+                "send-keys",
+                "p2",
+                "ctrl+shift+right",
+                "ctrl+shift+right"
+            ]
+        );
+        assert_eq!(
+            plan_effort_change("codex", "raise", "p1", &effort, 2).unwrap()[0].args,
+            vec![
+                "pane",
+                "send-keys",
+                "p1",
+                "ctrl+shift+right",
+                "ctrl+shift+right"
+            ]
+        );
+        assert!(plan_effort_change("codex", "raise", "p1", &default_effort(), 1).is_err());
+        assert!(plan_effort_change("codex", "raise", "p1", &effort, 0).is_err());
     }
     #[test]
     fn known_chatgpt_bundles_select_layer_one() {

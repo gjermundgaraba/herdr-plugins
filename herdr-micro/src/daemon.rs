@@ -6,10 +6,11 @@ use serde_json::{json, Value};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    env,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError},
-        Arc, Mutex,
+        mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError},
+        Arc, Mutex, OnceLock,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -26,16 +27,17 @@ use crate::{
         EffortDirection, VerticalDirection,
     },
     control::listen_for_control,
-    device::{DeviceEvent, MicroDevice},
+    device::DeviceEvent,
     gestures::{Fired, GestureDispatcher},
     ghostty::{
-        focused_session, inspect_ghostty, probe_session_terminals, GhosttyState,
-        SessionTerminalMapping,
+        focused_session, focused_terminal_id, inspect_ghostty, probe_session_terminals,
+        GhosttyState, SessionTerminalMapping,
     },
     herdr::{
         current_environment, discover_sessions, herdr_bin, run_command, run_json,
         session_environment, Environment,
     },
+    hid::HidClient,
     macos,
     protocol::{
         aggregate_lighting, assign_slots, device_owner, joystick_event, slot_lighting, SLOT_COUNT,
@@ -43,18 +45,20 @@ use crate::{
 };
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const ROUTING_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+const DEVICE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const NO_SESSIONS_SHUTDOWN: Duration = Duration::from_secs(60);
-const MAPPING_REPROBE: Duration = Duration::from_secs(30);
 const WORK_QUEUE_CAPACITY: usize = 16;
+const LATENCY_TRACE_ENV: &str = "HERDR_MICRO_LATENCY_TRACE";
 pub const DAEMON_PROTOCOL_VERSION: u32 = 1;
 
 fn runtime_controls(
-    active_hid_keys: &BTreeMap<u8, Option<String>>,
+    active_device_keys: &BTreeMap<u8, Option<String>>,
     mut next: Controls,
 ) -> (Controls, bool) {
-    let pending = next.hid_keys != *active_hid_keys;
+    let pending = next.action_device_keys != *active_device_keys;
     if pending {
-        next.hid_keys.clone_from(active_hid_keys);
+        next.action_device_keys.clone_from(active_device_keys);
     }
     (next, pending)
 }
@@ -65,6 +69,43 @@ fn log(message: impl AsRef<str>) {
         format_timestamp(SystemTime::now()),
         message.as_ref()
     );
+}
+
+fn latency_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env::var_os(LATENCY_TRACE_ENV).is_some())
+}
+
+fn trace_latency(stage: &'static str, kind: Option<&'static str>, elapsed: Duration) {
+    if latency_trace_enabled() {
+        log(format!(
+            "latency stage={stage}{} micros={}",
+            kind.map_or_else(String::new, |kind| format!(" kind={kind}")),
+            elapsed.as_micros()
+        ));
+    }
+}
+
+struct LatencySpan {
+    stage: &'static str,
+    kind: Option<&'static str>,
+    started: Instant,
+}
+
+impl LatencySpan {
+    fn new(stage: &'static str, kind: Option<&'static str>) -> Self {
+        Self {
+            stage,
+            kind,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for LatencySpan {
+    fn drop(&mut self) {
+        trace_latency(self.stage, self.kind, self.started.elapsed());
+    }
 }
 
 fn format_timestamp(time: SystemTime) -> String {
@@ -102,7 +143,8 @@ struct State {
     frontmost: Option<macos::Frontmost>,
     ghostty: Option<GhosttyState>,
     active_layer: Option<usize>,
-    last_open_error: String,
+    last_device_error: String,
+    output_errors: BTreeMap<String, String>,
     last_herdr_error: String,
     last_frontmost_error: String,
     last_controls_error: String,
@@ -113,7 +155,8 @@ struct State {
     managed_aggregate_zones: HashSet<String>,
     no_sessions_at: Option<Instant>,
     next_mapping_probe: Option<Instant>,
-    last_joystick_sector: Option<u8>,
+    next_device_open: Option<Instant>,
+    device_restore_pending: bool,
 }
 
 impl State {
@@ -126,8 +169,17 @@ impl State {
     }
 
     fn status(&self) -> Value {
+        let output_error = (!self.output_errors.is_empty()).then(|| {
+            self.output_errors
+                .values()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ")
+        });
         json!({
             "device": if self.owner.is_some() { "yielded" } else { &self.device_state },
+            "deviceError": (!self.last_device_error.is_empty()).then_some(&self.last_device_error),
+            "outputError": output_error,
             "owner": self.owner,
             "session": self.selected_session,
             "routing": if self.routing_ready { "ready" } else if self.selected_session.is_some() { "unavailable" } else { "none" },
@@ -156,12 +208,6 @@ impl State {
         })
     }
 
-    fn selected(&self) -> Option<String> {
-        self.routing_ready
-            .then(|| self.selected_session.clone())
-            .flatten()
-    }
-
     fn revoke_routing(&mut self) {
         if self.routing_ready {
             self.routing_ready = false;
@@ -175,6 +221,53 @@ impl State {
 }
 
 #[derive(Clone)]
+struct InputContext {
+    controls: Controls,
+    session: Option<String>,
+    target: Option<Agent>,
+    slots: Vec<Option<Agent>>,
+    routing_ready: bool,
+    generation: u64,
+}
+
+impl InputContext {
+    fn new(controls: Controls) -> Self {
+        Self {
+            controls,
+            session: None,
+            target: None,
+            slots: vec![None; SLOT_COUNT],
+            routing_ready: false,
+            generation: 0,
+        }
+    }
+
+    fn selected(&self, routing_generation: &AtomicU64) -> Option<String> {
+        (self.routing_ready && self.generation == routing_generation.load(Ordering::Acquire))
+            .then(|| self.session.clone())
+            .flatten()
+    }
+}
+
+#[derive(Default)]
+struct InputState {
+    gestures: GestureDispatcher,
+    last_joystick_sector: Option<u8>,
+    emitted_keys: HashMap<String, String>,
+    pending_releases: HashSet<String>,
+    next_release_retry: Option<Instant>,
+}
+
+enum InputNotice {
+    Disconnected(String),
+    Output {
+        source: String,
+        edge: &'static str,
+        error: Option<String>,
+    },
+}
+
+#[derive(Clone)]
 enum Work {
     Binding {
         binding: Box<Binding>,
@@ -182,12 +275,14 @@ enum Work {
         session: String,
         target: Option<Agent>,
         generation: u64,
+        queued_at: Instant,
     },
     FocusSlot {
         pane_id: String,
         source: String,
         session: String,
         generation: u64,
+        queued_at: Instant,
     },
 }
 
@@ -197,9 +292,64 @@ impl Work {
             Self::Binding { generation, .. } | Self::FocusSlot { generation, .. } => *generation,
         }
     }
+
+    fn queued_at(&self) -> Instant {
+        match self {
+            Self::Binding { queued_at, .. } | Self::FocusSlot { queued_at, .. } => *queued_at,
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Binding { binding, .. } => match binding.as_ref() {
+                Binding::Action(action) => action_name(action),
+                _ => "binding",
+            },
+            Self::FocusSlot { .. } => "focus-slot",
+        }
+    }
+
+    fn same_effort(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Binding {
+                    binding: first,
+                    session: first_session,
+                    target: first_target,
+                    generation: first_generation,
+                    ..
+                },
+                Self::Binding {
+                    binding: second,
+                    session: second_session,
+                    target: second_target,
+                    generation: second_generation,
+                    ..
+                },
+            ) => match (first.as_ref(), second.as_ref()) {
+                (
+                    Binding::Action(Action::Effort {
+                        direction: first_direction,
+                    }),
+                    Binding::Action(Action::Effort {
+                        direction: second_direction,
+                    }),
+                ) => {
+                    first_direction == second_direction
+                        && first_session == second_session
+                        && agent_identity(first_target.as_ref())
+                            == agent_identity(second_target.as_ref())
+                        && first_generation == second_generation
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
 }
 
 fn list_agents(session: &str, base: &Environment) -> Result<Vec<Agent>> {
+    let _latency = LatencySpan::new("agent-list", None);
     let args = vec!["agent".into(), "list".into()];
     parse_agents(&run_json(
         &herdr_bin(),
@@ -253,12 +403,21 @@ fn action_name(action: &Action) -> &'static str {
     }
 }
 
-fn run_herdr(args: Vec<String>, session: &str, base: &Environment) -> Result<Value> {
+fn run_herdr_json(args: Vec<String>, session: &str, base: &Environment) -> Result<Value> {
     run_json(
         &herdr_bin(),
         &args,
         Some(&session_environment(session, base)),
     )
+}
+
+fn run_herdr(args: Vec<String>, session: &str, base: &Environment) -> Result<()> {
+    run_command(
+        &herdr_bin(),
+        &args,
+        Some(&session_environment(session, base)),
+    )
+    .map(|_| ())
 }
 
 fn execute_scroll(
@@ -273,12 +432,12 @@ fn execute_scroll(
         log(format!("scroll ignored: {session} is not frontmost"));
         return Ok(false);
     }
-    let pane = run_herdr(vec!["pane".into(), "current".into()], session, base)?;
+    let pane = run_herdr_json(vec!["pane".into(), "current".into()], session, base)?;
     if pane.pointer("/result/pane/pane_id").and_then(Value::as_str) != Some(expected_pane) {
         log(format!("scroll ignored: focused pane changed in {session}"));
         return Ok(false);
     }
-    let layout = run_herdr(vec!["pane".into(), "layout".into()], session, base)?;
+    let layout = run_herdr_json(vec!["pane".into(), "layout".into()], session, base)?;
     let plan = scroll_plan(
         pane.pointer("/result/pane").unwrap_or(&Value::Null),
         layout.pointer("/result/layout").unwrap_or(&Value::Null),
@@ -314,14 +473,14 @@ fn session_is_frontmost(
     session: &str,
     mappings: &Arc<Mutex<Vec<SessionTerminalMapping>>>,
 ) -> Result<bool> {
-    if macos::frontmost()?.process != crate::actions::GHOSTTY_PROCESS {
+    if !macos::frontmost_bundle_is(crate::actions::GHOSTTY_PROCESS) {
         return Ok(false);
     }
-    let mappings = mappings
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .clone();
-    Ok(focused_session(&mappings, &inspect_ghostty()?).as_deref() == Some(session))
+    let terminal = focused_terminal_id()?;
+    let mappings = mappings.lock().unwrap_or_else(|error| error.into_inner());
+    Ok(mappings
+        .iter()
+        .any(|mapping| mapping.session_name == session && mapping.terminal_id == terminal))
 }
 
 fn execute_action(
@@ -330,6 +489,7 @@ fn execute_action(
     session: &str,
     base: &Environment,
     mappings: &Arc<Mutex<Vec<SessionTerminalMapping>>>,
+    repeat: usize,
 ) -> Result<bool> {
     match action {
         Action::Prompt { prompt, submit } => {
@@ -355,9 +515,10 @@ fn execute_action(
                 EffortDirection::Raise => "raise",
                 EffortDirection::Lower => "lower",
             };
-            let plan = plan_effort_change(&current.agent, direction, &current.pane_id, &effort)?;
+            let plan =
+                plan_effort_change(&current.agent, direction, &current.pane_id, &effort, repeat)?;
             execute_effort_plan(&herdr_bin(), &plan, |bin, args| {
-                run_json(bin, args, Some(&session_environment(session, base))).map(|_| ())
+                run_command(bin, args, Some(&session_environment(session, base))).map(|_| ())
             })?;
         }
         Action::FocusPane { direction } => {
@@ -398,10 +559,28 @@ fn action_worker(
     routing_generation: Arc<AtomicU64>,
     stopping: Arc<AtomicBool>,
 ) {
+    let mut deferred = None;
     while !stopping.load(Ordering::Acquire) {
-        let Ok(work) = receiver.recv_timeout(Duration::from_millis(50)) else {
-            continue;
+        let work = match deferred
+            .take()
+            .map(Ok)
+            .unwrap_or_else(|| receiver.recv_timeout(Duration::from_millis(50)))
+        {
+            Ok(work) => work,
+            Err(_) => continue,
         };
+        let kind = work.kind();
+        trace_latency("queue", Some(kind), work.queued_at().elapsed());
+        let _action_latency = LatencySpan::new("action", Some(kind));
+        let mut repeat = 1;
+        while let Ok(next) = receiver.try_recv() {
+            if work.same_effort(&next) {
+                repeat += 1;
+            } else {
+                deferred = Some(next);
+                break;
+            }
+        }
         let generation = work.generation();
         if generation != routing_generation.load(Ordering::Acquire) {
             log("control ignored: stale Herdr routing");
@@ -434,6 +613,7 @@ fn action_worker(
                 session,
                 ..
             } => {
+                let _command_latency = LatencySpan::new("command", Some("focus-slot"));
                 let result = run_herdr(
                     vec!["agent".into(), "focus".into(), pane_id.clone()],
                     &session,
@@ -442,7 +622,7 @@ fn action_worker(
                 if result.is_ok() {
                     log(format!("{source}: focused {session}/{pane_id}"));
                 }
-                result.map(|_| ())
+                result
             }
             Work::Binding {
                 binding,
@@ -453,7 +633,7 @@ fn action_worker(
             } => {
                 // This lookup belongs in the serialized worker: it is the last
                 // possible moment before delivery, not the physical event time.
-                let result = (|| {
+                (|| {
                     let agents = list_agents(&session, &base)?;
                     if generation != routing_generation.load(Ordering::Acquire) {
                         log(format!("{source} ignored: stale Herdr routing"));
@@ -469,18 +649,27 @@ fn action_worker(
                     else {
                         return Ok(());
                     };
-                    if execute_action(&action, current, &session, &base, &mappings)? {
+                    let executed = {
+                        let _command_latency =
+                            LatencySpan::new("command", Some(action_name(&action)));
+                        execute_action(&action, current, &session, &base, &mappings, repeat)
+                    }?;
+                    if executed {
                         log(format!(
-                            "{source}: {} in {session}{}",
+                            "{source}: {}{} in {session}{}",
                             action_name(&action),
+                            if repeat > 1 {
+                                format!(" x{repeat}")
+                            } else {
+                                String::new()
+                            },
                             current
                                 .map(|agent| format!(" for {} in {}", agent.agent, agent.pane_id))
                                 .unwrap_or_default()
                         ));
                     }
                     Ok(())
-                })();
-                result
+                })()
             }
         };
         if let Err(error) = result {
@@ -505,6 +694,7 @@ fn queue_binding(
                 session,
                 target,
                 generation,
+                queued_at: Instant::now(),
             };
             if let Err(error) = sender.try_send(work) {
                 log(match error {
@@ -535,17 +725,157 @@ fn handle_fired(
     }
 }
 
+fn agent_slot(key: &str) -> Option<usize> {
+    key.strip_prefix("AG0")
+        .and_then(|index| index.parse::<usize>().ok())
+        .filter(|index| *index < SLOT_COUNT)
+}
+
+fn emitted_function_key<'a>(controls: &'a Controls, source: &'a str) -> Option<&'a str> {
+    agent_slot(source)
+        .and_then(|index| {
+            controls
+                .agent_macos_keys
+                .get(&u8::try_from(index + 1).ok()?)
+        })
+        .map(String::as_str)
+        .or_else(|| {
+            let button = controls
+                .action_device_keys
+                .iter()
+                .find_map(|(button, key)| (key.as_deref() == Some(source)).then_some(button))?;
+            controls.action_macos_keys.get(button)?.as_deref()
+        })
+}
+
+fn emit_key_edge(
+    state: &mut InputState,
+    context: &InputContext,
+    routing_generation: &AtomicU64,
+    notices: &Sender<InputNotice>,
+    source: &str,
+    key: Option<&str>,
+    down: bool,
+) {
+    if down {
+        let Some(key) = key else { return };
+        if state.pending_releases.contains(source) {
+            release_emitted_key(state, notices, source);
+        }
+        if state.emitted_keys.contains_key(source)
+            || context.selected(routing_generation).is_none()
+            || !macos::frontmost_bundle_is(crate::actions::GHOSTTY_PROCESS)
+        {
+            return;
+        }
+        match macos::post_function_key(key, true) {
+            Ok(()) => {
+                state.emitted_keys.insert(source.into(), key.into());
+                state.pending_releases.remove(source);
+                let _ = notices.send(InputNotice::Output {
+                    source: source.into(),
+                    edge: "emission",
+                    error: None,
+                });
+            }
+            Err(error) => {
+                let _ = notices.send(InputNotice::Output {
+                    source: source.into(),
+                    edge: "emission",
+                    error: Some(error.to_string()),
+                });
+            }
+        }
+        return;
+    }
+    release_emitted_key(state, notices, source);
+}
+
+fn release_emitted_key(state: &mut InputState, notices: &Sender<InputNotice>, source: &str) {
+    let Some(key) = state.emitted_keys.get(source).cloned() else {
+        return;
+    };
+    match macos::post_function_key(&key, false) {
+        Ok(()) => {
+            state.emitted_keys.remove(source);
+            state.pending_releases.remove(source);
+            if state.pending_releases.is_empty() {
+                state.next_release_retry = None;
+            }
+            let _ = notices.send(InputNotice::Output {
+                source: source.into(),
+                edge: "release",
+                error: None,
+            });
+        }
+        Err(error) => {
+            state.pending_releases.insert(source.into());
+            state.next_release_retry = Some(Instant::now() + Duration::from_millis(250));
+            let _ = notices.send(InputNotice::Output {
+                source: source.into(),
+                edge: "release",
+                error: Some(error.to_string()),
+            });
+        }
+    }
+}
+
+fn output_failure(state: &mut State, source: &str, edge: &str, error: String) {
+    let message = format!("{source} macOS key {edge} failed: {error}");
+    if state.output_errors.get(source) != Some(&message) {
+        log(&message);
+        state.output_errors.insert(source.into(), message);
+    }
+}
+
+fn output_succeeded(state: &mut State, source: &str) {
+    state.output_errors.remove(source);
+}
+
+fn device_failure(state: &mut State, context: &str, error: String) {
+    state.device_state = "helper-error".into();
+    if state.last_device_error != error {
+        log(format!("{context}: {error}"));
+        state.last_device_error = error;
+    }
+}
+
+fn device_disconnected(state: &mut State, error: String) {
+    device_failure(state, "device disconnected", error);
+    state.device_restore_pending = true;
+    state.next_device_open = Some(Instant::now());
+}
+
+fn release_emitted_keys(state: &mut InputState, notices: &Sender<InputNotice>) {
+    for source in state.emitted_keys.keys().cloned().collect::<Vec<_>>() {
+        release_emitted_key(state, notices, &source);
+    }
+}
+
+fn retry_failed_releases(state: &mut InputState, notices: &Sender<InputNotice>, now: Instant) {
+    if !state.next_release_retry.is_some_and(|due| now >= due) {
+        return;
+    }
+    for source in state.pending_releases.clone() {
+        release_emitted_key(state, notices, &source);
+    }
+}
+
 fn handle_device_event(
     event: DeviceEvent,
-    state: &mut State,
-    controls: &Controls,
-    gestures: &mut GestureDispatcher,
+    state: &mut InputState,
+    context: &InputContext,
+    routing_generation: &AtomicU64,
     worker: &SyncSender<Work>,
-) -> bool {
+    notices: &Sender<InputNotice>,
+) {
+    let controls = &context.controls;
     match event {
-        DeviceEvent::Disconnected => {
-            log("device disconnected");
-            true
+        DeviceEvent::Disconnected { error } => {
+            state.gestures.clear();
+            state.last_joystick_sector = None;
+            release_emitted_keys(state, notices);
+            let _ = notices.send(InputNotice::Disconnected(error));
         }
         DeviceEvent::Joystick { angle, distance } => {
             let next = joystick_event(
@@ -568,31 +898,36 @@ fn handle_device_event(
                     worker,
                     Binding::Action(action),
                     format!("joystick {}", next.direction.unwrap()),
-                    state.selected(),
-                    state.agents.iter().find(|agent| agent.focused).cloned(),
-                    state.routing_generation(),
+                    context.selected(routing_generation),
+                    context.target.clone(),
+                    context.generation,
                 );
             }
-            false
         }
         DeviceEvent::Key { key, action } => {
-            if let Some(index) = key
-                .strip_prefix("AG0")
-                .and_then(|index| index.parse::<usize>().ok())
-                .filter(|index| *index < SLOT_COUNT)
-            {
+            if matches!(action, 0 | 1) {
+                emit_key_edge(
+                    state,
+                    context,
+                    routing_generation,
+                    notices,
+                    &key,
+                    emitted_function_key(controls, &key),
+                    action == 1,
+                );
+            }
+            if let Some(index) = agent_slot(&key) {
                 if action == 1 {
-                    let session = state.selected();
-                    let agent = state.slots[index]
-                        .as_ref()
-                        .and_then(|id| state.agents.iter().find(|agent| &agent.terminal_id == id));
+                    let session = context.selected(routing_generation);
+                    let agent = context.slots[index].as_ref();
                     match (session, agent) {
                         (Some(session), Some(agent)) => {
                             let work = Work::FocusSlot {
                                 pane_id: agent.pane_id.clone(),
                                 source: key,
                                 session,
-                                generation: state.routing_generation(),
+                                generation: context.generation,
+                                queued_at: Instant::now(),
                             };
                             if let Err(error) = worker.try_send(work) {
                                 log(match error {
@@ -606,10 +941,10 @@ fn handle_device_event(
                         _ => log(format!("{key} ignored: no ready Agent slot")),
                     }
                 }
-                return false;
+                return;
             }
             let binding = key_binding(controls, &key, action);
-            let captured = state.selected();
+            let captured = context.selected(routing_generation);
             if matches!(key.as_str(), "ENC_CC" | "ENC_CW") {
                 if let Some(binding) = binding {
                     queue_binding(
@@ -617,17 +952,17 @@ fn handle_device_event(
                         binding,
                         key,
                         captured,
-                        state.agents.iter().find(|agent| agent.focused).cloned(),
-                        state.routing_generation(),
+                        context.target.clone(),
+                        context.generation,
                     );
                 }
             } else if matches!(action, 0 | 1) {
                 match binding.as_ref() {
                     Some(Binding::Gesture(_)) => handle_fired(
                         worker,
-                        state.agents.iter().find(|agent| agent.focused).cloned(),
-                        state.routing_generation(),
-                        gestures.handle(
+                        context.target.clone(),
+                        context.generation,
+                        state.gestures.handle(
                             key,
                             binding.as_ref(),
                             action == 1,
@@ -640,18 +975,88 @@ fn handle_device_event(
                         binding.unwrap(),
                         key,
                         captured,
-                        state.agents.iter().find(|agent| agent.focused).cloned(),
-                        state.routing_generation(),
+                        context.target.clone(),
+                        context.generation,
                     ),
                     _ => {}
                 }
             }
-            false
         }
     }
 }
 
-fn send_lighting(device: &MicroDevice, state: &mut State) -> Result<()> {
+fn input_worker(
+    receiver: Receiver<DeviceEvent>,
+    context: Arc<Mutex<InputContext>>,
+    routing_generation: Arc<AtomicU64>,
+    work: SyncSender<Work>,
+    notices: Sender<InputNotice>,
+    stopping: Arc<AtomicBool>,
+) {
+    let mut state = InputState::default();
+    let mut previous = context
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    while !stopping.load(Ordering::Acquire) {
+        let current = context
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let generation = routing_generation.load(Ordering::Acquire);
+        if current.generation != previous.generation || current.generation != generation {
+            state.gestures.clear();
+            state.last_joystick_sector = None;
+            release_emitted_keys(&mut state, &notices);
+        } else if current.controls != previous.controls {
+            if current.controls.agent_macos_keys != previous.controls.agent_macos_keys
+                || current.controls.action_macos_keys != previous.controls.action_macos_keys
+            {
+                release_emitted_keys(&mut state, &notices);
+            }
+            state.gestures.clear();
+        }
+        previous = current.clone();
+        retry_failed_releases(&mut state, &notices, Instant::now());
+        handle_fired(
+            &work,
+            current.target.clone(),
+            current.generation,
+            state.gestures.drain_due(Instant::now()),
+        );
+        let wait = state
+            .gestures
+            .next_deadline()
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(Duration::from_millis(20))
+            .min(Duration::from_millis(20));
+        match receiver.recv_timeout(wait) {
+            Ok(event) => {
+                let kind = match &event {
+                    DeviceEvent::Key { .. } => "key",
+                    DeviceEvent::Joystick { .. } => "joystick",
+                    DeviceEvent::Disconnected { .. } => "disconnect",
+                };
+                let _latency = LatencySpan::new("input", Some(kind));
+                handle_device_event(
+                    event,
+                    &mut state,
+                    &current,
+                    &routing_generation,
+                    &work,
+                    &notices,
+                );
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    state.gestures.clear();
+    release_emitted_keys(&mut state, &notices);
+}
+
+fn send_lighting(device: &HidClient, state: &mut State) -> Result<()> {
+    let _latency = LatencySpan::new("lighting", None);
     let config = match load_lighting(&config_path("lighting.json")) {
         Ok(config) => {
             state.last_lighting_error.clear();
@@ -712,16 +1117,10 @@ fn send_lighting(device: &MicroDevice, state: &mut State) -> Result<()> {
     Ok(())
 }
 
-fn close_device(
-    device: &mut Option<MicroDevice>,
-    state: &mut State,
-    gestures: &mut GestureDispatcher,
-    blank: bool,
-) {
-    gestures.clear();
+fn close_device(device: &mut Option<HidClient>, state: &mut State, blank: bool) {
+    let _latency = LatencySpan::new("device-close", None);
     state.last_lighting.clear();
-    state.last_focused_app.clear();
-    state.last_joystick_sector = None;
+    let restore_was_pending = state.device_restore_pending;
     let Some(mut device) = device.take() else {
         return;
     };
@@ -739,15 +1138,26 @@ fn close_device(
             .collect();
         let _ = device.send("v.oai.thstatus", Some(Value::Array(blank)));
     }
+    state.last_focused_app.clear();
+    if let Err(error) = select_layer(Some(&device), state, Some(1)) {
+        log(format!("safe layer selection failed: {error:#}"));
+    }
     state.managed_aggregate_zones.clear();
-    let _ = device.close();
+    match device.close() {
+        Ok(()) if !restore_was_pending => {
+            state.device_restore_pending = false;
+            state.last_device_error.clear();
+        }
+        Ok(()) => {}
+        Err(error) => {
+            state.device_restore_pending = true;
+            state.next_device_open = Some(Instant::now());
+            device_failure(state, "device close failed", error.to_string());
+        }
+    }
 }
 
-fn select_layer(
-    device: Option<&MicroDevice>,
-    state: &mut State,
-    layer: Option<usize>,
-) -> Result<()> {
+fn select_layer(device: Option<&HidClient>, state: &mut State, layer: Option<usize>) -> Result<()> {
     let Some(layer) = layer else { return Ok(()) };
     state.active_layer = Some(layer);
     let Some(device) = device else { return Ok(()) };
@@ -762,9 +1172,8 @@ fn select_layer(
 }
 
 fn select_session(
-    device: Option<&MicroDevice>,
+    device: Option<&HidClient>,
     state: &mut State,
-    gestures: &mut GestureDispatcher,
     next: Option<String>,
 ) -> Result<()> {
     if state.selected_session == next {
@@ -784,7 +1193,6 @@ fn select_session(
         .as_ref()
         .map(|session| format!("Herdr session selected: {session}"))
         .unwrap_or_else(|| "Herdr session unselected".into()));
-    gestures.clear();
     Ok(())
 }
 
@@ -799,10 +1207,10 @@ fn routing_failure(state: &mut State, message: impl Into<String>) {
 fn refresh_sessions(
     state: &mut State,
     base: &Environment,
-    device: Option<&MicroDevice>,
-    gestures: &mut GestureDispatcher,
+    device: Option<&HidClient>,
     mappings: &Arc<Mutex<Vec<SessionTerminalMapping>>>,
 ) -> Result<bool> {
+    let _latency = LatencySpan::new("sessions", None);
     let discovered = match discover_sessions(base) {
         Ok(sessions) => sessions,
         Err(error) => {
@@ -824,7 +1232,7 @@ fn refresh_sessions(
         .as_ref()
         .is_some_and(|session| !state.sessions.contains(session))
     {
-        select_session(device, state, gestures, None)?;
+        select_session(device, state, None)?;
     }
     if changed {
         state.mappings.clear();
@@ -841,7 +1249,7 @@ fn refresh_mappings(
     base: &Environment,
     mappings: &Arc<Mutex<Vec<SessionTerminalMapping>>>,
 ) -> Result<bool> {
-    state.next_mapping_probe = Some(Instant::now() + MAPPING_REPROBE);
+    state.next_mapping_probe = None;
     if state.sessions.is_empty() {
         state.mappings.clear();
         *mappings.lock().unwrap_or_else(|error| error.into_inner()) = Vec::new();
@@ -877,10 +1285,10 @@ fn refresh_mappings(
 fn refresh_routing(
     state: &mut State,
     base: &Environment,
-    device: Option<&MicroDevice>,
-    gestures: &mut GestureDispatcher,
+    device: Option<&HidClient>,
     mappings: &Arc<Mutex<Vec<SessionTerminalMapping>>>,
 ) -> Result<bool> {
+    let _latency = LatencySpan::new("routing", None);
     let Some(frontmost_process) = state
         .frontmost
         .as_ref()
@@ -901,16 +1309,18 @@ fn refresh_routing(
     }
     match inspect_ghostty() {
         Ok(mut ghostty) => {
-            if state
-                .next_mapping_probe
-                .is_some_and(|due| Instant::now() >= due)
-                && !refresh_mappings(state, base, mappings)?
+            let mapping_stale = state.mappings.len() != state.sessions.len()
+                || state.mappings.iter().any(|mapping| {
+                    !ghostty
+                        .terminals
+                        .iter()
+                        .any(|terminal| terminal.id == mapping.terminal_id)
+                });
+            if mapping_stale
+                && state
+                    .next_mapping_probe
+                    .map_or(true, |due| Instant::now() >= due)
             {
-                state.revoke_routing();
-                return Ok(false);
-            }
-            let mut session = focused_session(&state.mappings, &ghostty);
-            if session.is_none() && state.next_mapping_probe.is_none() {
                 if !refresh_mappings(state, base, mappings)? {
                     state.revoke_routing();
                     return Ok(false);
@@ -923,14 +1333,14 @@ fn refresh_routing(
                         return Ok(false);
                     }
                 };
-                session = focused_session(&state.mappings, &ghostty);
             }
+            let session = focused_session(&state.mappings, &ghostty);
             state.ghostty = Some(ghostty);
             let Some(session) = session.filter(|session| state.sessions.contains(session)) else {
                 state.revoke_routing();
                 return Ok(false);
             };
-            select_session(device, state, gestures, Some(session.clone()))?;
+            select_session(device, state, Some(session.clone()))?;
             select_layer(
                 device,
                 state,
@@ -947,11 +1357,8 @@ fn refresh_routing(
     Ok(false)
 }
 
-fn refresh_agents(
-    state: &mut State,
-    base: &Environment,
-    device: Option<&MicroDevice>,
-) -> Result<()> {
+fn refresh_agents(state: &mut State, base: &Environment, device: Option<&HidClient>) -> Result<()> {
+    let _latency = LatencySpan::new("agents", None);
     let Some(session) = state.selected_session.clone() else {
         return Ok(());
     };
@@ -1006,6 +1413,7 @@ fn refresh_agents(
 }
 
 fn refresh_frontmost(state: &mut State) {
+    let _latency = LatencySpan::new("frontmost", None);
     match macos::frontmost() {
         Ok(frontmost) => {
             state.frontmost = Some(frontmost);
@@ -1024,63 +1432,65 @@ fn refresh_frontmost(state: &mut State) {
     }
 }
 
-fn refresh_owner(
-    state: &mut State,
-    device: &mut Option<MicroDevice>,
-    gestures: &mut GestureDispatcher,
-) -> Result<()> {
+fn refresh_owner(state: &mut State, device: &mut Option<HidClient>) {
     let frontmost = state
         .frontmost
         .as_ref()
         .map(|frontmost| frontmost.process.clone());
-    let owner = match device_owner(&[], frontmost.as_deref()) {
-        Some(owner) => Some(owner),
-        None => {
-            let output = run_command("/bin/ps", &["-axo".into(), "command=".into()], None)?;
-            let processes: Vec<_> = output.lines().map(str::trim).map(str::to_owned).collect();
-            device_owner(&processes, frontmost.as_deref())
-        }
-    }
-    .map(str::to_owned);
+    let owner = device_owner(frontmost.as_deref()).map(str::to_owned);
     if owner != state.owner {
-        let handoff_error = if owner.as_deref() == Some("ChatGPT") {
-            select_layer(
-                device.as_ref(),
-                state,
-                automatic_layer(frontmost.as_deref(), None),
-            )
-            .err()
-        } else {
-            None
-        };
         state.owner = owner;
         if let Some(owner) = &state.owner {
             log(format!("yielding to {owner}"));
             state.revoke_routing();
-            close_device(device, state, gestures, false);
+            close_device(device, state, false);
         } else {
             log("device owner cleared");
-        }
-        if let Some(error) = handoff_error {
-            return Err(error);
+            state.next_device_open = None;
         }
     }
-    Ok(())
 }
 
 fn open_device(
-    device: &mut Option<MicroDevice>,
+    device: &mut Option<HidClient>,
     event_tx: &Sender<DeviceEvent>,
     state: &mut State,
 ) -> Result<()> {
-    if device.is_some() || state.owner.is_some() {
+    let _latency = LatencySpan::new("device-open", None);
+    if device.is_some()
+        || (state.owner.is_some() && !state.device_restore_pending)
+        || state
+            .next_device_open
+            .is_some_and(|deadline| Instant::now() < deadline)
+    {
         return Ok(());
     }
-    match MicroDevice::open(event_tx.clone()) {
+    state.next_device_open = None;
+    match HidClient::connect(event_tx.clone()) {
+        Ok(mut opened) if state.owner.is_some() => {
+            state.last_focused_app.clear();
+            if let Err(error) = select_layer(Some(&opened), state, Some(1)) {
+                log(format!(
+                    "safe layer selection during recovery failed: {error:#}"
+                ));
+            }
+            match opened.close() {
+                Ok(()) => {
+                    state.device_restore_pending = false;
+                    state.last_device_error.clear();
+                    log("native HID ownership recovered");
+                }
+                Err(error) => {
+                    state.next_device_open = Some(Instant::now() + DEVICE_RETRY_INTERVAL);
+                    device_failure(state, "native HID recovery failed", error.to_string());
+                }
+            }
+        }
         Ok(opened) => {
             *device = Some(opened);
             state.device_state = "connected".into();
-            state.last_open_error.clear();
+            state.device_restore_pending = false;
+            state.last_device_error.clear();
             state.last_lighting.clear();
             log("device connected");
             select_layer(device.as_ref(), state, state.active_layer)?;
@@ -1089,17 +1499,18 @@ fn open_device(
             }
         }
         Err(error) => {
+            state.next_device_open = Some(Instant::now() + DEVICE_RETRY_INTERVAL);
             let message = error.to_string();
-            state.device_state = if message.contains("Input Monitoring") {
-                "permission-denied"
-            } else if message.contains("not found") {
+            state.device_state = if message.contains("not found") {
                 "absent"
+            } else if message.contains("helper") {
+                "helper-error"
             } else {
                 "busy"
             }
             .into();
-            if state.last_open_error != message {
-                state.last_open_error = message.clone();
+            if state.last_device_error != message {
+                state.last_device_error = message.clone();
                 log(format!("device open failed: {message}"));
             }
         }
@@ -1111,6 +1522,55 @@ fn publish(status: &Arc<Mutex<Value>>, state: &State) {
     *status.lock().unwrap_or_else(|error| error.into_inner()) = state.status();
 }
 
+fn publish_input(context: &Arc<Mutex<InputContext>>, state: &State, controls: &Controls) {
+    let agents_by_id: HashMap<_, _> = state
+        .agents
+        .iter()
+        .map(|agent| (agent.terminal_id.as_str(), agent))
+        .collect();
+    *context.lock().unwrap_or_else(|error| error.into_inner()) = InputContext {
+        controls: controls.clone(),
+        session: state.selected_session.clone(),
+        target: state.agents.iter().find(|agent| agent.focused).cloned(),
+        slots: state
+            .slots
+            .iter()
+            .map(|id| {
+                id.as_deref()
+                    .and_then(|id| agents_by_id.get(id))
+                    .map(|agent| (*agent).clone())
+            })
+            .collect(),
+        routing_ready: state.routing_ready,
+        generation: state.routing_generation(),
+    };
+}
+
+fn apply_input_notice(state: &mut State, notice: InputNotice) -> bool {
+    match notice {
+        InputNotice::Disconnected(error) => {
+            device_disconnected(state, error);
+            true
+        }
+        InputNotice::Output {
+            source,
+            edge,
+            error: Some(error),
+        } => {
+            output_failure(state, &source, edge, error);
+            false
+        }
+        InputNotice::Output {
+            source,
+            error: None,
+            ..
+        } => {
+            output_succeeded(state, &source);
+            false
+        }
+    }
+}
+
 /// Run the bridge in the foreground.  `main`/the start action owns process
 /// detachment; this function deliberately owns only the live daemon.
 pub fn run_daemon() -> Result<()> {
@@ -1120,20 +1580,38 @@ pub fn run_daemon() -> Result<()> {
     provision_effort(&config_path("effort.json")).map_err(|error| anyhow!(error))?;
     provision_lighting(&config_path("lighting.json")).map_err(|error| anyhow!(error))?;
     let mut controls = load_controls(&controls_path).map_err(|error| anyhow!(error))?;
-    let active_hid_keys = controls.hid_keys.clone();
+    let active_device_keys = controls.action_device_keys.clone();
     let (device_tx, device_rx) = mpsc::channel();
+    let (input_notice_tx, input_notice_rx) = mpsc::channel();
     let (work_tx, work_rx) = mpsc::sync_channel(WORK_QUEUE_CAPACITY);
     let mappings = Arc::new(Mutex::new(Vec::new()));
     let stopping = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(SIGINT, Arc::clone(&stopping))?;
     signal_hook::flag::register(SIGTERM, Arc::clone(&stopping))?;
     let mut state = State::new();
+    let input_context = Arc::new(Mutex::new(InputContext::new(controls.clone())));
     let worker = thread::spawn({
         let mappings = Arc::clone(&mappings);
         let base = base.clone();
         let routing_generation = Arc::clone(&state.routing_generation);
         let stopping = Arc::clone(&stopping);
         move || action_worker(work_rx, base, mappings, routing_generation, stopping)
+    });
+    let input = thread::spawn({
+        let context = Arc::clone(&input_context);
+        let routing_generation = Arc::clone(&state.routing_generation);
+        let work = work_tx.clone();
+        let stopping = Arc::clone(&stopping);
+        move || {
+            input_worker(
+                device_rx,
+                context,
+                routing_generation,
+                work,
+                input_notice_tx,
+                stopping,
+            )
+        }
     });
     let status = Arc::new(Mutex::new(state.status()));
     let server = listen_for_control(
@@ -1156,23 +1634,36 @@ pub fn run_daemon() -> Result<()> {
         let _ = server.run_with_shutdown(&shutdown_rx);
     });
     let mut device = None;
-    let mut gestures = GestureDispatcher::new();
-    let mut refresh_due = Instant::now();
+    let mut routing_due = Instant::now();
+    let mut state_due = Instant::now();
+    let mut sessions_ready = true;
     log("bridge started");
+    if latency_trace_enabled() {
+        log("latency trace started");
+    }
     while !stopping.load(Ordering::Acquire) {
+        let mut changed = false;
+        while let Ok(notice) = input_notice_rx.try_recv() {
+            if matches!(notice, InputNotice::Disconnected(_)) && device.is_none() {
+                continue;
+            }
+            if apply_input_notice(&mut state, notice) {
+                state.revoke_routing();
+                close_device(&mut device, &mut state, false);
+            }
+            changed = true;
+        }
         let now = Instant::now();
-        if now >= refresh_due {
-            refresh_due = now + REFRESH_INTERVAL;
-            let routing_generation = state.routing_generation();
+        let refresh_state = now >= state_due;
+        if refresh_state {
+            state_due = now + REFRESH_INTERVAL;
             match load_controls(&controls_path) {
                 Ok(next) => {
-                    let (next, hid_keys_pending) = runtime_controls(&active_hid_keys, next);
-                    if controls != next {
-                        gestures.clear();
-                    }
+                    let (next, device_keys_pending) = runtime_controls(&active_device_keys, next);
                     controls = next;
-                    if hid_keys_pending {
-                        let pending = "HID key changes require micro-setup and a bridge restart";
+                    if device_keys_pending {
+                        let pending =
+                            "action HID key changes require micro-setup and a bridge restart";
                         if state.last_controls_error != pending {
                             log(format!("control configuration pending: {pending}"));
                         }
@@ -1187,41 +1678,32 @@ pub fn run_daemon() -> Result<()> {
                 }
                 Err(_) => {}
             }
+            if state.owner.is_none() {
+                sessions_ready =
+                    match refresh_sessions(&mut state, &base, device.as_ref(), &mappings) {
+                        Ok(shutdown) => {
+                            if shutdown {
+                                log("No Herdr sessions for 60 seconds; releasing device");
+                                stopping.store(true, Ordering::Release);
+                            }
+                            true
+                        }
+                        Err(error) => {
+                            log(format!("refresh failed: {error:#}"));
+                            false
+                        }
+                    };
+            }
+            changed = true;
+        }
+        if now >= routing_due {
+            routing_due = now + ROUTING_REFRESH_INTERVAL;
+            let previous_session = state.selected_session.clone();
             refresh_frontmost(&mut state);
-            let owner_checked = match refresh_owner(&mut state, &mut device, &mut gestures) {
-                Ok(()) => true,
-                Err(error) => {
-                    state.revoke_routing();
-                    log(format!("owner refresh failed: {error:#}"));
-                    false
-                }
-            };
-            let mut shutdown = false;
-            if owner_checked && state.owner.is_none() {
-                let sessions_refreshed = match refresh_sessions(
-                    &mut state,
-                    &base,
-                    device.as_ref(),
-                    &mut gestures,
-                    &mappings,
-                ) {
-                    Ok(next_shutdown) => {
-                        shutdown = next_shutdown;
-                        true
-                    }
-                    Err(error) => {
-                        log(format!("refresh failed: {error:#}"));
-                        false
-                    }
-                };
-                if sessions_refreshed {
-                    let routing_ready = match refresh_routing(
-                        &mut state,
-                        &base,
-                        device.as_ref(),
-                        &mut gestures,
-                        &mappings,
-                    ) {
+            refresh_owner(&mut state, &mut device);
+            if state.owner.is_none() && sessions_ready {
+                let routing_ready =
+                    match refresh_routing(&mut state, &base, device.as_ref(), &mappings) {
                         Ok(ready) => ready,
                         Err(error) => {
                             state.revoke_routing();
@@ -1229,56 +1711,40 @@ pub fn run_daemon() -> Result<()> {
                             false
                         }
                     };
-                    if let Err(error) = open_device(&mut device, &device_tx, &mut state) {
+                if let Err(error) = open_device(&mut device, &device_tx, &mut state) {
+                    log(format!("refresh failed: {error:#}"));
+                }
+                if routing_ready
+                    && (refresh_state
+                        || previous_session != state.selected_session
+                        || !state.routing_ready)
+                {
+                    if let Err(error) = refresh_agents(&mut state, &base, device.as_ref()) {
                         log(format!("refresh failed: {error:#}"));
                     }
-                    if routing_ready {
-                        if let Err(error) = refresh_agents(&mut state, &base, device.as_ref()) {
-                            log(format!("refresh failed: {error:#}"));
-                        }
-                    }
                 }
             }
-            if routing_generation != state.routing_generation() {
-                gestures.clear();
-                while let Ok(event) = device_rx.try_recv() {
-                    if matches!(event, DeviceEvent::Disconnected) {
-                        log("device disconnected");
-                        close_device(&mut device, &mut state, &mut gestures, false);
-                        break;
-                    }
+            if state.owner.is_some() && state.device_restore_pending {
+                if let Err(error) = open_device(&mut device, &device_tx, &mut state) {
+                    log(format!("native HID recovery failed: {error:#}"));
                 }
             }
+            changed = true;
+        }
+        if changed {
+            publish_input(&input_context, &state, &controls);
             publish(&status, &state);
-            if shutdown {
-                log("No Herdr sessions for 60 seconds; releasing device");
-                stopping.store(true, Ordering::Release);
-            }
         }
-        match device_rx.try_recv() {
-            Ok(event) => {
-                if handle_device_event(event, &mut state, &controls, &mut gestures, &work_tx) {
-                    close_device(&mut device, &mut state, &mut gestures, false);
-                }
-                continue;
-            }
-            Err(TryRecvError::Disconnected) => break,
-            Err(TryRecvError::Empty) => {}
-        }
-        handle_fired(
-            &work_tx,
-            state.agents.iter().find(|agent| agent.focused).cloned(),
-            state.routing_generation(),
-            gestures.drain_due(Instant::now()),
-        );
-        let deadline = gestures
-            .next_deadline()
-            .map(|deadline| deadline.min(refresh_due))
-            .unwrap_or(refresh_due);
-        match device_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok(event) => {
-                if handle_device_event(event, &mut state, &controls, &mut gestures, &work_tx) {
-                    close_device(&mut device, &mut state, &mut gestures, false);
+        let deadline = routing_due.min(state_due);
+        match input_notice_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(notice) => {
+                if !matches!(notice, InputNotice::Disconnected(_)) || device.is_some() {
+                    if apply_input_notice(&mut state, notice) {
+                        state.revoke_routing();
+                        close_device(&mut device, &mut state, false);
+                    }
+                    publish_input(&input_context, &state, &controls);
+                    publish(&status, &state);
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -1288,7 +1754,8 @@ pub fn run_daemon() -> Result<()> {
     log("stopping");
     state.revoke_routing();
     stopping.store(true, Ordering::Release);
-    close_device(&mut device, &mut state, &mut gestures, true);
+    close_device(&mut device, &mut state, true);
+    let _ = input.join();
     publish(&status, &state);
     drop(work_tx);
     let _ = worker.join();
@@ -1321,6 +1788,13 @@ mod tests {
             terminal_id: "t1".into(),
         }];
         let status = state.status();
+        assert!(status["deviceError"].is_null());
+        assert!(status["outputError"].is_null());
+        state.last_device_error = "USB restoration failed".into();
+        state
+            .output_errors
+            .insert("AG00".into(), "CGEvent post failed".into());
+        let status = state.status();
         assert_eq!(status["routing"], "ready");
         assert_eq!(
             status["sessionMappings"],
@@ -1328,16 +1802,41 @@ mod tests {
         );
         assert_eq!(status["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(status["protocol"], DAEMON_PROTOCOL_VERSION);
-        assert_eq!(status.as_object().unwrap().len(), 13);
+        assert_eq!(status["deviceError"], "USB restoration failed");
+        assert_eq!(status["outputError"], "CGEvent post failed");
+        assert_eq!(status.as_object().unwrap().len(), 15);
+    }
+
+    #[test]
+    fn output_error_clears_only_for_the_recovered_source() {
+        let mut state = State::new();
+        output_failure(&mut state, "AG00", "release", "denied".into());
+        output_failure(&mut state, "AG01", "release", "denied".into());
+        output_succeeded(&mut state, "AG01");
+        assert_eq!(
+            state.status()["outputError"],
+            "AG00 macOS key release failed: denied"
+        );
+        output_succeeded(&mut state, "AG00");
+        assert!(state.status()["outputError"].is_null());
+    }
+
+    #[test]
+    fn unexpected_disconnect_requests_immediate_native_restore() {
+        let mut state = State::new();
+        let before = Instant::now();
+        device_disconnected(&mut state, "helper died".into());
+        assert!(state.device_restore_pending);
+        assert!(state
+            .next_device_open
+            .is_some_and(|deadline| deadline >= before));
+        assert_eq!(state.last_device_error, "helper died");
     }
 
     #[test]
     fn key_events_capture_the_ready_session_without_hardware() {
         let (sender, receiver) = mpsc::sync_channel(1);
-        let mut state = State::new();
-        state.selected_session = Some("work".into());
-        state.routing_ready = true;
-        state.agents.push(Agent {
+        let target = Agent {
             terminal_id: "terminal".into(),
             pane_id: "pane".into(),
             agent: "codex".into(),
@@ -1345,19 +1844,29 @@ mod tests {
             state_change_seq: 1,
             focused: true,
             cwd: "/tmp".into(),
-        });
-        let controls = crate::config::default_controls();
-        let mut gestures = GestureDispatcher::new();
-        assert!(!handle_device_event(
+        };
+        let context = InputContext {
+            controls: crate::config::default_controls(),
+            session: Some("work".into()),
+            target: Some(target),
+            slots: vec![None; SLOT_COUNT],
+            routing_ready: true,
+            generation: 0,
+        };
+        let routing_generation = AtomicU64::new(0);
+        let mut state = InputState::default();
+        let (notices, _) = mpsc::channel();
+        handle_device_event(
             DeviceEvent::Key {
-                key: "ACT12".into(),
-                action: 1
+                key: "F24".into(),
+                action: 1,
             },
             &mut state,
-            &controls,
-            &mut gestures,
-            &sender
-        ));
+            &context,
+            &routing_generation,
+            &sender,
+            &notices,
+        );
         match receiver.recv_timeout(Duration::from_millis(100)).unwrap() {
             Work::Binding {
                 session, target, ..
@@ -1373,6 +1882,71 @@ mod tests {
     }
 
     #[test]
+    fn input_thread_dispatches_without_the_refresh_loop() {
+        let (events, event_rx) = mpsc::channel();
+        let (work_tx, work_rx) = mpsc::sync_channel(1);
+        let (notices, _) = mpsc::channel();
+        let stopping = Arc::new(AtomicBool::new(false));
+        let routing_generation = Arc::new(AtomicU64::new(0));
+        let context = Arc::new(Mutex::new(InputContext {
+            controls: crate::config::default_controls(),
+            session: Some("work".into()),
+            target: Some(Agent {
+                terminal_id: "terminal".into(),
+                pane_id: "pane".into(),
+                agent: "codex".into(),
+                agent_status: AgentStatus::Idle,
+                state_change_seq: 1,
+                focused: true,
+                cwd: "/tmp".into(),
+            }),
+            slots: vec![None; SLOT_COUNT],
+            routing_ready: true,
+            generation: 0,
+        }));
+        let input = thread::spawn({
+            let stopping = Arc::clone(&stopping);
+            let routing_generation = Arc::clone(&routing_generation);
+            move || {
+                input_worker(
+                    event_rx,
+                    context,
+                    routing_generation,
+                    work_tx,
+                    notices,
+                    stopping,
+                )
+            }
+        });
+        events
+            .send(DeviceEvent::Key {
+                key: "F24".into(),
+                action: 1,
+            })
+            .unwrap();
+        assert!(matches!(
+            work_rx.recv_timeout(Duration::from_millis(100)),
+            Ok(Work::Binding { session, .. }) if session == "work"
+        ));
+        stopping.store(true, Ordering::Release);
+        input.join().unwrap();
+    }
+
+    #[test]
+    fn oai_agent_keys_map_to_configured_macos_keys() {
+        let mut controls = crate::config::default_controls();
+        assert_eq!(agent_slot("AG00"), Some(0));
+        assert_eq!(agent_slot("AG05"), Some(5));
+        assert_eq!(agent_slot("AG06"), None);
+        assert_eq!(emitted_function_key(&controls, "AG00"), Some("F13"));
+        assert_eq!(emitted_function_key(&controls, "F19"), Some("F19"));
+        assert_eq!(emitted_function_key(&controls, "F20"), None);
+        assert_eq!(emitted_function_key(&controls, "F24"), None);
+        controls.action_macos_keys.insert(2, Some("F20".into()));
+        assert_eq!(emitted_function_key(&controls, "F21"), Some("F20"));
+    }
+
+    #[test]
     fn revoking_routing_invalidates_queued_work() {
         let mut state = State::new();
         state.routing_ready = true;
@@ -1384,11 +1958,13 @@ mod tests {
     #[test]
     fn hid_key_reload_waits_for_a_restart() {
         let initial = crate::config::default_controls();
-        let active = initial.hid_keys.clone();
+        let active = initial.action_device_keys.clone();
         let mut changed = initial.clone();
-        changed.hid_keys.insert(5, Some("F17".into()));
-        let (runtime, pending) = runtime_controls(&active, changed);
+        changed.action_device_keys.insert(5, Some("F17".into()));
+        changed.agent_macos_keys.insert(1, "F19".into());
+        let (runtime, pending) = runtime_controls(&active, changed.clone());
         assert!(pending);
-        assert_eq!(runtime.hid_keys, initial.hid_keys);
+        assert_eq!(runtime.agent_macos_keys, changed.agent_macos_keys);
+        assert_eq!(runtime.action_device_keys, initial.action_device_keys);
     }
 }

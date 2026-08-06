@@ -23,8 +23,9 @@ use crate::{
     control::{ensure_state_dir, request_status},
     device::{
         keymap::{read_keymap, update_keymap_with, write_keymap},
-        DeviceEvent, MicroDevice, DEFAULT_REQUEST_TIMEOUT,
+        DeviceEvent, DEFAULT_REQUEST_TIMEOUT,
     },
+    hid::HidClient,
 };
 
 const PI_EXTENSION: &str = ".pi/agent/extensions/herdr-micro-effort.ts";
@@ -55,6 +56,14 @@ const BUTTON_KEY_SLOTS: [(u8, &str, &str); 7] = [
     (6, "/keymap/3/1", "KV_OAI_ACT11"),
     (7, "/keymap/3/2", "KV_OAI_ACT12"),
 ];
+const AGENT_KEY_SLOTS: [(u8, &str, &str); 6] = [
+    (1, "/keymap/0/0", "KV_OAI_AG00"),
+    (2, "/keymap/0/1", "KV_OAI_AG01"),
+    (3, "/keymap/1/0", "KV_OAI_AG02"),
+    (4, "/keymap/1/1", "KV_OAI_AG03"),
+    (5, "/keymap/1/2", "KV_OAI_AG04"),
+    (6, "/keymap/1/3", "KV_OAI_AG05"),
+];
 
 /// Resolve the plugin directory without depending on the action's current
 /// directory. The installed executable lives at `<plugin>/bin/herdr-micro`.
@@ -76,10 +85,10 @@ pub fn plugin_root() -> Result<PathBuf> {
     plugin_root_from(env::var_os("HERDR_PLUGIN_ROOT"), &env::current_exe()?)
 }
 
-fn oai_profile(keymap: &mut Value) -> Result<&mut serde_json::Map<String, Value>> {
+fn oai_profile_index(keymap: &Value, managed_link_id: Option<&Value>) -> Result<usize> {
     let profiles = keymap
-        .get_mut("profiles")
-        .and_then(Value::as_array_mut)
+        .get("profiles")
+        .and_then(Value::as_array)
         .ok_or_else(|| anyhow!("keymap profiles must be an array"))?;
     let matches: Vec<_> = profiles
         .iter()
@@ -93,12 +102,26 @@ fn oai_profile(keymap: &mut Value) -> Result<&mut serde_json::Map<String, Value>
         })
         .map(|(index, _)| index)
         .collect();
-    if matches.len() != 1 {
-        bail!("expected one OAI profile, found {}", matches.len());
+    if matches.len() == 1 {
+        return Ok(matches[0]);
     }
-    profiles[matches[0]]
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("OAI profile must be an object"))
+    let managed: Vec<_> = managed_link_id
+        .into_iter()
+        .flat_map(|id| {
+            matches
+                .iter()
+                .copied()
+                .filter(move |index| profiles[*index].pointer("/layers/1/linkedAppId") == Some(id))
+        })
+        .collect();
+    if managed.len() == 1 {
+        return Ok(managed[0]);
+    }
+    bail!(
+        "expected one OAI or managed profile, found {} OAI and {} managed",
+        matches.len(),
+        managed.len()
+    )
 }
 
 fn layout_codes(layout: &Value) -> Vec<&Value> {
@@ -150,7 +173,10 @@ fn is_blank_layer(layer: &Value) -> bool {
 
 /// Copies the compatible Layer 1 layout into blank or previously managed Layer 2.
 pub fn configure_micro(keymap: &mut Value) -> Result<()> {
-    configure_micro_with_hid(keymap, &Default::default())
+    configure_micro_with_hid(
+        keymap,
+        &crate::config::default_controls().action_device_keys,
+    )
 }
 
 fn configure_micro_with_hid(
@@ -167,8 +193,18 @@ fn configure_micro_with_hid(
         .filter_map(|app| app.get("id").cloned())
         .collect();
     let managed_link_id = (managed_ids.len() == 1).then(|| managed_ids.pop().unwrap());
+    let profile_index = oai_profile_index(keymap, managed_link_id.as_ref())?;
+    let profile_id = keymap
+        .pointer(&format!("/profiles/{profile_index}/id"))
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("OAI profile ID must be a non-negative integer"))?;
     {
-        let profile = oai_profile(keymap)?;
+        let profile = keymap
+            .get_mut("profiles")
+            .and_then(Value::as_array_mut)
+            .and_then(|profiles| profiles.get_mut(profile_index))
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| anyhow!("OAI profile must be an object"))?;
         let layers = profile
             .get_mut("layers")
             .and_then(Value::as_array_mut)
@@ -187,6 +223,7 @@ fn configure_micro_with_hid(
         {
             bail!("Layer 1 is not a compatible Codex Micro OAI layout");
         }
+        validate_agent_slots(&source_layout)?;
         validate_button_slots(&source_layout)?;
         let target_is_managed = managed_link_id
             .as_ref()
@@ -200,7 +237,7 @@ fn configure_micro_with_hid(
                     .get("layout")
                     .cloned()
                     .ok_or_else(|| anyhow!("Layer {HERDR_LAYER} layout is missing"))?;
-                set_hid_codes(&mut normalized, &Default::default())?;
+                reset_hid_codes(&mut normalized)?;
                 if normalized != source_layout {
                     bail!("Layer {HERDR_LAYER} is not blank or managed; refusing to overwrite it");
                 }
@@ -214,6 +251,7 @@ fn configure_micro_with_hid(
         let target = layers[HERDR_LAYER - 1]
             .get_mut("layout")
             .ok_or_else(|| anyhow!("Layer {HERDR_LAYER} layout is missing"))?;
+        reset_hid_codes(target)?;
         set_hid_codes(target, hid_keys)?;
     }
 
@@ -270,7 +308,12 @@ fn configure_micro_with_hid(
         app.insert("path".into(), Value::String(String::new()));
         layer_ids.push(id);
     }
-    let profile = oai_profile(keymap)?;
+    let profile = keymap
+        .get_mut("profiles")
+        .and_then(Value::as_array_mut)
+        .and_then(|profiles| profiles.get_mut(profile_index))
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| anyhow!("OAI profile must be an object"))?;
     let layers = profile
         .get_mut("layers")
         .and_then(Value::as_array_mut)
@@ -280,6 +323,19 @@ fn configure_micro_with_hid(
             .as_object_mut()
             .ok_or_else(|| anyhow!("Layer {} must be an object", index + 1))?
             .insert("linkedAppId".into(), id);
+    }
+    keymap
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("keymap must be an object"))?
+        .insert("activeProfileId".into(), Value::from(profile_id));
+    Ok(())
+}
+
+fn validate_agent_slots(layout: &Value) -> Result<()> {
+    for (slot, pointer, stock) in AGENT_KEY_SLOTS {
+        if layout.pointer(pointer).and_then(Value::as_str) != Some(stock) {
+            bail!("Layer 1 Agent slot {slot} must use {stock}");
+        }
     }
     Ok(())
 }
@@ -293,17 +349,25 @@ fn validate_button_slots(layout: &Value) -> Result<()> {
     Ok(())
 }
 
-fn set_hid_codes(
-    layout: &mut Value,
-    hid_keys: &std::collections::BTreeMap<u8, Option<String>>,
-) -> Result<()> {
-    for (button, pointer, stock) in BUTTON_KEY_SLOTS {
-        let slot = layout
+fn reset_hid_codes(layout: &mut Value) -> Result<()> {
+    for (slot, pointer, stock) in AGENT_KEY_SLOTS {
+        let value = layout
             .pointer_mut(pointer)
-            .ok_or_else(|| anyhow!("Layer 2 button {button} is missing"))?;
-        let current = slot
+            .ok_or_else(|| anyhow!("Layer 2 Agent slot {slot} is missing"))?;
+        let current = value
             .as_str()
-            .ok_or_else(|| anyhow!("Layer 2 button {button} must be a key code"))?;
+            .ok_or_else(|| anyhow!("Layer 2 Agent slot {slot} must be a key code"))?;
+        if current != stock {
+            bail!("Layer 2 Agent slot {slot} must use {stock}");
+        }
+    }
+    for (slot, pointer, stock) in BUTTON_KEY_SLOTS {
+        let value = layout
+            .pointer_mut(pointer)
+            .ok_or_else(|| anyhow!("Layer 2 key slot {slot} is missing"))?;
+        let current = value
+            .as_str()
+            .ok_or_else(|| anyhow!("Layer 2 key slot {slot} must be a key code"))?;
         if current != stock
             && current != "KC_NONE"
             && current
@@ -311,13 +375,30 @@ fn set_hid_codes(
                 .and_then(function_key_number)
                 .is_none()
         {
-            bail!("Layer 2 button {button} has unexpected code {current}");
+            bail!("Layer 2 key slot {slot} has unexpected code {current}");
         }
-        *slot = Value::String(match hid_keys.get(&button) {
-            Some(Some(key)) => format!("KC_{key}"),
-            Some(None) => "KC_NONE".into(),
-            None => stock.into(),
-        });
+        *value = Value::String(stock.into());
+    }
+    Ok(())
+}
+
+fn set_hid_codes(
+    layout: &mut Value,
+    hid_keys: &std::collections::BTreeMap<u8, Option<String>>,
+) -> Result<()> {
+    for (button, pointer, _) in BUTTON_KEY_SLOTS {
+        let slot = layout
+            .pointer_mut(pointer)
+            .ok_or_else(|| anyhow!("Layer 2 button {button} is missing"))?;
+        *slot = Value::String(
+            match hid_keys
+                .get(&button)
+                .ok_or_else(|| anyhow!("button HID key {button} is missing"))?
+            {
+                Some(key) => format!("KC_{key}"),
+                None => "KC_NONE".into(),
+            },
+        );
     }
     Ok(())
 }
@@ -375,8 +456,9 @@ pub struct SetupReport {
     pub lighting: PathBuf,
 }
 
-pub fn setup_micro() -> Result<SetupReport> {
-    let (controls, effort, lighting, parsed_controls) = provision_and_validate_configs()?;
+fn update_micro_keymap(
+    configure: impl FnOnce(&mut Value) -> Result<()>,
+) -> Result<(String, Option<PathBuf>)> {
     if let Some(owner) = active_owner()? {
         bail!("quit {owner} first");
     }
@@ -384,7 +466,7 @@ pub fn setup_micro() -> Result<SetupReport> {
         bail!("stop the Micro bridge first");
     }
     let (event_tx, _events) = mpsc::channel::<DeviceEvent>();
-    let mut device = MicroDevice::open(event_tx)?;
+    let mut device = HidClient::connect(event_tx)?;
     let result = (|| {
         let status = device.request("device.status", None, DEFAULT_REQUEST_TIMEOUT)?;
         let firmware = status
@@ -396,7 +478,7 @@ pub fn setup_micro() -> Result<SetupReport> {
         let before = read_keymap(&device)?;
         let mut keymap: Value = serde_json::from_slice(&before).context("invalid keymap JSON")?;
         let canonical_before = serde_json::to_vec(&keymap)?;
-        configure_micro_with_hid(&mut keymap, &parsed_controls.hid_keys)?;
+        configure(&mut keymap)?;
         let after = serde_json::to_vec(&keymap)?;
         let backup = if after == canonical_before {
             None
@@ -409,28 +491,34 @@ pub fn setup_micro() -> Result<SetupReport> {
                 |bytes| write_keymap(&device, bytes),
             )?
         };
-        Ok(SetupReport {
-            firmware,
-            backup,
-            controls,
-            effort,
-            lighting,
-        })
+        Ok((firmware, backup))
     })();
     let close = device.close();
     match (result, close) {
         (Ok(report), Ok(())) => Ok(report),
         (Err(error), _) => Err(error),
-        (Ok(report), Err(error)) => match report.backup {
-            Some(backup) => Err(error).with_context(|| {
-                format!(
-                    "device close failed after the verified keymap update; backup: {}",
-                    backup.display()
-                )
-            }),
-            None => Err(error),
-        },
+        (Ok((_, Some(backup))), Err(error)) => Err(error).with_context(|| {
+            format!(
+                "device close failed after the verified keymap update; backup: {}",
+                backup.display()
+            )
+        }),
+        (Ok(_), Err(error)) => Err(error),
     }
+}
+
+pub fn setup_micro() -> Result<SetupReport> {
+    let (controls, effort, lighting, parsed_controls) = provision_and_validate_configs()?;
+    let (firmware, backup) = update_micro_keymap(|keymap| {
+        configure_micro_with_hid(keymap, &parsed_controls.action_device_keys)
+    })?;
+    Ok(SetupReport {
+        firmware,
+        backup,
+        controls,
+        effort,
+        lighting,
+    })
 }
 
 pub fn configure_controls() -> Result<PathBuf> {
@@ -621,10 +709,11 @@ mod tests {
     }
 
     #[test]
-    fn configures_only_a_blank_layer_two() {
+    fn configures_hid_keys_on_a_blank_layer_two() {
         let source = oai_layout();
         let mut keymap = json!({
-            "profiles": [{ "layers": [
+            "activeProfileId": 7,
+            "profiles": [{ "id": 7, "layers": [
                 { "layout": source },
                 blank_layer()
             ] }]
@@ -639,47 +728,71 @@ mod tests {
             Some(&json!(1))
         );
         assert_eq!(
-            keymap.pointer("/profiles/0/layers/0/layout"),
-            keymap.pointer("/profiles/0/layers/1/layout")
+            keymap.pointer("/profiles/0/layers/1/layout/keymap/0"),
+            Some(&json!(["KV_OAI_AG00", "KV_OAI_AG01"]))
         );
-    }
-
-    #[test]
-    fn configured_hid_keys_change_only_managed_layer_two_switches() {
-        let source = oai_layout();
-        let mut keymap = json!({
-            "profiles": [{ "layers": [
-                { "layout": source },
-                blank_layer()
-            ] }]
-        });
-        configure_micro_with_hid(
-            &mut keymap,
-            &std::collections::BTreeMap::from([(5, Some("F19".into()))]),
-        )
-        .unwrap();
-        let hid_keys = std::collections::BTreeMap::from([
-            (2, Some("F16".into())),
-            (5, Some("F17".into())),
-            (6, None),
-        ]);
-        configure_micro_with_hid(&mut keymap, &hid_keys).unwrap();
         assert_eq!(
             keymap.pointer("/profiles/0/layers/1/layout/keymap/3/0"),
-            Some(&json!("KC_F17"))
+            Some(&json!("KC_F19"))
         );
         assert_eq!(
-            keymap.pointer("/profiles/0/layers/1/layout/keymap/2/1"),
-            Some(&json!("KC_F16"))
+            keymap.pointer("/profiles/0/layers/1/layout/keymap/2/0"),
+            Some(&json!("KC_F20"))
         );
         assert_eq!(
             keymap.pointer("/profiles/0/layers/1/layout/keymap/3/1"),
             Some(&json!("KC_NONE"))
         );
-        configure_micro_with_hid(&mut keymap, &Default::default()).unwrap();
+        let configured = keymap.clone();
+        configure_micro(&mut keymap).unwrap();
+        assert_eq!(keymap, configured);
+        *keymap
+            .pointer_mut("/profiles/0/layers/1/layout/keymap/0/0")
+            .unwrap() = json!("KC_F13");
+        assert!(configure_micro(&mut keymap)
+            .unwrap_err()
+            .to_string()
+            .contains("must use KV_OAI_AG00"));
+    }
+
+    #[test]
+    fn prefers_the_existing_managed_profile_and_activates_it() {
+        let source = oai_layout();
+        let blank = blank_layer();
+        let mut keymap = json!({
+            "activeProfileId": 1,
+            "linkedApps": [
+                {"id": 10, "process": "gjermundgaraba.herdr-micro.layer-2"},
+                {"id": 11, "process": "com.mitchellh.ghostty"}
+            ],
+            "profiles": [
+                {"id": 0, "layers": [
+                    {"layout": source},
+                    {"linkedAppId": 10, "layout": oai_layout()}
+                ]},
+                {"id": 1, "layers": [
+                    {"layout": oai_layout()},
+                    {"linkedAppId": 11, "layout": blank["layout"].clone()}
+                ]}
+            ]
+        });
+        configure_micro(&mut keymap).unwrap();
+        assert_eq!(keymap["activeProfileId"], json!(0));
         assert_eq!(
-            keymap.pointer("/profiles/0/layers/1/layout/keymap/3/1"),
-            Some(&json!("KV_OAI_ACT11"))
+            keymap.pointer("/profiles/0/layers/1/layout/keymap/0/0"),
+            Some(&json!("KV_OAI_AG00"))
+        );
+        assert_eq!(
+            keymap.pointer("/profiles/0/layers/1/layout/keymap/1/3"),
+            Some(&json!("KV_OAI_AG05"))
+        );
+        assert_eq!(
+            keymap.pointer("/profiles/1/layers/1/linkedAppId"),
+            Some(&json!(11))
+        );
+        assert_eq!(
+            keymap.pointer("/profiles/1/layers/1/layout"),
+            Some(&blank["layout"])
         );
     }
 
@@ -689,7 +802,7 @@ mod tests {
         let mut target = source.clone();
         *target.pointer_mut("/keymap/3/0").unwrap() = json!("KC_F19");
         let mut keymap = json!({
-            "profiles": [{ "layers": [
+            "profiles": [{ "id": 0, "layers": [
                 { "layout": source },
                 { "layout": target }
             ] }]
@@ -711,7 +824,7 @@ mod tests {
             json!({ "layout": { "keymap": [["KC_NONE"]], "encoders": [], "joystick": { "type": "RADIAL", "sectors": [{ "k": "KI_X", "a1": "bad", "a2": 0.25 }] } } }),
         ] {
             let mut keymap = json!({
-                "profiles": [{ "layers": [
+                "profiles": [{ "id": 0, "layers": [
                     { "layout": { "keymap": [REQUIRED_OAI_CODES] } },
                     layer
                 ] }]
@@ -725,7 +838,7 @@ mod tests {
         let mut required = REQUIRED_OAI_CODES;
         required[5] = "KV_OAI_AG05-extra";
         let mut keymap = json!({
-            "profiles": [{ "layers": [
+            "profiles": [{ "id": 0, "layers": [
                 {
                     "layout": { "keymap": [required], "metadata": "KV_OAI_AG05" },
                     "description": "KV_OAI_AG05"
@@ -735,7 +848,7 @@ mod tests {
         });
         assert_eq!(
             configure_micro(&mut keymap).unwrap_err().to_string(),
-            "expected one OAI profile, found 0"
+            "expected one OAI or managed profile, found 0 OAI and 0 managed"
         );
     }
 

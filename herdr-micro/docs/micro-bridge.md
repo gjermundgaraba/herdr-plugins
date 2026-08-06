@@ -2,17 +2,23 @@
 
 ## Current architecture
 
-`herdr-micro` is one detached Rust daemon and the sole owner of the Codex
-Micro vendor HID interface. The workspace's `codex-micro` library contains
-only HID transport, device framing, raw events, and keymap I/O; Herdr routing
-and behavior stay in the `herdr-micro` crate and link into the same process.
-There is no second daemon or IPC boundary. A Unix socket in
-`HERDR_PLUGIN_STATE_DIR` provides status and stop control; `micro.log` is
-stored beside it, and a process lock protects hardware ownership.
+`herdr-micro` has two deliberately unequal processes. A launchd-activated,
+root-owned helper contains only the Codex Micro USB transport and holds one
+exclusive device lease. The detached user daemon owns Herdr routing,
+configuration, Ghostty inspection, gestures, and macOS event output. They use a
+versioned local socket whose peers are checked by effective UID. The helper
+accepts only the six device methods the bridge and guarded setup require.
+
+A separate Unix socket in `HERDR_PLUGIN_STATE_DIR` provides user-daemon status
+and stop control; `micro.log` is stored beside it. The helper restores the
+normal macOS HID driver when its authenticated client disconnects and exits
+after five idle seconds. launchd starts it again on the next connection.
 
 ```text
-Codex Micro over USB or BLE
-  → direct macOS IOKit HID transport
+Codex Micro over USB
+  → root helper: capture USB device and detach the system HID driver
+  → authenticated local event/request stream
+  → unprivileged herdr-micro daemon
   → six sticky Herdr agent slots and configured controls
   → focused Ghostty terminal UUID
   → matching default or named Herdr session
@@ -25,9 +31,10 @@ its AppleScript API, restores the title, and keeps the mapping only in memory.
 Every Herdr CLI call then uses the selected session's `HERDR_SESSION` value.
 Agents and actions are never mixed across sessions.
 
-USB and BLE use the same JSON-RPC payloads with transport-specific HID report
-framing. The daemon prefers USB when both transports are present and requires
-a successful `device.status` round trip before reporting a connection.
+The helper uses the Micro's JSON-RPC HID reports over its raw USB interface and
+requires a successful `device.status` round trip before reporting a
+connection. Bluetooth is intentionally unsupported because it cannot provide
+the exclusive ownership that prevents duplicate ChatGPT input.
 
 Layer routing is fixed:
 
@@ -37,10 +44,13 @@ Layer routing is fixed:
 | Ghostty terminal mapped to a running Herdr session | Own device; select Layer 2 and that session |
 | Unrelated application | Preserve the last applicable layer; dispatch nothing |
 
-Layer 2 retains `KV_OAI_AG00` through `KV_OAI_AG05` and the OAI encoder actions.
-Each of the seven action switches may instead use a unique `F13` through `F24`
-code or be disabled by `controls.json`; `micro-setup` applies and verifies that
-managed keymap.
+Layer 2 retains `KV_OAI_AG00` through `KV_OAI_AG05`; those private codes are
+required for six-way status lighting. The seven action switches may use unique
+F13–F24 codes or be disabled. The double-width action key spans two switches,
+so one half is disabled by default. `micro-setup` applies and verifies the
+managed keymap. `agentMacosKeys` configures the macOS F13–F20 events synthesized
+for Agent presses without changing their on-device OAI identity. `actionMacosKeys`
+independently selects which action switches synthesize macOS F13–F20 events.
 
 ## Compatibility
 
@@ -50,28 +60,29 @@ managed keymap.
 | Herdr | 0.7.5 or newer |
 | Ghostty | 1.3 or newer; Automation permission required |
 | Build toolchain | Rust 1.71 or newer |
-| Codex Micro firmware 0.4.1 | USB and BLE physically verified |
-| Codex Micro firmware 0.6.1 | USB and BLE physically verified; a fresh BLE host pairing may be required after upgrade |
+| Codex Micro firmware 0.4.1 | USB physically verified |
+| Codex Micro firmware 0.6.1 | USB physically verified |
 | Effort control | Codex CLI, Claude Code, and Pi with the bundled extension |
-
-Firmware 0.6.1 can leave an existing macOS BLE pairing with stale GATT
-metadata. Pair an unused BLE host slot; if none is free, forget and re-pair
-the affected `Codex Micro #N`. USB remains the recovery transport.
 
 ## Ownership and safety
 
-- Direct HID access requires macOS Input Monitoring permission. Do not run Work
-  Louder Input or another Input Monitoring/HID client beside the bridge. The
-  daemon yields when Input is running and while ChatGPT/Codex is frontmost.
+- Capturing the keyboard-class USB device requires root. The explicit installer
+  copies a dedicated helper and launchd plist to root-owned system paths. While
+  the user bridge owns Layer 2, the helper detaches the normal macOS HID driver
+  and claims the Micro's USB interface; it restores the driver before yielding
+  to ChatGPT/Codex.
+- The helper socket is owner-only and mutually authenticates the configured
+  user and root helper. Exact protocol and helper build versions must match; an
+  upgrade never falls back to direct or shared HID access.
 - The daemon never writes firmware or keymaps. Only the explicit `micro-setup`
   action changes the keymap; it requires a blank or previously managed Layer 2,
   creates a backup, and verifies the full read-back.
 - Controls target the captured Herdr session and pane. `scroll` additionally
   rechecks the focused Ghostty UUID before posting wheel events.
-- `scroll` uses targeted CoreGraphics mouse/wheel events, restores the cursor,
-  and requires Accessibility permission. Configured F13–F24 controls are
-  ordinary system-wide keys emitted by the hardware and must otherwise be
-  unbound; other controls do not synthesize global keyboard events.
+- CoreGraphics output requires Accessibility permission. Agent keys and action
+  switches explicitly selected by `actionMacosKeys` synthesize their configured
+  F13–F20 press/release events. Other action-switch HID codes remain internal
+  to the bridge. `scroll` posts targeted wheel events and restores the cursor.
 - A selected-session failure does not fall back to another session. Controlled
   shutdown and 60 seconds without any Herdr session blank the LEDs.
 
@@ -80,24 +91,28 @@ the affected `Codex Micro #N`. USB remains the recovery transport.
 - The OAI HID protocol and firmware actions are proprietary and unsupported;
   Work Louder publishes firmware binaries, not a third-party SDK or protocol
   contract. Firmware or host-app changes may break the bridge.
-- Only the six Agent keys are independently addressable on the tested Codex
-  Micro. The seven action switches are configurable; the stock double-width
-  lower keycap spans switches 5 and 6. Perimeter lighting is an aggregate zone.
+- Only the six Agent keys are independently addressable for lighting on the
+  tested Codex Micro. The stock double-width lower keycap spans action switches
+  5 and 6. Perimeter lighting is an aggregate zone.
 - Aggregate-zone synchronization flags exist in the protocol but have not been
   physically verified.
-- True held macOS keys, voice control, eight-way joystick sectors, and analog
-  pointer mode are not implemented.
-- Bluetooth standby requires a physical key, dial, or joystick action to wake
-  the device; the daemon reconnects and repaints after wake.
+- Modifier/chord synthesis, voice control, eight-way joystick sectors, and
+  analog pointer mode are not implemented.
+- The bridge requires a USB connection; Bluetooth would reintroduce shared HID
+  delivery and duplicate ChatGPT input.
 - Claude effort changes require an empty prompt. Existing Pi sessions need
   `/reload` after installing the extension. Effort changes affect later model
   requests, not a request already in flight.
 
 The [research record](research/README.md) preserves tested versions, results,
 hardware evidence, caveats, and source links.
+[Future investigations](future-investigations.md) tracks deferred hardware and
+protocol work.
 
 ## Lifecycle
 
 Herdr v1 startup hooks are not supervised services and have no teardown hook.
-Run `micro-stop` before disabling, uninstalling, unlinking, or updating the
-plugin. `micro-start` replaces a daemon from a different plugin version.
+launchd supervises only the on-demand USB helper; the startup hook starts the
+user daemon. Stop the bridge before updating. Ordinary plugin updates do not
+require reinstalling the privileged helper; reinstall it only when its explicit
+build version changes. Uninstall the helper before removing the plugin.

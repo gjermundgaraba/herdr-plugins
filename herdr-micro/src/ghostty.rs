@@ -55,6 +55,19 @@ pub fn inspect_ghostty() -> Result<GhosttyState> {
     parse_ghostty_state(&run_command("/usr/bin/osascript", &args, None)?)
 }
 
+pub fn focused_terminal_id() -> Result<String> {
+    let script = r#"tell application "Ghostty"
+if not frontmost then error "Ghostty is not frontmost"
+get id of focused terminal of selected tab of front window
+end tell"#;
+    let output = run_command("/usr/bin/osascript", &["-e".into(), script.into()], None)?;
+    let id = output.trim();
+    if id.is_empty() {
+        bail!("Ghostty returned an empty focused terminal ID");
+    }
+    Ok(id.into())
+}
+
 fn set_session_title(session_name: &str, title: Option<&str>, base: &Environment) -> Result<()> {
     let mut args = vec!["terminal".into(), "title".into()];
     match title {

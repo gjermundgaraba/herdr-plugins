@@ -31,13 +31,14 @@ dependencies = [
 
 [[package]]
 name = "codex-micro"
-version = "0.10.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
  "libc",
  "objc2-core-foundation",
  "objc2-io-kit",
+ "serde",
  "serde_json",
 ]
 
@@ -64,7 +65,7 @@ dependencies = [
 
 [[package]]
 name = "herdr-micro"
-version = "0.11.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "codex-micro",
@@ -161,8 +162,8 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "33fafba39597d6dc1fb709123dfa8289d39406734be322956a69f0931c73bb15"
 dependencies = [
- "bitflags",
  "dispatch2",
+ "libc",
  "objc2",
  "objc2-core-foundation",
 ]

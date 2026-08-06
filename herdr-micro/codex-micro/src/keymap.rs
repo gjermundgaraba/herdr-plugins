@@ -48,7 +48,27 @@ where
     }
 }
 
-pub fn read_keymap(device: &MicroDevice) -> Result<Vec<u8>> {
+pub trait Requester {
+    fn request(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        timeout: std::time::Duration,
+    ) -> Result<Value>;
+}
+
+impl Requester for MicroDevice {
+    fn request(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        timeout: std::time::Duration,
+    ) -> Result<Value> {
+        MicroDevice::request(self, method, params, timeout)
+    }
+}
+
+pub fn read_keymap(device: &impl Requester) -> Result<Vec<u8>> {
     read_keymap_with(|offset| {
         device.request(
             "fs.readbin",
@@ -72,7 +92,7 @@ where
     Ok(())
 }
 
-pub fn write_keymap(device: &MicroDevice, bytes: &[u8]) -> Result<()> {
+pub fn write_keymap(device: &impl Requester, bytes: &[u8]) -> Result<()> {
     write_keymap_chunks_with(bytes, |offset, data, completed| {
         device
             .request(

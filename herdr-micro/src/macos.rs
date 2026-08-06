@@ -1,8 +1,7 @@
 //! Small AppKit/CoreGraphics helpers used by the daemon and doctor.
 //!
 //! AppKit identifies the foreground application; Core Graphics supplies that
-//! application's visible normal window. It does not inspect accessibility
-//! objects or post global keyboard input.
+//! application's visible normal window and posts explicitly configured input.
 
 use std::{ptr::NonNull, thread, time::Duration};
 
@@ -14,8 +13,8 @@ use objc2_core_foundation::{
 };
 use objc2_core_graphics::{
     kCGNullWindowID, kCGWindowBounds, kCGWindowLayer, kCGWindowName, kCGWindowOwnerPID, CGEvent,
-    CGEventTapLocation, CGEventType, CGMouseButton, CGPreflightPostEventAccess, CGScrollEventUnit,
-    CGWarpMouseCursorPosition, CGWindowListCopyWindowInfo, CGWindowListOption,
+    CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton, CGPreflightPostEventAccess,
+    CGScrollEventUnit, CGWarpMouseCursorPosition, CGWindowListCopyWindowInfo, CGWindowListOption,
 };
 use serde::Serialize;
 
@@ -43,6 +42,29 @@ pub fn post_event_access() -> Result<()> {
     } else {
         bail!("macOS post-event access is denied")
     }
+}
+
+pub fn post_function_key(key: &str, down: bool) -> Result<()> {
+    post_event_access()?;
+    let keycode = function_key_code(key).ok_or_else(|| anyhow!("unsupported macOS key: {key}"))?;
+    let event = CGEvent::new_keyboard_event(None, keycode, down)
+        .ok_or_else(|| anyhow!("could not create {key} event"))?;
+    CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+    Ok(())
+}
+
+fn function_key_code(key: &str) -> Option<CGKeyCode> {
+    Some(match key {
+        "F13" => 0x69,
+        "F14" => 0x6B,
+        "F15" => 0x71,
+        "F16" => 0x6A,
+        "F17" => 0x40,
+        "F18" => 0x4F,
+        "F19" => 0x50,
+        "F20" => 0x5A,
+        _ => return None,
+    })
 }
 
 pub fn frontmost() -> Result<Frontmost> {
@@ -255,5 +277,12 @@ mod tests {
         assert!(!usable_window_for(42, Some(1.0), Some(42.0)));
         assert!(!usable_window_for(42, Some(0.0), Some(7.0)));
         assert!(!usable_window_for(42, None, Some(42.0)));
+    }
+
+    #[test]
+    fn maps_only_macos_function_keycodes() {
+        assert_eq!(function_key_code("F13"), Some(0x69));
+        assert_eq!(function_key_code("F20"), Some(0x5A));
+        assert_eq!(function_key_code("F21"), None);
     }
 }

@@ -1,18 +1,13 @@
-//! Direct IOKit transport for the Codex Micro.
+//! Direct USB IOKit transport for the Work Louder Micro.
 //!
-//! The owner thread is deliberately the only place that touches IOKit.  The
-//! public handle only sends commands and waits for replies, which keeps a BLE
-//! reconnect from leaving callbacks pointed at a moved or dropped context.
+//! One owner thread owns every native handle. The public handle only sends
+//! commands and waits for replies, so callbacks never outlive their storage.
 
 use std::{
     collections::{BTreeSet, HashMap},
     ffi::{c_void, CStr},
-    fs::{File, OpenOptions},
-    io,
-    os::unix::{fs::OpenOptionsExt, io::AsRawFd},
-    path::Path,
     pin::Pin,
-    ptr::NonNull,
+    ptr::{self, NonNull},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender, SyncSender, TryRecvError},
@@ -22,13 +17,20 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, bail, Result};
-use objc2_core_foundation::{kCFRunLoopDefaultMode, CFDictionary, CFNumber, CFRunLoop, CFString};
-use objc2_io_kit::{
-    kIOHIDLocationIDKey, kIOHIDProductIDKey, kIOHIDSerialNumberKey, kIOHIDTransportKey,
-    kIOHIDVendorIDKey, kIOReturnSuccess, IOHIDAccessType, IOHIDCheckAccess, IOHIDDevice,
-    IOHIDManager, IOHIDReportType, IOHIDRequestType, IOOptionBits, IOReturn,
+use anyhow::{anyhow, bail, Context, Result};
+use objc2_core_foundation::{
+    kCFRunLoopDefaultMode, CFDictionary, CFNumber, CFRetained, CFRunLoop, CFRunLoopSource,
+    CFString, CFUUID,
 };
+use objc2_io_kit::{
+    io_object_t, io_service_t, kIOMainPortDefault, kIOReturnExclusiveAccess, kIOReturnSuccess,
+    kIOUSBFindInterfaceDontCare, kUSBIn, kUSBInterrupt, kUSBProductID, kUSBVendorID,
+    IOCFPlugInInterface, IOCreatePlugInInterfaceForService, IOIteratorNext, IOObjectRelease,
+    IORegistryEntryCreateCFProperty, IOServiceGetMatchingServices, IOServiceMatching,
+    IOUSBDevRequestTO, IOUSBDeviceInterface500, IOUSBFindInterfaceRequest,
+    IOUSBInterfaceInterface197, USBReEnumerateOptions,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::wire::{encode_message, Reassembler, REPORT_ID, REPORT_SIZE};
@@ -36,59 +38,30 @@ use crate::wire::{encode_message, Reassembler, REPORT_ID, REPORT_SIZE};
 pub const MICRO_VENDOR_ID: i32 = 0x303A;
 pub const MICRO_PRODUCT_ID: i32 = 0x8360;
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+pub const DEVICE_OPEN_TIMEOUT: Duration = Duration::from_secs(7);
 const KEYBOARD_REPORT_ID: u32 = 1;
 const F13_USAGE: u8 = 0x68;
 const F24_USAGE: u8 = 0x73;
+const INTERFACE_NUMBER: i64 = 0;
+const INTERRUPT_ENDPOINT: u8 = 0x81;
+const CONTROL_TIMEOUT_MS: u32 = 2_000;
+const HID_SET_REPORT_REQUEST_TYPE: u8 = 0x21; // host-to-device, class, interface
+const HID_SET_REPORT: u8 = 0x09;
+const HID_OUTPUT_REPORT: u16 = 2;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum InputMonitoringAccess {
-    Granted,
-    Denied,
-    Unknown,
-}
-
-pub fn input_monitoring_access() -> InputMonitoringAccess {
-    classify_input_monitoring(IOHIDCheckAccess(IOHIDRequestType::ListenEvent))
-}
-
-fn classify_input_monitoring(access: IOHIDAccessType) -> InputMonitoringAccess {
-    match access {
-        IOHIDAccessType::Granted => InputMonitoringAccess::Granted,
-        IOHIDAccessType::Denied => InputMonitoringAccess::Denied,
-        _ => InputMonitoringAccess::Unknown,
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Transport {
-    Usb,
-    BluetoothLowEnergy,
-    Other,
-}
-
-impl Transport {
-    fn from_iokit(value: &str) -> Self {
-        match value {
-            "USB" => Self::Usb,
-            "Bluetooth Low Energy" => Self::BluetoothLowEnergy,
-            _ => Self::Other,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
 pub enum DeviceEvent {
     Key { key: String, action: i64 },
     Joystick { angle: f64, distance: f64 },
-    Disconnected,
+    Disconnected { error: String },
 }
 
 enum CallbackEvent {
-    Report { id: u32, bytes: Vec<u8> },
-    Removed,
+    ReadComplete { result: i32, length: usize },
 }
 
-/// Stable for the full registration lifetime; IOKit retains only this pointer.
+/// Pinned until the async source is removed and the interface is closed.
 struct CallbackContext {
     callback_tx: Sender<CallbackEvent>,
 }
@@ -118,33 +91,48 @@ pub struct MicroDevice {
     command_tx: Sender<Command>,
     next_request_id: AtomicU64,
     closed: Arc<AtomicBool>,
-    owner: Option<JoinHandle<()>>,
-    lock: Option<DeviceLock>,
+    owner: Option<JoinHandle<Result<()>>>,
 }
 
 impl MicroDevice {
-    /// Opens the best available Micro and does the required `device.status`
-    /// round trip before returning it.
-    pub fn open(event_tx: Sender<DeviceEvent>) -> Result<Self> {
-        if input_monitoring_access() == InputMonitoringAccess::Denied {
-            bail!("Input Monitoring access is denied")
-        }
-        let lock = DeviceLock::acquire()?;
+    /// Exclusively captures the USB Micro and completes `device.status`.
+    pub fn open_exclusive(event_tx: Sender<DeviceEvent>) -> Result<Self> {
         let (command_tx, command_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let closed = Arc::new(AtomicBool::new(false));
         let owner_closed = Arc::clone(&closed);
+        let owner_event_tx = event_tx.clone();
         let owner = thread::Builder::new()
-            .name("codex-micro-hid".into())
-            .spawn(move || owner_main(command_rx, event_tx, ready_tx, owner_closed))?;
+            .name("codex-micro-usb".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    owner_main(command_rx, event_tx, ready_tx, owner_closed)
+                }));
+                match result {
+                    Ok(result) => {
+                        if let Err(error) = &result {
+                            let _ = owner_event_tx.send(DeviceEvent::Disconnected {
+                                error: error.to_string(),
+                            });
+                        }
+                        result
+                    }
+                    Err(_) => {
+                        let error = "Micro USB owner thread panicked";
+                        let _ = owner_event_tx.send(DeviceEvent::Disconnected {
+                            error: error.into(),
+                        });
+                        Err(anyhow!(error))
+                    }
+                }
+            })?;
 
-        match ready_rx.recv_timeout(DEFAULT_REQUEST_TIMEOUT + Duration::from_secs(1)) {
+        match ready_rx.recv_timeout(DEVICE_OPEN_TIMEOUT) {
             Ok(Ok(())) => Ok(Self {
                 command_tx,
                 next_request_id: AtomicU64::new(1),
                 closed,
                 owner: Some(owner),
-                lock: Some(lock),
             }),
             Ok(Err(error)) => {
                 let _ = owner.join();
@@ -199,15 +187,11 @@ impl MicroDevice {
         if !self.closed.swap(true, Ordering::AcqRel) {
             let _ = self.command_tx.send(Command::Close);
         }
-        let joined = self
-            .owner
-            .take()
-            .map(|owner| owner.join())
-            .transpose()
-            .map_err(|_| anyhow!("Micro HID owner thread panicked"));
-        self.lock.take();
-        joined?;
-        Ok(())
+        match self.owner.take().map(JoinHandle::join) {
+            Some(Ok(result)) => result,
+            Some(Err(_)) => Err(anyhow!("Micro USB owner thread panicked")),
+            None => Ok(()),
+        }
     }
 
     fn ensure_open(&self) -> Result<()> {
@@ -228,42 +212,6 @@ fn await_send_reply(
         .map_err(|error| anyhow!(error))
 }
 
-struct DeviceLock(File);
-
-impl DeviceLock {
-    fn acquire() -> Result<Self> {
-        let uid = unsafe { libc::getuid() };
-        // Stable across pre-extraction builds so upgrades cannot acquire two locks.
-        Self::acquire_at(&std::env::temp_dir().join(format!("herdr-micro-{uid}.lock")))
-    }
-
-    fn acquire_at(path: &Path) -> Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(path)?;
-        // SAFETY: flock only operates on this live file descriptor.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
-                bail!("another process owns the Codex Micro")
-            }
-            return Err(error.into());
-        }
-        Ok(Self(file))
-    }
-}
-
-impl Drop for DeviceLock {
-    fn drop(&mut self) {
-        // SAFETY: the descriptor remains valid until this destructor returns.
-        let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
-    }
-}
-
 impl Drop for MicroDevice {
     fn drop(&mut self) {
         let _ = self.close();
@@ -275,30 +223,32 @@ fn owner_main(
     event_tx: Sender<DeviceEvent>,
     ready_tx: SyncSender<std::result::Result<(), String>>,
     closed: Arc<AtomicBool>,
-) {
+) -> Result<()> {
     let result = (|| {
         let mut owner = Owner::open(Arc::new(Mutex::new(command_rx)), event_tx, closed)?;
         if ready_tx.send(Ok(())).is_err() {
-            owner.teardown(true);
+            owner.teardown()?;
             bail!("opener dropped")
         }
-        owner.run();
-        Ok(())
+        owner.run()
     })();
-    if let Err(error) = result {
+    if let Err(error) = &result {
         let _ = ready_tx.send(Err(error.to_string()));
     }
+    result
 }
 
 struct Owner {
-    manager: objc2_core_foundation::CFRetained<IOHIDManager>,
-    device: objc2_core_foundation::CFRetained<IOHIDDevice>,
-    transport: Transport,
-    run_loop: objc2_core_foundation::CFRetained<CFRunLoop>,
+    device: UsbDevice,
+    interface: UsbInterface,
+    _device_service: IoObject,
+    _interface_service: IoObject,
+    pipe: u8,
+    run_loop: CFRetained<CFRunLoop>,
     run_loop_mode: &'static CFString,
+    async_source: CFRetained<CFRunLoopSource>,
     input_buffer: Box<[u8; REPORT_SIZE]>,
-    #[allow(dead_code)] // Kept pinned solely for the foreign callback pointer.
-    context: Pin<Box<CallbackContext>>,
+    context: Option<Pin<Box<CallbackContext>>>,
     callback_rx: Receiver<CallbackEvent>,
     command_rx: Arc<Mutex<Receiver<Command>>>,
     event_tx: Sender<DeviceEvent>,
@@ -306,6 +256,9 @@ struct Owner {
     function_keys_down: BTreeSet<u8>,
     pending: HashMap<u64, Pending>,
     closed: Arc<AtomicBool>,
+    read_pending: bool,
+    torn_down: bool,
+    terminal_error: Option<String>,
 }
 
 impl Owner {
@@ -314,91 +267,57 @@ impl Owner {
         event_tx: Sender<DeviceEvent>,
         closed: Arc<AtomicBool>,
     ) -> Result<Self> {
-        let manager = IOHIDManager::new(None, 0 as IOOptionBits);
-        let vendor_key = cf_string(kIOHIDVendorIDKey);
-        let product_key = cf_string(kIOHIDProductIDKey);
-        let vendor = CFNumber::new_i32(MICRO_VENDOR_ID);
-        let product = CFNumber::new_i32(MICRO_PRODUCT_ID);
-        let matching = CFDictionary::<CFString, CFNumber>::from_slices(
-            &[&vendor_key, &product_key],
-            &[&vendor, &product],
-        );
-        // SAFETY: Both keys and values are the documented IOKit CF types and
-        // `matching` remains retained until IOKit has copied its criteria.
-        unsafe { manager.set_device_matching(Some(matching.as_opaque())) };
-        if manager.open(0) != kIOReturnSuccess {
-            bail!("Codex Micro not found or unavailable")
+        let device_service = find_micro_device()?;
+        let mut device = UsbDevice::new(device_service.0)?;
+        device.verify_identity()?;
+        if let Err(error) = device.capture() {
+            return Err(restore_after_open_error(&mut device, error));
         }
 
-        let candidates = choose_devices(&manager)?;
-        let mut last_error = None;
-        for candidate in candidates {
-            match Self::open_candidate(
-                manager.clone(),
-                candidate,
-                Arc::clone(&command_rx),
-                event_tx.clone(),
-                Arc::clone(&closed),
-            ) {
-                Ok(mut owner) => match owner.handshake() {
-                    Ok(()) => return Ok(owner),
-                    Err(error) => {
-                        owner.teardown(false);
-                        closed.store(false, Ordering::Release);
-                        last_error = Some(error);
-                    }
-                },
-                Err(error) => last_error = Some(error),
+        let setup = (|| {
+            let interface_service = wait_for_interface_zero(&device)?;
+            let mut interface = UsbInterface::new(interface_service.0)?;
+            if interface.identity()? != (INTERFACE_NUMBER as u8, 0) {
+                bail!("IOKit USB interface identity changed during open")
             }
-        }
-        let _ = manager.close(0);
-        Err(last_error.unwrap_or_else(|| anyhow!("Codex Micro not found or unavailable")))
-    }
+            interface.open()?;
+            let pipe = interface.interrupt_in_pipe()?;
 
-    fn open_candidate(
-        manager: objc2_core_foundation::CFRetained<IOHIDManager>,
-        candidate: DeviceCandidate,
-        command_rx: Arc<Mutex<Receiver<Command>>>,
-        event_tx: Sender<DeviceEvent>,
-        closed: Arc<AtomicBool>,
-    ) -> Result<Self> {
-        let DeviceCandidate {
-            device, transport, ..
-        } = candidate;
-        let run_loop =
-            CFRunLoop::current().ok_or_else(|| anyhow!("no Core Foundation run loop"))?;
-        // kCFRunLoopDefaultMode is supplied by CoreFoundation for the process lifetime.
-        let run_loop_mode = unsafe { kCFRunLoopDefaultMode }
-            .ok_or_else(|| anyhow!("no Core Foundation default run loop mode"))?;
-        if device.open(0) != kIOReturnSuccess {
-            bail!("Codex Micro is unavailable")
-        }
+            let run_loop =
+                CFRunLoop::current().ok_or_else(|| anyhow!("no Core Foundation run loop"))?;
+            // Supplied by CoreFoundation for the process lifetime.
+            let run_loop_mode = unsafe { kCFRunLoopDefaultMode }
+                .ok_or_else(|| anyhow!("no Core Foundation default run loop mode"))?;
+            let async_source = interface.create_async_source()?;
+            run_loop.add_source(Some(&async_source), Some(run_loop_mode));
+            Ok((
+                interface_service,
+                interface,
+                pipe,
+                run_loop,
+                run_loop_mode,
+                async_source,
+            ))
+        })();
+        let (interface_service, interface, pipe, run_loop, run_loop_mode, async_source) =
+            match setup {
+                Ok(setup) => setup,
+                Err(error) => return Err(restore_after_open_error(&mut device, error)),
+            };
+
         let (callback_tx, callback_rx) = mpsc::channel();
         let context = Box::pin(CallbackContext { callback_tx });
-        let mut input_buffer = Box::new([0; REPORT_SIZE]);
-        let buffer = NonNull::from(input_buffer.as_mut()).cast::<u8>();
-        let context_ptr = context.as_ref().get_ref() as *const CallbackContext as *mut c_void;
-        // SAFETY: `input_buffer` and pinned `context` outlive registration;
-        // teardown unregisters before either allocation is dropped.
-        unsafe {
-            device.register_input_report_callback(
-                buffer,
-                REPORT_SIZE as isize,
-                Some(input_report_callback),
-                context_ptr,
-            );
-            device.register_removal_callback(Some(removal_callback), context_ptr);
-            device.schedule_with_run_loop(&run_loop, run_loop_mode);
-        }
-
-        Ok(Self {
-            manager,
+        let mut owner = Self {
             device,
-            transport,
+            interface,
+            _device_service: device_service,
+            _interface_service: interface_service,
+            pipe,
             run_loop,
             run_loop_mode,
-            input_buffer,
-            context,
+            async_source,
+            input_buffer: Box::new([0; REPORT_SIZE]),
+            context: Some(context),
             callback_rx,
             command_rx,
             event_tx,
@@ -406,19 +325,29 @@ impl Owner {
             function_keys_down: BTreeSet::new(),
             pending: HashMap::new(),
             closed,
-        })
+            read_pending: false,
+            torn_down: false,
+            terminal_error: None,
+        };
+        if let Err(error) = owner.submit_read() {
+            owner
+                .teardown()
+                .with_context(|| format!("restore USB device after read setup failed: {error}"))?;
+            return Err(error);
+        }
+        if let Err(error) = owner.handshake() {
+            owner
+                .teardown()
+                .with_context(|| format!("restore USB device after handshake failed: {error}"))?;
+            return Err(error);
+        }
+        Ok(owner)
     }
 
     fn handshake(&mut self) -> Result<()> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         let deadline = Instant::now() + DEFAULT_REQUEST_TIMEOUT;
-        self.start_request(
-            0,
-            "device.status".into(),
-            None,
-            Instant::now() + DEFAULT_REQUEST_TIMEOUT,
-            reply_tx,
-        )?;
+        self.start_request(0, "device.status".into(), None, deadline, reply_tx)?;
         while Instant::now() < deadline {
             self.pump();
             match reply_rx.try_recv() {
@@ -431,9 +360,12 @@ impl Owner {
         bail!("device.status timed out")
     }
 
-    fn run(&mut self) {
+    fn run(&mut self) -> Result<()> {
         loop {
             self.pump();
+            if self.closed.load(Ordering::Acquire) {
+                break;
+            }
             let command = match self.command_rx.lock() {
                 Ok(receiver) => receiver.try_recv(),
                 Err(_) => break,
@@ -461,24 +393,31 @@ impl Owner {
                 }
                 Err(TryRecvError::Empty) => {}
             }
-            if self.closed.load(Ordering::Acquire) {
-                break;
-            }
         }
-        self.teardown(true);
+        let result = self.teardown();
+        if let Some(error) = self.terminal_error.take() {
+            result?;
+            bail!(error)
+        }
+        result
     }
 
     fn pump(&mut self) {
-        // Running a short turn lets CoreFoundation dispatch HID callbacks while
-        // still giving channel commands and request timeouts predictable latency.
         let _ = CFRunLoop::run_in_mode(Some(self.run_loop_mode), 0.01, true);
-        while let Ok(event) = self.callback_rx.try_recv() {
-            match event {
-                CallbackEvent::Report { id, bytes } => self.handle_report(id, &bytes),
-                CallbackEvent::Removed => {
-                    self.closed.store(true, Ordering::Release);
-                    let _ = self.event_tx.send(DeviceEvent::Disconnected);
-                    self.fail_all("Codex Micro disconnected");
+        while let Ok(CallbackEvent::ReadComplete { result, length }) = self.callback_rx.try_recv() {
+            self.read_pending = false;
+            if result != kIOReturnSuccess {
+                self.disconnect(format!("interrupt read failed: 0x{:08X}", result as u32));
+                continue;
+            }
+            let length = length.min(REPORT_SIZE);
+            if length > 0 {
+                let bytes = self.input_buffer[..length].to_vec();
+                self.handle_report(bytes[0] as u32, &bytes);
+            }
+            if !self.closed.load(Ordering::Acquire) {
+                if let Err(error) = self.submit_read() {
+                    self.disconnect(error.to_string());
                 }
             }
         }
@@ -491,6 +430,19 @@ impl Owner {
         for id in expired {
             self.fail_pending(id, format!("request {id} timed out"));
         }
+    }
+
+    fn submit_read(&mut self) -> Result<()> {
+        let context = self
+            .context
+            .as_ref()
+            .expect("callback context is live before teardown")
+            .as_ref()
+            .get_ref() as *const CallbackContext as *mut c_void;
+        self.interface
+            .read_async(self.pipe, self.input_buffer.as_mut_ptr().cast(), context)?;
+        self.read_pending = true;
+        Ok(())
     }
 
     fn start_request(
@@ -511,21 +463,8 @@ impl Owner {
 
     fn write(&self, method: String, params: Option<Value>, id: Option<u64>) -> Result<()> {
         for mut report in encode_message(&method, params.as_ref(), id)? {
-            let wire = output_wire(&mut report, self.transport)?;
-            let pointer = NonNull::from(&mut *wire).cast::<u8>();
-            // SAFETY: `wire` is a live mutable subslice for the duration of the
-            // synchronous IOKit call, and its transport-specific size is exact.
-            let status = unsafe {
-                self.device.set_report(
-                    IOHIDReportType::Output,
-                    REPORT_ID as isize,
-                    pointer,
-                    wire.len() as isize,
-                )
-            };
-            if status != kIOReturnSuccess {
-                bail!("IOHIDDeviceSetReport failed: 0x{:08X}", status as u32)
-            }
+            let payload = output_wire(&mut report)?;
+            self.device.set_output_report(payload)?;
         }
         Ok(())
     }
@@ -547,6 +486,9 @@ impl Owner {
                 }
                 self.function_keys_down = next;
             }
+            return;
+        }
+        if report_id != REPORT_ID as u32 {
             return;
         }
         for envelope in self.reassembler.push(report) {
@@ -572,6 +514,13 @@ impl Owner {
         }
     }
 
+    fn disconnect(&mut self, error: String) {
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            self.terminal_error = Some(error.clone());
+        }
+        self.fail_all(&error);
+    }
+
     fn fail_pending(&mut self, id: u64, error: String) {
         if let Some(pending) = self.pending.remove(&id) {
             let _ = pending.reply.send(Err(error));
@@ -584,63 +533,74 @@ impl Owner {
         }
     }
 
-    fn teardown(&mut self, close_manager: bool) {
+    fn teardown(&mut self) -> Result<()> {
+        if self.torn_down {
+            return Ok(());
+        }
         self.closed.store(true, Ordering::Release);
         self.fail_all("device disconnected");
-        // SAFETY: This is the same owner thread that registered and scheduled
-        // the callbacks. Clearing them precedes unscheduling, close, and drop.
-        unsafe {
-            self.device.register_input_report_callback(
-                NonNull::from(self.input_buffer.as_mut()).cast(),
-                REPORT_SIZE as isize,
-                None,
-                std::ptr::null_mut(),
-            );
-            self.device
-                .register_removal_callback(None, std::ptr::null_mut());
-            self.device
-                .unschedule_from_run_loop(&self.run_loop, self.run_loop_mode);
+        let mut errors = Vec::new();
+        if self.read_pending {
+            if let Err(error) = self.interface.abort(self.pipe) {
+                errors.push(error.to_string());
+            }
         }
-        let _ = self.device.close(0);
-        if close_manager {
-            let _ = self.manager.close(0);
+        let deadline = Instant::now() + DEFAULT_REQUEST_TIMEOUT;
+        while self.read_pending && Instant::now() < deadline {
+            let _ = CFRunLoop::run_in_mode(Some(self.run_loop_mode), 0.01, true);
+            while let Ok(CallbackEvent::ReadComplete { .. }) = self.callback_rx.try_recv() {
+                self.read_pending = false;
+            }
         }
-        // `context` drops only after IOKit no longer has a callback registration.
+        if self.read_pending {
+            errors.push("interrupt read did not finish during teardown".into());
+            // IOKit still owns these raw pointers; keep them alive until this short-lived
+            // helper exits rather than risking a late callback or DMA into freed memory.
+            if let Some(context) = self.context.take() {
+                std::mem::forget(context);
+            }
+            let buffer = std::mem::replace(&mut self.input_buffer, Box::new([0; REPORT_SIZE]));
+            std::mem::forget(buffer);
+        }
+        self.run_loop
+            .remove_source(Some(&self.async_source), Some(self.run_loop_mode));
+        self.async_source.invalidate();
+        self.interface.release();
+        if let Err(error) = self.device.restore() {
+            errors.push(error.to_string());
+        }
+        self.device.close();
+        self.device.release();
+        self.torn_down = true;
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            bail!(errors.join("; "))
+        }
     }
 }
 
-unsafe extern "C-unwind" fn input_report_callback(
-    context: *mut c_void,
-    result: IOReturn,
-    _sender: *mut c_void,
-    report_type: IOHIDReportType,
-    report_id: u32,
-    report: NonNull<u8>,
-    length: isize,
-) {
-    if context.is_null()
-        || result != kIOReturnSuccess
-        || report_type != IOHIDReportType::Input
-        || (report_id != KEYBOARD_REPORT_ID && report_id != REPORT_ID as u32)
-        || length <= 0
-    {
+impl Drop for Owner {
+    fn drop(&mut self) {
+        let _ = self.teardown();
+    }
+}
+
+unsafe extern "C-unwind" fn read_callback(context: *mut c_void, result: i32, length: *mut c_void) {
+    if context.is_null() {
         return;
     }
-    let length = usize::try_from(length).unwrap_or(0).min(REPORT_SIZE);
-    // SAFETY: IOKit guarantees `report` points to `length` received bytes for
-    // this callback; `context` stays pinned until callbacks are unregistered.
-    let context = unsafe { &*(context.cast::<CallbackContext>()) };
-    let bytes = unsafe { std::slice::from_raw_parts(report.as_ptr(), length) }.to_vec();
-    let _ = context.callback_tx.send(CallbackEvent::Report {
-        id: report_id,
-        bytes,
+    // SAFETY: Owner pins this context until after abort, source removal, and close.
+    let context = unsafe { &*context.cast::<CallbackContext>() };
+    let _ = context.callback_tx.send(CallbackEvent::ReadComplete {
+        result,
+        length: length as usize,
     });
 }
 
 fn function_keys(report: &[u8]) -> Option<BTreeSet<u8>> {
     let report = match report {
         [id, payload @ ..] if *id == KEYBOARD_REPORT_ID as u8 && payload.len() >= 8 => payload,
-        payload if payload.len() >= 8 => payload,
         _ => return None,
     };
     Some(
@@ -656,121 +616,574 @@ fn function_key_name(usage: u8) -> String {
     format!("F{}", usage - F13_USAGE + 13)
 }
 
-unsafe extern "C-unwind" fn removal_callback(
-    context: *mut c_void,
-    _result: IOReturn,
-    _sender: *mut c_void,
-) {
-    if context.is_null() {
-        return;
-    }
-    // SAFETY: Registration keeps this pinned context alive until unregistered.
-    let context = unsafe { &*(context.cast::<CallbackContext>()) };
-    let _ = context.callback_tx.send(CallbackEvent::Removed);
-}
+struct IoObject(io_object_t);
 
-struct DeviceCandidate {
-    device: objc2_core_foundation::CFRetained<IOHIDDevice>,
-    transport: Transport,
-    location: Option<i64>,
-    serial: String,
-}
-
-impl DeviceCandidate {
-    fn sort_key(&self) -> (u8, Option<i64>, &str) {
-        candidate_key(self.transport, self.location, &self.serial)
+impl Drop for IoObject {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            let _ = IOObjectRelease(self.0);
+        }
     }
 }
 
-fn candidate_key(
-    transport: Transport,
-    location: Option<i64>,
-    serial: &str,
-) -> (u8, Option<i64>, &str) {
-    (transport_rank(transport), location, serial)
-}
+struct PlugIn(NonNull<*mut IOCFPlugInInterface>);
 
-fn transport_rank(transport: Transport) -> u8 {
-    match transport {
-        Transport::Usb => 0,
-        Transport::BluetoothLowEnergy => 1,
-        Transport::Other => 2,
-    }
-}
-
-fn choose_devices(manager: &IOHIDManager) -> Result<Vec<DeviceCandidate>> {
-    let devices = manager
-        .devices()
-        .ok_or_else(|| anyhow!("Codex Micro not found or unavailable"))?;
-    let count = devices.count();
-    if count <= 0 {
-        bail!("Codex Micro not found or unavailable")
-    }
-    let mut pointers: Vec<*const c_void> = vec![std::ptr::null(); count as usize];
-    // SAFETY: `pointers` has one entry per CFSet member; IOHIDManager returns
-    // only IOHIDDevice objects for this set, which are retained before return.
-    unsafe { devices.values(pointers.as_mut_ptr()) };
-    let location_key = cf_string(kIOHIDLocationIDKey);
-    let serial_key = cf_string(kIOHIDSerialNumberKey);
-    let mut candidates = Vec::new();
-    for pointer in pointers {
-        let Some(pointer) = NonNull::new(pointer.cast_mut()) else {
-            continue;
+impl PlugIn {
+    fn new(service: io_service_t, user_client: [u8; 16]) -> Result<Self> {
+        let user_client = uuid(user_client);
+        let plugin_id = uuid(IOCF_PLUGIN_INTERFACE_ID);
+        let mut plugin = ptr::null_mut();
+        let mut score = 0;
+        // SAFETY: service is retained, UUIDs are valid, and both out-pointers live.
+        let status = unsafe {
+            IOCreatePlugInInterfaceForService(
+                service,
+                Some(&user_client),
+                Some(&plugin_id),
+                &mut plugin,
+                &mut score,
+            )
         };
-        // SAFETY: the CFSet is documented to contain IOHIDDevice values and
-        // remains retained while this newly retained device handle is created.
-        let device =
-            unsafe { objc2_core_foundation::CFRetained::retain(pointer.cast::<IOHIDDevice>()) };
-        let location = device
-            .property(&location_key)
-            .and_then(|value| value.downcast_ref::<CFNumber>().and_then(CFNumber::as_i64));
-        let serial = device
-            .property(&serial_key)
-            .and_then(|value| value.downcast_ref::<CFString>().map(ToString::to_string))
-            .unwrap_or_default();
-        candidates.push(DeviceCandidate {
-            transport: device_transport(&device),
-            device,
-            location,
-            serial,
-        });
+        if status != kIOReturnSuccess {
+            bail!(
+                "IOCreatePlugInInterfaceForService failed: 0x{:08X}",
+                status as u32
+            )
+        }
+        Ok(Self(
+            NonNull::new(plugin).ok_or_else(|| anyhow!("IOKit returned a null plug-in"))?,
+        ))
     }
-    candidates.sort_by(|left, right| left.sort_key().cmp(&right.sort_key()));
-    if candidates
-        .windows(2)
-        .any(|pair| pair[0].sort_key() == pair[1].sort_key())
-    {
-        bail!("multiple Codex Micro devices have the same stable identity")
+
+    fn query<T>(&self, interface_id: [u8; 16]) -> Result<NonNull<*mut T>> {
+        let id = uuid(interface_id);
+        let mut output = ptr::null_mut();
+        // SAFETY: the plug-in COM pointer is live and output has the requested **T layout.
+        let status = unsafe {
+            let table = &**self.0.as_ptr();
+            let query = table
+                .QueryInterface
+                .ok_or_else(|| anyhow!("IOKit plug-in has no QueryInterface"))?;
+            query(
+                self.0.as_ptr().cast(),
+                id.uuid_bytes(),
+                (&mut output as *mut *mut *mut T).cast(),
+            )
+        };
+        if status != 0 {
+            bail!("IOKit QueryInterface failed: 0x{:08X}", status as u32)
+        }
+        NonNull::new(output).ok_or_else(|| anyhow!("IOKit returned a null COM interface"))
     }
-    if candidates.is_empty() {
-        bail!("Codex Micro not found or unavailable")
-    }
-    Ok(candidates)
 }
 
-fn device_transport(device: &IOHIDDevice) -> Transport {
-    let key = cf_string(kIOHIDTransportKey);
-    device
-        .property(&key)
-        .and_then(|value| value.downcast_ref::<CFString>().map(ToString::to_string))
-        .as_deref()
-        .map(Transport::from_iokit)
-        .unwrap_or(Transport::Other)
+impl Drop for PlugIn {
+    fn drop(&mut self) {
+        // SAFETY: this is the matching Release for the live plug-in reference.
+        unsafe {
+            if let Some(release) = (**self.0.as_ptr()).Release {
+                release(self.0.as_ptr().cast());
+            }
+        }
+    }
 }
 
-fn cf_string(value: &CStr) -> objc2_core_foundation::CFRetained<CFString> {
-    CFString::from_str(value.to_str().expect("IOKit keys are UTF-8"))
+struct UsbDevice {
+    raw: NonNull<*mut IOUSBDeviceInterface500>,
+    open: bool,
+    captured: bool,
+    released: bool,
 }
 
-fn output_wire(report: &mut [u8; REPORT_SIZE], transport: Transport) -> Result<&mut [u8]> {
+impl UsbDevice {
+    fn new(service: io_service_t) -> Result<Self> {
+        let plugin = PlugIn::new(service, USB_DEVICE_USER_CLIENT_ID)?;
+        Ok(Self {
+            raw: plugin.query(USB_DEVICE_INTERFACE_ID_500)?,
+            open: false,
+            captured: false,
+            released: false,
+        })
+    }
+
+    fn table(&self) -> &IOUSBDeviceInterface500 {
+        // SAFETY: QueryInterface returned this COM v500 table and self owns its ref.
+        unsafe { &**self.raw.as_ptr() }
+    }
+
+    fn this(&self) -> *mut c_void {
+        self.raw.as_ptr().cast()
+    }
+
+    fn verify_identity(&self) -> Result<()> {
+        let mut vendor = 0;
+        let mut product = 0;
+        let get_vendor = self
+            .table()
+            .GetDeviceVendor
+            .ok_or_else(|| anyhow!("USB device interface has no GetDeviceVendor"))?;
+        let get_product = self
+            .table()
+            .GetDeviceProduct
+            .ok_or_else(|| anyhow!("USB device interface has no GetDeviceProduct"))?;
+        // SAFETY: COM pointer and both out-pointers are valid.
+        let vendor_status = unsafe { get_vendor(self.this(), &mut vendor) };
+        let product_status = unsafe { get_product(self.this(), &mut product) };
+        if vendor_status != kIOReturnSuccess
+            || product_status != kIOReturnSuccess
+            || vendor != MICRO_VENDOR_ID as u16
+            || product != MICRO_PRODUCT_ID as u16
+        {
+            bail!("IOKit USB device identity changed during open")
+        }
+        Ok(())
+    }
+
+    fn capture(&mut self) -> Result<()> {
+        let open = self
+            .table()
+            .USBDeviceOpenSeize
+            .ok_or_else(|| anyhow!("USB device interface has no USBDeviceOpenSeize"))?;
+        // SAFETY: live COM device pointer.
+        let status = unsafe { open(self.this()) };
+        if status == kIOReturnSuccess {
+            self.open = true;
+        } else if status != kIOReturnExclusiveAccess as i32 {
+            bail!("USBDeviceOpenSeize failed: 0x{:08X}", status as u32)
+        }
+
+        // Root capture/release re-enumeration explicitly does not require an open
+        // device, so exclusive access here can still be resolved by capture.
+        let reenumerate = self
+            .table()
+            .USBDeviceReEnumerate
+            .ok_or_else(|| anyhow!("USB device interface has no USBDeviceReEnumerate"))?;
+        // SAFETY: live COM device pointer; capture mask is the documented driver-detach path.
+        let status = unsafe {
+            reenumerate(
+                self.this(),
+                USBReEnumerateOptions::ReEnumerateCaptureDeviceMask.0 as u32,
+            )
+        };
+        if status != kIOReturnSuccess {
+            bail!("USB device capture failed: 0x{:08X}", status as u32)
+        }
+        self.captured = true;
+        self.open = false;
+
+        // Capture invalidates the previous open while the device re-enumerates.
+        let deadline = Instant::now() + DEFAULT_REQUEST_TIMEOUT;
+        loop {
+            let status = unsafe { open(self.this()) };
+            if status == kIOReturnSuccess {
+                self.open = true;
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!("captured USB device reopen failed: 0x{:08X}", status as u32)
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        if !self.captured {
+            return Ok(());
+        }
+        let reenumerate = self
+            .table()
+            .USBDeviceReEnumerate
+            .ok_or_else(|| anyhow!("USB device interface has no USBDeviceReEnumerate"))?;
+        // SAFETY: live device pointer; the release mask returns it to driver matching.
+        let status = unsafe {
+            reenumerate(
+                self.this(),
+                USBReEnumerateOptions::ReEnumerateReleaseDeviceMask.0 as u32,
+            )
+        };
+        if status != kIOReturnSuccess {
+            bail!("USB device restoration failed: 0x{:08X}", status as u32)
+        }
+        self.captured = false;
+        self.open = false;
+        Ok(())
+    }
+
+    fn set_output_report(&self, payload: &mut [u8]) -> Result<()> {
+        let request = self
+            .table()
+            .DeviceRequestTO
+            .ok_or_else(|| anyhow!("USB device interface has no DeviceRequestTO"))?;
+        let mut request_data = IOUSBDevRequestTO {
+            bmRequestType: HID_SET_REPORT_REQUEST_TYPE,
+            bRequest: HID_SET_REPORT,
+            wValue: (HID_OUTPUT_REPORT << 8) | REPORT_ID as u16,
+            wIndex: INTERFACE_NUMBER as u16,
+            wLength: payload.len() as u16,
+            pData: payload.as_mut_ptr().cast(),
+            wLenDone: 0,
+            noDataTimeout: CONTROL_TIMEOUT_MS,
+            completionTimeout: CONTROL_TIMEOUT_MS,
+        };
+        // SAFETY: payload remains live for this bounded synchronous endpoint-zero request.
+        let status = unsafe { request(self.this(), &mut request_data) };
+        if status != kIOReturnSuccess {
+            bail!("HID SET_REPORT failed: 0x{:08X}", status as u32)
+        }
+        if request_data.wLenDone != payload.len() as u32 {
+            bail!(
+                "HID SET_REPORT wrote {} of {} bytes",
+                request_data.wLenDone,
+                payload.len()
+            )
+        }
+        Ok(())
+    }
+
+    fn close(&mut self) {
+        if !self.open {
+            return;
+        }
+        if let Some(close) = self.table().USBDeviceClose {
+            // SAFETY: live and currently open device pointer.
+            let _ = unsafe { close(self.this()) };
+        }
+        self.open = false;
+    }
+
+    fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        // A failed restore leaves `captured` true. Keep the final COM reference
+        // alive so Drop can retry restoration without dereferencing freed memory;
+        // if that retry also fails, leaking until helper exit is the safe outcome.
+        if self.captured {
+            return;
+        }
+        // SAFETY: matching Release for QueryInterface's device reference.
+        unsafe {
+            if let Some(release) = self.table().Release {
+                release(self.this());
+            }
+        }
+        self.released = true;
+    }
+}
+
+impl Drop for UsbDevice {
+    fn drop(&mut self) {
+        let _ = self.restore();
+        self.close();
+        self.release();
+    }
+}
+
+struct UsbInterface {
+    raw: NonNull<*mut IOUSBInterfaceInterface197>,
+    open: bool,
+    released: bool,
+}
+
+impl UsbInterface {
+    fn new(service: io_service_t) -> Result<Self> {
+        let plugin = PlugIn::new(service, USB_INTERFACE_USER_CLIENT_ID)?;
+        Ok(Self {
+            raw: plugin.query(USB_INTERFACE_ID_197)?,
+            open: false,
+            released: false,
+        })
+    }
+
+    fn table(&self) -> &IOUSBInterfaceInterface197 {
+        // SAFETY: QueryInterface returned this COM v197 table and self owns its ref.
+        unsafe { &**self.raw.as_ptr() }
+    }
+
+    fn this(&self) -> *mut c_void {
+        self.raw.as_ptr().cast()
+    }
+
+    fn open(&mut self) -> Result<()> {
+        let open = self
+            .table()
+            .USBInterfaceOpen
+            .ok_or_else(|| anyhow!("USB interface has no USBInterfaceOpen"))?;
+        // SAFETY: live COM interface pointer.
+        let status = unsafe { open(self.this()) };
+        if status != kIOReturnSuccess {
+            bail!("USBInterfaceOpen failed: 0x{:08X}", status as u32)
+        }
+        self.open = true;
+        Ok(())
+    }
+
+    fn identity(&self) -> Result<(u8, u8)> {
+        let get_number = self
+            .table()
+            .GetInterfaceNumber
+            .ok_or_else(|| anyhow!("USB interface has no GetInterfaceNumber"))?;
+        let get_alternate = self
+            .table()
+            .GetAlternateSetting
+            .ok_or_else(|| anyhow!("USB interface has no GetAlternateSetting"))?;
+        let (mut number, mut alternate) = (0, 0);
+        // SAFETY: live COM interface pointer and valid out-pointers; open is not required.
+        let number_status = unsafe { get_number(self.this(), &mut number) };
+        let alternate_status = unsafe { get_alternate(self.this(), &mut alternate) };
+        if number_status != kIOReturnSuccess || alternate_status != kIOReturnSuccess {
+            bail!("failed to identify USB interface")
+        }
+        Ok((number, alternate))
+    }
+
+    fn interrupt_in_pipe(&self) -> Result<u8> {
+        let mut count = 0;
+        let get_count = self
+            .table()
+            .GetNumEndpoints
+            .ok_or_else(|| anyhow!("USB interface has no GetNumEndpoints"))?;
+        // SAFETY: live open interface and valid out-pointer.
+        let status = unsafe { get_count(self.this(), &mut count) };
+        if status != kIOReturnSuccess {
+            bail!("GetNumEndpoints failed: 0x{:08X}", status as u32)
+        }
+        let get_properties = self
+            .table()
+            .GetPipeProperties
+            .ok_or_else(|| anyhow!("USB interface has no GetPipeProperties"))?;
+        let mut found = None;
+        for pipe in 1..=count {
+            let (mut direction, mut number, mut transfer, mut packet, mut interval) =
+                (0, 0, 0, 0, 0);
+            // SAFETY: live open interface and valid property out-pointers.
+            let status = unsafe {
+                get_properties(
+                    self.this(),
+                    pipe,
+                    &mut direction,
+                    &mut number,
+                    &mut transfer,
+                    &mut packet,
+                    &mut interval,
+                )
+            };
+            if status != kIOReturnSuccess
+                || endpoint_address(direction, number) != INTERRUPT_ENDPOINT
+                || transfer != kUSBInterrupt as u8
+                || packet != REPORT_SIZE as u16
+            {
+                continue;
+            }
+            if found.replace(pipe).is_some() {
+                bail!("multiple 0x81/64-byte interrupt IN pipes found")
+            }
+        }
+        found.ok_or_else(|| anyhow!("0x81/64-byte interrupt IN pipe not found"))
+    }
+
+    fn create_async_source(&self) -> Result<CFRetained<CFRunLoopSource>> {
+        let create = self
+            .table()
+            .CreateInterfaceAsyncEventSource
+            .ok_or_else(|| anyhow!("USB interface has no async event source"))?;
+        let mut source = ptr::null_mut();
+        // SAFETY: live interface pointer and valid created-source out-pointer.
+        let status = unsafe { create(self.this(), &mut source) };
+        if status != kIOReturnSuccess {
+            bail!(
+                "CreateInterfaceAsyncEventSource failed: 0x{:08X}",
+                status as u32
+            )
+        }
+        let source = NonNull::new(source).ok_or_else(|| anyhow!("IOKit returned a null source"))?;
+        // SAFETY: CreateInterfaceAsyncEventSource returns a +1 CF object.
+        Ok(unsafe { CFRetained::from_raw(source) })
+    }
+
+    fn read_async(&self, pipe: u8, buffer: *mut c_void, context: *mut c_void) -> Result<()> {
+        let read = self
+            .table()
+            .ReadPipeAsync
+            .ok_or_else(|| anyhow!("USB interface has no ReadPipeAsync"))?;
+        // SAFETY: buffer and pinned context remain live until completion or abort.
+        let status = unsafe {
+            read(
+                self.this(),
+                pipe,
+                buffer,
+                REPORT_SIZE as u32,
+                Some(read_callback),
+                context,
+            )
+        };
+        if status != kIOReturnSuccess {
+            bail!("ReadPipeAsync failed: 0x{:08X}", status as u32)
+        }
+        Ok(())
+    }
+
+    fn abort(&self, pipe: u8) -> Result<()> {
+        if !self.open {
+            bail!("USB interface is not open during abort")
+        }
+        let abort = self
+            .table()
+            .AbortPipe
+            .ok_or_else(|| anyhow!("USB interface has no AbortPipe"))?;
+        // SAFETY: live open interface and discovered pipe reference.
+        let status = unsafe { abort(self.this(), pipe) };
+        if status != kIOReturnSuccess {
+            bail!("AbortPipe failed: 0x{:08X}", status as u32)
+        }
+        Ok(())
+    }
+
+    fn close(&mut self) {
+        if !self.open {
+            return;
+        }
+        if let Some(close) = self.table().USBInterfaceClose {
+            // SAFETY: live and currently open interface pointer.
+            let _ = unsafe { close(self.this()) };
+        }
+        self.open = false;
+    }
+
+    fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        self.close();
+        // SAFETY: matching Release for QueryInterface's interface reference.
+        unsafe {
+            if let Some(release) = self.table().Release {
+                release(self.this());
+            }
+        }
+        self.released = true;
+    }
+}
+
+impl Drop for UsbInterface {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+fn find_micro_device() -> Result<IoObject> {
+    // SAFETY: static bytes are a valid NUL-terminated IOKit class name.
+    let matching = unsafe { IOServiceMatching(b"IOUSBHostDevice\0".as_ptr().cast()) }
+        .ok_or_else(|| anyhow!("IOServiceMatching failed"))?;
+    // SAFETY: CFMutableDictionary is a CFDictionary subtype with identical ownership.
+    let matching = unsafe { CFRetained::cast_unchecked::<CFDictionary>(matching) };
+    let mut iterator = 0;
+    // SAFETY: the matching dictionary is consumed and iterator is a valid out-pointer.
+    let status =
+        unsafe { IOServiceGetMatchingServices(kIOMainPortDefault, Some(matching), &mut iterator) };
+    if status != kIOReturnSuccess {
+        bail!(
+            "IOServiceGetMatchingServices failed: 0x{:08X}",
+            status as u32
+        )
+    }
+    let iterator = IoObject(iterator);
+    let mut found = Vec::new();
+    loop {
+        let service = IOIteratorNext(iterator.0);
+        if service == 0 {
+            break;
+        }
+        let service = IoObject(service);
+        if property_number(service.0, kUSBVendorID) == Some(MICRO_VENDOR_ID as i64)
+            && property_number(service.0, kUSBProductID) == Some(MICRO_PRODUCT_ID as i64)
+        {
+            found.push(service);
+        }
+    }
+    match found.len() {
+        0 => bail!("Codex Micro USB device not found"),
+        1 => Ok(found.pop().expect("one device")),
+        count => bail!("multiple Codex Micro USB devices found ({count})"),
+    }
+}
+
+fn restore_after_open_error(device: &mut UsbDevice, error: anyhow::Error) -> anyhow::Error {
+    match device.restore() {
+        Ok(()) => error,
+        Err(recovery) => anyhow!("{error:#}; USB restoration failed: {recovery:#}"),
+    }
+}
+
+fn wait_for_interface_zero(device: &UsbDevice) -> Result<IoObject> {
+    let deadline = Instant::now() + DEFAULT_REQUEST_TIMEOUT;
+    loop {
+        match find_interface_zero(device) {
+            Ok(interface) => return Ok(interface),
+            Err(_) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => return Err(error).context("wait for captured USB interface 0"),
+        }
+    }
+}
+
+fn find_interface_zero(device: &UsbDevice) -> Result<IoObject> {
+    let create = device
+        .table()
+        .CreateInterfaceIterator
+        .ok_or_else(|| anyhow!("USB device has no CreateInterfaceIterator"))?;
+    let any = kIOUSBFindInterfaceDontCare as u16;
+    let mut request = IOUSBFindInterfaceRequest {
+        bInterfaceClass: any,
+        bInterfaceSubClass: any,
+        bInterfaceProtocol: any,
+        bAlternateSetting: any,
+    };
+    let mut iterator = 0;
+    // SAFETY: live captured device, initialized request, and valid iterator out-pointer.
+    let status = unsafe { create(device.this(), &mut request, &mut iterator) };
+    if status != kIOReturnSuccess {
+        bail!("CreateInterfaceIterator failed: 0x{:08X}", status as u32)
+    }
+    let iterator = IoObject(iterator);
+    let mut found = Vec::new();
+    loop {
+        let service = IOIteratorNext(iterator.0);
+        if service == 0 {
+            break;
+        }
+        let service = IoObject(service);
+        let is_interface_zero = UsbInterface::new(service.0)
+            .and_then(|interface| interface.identity())
+            .is_ok_and(|identity| identity == (INTERFACE_NUMBER as u8, 0));
+        if is_interface_zero {
+            found.push(service);
+        }
+    }
+    match found.len() {
+        0 => bail!("Codex Micro USB interface 0 not found"),
+        1 => Ok(found.pop().expect("one interface")),
+        count => bail!("multiple Codex Micro USB interface-0 services found ({count})"),
+    }
+}
+
+fn property_number(service: io_service_t, key: &CStr) -> Option<i64> {
+    let key = CFString::from_str(key.to_str().ok()?);
+    // SAFETY: service is retained, key is a CFString, and no options are used.
+    unsafe { IORegistryEntryCreateCFProperty(service, Some(&key), None, 0) }
+        .and_then(|value| value.downcast_ref::<CFNumber>().and_then(CFNumber::as_i64))
+}
+
+fn endpoint_address(direction: u8, number: u8) -> u8 {
+    number | if direction == kUSBIn as u8 { 0x80 } else { 0 }
+}
+
+fn output_wire(report: &mut [u8; REPORT_SIZE]) -> Result<&mut [u8]> {
     if report[0] != REPORT_ID {
         bail!("invalid Micro report ID")
     }
-    Ok(if transport == Transport::Usb {
-        &mut report[1..]
-    } else {
-        report
-    })
+    Ok(&mut report[1..])
 }
 
 fn parse_event(envelope: &Value) -> Option<DeviceEvent> {
@@ -797,35 +1210,50 @@ fn error_message(error: &Value) -> String {
         .to_owned()
 }
 
+fn uuid(bytes: [u8; 16]) -> CFRetained<CFUUID> {
+    let [b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15] = bytes;
+    CFUUID::constant_uuid_with_bytes(
+        None, b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15,
+    )
+    .expect("constant UUID")
+}
+
+const IOCF_PLUGIN_INTERFACE_ID: [u8; 16] = [
+    0xC2, 0x44, 0xE8, 0x58, 0x10, 0x9C, 0x11, 0xD4, 0x91, 0xD4, 0x00, 0x50, 0xE4, 0xC6, 0x42, 0x6F,
+];
+const USB_DEVICE_USER_CLIENT_ID: [u8; 16] = [
+    0x9D, 0xC7, 0xB7, 0x80, 0x9E, 0xC0, 0x11, 0xD4, 0xA5, 0x4F, 0x00, 0x0A, 0x27, 0x05, 0x28, 0x61,
+];
+const USB_INTERFACE_USER_CLIENT_ID: [u8; 16] = [
+    0x2D, 0x97, 0x86, 0xC6, 0x9E, 0xF3, 0x11, 0xD4, 0xAD, 0x51, 0x00, 0x0A, 0x27, 0x05, 0x28, 0x61,
+];
+const USB_DEVICE_INTERFACE_ID_500: [u8; 16] = [
+    0xA3, 0x3C, 0xF0, 0x47, 0x4B, 0x5B, 0x48, 0xE2, 0xB5, 0x7D, 0x02, 0x07, 0xFC, 0xEA, 0xE1, 0x3B,
+];
+const USB_INTERFACE_ID_197: [u8; 16] = [
+    0xC6, 0x3D, 0x3C, 0x92, 0x08, 0x84, 0x11, 0xD7, 0x96, 0x92, 0x00, 0x03, 0x93, 0x3E, 0x3E, 0x3E,
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use objc2_io_kit::kUSBOut;
     use serde_json::json;
 
     #[test]
-    fn usb_omits_only_the_report_id() {
+    fn usb_set_report_omits_only_report_id() {
         let mut report = [0; REPORT_SIZE];
         report[0] = REPORT_ID;
         report[1] = 2;
-        let usb = output_wire(&mut report, Transport::Usb).unwrap();
-        assert_eq!(usb.len(), 63);
-        assert_eq!(usb[0], 2);
-        assert_eq!(
-            output_wire(&mut report, Transport::BluetoothLowEnergy)
-                .unwrap()
-                .len(),
-            64
-        );
+        let payload = output_wire(&mut report).unwrap();
+        assert_eq!(payload.len(), 63);
+        assert_eq!(payload[0], 2);
     }
 
     #[test]
-    fn transport_selection_matches_iokit_values() {
-        assert_eq!(Transport::from_iokit("USB"), Transport::Usb);
-        assert_eq!(
-            Transport::from_iokit("Bluetooth Low Energy"),
-            Transport::BluetoothLowEnergy
-        );
-        assert_eq!(Transport::from_iokit("Bluetooth"), Transport::Other);
+    fn endpoint_address_identifies_interrupt_in_endpoint() {
+        assert_eq!(endpoint_address(kUSBIn as u8, 1), INTERRUPT_ENDPOINT);
+        assert_ne!(endpoint_address(kUSBOut as u8, 1), INTERRUPT_ENDPOINT);
     }
 
     #[test]
@@ -846,12 +1274,8 @@ mod tests {
     }
 
     #[test]
-    fn reads_function_keys_from_keyboard_reports_with_or_without_report_id() {
+    fn reads_function_keys_from_id_prefixed_keyboard_reports() {
         let expected = BTreeSet::from([F13_USAGE, F24_USAGE]);
-        assert_eq!(
-            function_keys(&[0, 0, F13_USAGE, F24_USAGE, 0, 0, 0, 0]),
-            Some(expected.clone())
-        );
         assert_eq!(
             function_keys(&[
                 KEYBOARD_REPORT_ID as u8,
@@ -867,36 +1291,16 @@ mod tests {
             Some(expected)
         );
         assert_eq!(
-            function_keys(&[1, 0, F13_USAGE, 0, 0, 0, 0, 0]),
-            Some(BTreeSet::from([F13_USAGE]))
+            function_keys(&[0, 0, F13_USAGE, F24_USAGE, 0, 0, 0, 0]),
+            None
         );
-        assert_eq!(function_keys(&[0; 8]), Some(BTreeSet::new()));
         assert_eq!(function_keys(&[0; 7]), None);
         assert_eq!(function_key_name(F13_USAGE), "F13");
         assert_eq!(function_key_name(F24_USAGE), "F24");
     }
 
     #[test]
-    fn request_write_error_reaches_caller() {
-        let (_reply_tx, reply_rx) = mpsc::sync_channel(1);
-        assert!(await_send_reply(reply_rx, Duration::from_millis(1)).is_err());
-    }
-
-    #[test]
-    fn lock_excludes_another_micro_owner() {
-        let path =
-            std::env::temp_dir().join(format!("codex-micro-lock-test-{}", std::process::id()));
-        let first = DeviceLock::acquire_at(&path).unwrap();
-        assert!(DeviceLock::acquire_at(&path).is_err());
-        drop(first);
-        assert!(DeviceLock::acquire_at(&path).is_ok());
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
     fn close_joins_an_owner_after_removal() {
-        let path =
-            std::env::temp_dir().join(format!("codex-micro-close-test-{}", std::process::id()));
         let (command_tx, _command_rx) = mpsc::channel();
         let joined = Arc::new(AtomicBool::new(false));
         let owner_joined = Arc::clone(&joined);
@@ -907,45 +1311,11 @@ mod tests {
             owner: Some(thread::spawn(move || {
                 thread::sleep(Duration::from_millis(20));
                 owner_joined.store(true, Ordering::Release);
+                Ok(())
             })),
-            lock: Some(DeviceLock::acquire_at(&path).unwrap()),
         };
         device.close().unwrap();
         assert!(joined.load(Ordering::Acquire));
         assert!(device.owner.is_none());
-        assert!(device.lock.is_none());
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn candidate_order_prefers_usb_then_stable_identity() {
-        assert!(
-            candidate_key(Transport::Usb, Some(2), "b")
-                < candidate_key(Transport::BluetoothLowEnergy, Some(1), "a")
-        );
-        assert!(
-            candidate_key(Transport::Usb, Some(1), "b")
-                < candidate_key(Transport::Usb, Some(2), "a")
-        );
-        assert!(
-            candidate_key(Transport::Usb, Some(1), "a")
-                < candidate_key(Transport::Usb, Some(1), "b")
-        );
-    }
-
-    #[test]
-    fn input_monitoring_access_is_classified() {
-        assert_eq!(
-            classify_input_monitoring(IOHIDAccessType::Granted),
-            InputMonitoringAccess::Granted
-        );
-        assert_eq!(
-            classify_input_monitoring(IOHIDAccessType::Denied),
-            InputMonitoringAccess::Denied
-        );
-        assert_eq!(
-            classify_input_monitoring(IOHIDAccessType::Unknown),
-            InputMonitoringAccess::Unknown
-        );
     }
 }

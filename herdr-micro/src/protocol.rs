@@ -12,25 +12,15 @@ pub struct JoystickEvent {
     pub direction: Option<&'static str>,
 }
 
-pub fn device_owner(processes: &[String], frontmost_bundle: Option<&str>) -> Option<&'static str> {
-    let native_frontmost = CHATGPT_BUNDLE_IDS
-        .into_iter()
-        .find(|bundle| crate::macos::frontmost_bundle_is(bundle));
-    device_owner_with_bundles(
-        &crate::macos::running_bundle_ids(),
-        processes,
-        native_frontmost.or(frontmost_bundle),
-    )
+pub fn device_owner(frontmost_bundle: Option<&str>) -> Option<&'static str> {
+    device_owner_with_bundles(&crate::macos::running_bundle_ids(), frontmost_bundle)
 }
 
 pub fn device_owner_with_bundles(
     running_bundles: &[String],
-    processes: &[String],
     frontmost_bundle: Option<&str>,
 ) -> Option<&'static str> {
-    let input_running = bundle_is_running(running_bundles, "it.focusense.input-app")
-        || has_process(processes, "input", "input");
-    if input_running {
+    if bundle_is_running(running_bundles, "it.focusense.input-app") {
         return Some("Input");
     }
 
@@ -38,9 +28,7 @@ pub fn device_owner_with_bundles(
         frontmost_bundle.is_some_and(|bundle| CHATGPT_BUNDLE_IDS.contains(&bundle));
     let chatgpt_running = CHATGPT_BUNDLE_IDS
         .iter()
-        .any(|bundle| bundle_is_running(running_bundles, bundle))
-        || has_process(processes, "ChatGPT", "ChatGPT")
-        || has_process(processes, "Codex", "ChatGPT");
+        .any(|bundle| bundle_is_running(running_bundles, bundle));
     (frontmost_openai && chatgpt_running).then_some("ChatGPT")
 }
 
@@ -48,15 +36,6 @@ fn bundle_is_running(bundles: &[String], expected: &str) -> bool {
     bundles.iter().any(|bundle| bundle == expected)
 }
 
-fn has_process(processes: &[String], app: &str, executable: &str) -> bool {
-    let suffix = format!("/{app}.app/Contents/MacOS/{executable}");
-    processes.iter().any(|command| {
-        command
-            .split_ascii_whitespace()
-            .next()
-            .is_some_and(|path| path.ends_with(&suffix))
-    })
-}
 fn priority(status: AgentStatus) -> u8 {
     match status {
         AgentStatus::Unknown => 0,
@@ -248,28 +227,22 @@ mod tests {
         );
     }
     #[test]
-    fn device_owners_use_bundle_identity_with_relocated_process_fallback() {
-        let input = "/Users/me/Applications/input.app/Contents/MacOS/input --background".to_owned();
+    fn device_owners_use_bundle_identity() {
         assert_eq!(
-            device_owner_with_bundles(&[], &[input], None),
+            device_owner_with_bundles(&["it.focusense.input-app".into()], None),
             Some("Input")
         );
 
-        let chatgpt = "/Volumes/Tools/ChatGPT.app/Contents/MacOS/ChatGPT --launch".to_owned();
         assert_eq!(
-            device_owner_with_bundles(&["com.openai.codex".into()], &[], Some("com.openai.codex")),
+            device_owner_with_bundles(&["com.openai.codex".into()], Some("com.openai.codex")),
             Some("ChatGPT")
         );
         assert_eq!(
-            device_owner_with_bundles(&["com.openai.chat".into()], &[], Some("com.openai.chat")),
+            device_owner_with_bundles(&["com.openai.chat".into()], Some("com.openai.chat")),
             Some("ChatGPT")
         );
         assert_eq!(
-            device_owner_with_bundles(&[], &[chatgpt], Some("com.openai.codex")),
-            Some("ChatGPT")
-        );
-        assert_eq!(
-            device_owner_with_bundles(&["com.openai.codex".into()], &[], Some("com.example.other")),
+            device_owner_with_bundles(&["com.openai.codex".into()], Some("com.example.other")),
             None
         );
     }

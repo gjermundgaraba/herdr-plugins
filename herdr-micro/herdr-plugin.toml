@@ -1,6 +1,6 @@
 id = "gjermundgaraba.herdr-micro"
 name = "Herdr Micro"
-version = "0.11.0"
+version = "0.1.0"
 min_herdr_version = "0.7.5"
 description = "Control Herdr from a Work Louder Codex Micro."
 platforms = ["macos"]
@@ -16,6 +16,12 @@ command = ["install", "-m", "750", "target/release/herdr-micro", "bin/.herdr-mic
 
 [[build]]
 command = ["mv", "-f", "bin/.herdr-micro.new", "bin/herdr-micro"]
+
+[[build]]
+command = ["install", "-m", "750", "target/release/herdr-micro-hid", "bin/.herdr-micro-hid.new"]
+
+[[build]]
+command = ["mv", "-f", "bin/.herdr-micro-hid.new", "bin/herdr-micro-hid"]
 
 [[startup]]
 command = ["bin/herdr-micro", "start"]

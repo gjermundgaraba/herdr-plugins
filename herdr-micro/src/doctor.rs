@@ -6,8 +6,9 @@ use std::{env, fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Command
 use crate::{
     config::{config_path, load_controls, load_effort, load_lighting},
     control::request_status,
-    device::{input_monitoring_access, InputMonitoringAccess},
     ghostty::inspect_ghostty,
+    helper_install,
+    hid::HELPER_VERSION,
     macos::{frontmost, post_event_access},
     setup::plugin_root,
 };
@@ -72,6 +73,17 @@ fn pi_extension() -> Option<PathBuf> {
         .map(|home| PathBuf::from(home).join(".pi/agent/extensions/herdr-micro-effort.ts"))
 }
 
+fn report_runtime_errors(report: &mut Report, status: &serde_json::Value) {
+    for (field, label) in [
+        ("deviceError", "Micro device runtime error"),
+        ("outputError", "macOS output runtime error"),
+    ] {
+        if let Some(error) = status.get(field).and_then(serde_json::Value::as_str) {
+            report.push(Level::Warn, format!("{label}: {error}"));
+        }
+    }
+}
+
 pub fn doctor() -> Report {
     let mut report = Report::default();
     check(&mut report, "Rust executable", || {
@@ -82,22 +94,15 @@ pub fn doctor() -> Report {
         }
         Ok(path.display().to_string())
     });
+    check(&mut report, "Privileged USB helper", || {
+        helper_install::verify_installed()?;
+        Ok(format!("version {HELPER_VERSION}"))
+    });
     match post_event_access() {
-        Ok(()) => report.push(Level::Ok, "Scroll event access"),
+        Ok(()) => report.push(Level::Ok, "macOS event output"),
         Err(_) => report.push(
-            Level::Warn,
-            "Scroll event access is denied; enable Accessibility for Herdr or its terminal host",
-        ),
-    }
-    match input_monitoring_access() {
-        InputMonitoringAccess::Granted => report.push(Level::Ok, "Input Monitoring access"),
-        InputMonitoringAccess::Denied => report.push(
             Level::Fail,
-            "Input Monitoring is denied; enable it for Herdr or its terminal host",
-        ),
-        InputMonitoringAccess::Unknown => report.push(
-            Level::Warn,
-            "Input Monitoring access could not be determined; standard HID key events may be withheld",
+            "macOS event output is denied; enable Accessibility for Herdr or its terminal host",
         ),
     }
     match frontmost() {
@@ -145,11 +150,14 @@ pub fn doctor() -> Report {
         Ok(lighting.display().to_string())
     });
     match request_status(Duration::from_millis(750)) {
-        Ok(status) => match status.get("device").and_then(serde_json::Value::as_str) {
-            Some("connected") => report.push(Level::Ok, "Micro bridge: connected"),
-            Some(device) => report.push(Level::Warn, format!("Micro bridge: {device}")),
-            None => report.push(Level::Warn, "Micro bridge returned no device status"),
-        },
+        Ok(status) => {
+            match status.get("device").and_then(serde_json::Value::as_str) {
+                Some("connected") => report.push(Level::Ok, "Micro bridge: connected"),
+                Some(device) => report.push(Level::Warn, format!("Micro bridge: {device}")),
+                None => report.push(Level::Warn, "Micro bridge returned no device status"),
+            }
+            report_runtime_errors(&mut report, &status);
+        }
         Err(error) => report.push(Level::Warn, format!("Micro bridge is not running: {error}")),
     }
     if effort_config.as_ref().map_or(true, |config| {
@@ -202,5 +210,21 @@ mod tests {
         report.push(Level::Fail, "three");
         assert!(report.failed());
         assert_eq!(report.render(), "[ok] one\n[warn] two\n[fail] three");
+    }
+
+    #[test]
+    fn runtime_errors_are_reported_separately() {
+        let mut report = Report::default();
+        report_runtime_errors(
+            &mut report,
+            &serde_json::json!({
+                "deviceError": "USB restoration failed",
+                "outputError": "CGEvent post failed",
+            }),
+        );
+        assert_eq!(
+            report.render(),
+            "[warn] Micro device runtime error: USB restoration failed\n[warn] macOS output runtime error: CGEvent post failed"
+        );
     }
 }
