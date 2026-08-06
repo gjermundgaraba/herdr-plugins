@@ -1,10 +1,10 @@
 //! Privileged Codex Micro access over a local, versioned NDJSON socket.
 
-use anyhow::{anyhow, bail, Context, Result};
-use serde_json::{json, Value};
+use anyhow::{Context, Result, anyhow, bail};
+use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    ffi::{c_char, c_int, c_void, CString},
+    ffi::{CString, c_char, c_int, c_void},
     io::{self, Read, Write},
     os::unix::{
         io::{AsRawFd, FromRawFd},
@@ -13,15 +13,15 @@ use std::{
     path::{Path, PathBuf},
     ptr,
     sync::{
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Sender, SyncSender},
-        Arc, Mutex,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
-use crate::device::{DeviceEvent, MicroDevice, DEFAULT_REQUEST_TIMEOUT, DEVICE_OPEN_TIMEOUT};
+use crate::device::{DEFAULT_REQUEST_TIMEOUT, DEVICE_OPEN_TIMEOUT, DeviceEvent, MicroDevice};
 
 pub const HID_PROTOCOL_VERSION: u32 = 1;
 pub const HID_LAUNCH_SOCKET_NAME: &str = "Control";
@@ -533,7 +533,7 @@ fn serve_client(stream: &mut UnixStream) -> Result<()> {
         match done_rx.try_recv() {
             Ok(result) => break result.map_err(anyhow::Error::msg),
             Err(mpsc::TryRecvError::Disconnected) => {
-                break Err(anyhow!("HID command reader stopped"))
+                break Err(anyhow!("HID command reader stopped"));
             }
             Err(mpsc::TryRecvError::Empty) => {}
         }
@@ -942,9 +942,11 @@ mod tests {
         // SAFETY: getuid has no preconditions.
         let uid = unsafe { libc::getuid() };
         let error = HidClient::connect_at(&path, events, uid).err().unwrap();
-        assert!(error
-            .to_string()
-            .contains("incompatible USB helper version"));
+        assert!(
+            error
+                .to_string()
+                .contains("incompatible USB helper version")
+        );
         server.join().unwrap();
         fs::remove_file(path).unwrap();
     }

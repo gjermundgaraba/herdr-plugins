@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 
-use anyhow::{anyhow, bail, Context, Result};
-use base64::{engine::general_purpose::STANDARD, Engine};
-use serde_json::{json, Value};
+use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine, engine::general_purpose::STANDARD};
+use serde_json::{Value, json};
 
-use crate::{MicroDevice, DEFAULT_REQUEST_TIMEOUT};
+use crate::{DEFAULT_REQUEST_TIMEOUT, MicroDevice};
 
 const READ_CHUNK: usize = 512;
 const WRITE_CHUNK: usize = 384;

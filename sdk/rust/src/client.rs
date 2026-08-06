@@ -1,14 +1,14 @@
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use interprocess::local_socket::traits::Stream as _;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::{
     AgentInfo, EventEnvelope, EventSubscription, LayoutDescription, LayoutExportParams,
@@ -376,14 +376,14 @@ fn read_json_line<T: DeserializeOwned, R: BufRead>(reader: &mut R) -> Result<Opt
 fn connect_local_stream(path: &Path) -> io::Result<LocalStream> {
     #[cfg(unix)]
     {
-        use interprocess::local_socket::{prelude::*, GenericFilePath};
+        use interprocess::local_socket::{GenericFilePath, prelude::*};
 
         LocalStream::connect(path.to_fs_name::<GenericFilePath>()?)
     }
 
     #[cfg(windows)]
     {
-        use interprocess::local_socket::{prelude::*, GenericNamespaced};
+        use interprocess::local_socket::{GenericNamespaced, prelude::*};
 
         let name = path.to_string_lossy().to_string();
         LocalStream::connect(name.to_ns_name::<GenericNamespaced>()?)

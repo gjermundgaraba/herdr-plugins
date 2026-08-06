@@ -207,7 +207,7 @@ pub fn parse_controls(value: &Value) -> Result<Controls, String> {
             _ => {
                 return Err(format!(
                     "actionDeviceKeys.{button} must be null or F13 through F24"
-                ))
+                ));
             }
         };
         if let Some(key) = &key {
@@ -236,7 +236,7 @@ pub fn parse_controls(value: &Value) -> Result<Controls, String> {
             _ => {
                 return Err(format!(
                     "actionMacosKeys.{button} must be null or F13 through F20"
-                ))
+                ));
             }
         };
         if let Some(key) = &key {

@@ -1,16 +1,16 @@
 use ratatui::{
+    Frame,
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Paragraph},
-    Frame,
 };
 use unicode_truncate::UnicodeTruncateStr;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    model::{Filter, Item, Kind, Picker},
     Mode,
+    model::{Filter, Item, Kind, Picker},
 };
 use herdr_client::AgentStatus;
 
@@ -317,7 +317,7 @@ fn truncate_start(value: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use crate::model::Dispatch;
-    use ratatui::{backend::TestBackend, Terminal};
+    use ratatui::{Terminal, backend::TestBackend};
     use serde_json::json;
 
     #[test]

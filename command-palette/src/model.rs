@@ -1,7 +1,7 @@
 use herdr_client::AgentStatus;
 use nucleo_matcher::{
-    pattern::{CaseMatching, Normalization, Pattern},
     Config, Matcher, Utf32Str,
+    pattern::{CaseMatching, Normalization, Pattern},
 };
 use serde_json::Value;
 

@@ -1,10 +1,10 @@
 use std::{cmp::Reverse, collections::HashMap, process::Command};
 
 use herdr_client::{
-    herdr_config_path, AgentStatus, Client, PluginInvocationContext, SessionSnapshot,
+    AgentStatus, Client, PluginInvocationContext, SessionSnapshot, herdr_config_path,
 };
 use serde::Deserialize;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::model::{Dispatch, Item, Kind};
 

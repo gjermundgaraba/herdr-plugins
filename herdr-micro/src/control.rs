@@ -1,7 +1,7 @@
 //! The small local control socket shared by the Micro action scripts and daemon.
 
-use anyhow::{anyhow, bail, Context, Result};
-use serde_json::{json, Value};
+use anyhow::{Context, Result, anyhow, bail};
+use serde_json::{Value, json};
 use std::env;
 use std::fs::{self, Permissions};
 use std::io::{ErrorKind, Read, Write};
@@ -9,9 +9,9 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{
+    Arc,
     atomic::{AtomicBool, Ordering},
     mpsc::Receiver,
-    Arc,
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -170,8 +170,11 @@ pub fn start_daemon_at<F>(path: &Path, launch: F, ready_timeout: Duration) -> Re
 where
     F: FnOnce() -> Result<()>,
 {
-    if let Some(status) = live_status(request_at(path, Command::Status, Duration::from_millis(500)))
-    {
+    if let Some(status) = live_status(request_at(
+        path,
+        Command::Status,
+        Duration::from_millis(500),
+    )) {
         return Ok(status);
     }
 
@@ -182,9 +185,11 @@ where
     launch()?;
     let deadline = Instant::now() + ready_timeout;
     loop {
-        if let Some(status) =
-            live_status(request_at(path, Command::Status, Duration::from_millis(250)))
-        {
+        if let Some(status) = live_status(request_at(
+            path,
+            Command::Status,
+            Duration::from_millis(250),
+        )) {
             return Ok(status);
         }
         if Instant::now() >= deadline {
@@ -316,7 +321,12 @@ where
         Ok(listener) => listener,
         Err(error) if error.raw_os_error() == Some(libc::EADDRINUSE) => {
             let before = identity(&path)?;
-            if live_status(request_at(&path, Command::Status, Duration::from_millis(500))).is_some()
+            if live_status(request_at(
+                &path,
+                Command::Status,
+                Duration::from_millis(500),
+            ))
+            .is_some()
             {
                 bail!("Micro bridge is already running");
             }
@@ -417,9 +427,8 @@ mod tests {
         path: PathBuf,
         stopping: Arc<AtomicBool>,
     ) -> (Arc<ControlServer>, mpsc::Sender<()>, thread::JoinHandle<()>) {
-        let server = Arc::new(
-            listen_for_control_at(path, || json!({ "running": true }), stopping).unwrap(),
-        );
+        let server =
+            Arc::new(listen_for_control_at(path, || json!({ "running": true }), stopping).unwrap());
         let (shutdown, shutdown_rx) = mpsc::channel();
         let runner = Arc::clone(&server);
         let thread = thread::spawn(move || runner.run_with_shutdown(&shutdown_rx).unwrap());
@@ -517,7 +526,11 @@ mod tests {
         let path = dir.join(SOCKET_NAME);
         let (server, shutdown, runner) =
             start_test_server(path.clone(), Arc::new(AtomicBool::new(false)));
-        let error = match listen_for_control_at(path.clone(), || json!({}), Arc::new(AtomicBool::new(false))) {
+        let error = match listen_for_control_at(
+            path.clone(),
+            || json!({}),
+            Arc::new(AtomicBool::new(false)),
+        ) {
             Ok(_) => panic!("duplicate bind succeeded"),
             Err(error) => error,
         };
@@ -535,7 +548,9 @@ mod tests {
         let path = dir.join(SOCKET_NAME);
         drop(UnixListener::bind(&path).unwrap());
         let stale = identity(&path).unwrap().unwrap();
-        let mut server = listen_for_control_at(path.clone(), || json!({}), Arc::new(AtomicBool::new(false))).unwrap();
+        let mut server =
+            listen_for_control_at(path.clone(), || json!({}), Arc::new(AtomicBool::new(false)))
+                .unwrap();
         assert_ne!(identity(&path).unwrap().unwrap(), stale);
         server.close().unwrap();
         assert!(!path.exists());

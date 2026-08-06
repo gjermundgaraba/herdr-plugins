@@ -1,16 +1,16 @@
 //! The long-lived Codex Micro bridge.  Keep the policy here; HID framing,
 //! Herdr parsing, gestures, and macOS operations live in their small modules.
 
-use anyhow::{anyhow, bail, Result};
-use serde_json::{json, Value};
+use anyhow::{Result, anyhow, bail};
+use serde_json::{Value, json};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     env,
     sync::{
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError},
-        Arc, Mutex, OnceLock,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -18,29 +18,29 @@ use std::{
 
 use crate::{
     actions::{
-        automatic_layer, diff_pane_args, execute_effort_plan, fast_mode_plan, layer_identity,
-        parse_agents, plan_effort_change, prompt_args, scroll_plan, submit_args, Agent,
+        Agent, automatic_layer, diff_pane_args, execute_effort_plan, fast_mode_plan,
+        layer_identity, parse_agents, plan_effort_change, prompt_args, scroll_plan, submit_args,
     },
     config::{
+        Action, AgentStatus, Binding, Controls, Direction, EffortDirection, VerticalDirection,
         config_path, key_binding, load_controls, load_effort, load_lighting, provision_controls,
-        provision_effort, provision_lighting, Action, AgentStatus, Binding, Controls, Direction,
-        EffortDirection, VerticalDirection,
+        provision_effort, provision_lighting,
     },
     control::listen_for_control,
     device::DeviceEvent,
     gestures::{Fired, GestureDispatcher},
     ghostty::{
-        focused_session, focused_terminal_id, inspect_ghostty, probe_session_terminals,
-        GhosttyState, SessionTerminalMapping,
+        GhosttyState, SessionTerminalMapping, focused_session, focused_terminal_id,
+        inspect_ghostty, probe_session_terminals,
     },
     herdr::{
-        current_environment, discover_sessions, herdr_bin, run_command, run_json,
-        session_environment, Environment,
+        Environment, current_environment, discover_sessions, herdr_bin, run_command, run_json,
+        session_environment,
     },
     hid::HidClient,
     macos,
     protocol::{
-        aggregate_lighting, assign_slots, device_owner, joystick_event, slot_lighting, SLOT_COUNT,
+        SLOT_COUNT, aggregate_lighting, assign_slots, device_owner, joystick_event, slot_lighting,
     },
 };
 
@@ -546,7 +546,7 @@ fn execute_action(
                 session,
                 base,
                 mappings,
-            )
+            );
         }
     }
     Ok(true)
@@ -1824,9 +1824,11 @@ mod tests {
         let before = Instant::now();
         device_disconnected(&mut state, "helper died".into());
         assert!(state.device_restore_pending);
-        assert!(state
-            .next_device_open
-            .is_some_and(|deadline| deadline >= before));
+        assert!(
+            state
+                .next_device_open
+                .is_some_and(|deadline| deadline >= before)
+        );
         assert_eq!(state.last_device_error, "helper died");
     }
 

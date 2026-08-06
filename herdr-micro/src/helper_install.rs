@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::{
     env,
     ffi::OsStr,
@@ -15,7 +15,7 @@ use std::{
     time::Duration,
 };
 
-use crate::hid::{hid_socket_path, HELPER_LABEL, HELPER_VERSION, HID_LAUNCH_SOCKET_NAME};
+use crate::hid::{HELPER_LABEL, HELPER_VERSION, HID_LAUNCH_SOCKET_NAME, hid_socket_path};
 
 pub const HELPER_BINARY_NAME: &str = "herdr-micro-hid";
 pub const HELPER_PATH: &str = "/Library/PrivilegedHelperTools/dev.herdr.herdr-micro-hid";

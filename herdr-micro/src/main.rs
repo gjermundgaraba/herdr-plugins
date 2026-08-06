@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use herdr_micro::{
     actions::{execute_effort_plan, plan_effort_change},
     config::{config_path, default_effort, load_effort},
@@ -7,7 +7,7 @@ use herdr_micro::{
     herdr::{herdr_bin, run_command},
     setup,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     env,
     ffi::OsString,

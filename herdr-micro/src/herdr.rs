@@ -1,7 +1,7 @@
 //! Small, CLI-only Herdr client helpers.  The bridge deliberately does not
 //! retain a socket connection: every call is scoped to one selected session.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use serde_json::Value;
 use std::{

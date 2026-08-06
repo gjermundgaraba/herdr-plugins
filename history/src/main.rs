@@ -118,7 +118,7 @@ fn acquire_lock(path: &Path, deadline: Instant) -> Result<Option<File>, String> 
             Err(TryLockError::WouldBlock) if Instant::now() < deadline => thread::sleep(LOCK_RETRY),
             Err(TryLockError::WouldBlock) => return Ok(None),
             Err(TryLockError::Error(error)) => {
-                return Err(format!("cannot lock {}: {error}", path.display()))
+                return Err(format!("cannot lock {}: {error}", path.display()));
             }
         }
     }

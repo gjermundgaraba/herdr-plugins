@@ -5,16 +5,16 @@
 
 use std::{ptr::NonNull, thread, time::Duration};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use objc2::rc::Retained;
 use objc2_app_kit::{NSRunningApplication, NSWorkspace};
 use objc2_core_foundation::{
-    kCFRunLoopDefaultMode, CFDictionary, CFNumber, CFRunLoop, CFString, CFType, CGPoint,
+    CFDictionary, CFNumber, CFRunLoop, CFString, CFType, CGPoint, kCFRunLoopDefaultMode,
 };
 use objc2_core_graphics::{
-    kCGNullWindowID, kCGWindowBounds, kCGWindowLayer, kCGWindowName, kCGWindowOwnerPID, CGEvent,
-    CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton, CGPreflightPostEventAccess,
+    CGEvent, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton, CGPreflightPostEventAccess,
     CGScrollEventUnit, CGWarpMouseCursorPosition, CGWindowListCopyWindowInfo, CGWindowListOption,
+    kCGNullWindowID, kCGWindowBounds, kCGWindowLayer, kCGWindowName, kCGWindowOwnerPID,
 };
 use serde::Serialize;
 

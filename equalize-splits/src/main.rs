@@ -51,7 +51,8 @@ fn run() -> Result<(), String> {
         .write(true)
         .open(state_dir.join("equalize.lock"))
         .map_err(|error| format!("open lock: {error}"))?;
-    lock.lock().map_err(|error| format!("acquire lock: {error}"))?;
+    lock.lock()
+        .map_err(|error| format!("acquire lock: {error}"))?;
 
     let client = Client::from_env()
         .map_err(|error| error.to_string())?

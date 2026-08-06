@@ -1,7 +1,7 @@
 //! One-shot setup and small action helpers for the Micro plugin.
 
-use anyhow::{anyhow, bail, Context, Result};
-use serde_json::{json, Value};
+use anyhow::{Context, Result, anyhow, bail};
+use serde_json::{Value, json};
 use std::{
     env,
     ffi::OsString,
@@ -15,15 +15,15 @@ use std::{
 };
 
 use crate::{
-    actions::{layer_identity, HERDR_LAYER},
+    actions::{HERDR_LAYER, layer_identity},
     config::{
-        config_path, function_key_number, load_controls, load_effort, load_lighting,
-        provision_controls, provision_effort, provision_lighting, Controls,
+        Controls, config_path, function_key_number, load_controls, load_effort, load_lighting,
+        provision_controls, provision_effort, provision_lighting,
     },
     control::{ensure_state_dir, request_status},
     device::{
+        DEFAULT_REQUEST_TIMEOUT, DeviceEvent,
         keymap::{read_keymap, update_keymap_with, write_keymap},
-        DeviceEvent, DEFAULT_REQUEST_TIMEOUT,
     },
     hid::HidClient,
 };
@@ -753,10 +753,12 @@ mod tests {
         *keymap
             .pointer_mut("/profiles/0/layers/1/layout/keymap/0/0")
             .unwrap() = json!("KC_F13");
-        assert!(configure_micro(&mut keymap)
-            .unwrap_err()
-            .to_string()
-            .contains("must use KV_OAI_AG00"));
+        assert!(
+            configure_micro(&mut keymap)
+                .unwrap_err()
+                .to_string()
+                .contains("must use KV_OAI_AG00")
+        );
     }
 
     #[test]
@@ -811,10 +813,12 @@ mod tests {
                 { "layout": target }
             ] }]
         });
-        assert!(configure_micro(&mut keymap)
-            .unwrap_err()
-            .to_string()
-            .contains("not blank or managed"));
+        assert!(
+            configure_micro(&mut keymap)
+                .unwrap_err()
+                .to_string()
+                .contains("not blank or managed")
+        );
     }
 
     #[test]

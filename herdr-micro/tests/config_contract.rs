@@ -15,11 +15,13 @@ fn controls(button: serde_json::Value) -> serde_json::Value {
 
 #[test]
 fn config_rejects_extra_gesture_fields() {
-    assert!(parse_controls(&controls(json!({
-        "tap": { "action": "submit" },
-        "unexpected": true
-    })))
-    .is_err());
+    assert!(
+        parse_controls(&controls(json!({
+            "tap": { "action": "submit" },
+            "unexpected": true
+        })))
+        .is_err()
+    );
 }
 
 #[test]

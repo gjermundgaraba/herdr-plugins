@@ -1,12 +1,12 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::thread;
 use std::time::Duration;
 
 use crate::{
-    config::{AgentStatus, EffortConfig},
     PLUGIN_ID,
+    config::{AgentStatus, EffortConfig},
 };
 
 pub const CHATGPT_BUNDLE_IDS: [&str; 2] = ["com.openai.codex", "com.openai.chat"];
@@ -322,7 +322,7 @@ pub fn automatic_layer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{default_effort, EffortConfig, EffortKeys};
+    use crate::config::{EffortConfig, EffortKeys, default_effort};
     use serde_json::json;
 
     fn agent(kind: &str) -> Agent {
@@ -387,11 +387,13 @@ mod tests {
     }
     #[test]
     fn rejects_non_string_agent_fields() {
-        assert!(parse_agents(&json!({"result":{"agents":[{
-            "terminal_id": 7,
-            "pane_id": "p1"
-        }]}}))
-        .is_err());
+        assert!(
+            parse_agents(&json!({"result":{"agents":[{
+                "terminal_id": 7,
+                "pane_id": "p1"
+            }]}}))
+            .is_err()
+        );
     }
     #[test]
     fn computes_scroll_geometry() {

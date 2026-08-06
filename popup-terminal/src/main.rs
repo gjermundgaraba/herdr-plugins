@@ -1,4 +1,4 @@
-use herdr_client::{herdr_config_path, Environment, PluginInvocationContext};
+use herdr_client::{Environment, PluginInvocationContext, herdr_config_path};
 use serde::Deserialize;
 use std::{
     env, fs,

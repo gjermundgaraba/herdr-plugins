@@ -5,35 +5,35 @@
 
 use std::{
     collections::{BTreeSet, HashMap},
-    ffi::{c_void, CStr},
+    ffi::{CStr, c_void},
     pin::Pin,
     ptr::{self, NonNull},
     sync::{
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender, SyncSender, TryRecvError},
-        Arc, Mutex,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use objc2_core_foundation::{
-    kCFRunLoopDefaultMode, CFDictionary, CFNumber, CFRetained, CFRunLoop, CFRunLoopSource,
-    CFString, CFUUID,
+    CFDictionary, CFNumber, CFRetained, CFRunLoop, CFRunLoopSource, CFString, CFUUID,
+    kCFRunLoopDefaultMode,
 };
 use objc2_io_kit::{
-    io_object_t, io_service_t, kIOMainPortDefault, kIOReturnExclusiveAccess, kIOReturnSuccess,
-    kIOUSBFindInterfaceDontCare, kUSBIn, kUSBInterrupt, kUSBProductID, kUSBVendorID,
     IOCFPlugInInterface, IOCreatePlugInInterfaceForService, IOIteratorNext, IOObjectRelease,
     IORegistryEntryCreateCFProperty, IOServiceGetMatchingServices, IOServiceMatching,
     IOUSBDevRequestTO, IOUSBDeviceInterface500, IOUSBFindInterfaceRequest,
-    IOUSBInterfaceInterface197, USBReEnumerateOptions,
+    IOUSBInterfaceInterface197, USBReEnumerateOptions, io_object_t, io_service_t,
+    kIOMainPortDefault, kIOReturnExclusiveAccess, kIOReturnSuccess, kIOUSBFindInterfaceDontCare,
+    kUSBIn, kUSBInterrupt, kUSBProductID, kUSBVendorID,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::wire::{encode_message, Reassembler, REPORT_ID, REPORT_SIZE};
+use crate::wire::{REPORT_ID, REPORT_SIZE, Reassembler, encode_message};
 
 pub const MICRO_VENDOR_ID: i32 = 0x303A;
 pub const MICRO_PRODUCT_ID: i32 = 0x8360;
@@ -1211,7 +1211,24 @@ fn error_message(error: &Value) -> String {
 }
 
 fn uuid(bytes: [u8; 16]) -> CFRetained<CFUUID> {
-    let [b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15] = bytes;
+    let [
+        b0,
+        b1,
+        b2,
+        b3,
+        b4,
+        b5,
+        b6,
+        b7,
+        b8,
+        b9,
+        b10,
+        b11,
+        b12,
+        b13,
+        b14,
+        b15,
+    ] = bytes;
     CFUUID::constant_uuid_with_bytes(
         None, b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15,
     )

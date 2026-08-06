@@ -1,10 +1,10 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::thread;
 use std::time::Duration;
 
-use crate::herdr::{herdr_bin, run_command, run_json, session_environment, Environment};
+use crate::herdr::{Environment, herdr_bin, run_command, run_json, session_environment};
 
 pub const GHOSTTY_STATE_SCRIPT: &str = r#"
 const app = Application("Ghostty");
@@ -344,10 +344,12 @@ mod tests {
         let unfocused = parse_ghostty_state(r#"{"frontmost":false,"terminals":[]}"#).unwrap();
         assert_eq!(unfocused.focused_terminal_id, None);
         assert!(parse_ghostty_state(r#"{"frontmost":true,"terminals":null}"#).is_err());
-        assert!(parse_ghostty_state(
-            r#"{"frontmost":true,"focusedTerminalId":null,"terminals":[{"id":"","name":"x"}]}"#
-        )
-        .is_err());
+        assert!(
+            parse_ghostty_state(
+                r#"{"frontmost":true,"focusedTerminalId":null,"terminals":[{"id":"","name":"x"}]}"#
+            )
+            .is_err()
+        );
         let mapping = vec![SessionTerminalMapping {
             session_name: "default".into(),
             terminal_id: "p".into(),

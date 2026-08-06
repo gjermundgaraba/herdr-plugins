@@ -90,7 +90,7 @@ fn maybe_open_action() -> Option<ExitCode> {
         Ok(action_id) => action_id,
         Err(std::env::VarError::NotPresent) => return None,
         Err(std::env::VarError::NotUnicode(_)) => {
-            return Some(fail_visibly("HERDR_PLUGIN_ACTION_ID is not valid UTF-8"))
+            return Some(fail_visibly("HERDR_PLUGIN_ACTION_ID is not valid UTF-8"));
         }
     };
     let filter = match action_id.as_str() {
@@ -371,12 +371,14 @@ mod tests {
         );
         assert_eq!(picker.query, "j");
 
-        assert!(handle_key(
-            &mut picker,
-            &mut mode,
-            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-        )
-        .is_none());
+        assert!(
+            handle_key(
+                &mut picker,
+                &mut mode,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            )
+            .is_none()
+        );
         assert_eq!(mode, Mode::VimNormal);
     }
 

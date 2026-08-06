@@ -166,9 +166,10 @@ pub fn doctor() -> Report {
         // not an installation failure.
         Err(error) => report.push(Level::Warn, format!("Micro bridge is not running: {error}")),
     }
-    if effort_config.as_ref().is_none_or(|config| {
-        config.codex.raise.is_none() || config.codex.lower.is_none()
-    }) {
+    if effort_config
+        .as_ref()
+        .is_none_or(|config| config.codex.raise.is_none() || config.codex.lower.is_none())
+    {
         report.push(
             Level::Warn,
             format!("Codex effort shortcuts are unset in {}", effort.display()),
@@ -197,11 +198,7 @@ pub fn doctor() -> Report {
 pub fn run_doctor() -> i32 {
     let report = doctor();
     println!("{}", report.render());
-    if report.failed() {
-        1
-    } else {
-        0
-    }
+    if report.failed() { 1 } else { 0 }
 }
 
 #[cfg(test)]

@@ -223,12 +223,16 @@ mod tests {
             ..Default::default()
         });
         let now = Instant::now();
-        assert!(dispatcher
-            .handle("key", Some(&binding), true, Some("first".into()), now)
-            .is_empty());
-        assert!(dispatcher
-            .handle("key", Some(&binding), false, Some("first".into()), now)
-            .is_empty());
+        assert!(
+            dispatcher
+                .handle("key", Some(&binding), true, Some("first".into()), now)
+                .is_empty()
+        );
+        assert!(
+            dispatcher
+                .handle("key", Some(&binding), false, Some("first".into()), now)
+                .is_empty()
+        );
         let fired = dispatcher.handle("key", Some(&binding), true, Some("second".into()), now);
         assert!(fired.is_empty());
         let fired = dispatcher.handle("key", Some(&binding), false, Some("second".into()), now);

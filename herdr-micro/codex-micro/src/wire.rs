@@ -83,9 +83,11 @@ mod tests {
             "event"
         );
         assert_eq!(Reassembler::default().push(&reports[0][1..]).len(), 1);
-        assert!(Reassembler::default()
-            .push(&[REPORT_ID, CHANNEL_RPC, 62])
-            .is_empty());
+        assert!(
+            Reassembler::default()
+                .push(&[REPORT_ID, CHANNEL_RPC, 62])
+                .is_empty()
+        );
         let mut over = Reassembler::default();
         let mut fragment = vec![CHANNEL_RPC, 61];
         fragment.extend(std::iter::repeat_n(b'x', 61));
