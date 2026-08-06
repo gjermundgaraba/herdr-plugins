@@ -1,12 +1,9 @@
 use std::{
     cmp::Reverse,
     collections::HashMap,
-    fs,
-    path::PathBuf,
     process::Command,
     sync::mpsc::{Receiver, Sender, channel},
     thread,
-    time::UNIX_EPOCH,
 };
 
 use herdr_client::{
@@ -533,7 +530,15 @@ fn invocation_context() -> Option<PluginInvocationContext> {
 
 fn load_default_bindings() -> Result<Vec<NativeBinding>, String> {
     let herdr = std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".into());
-    let text = default_config_text(&herdr)?;
+    let output = Command::new(herdr)
+        .arg("--default-config")
+        .output()
+        .map_err(|error| format!("could not run herdr --default-config: {error}"))?;
+    if !output.status.success() {
+        return Err("herdr --default-config failed".into());
+    }
+    let text = String::from_utf8(output.stdout)
+        .map_err(|error| format!("default config is not UTF-8: {error}"))?;
     let mut bindings = parse_default_bindings(&text);
     for action in SAFE_API_ACTIONS {
         if !bindings.iter().any(|binding| binding.action == action) {
@@ -546,78 +551,8 @@ fn load_default_bindings() -> Result<Vec<NativeBinding>, String> {
     Ok(bindings)
 }
 
-/// The default config only changes with the Herdr binary, so cache its output
-/// keyed by the binary's path, size, and mtime.
-fn default_config_text(herdr: &str) -> Result<String, String> {
-    let cache = cache_slot(herdr);
-    if let Some((path, key)) = &cache
-        && let Ok(cached) = fs::read_to_string(path)
-        && let Some((cached_key, text)) = cached.split_once('\n')
-        && cached_key == key
-    {
-        return Ok(text.into());
-    }
-    let output = Command::new(herdr)
-        .arg("--default-config")
-        .output()
-        .map_err(|error| format!("could not run herdr --default-config: {error}"))?;
-    if !output.status.success() {
-        return Err("herdr --default-config failed".into());
-    }
-    let text = String::from_utf8(output.stdout)
-        .map_err(|error| format!("default config is not UTF-8: {error}"))?;
-    if let Some((path, key)) = &cache {
-        let _ = fs::write(path, format!("{key}\n{text}"));
-    }
-    Ok(text)
-}
-
-fn cache_slot(herdr: &str) -> Option<(PathBuf, String)> {
-    let state_dir = std::env::var_os("HERDR_PLUGIN_STATE_DIR")?;
-    let meta = fs::metadata(herdr).ok()?;
-    let mtime = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
-    Some((
-        PathBuf::from(state_dir).join("default-config.cache"),
-        format!(
-            "{herdr}|{}|{}.{}",
-            meta.len(),
-            mtime.as_secs(),
-            mtime.subsec_nanos()
-        ),
-    ))
-}
-
 fn parse_default_bindings(text: &str) -> Vec<NativeBinding> {
-    let lines = binding_lines(text);
-    let doc: String = lines
-        .iter()
-        .map(|(name, value)| format!("{name} = {value}\n"))
-        .collect();
-    match toml::from_str::<Value>(&doc) {
-        Ok(table) => lines
-            .into_iter()
-            .map(|(name, _)| NativeBinding {
-                action: name.into(),
-                keys: table.get(name).and_then(parse_keys).unwrap_or_default(),
-            })
-            .collect(),
-        // A malformed or duplicate line poisons the combined document; fall
-        // back to per-line parsing so only the bad line is dropped.
-        Err(_) => lines
-            .into_iter()
-            .filter_map(|(name, value)| {
-                let parsed = toml::from_str::<Value>(&format!("value = {value}")).ok()?;
-                Some(NativeBinding {
-                    action: name.into(),
-                    keys: parsed.get("value").and_then(parse_keys).unwrap_or_default(),
-                })
-            })
-            .collect(),
-    }
-}
-
-fn binding_lines(text: &str) -> Vec<(&str, &str)> {
-    let mut lines = Vec::new();
+    let mut bindings = Vec::new();
     let mut in_keys = false;
     for raw in text.lines() {
         let line = raw.trim_start();
@@ -643,9 +578,15 @@ fn binding_lines(text: &str) -> Vec<(&str, &str)> {
         {
             continue;
         }
-        lines.push((name, raw_value.trim()));
+        let Ok(value) = toml::from_str::<Value>(&format!("value = {}", raw_value.trim())) else {
+            continue;
+        };
+        bindings.push(NativeBinding {
+            action: name.into(),
+            keys: value.get("value").and_then(parse_keys).unwrap_or_default(),
+        });
     }
-    lines
+    bindings
 }
 
 fn load_plugin_keybindings(

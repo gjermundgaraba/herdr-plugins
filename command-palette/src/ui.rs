@@ -123,11 +123,9 @@ fn render_rows(
         .len()
         .min(start + (area.height / ROW_HEIGHT) as usize);
     for (visible, index) in (start..end).enumerate() {
-        let Some(item) = picker.row(index) else {
-            break;
-        };
         render_row(
-            item,
+            // start..end is clamped to picker.len(), so the row exists.
+            picker.row(index).unwrap(),
             index == picker.selected,
             matches!(picker.filter, Filter::All | Filter::Actions),
             spinner_frame,

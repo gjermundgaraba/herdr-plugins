@@ -171,15 +171,15 @@ impl Picker {
 
     pub fn needs_spinner(&self) -> bool {
         let end = self.len().min(self.scroll + self.visible_rows);
-        (self.scroll..end)
-            .filter_map(|index| self.row(index))
-            .any(|item| {
+        (self.scroll..end).any(|index| {
+            self.row(index).is_some_and(|item| {
                 item.kind == Kind::Agent
                     && item
                         .agent_status
                         .as_ref()
                         .is_some_and(|status| status.as_str() == AgentStatus::WORKING)
             })
+        })
     }
 
     pub fn set_filter(&mut self, filter: Filter) {

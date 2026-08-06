@@ -28,7 +28,6 @@ enum Mode {
 
 const SPINNER_TICK: Duration = Duration::from_millis(100);
 const SOURCE_POLL: Duration = Duration::from_millis(15);
-const IDLE_POLL: Duration = Duration::from_secs(1);
 const PLUGIN_ID: &str = "gjermundgaraba.herdr-command-palette";
 
 fn main() -> ExitCode {
@@ -221,7 +220,9 @@ fn run(
         } else if spinner_active {
             next_spinner_frame.saturating_duration_since(Instant::now())
         } else {
-            IDLE_POLL
+            // Nothing time-based remains once sources are done and no spinner
+            // is visible; block until input. crossterm/mio clamp huge timeouts.
+            Duration::MAX
         };
         if event::poll(timeout)? {
             // Drain every queued event before redrawing so fast typing and
