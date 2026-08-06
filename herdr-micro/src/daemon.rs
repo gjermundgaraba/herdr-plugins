@@ -1319,7 +1319,7 @@ fn refresh_routing(
             if mapping_stale
                 && state
                     .next_mapping_probe
-                    .map_or(true, |due| Instant::now() >= due)
+                    .is_none_or(|due| Instant::now() >= due)
             {
                 if !refresh_mappings(state, base, mappings)? {
                     state.revoke_routing();
@@ -1624,10 +1624,7 @@ pub fn run_daemon() -> Result<()> {
                     .clone()
             }
         },
-        {
-            let stopping = Arc::clone(&stopping);
-            move || stopping.store(true, Ordering::Release)
-        },
+        Arc::clone(&stopping),
     )?;
     let (shutdown_tx, shutdown_rx) = mpsc::channel();
     let control_thread = thread::spawn(move || {

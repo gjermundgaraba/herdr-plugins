@@ -132,13 +132,17 @@ where
         {
             return Ok(status);
         }
-        request_at(path, Command::Stop, Duration::from_secs(2))
-            .context("stop incompatible Micro bridge")?;
+        // An already-stopping daemon answers with an error payload; only a
+        // live incompatible one still needs the stop request.
+        if status.get("error").is_none() {
+            request_at(path, Command::Stop, Duration::from_secs(2))
+                .context("stop incompatible Micro bridge")?;
+        }
         let deadline = Instant::now() + ready_timeout;
         while identity(path)? == old_socket {
             if Instant::now() >= deadline {
                 bail!(
-                    "incompatible Micro bridge did not stop; see {}",
+                    "previous Micro bridge did not stop; see {}",
                     log_file().display()
                 );
             }
@@ -166,7 +170,8 @@ pub fn start_daemon_at<F>(path: &Path, launch: F, ready_timeout: Duration) -> Re
 where
     F: FnOnce() -> Result<()>,
 {
-    if let Ok(status) = request_at(path, Command::Status, Duration::from_millis(500)) {
+    if let Some(status) = live_status(request_at(path, Command::Status, Duration::from_millis(500)))
+    {
         return Ok(status);
     }
 
@@ -177,7 +182,9 @@ where
     launch()?;
     let deadline = Instant::now() + ready_timeout;
     loop {
-        if let Ok(status) = request_at(path, Command::Status, Duration::from_millis(250)) {
+        if let Some(status) =
+            live_status(request_at(path, Command::Status, Duration::from_millis(250)))
+        {
             return Ok(status);
         }
         if Instant::now() >= deadline {
@@ -185,6 +192,12 @@ where
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// A daemon that answers a status request with an error payload (e.g. while
+/// stopping) does not count as live.
+fn live_status(result: Result<Value>) -> Option<Value> {
+    result.ok().filter(|status| status.get("error").is_none())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -211,7 +224,6 @@ pub struct ControlServer {
     path: PathBuf,
     owned: SocketIdentity,
     status: Arc<dyn Fn() -> Value + Send + Sync>,
-    stop: Arc<dyn Fn() + Send + Sync>,
     stopping: Arc<AtomicBool>,
 }
 
@@ -232,7 +244,12 @@ impl ControlServer {
                 break;
             }
             match listener.accept() {
-                Ok((stream, _)) => self.serve_connection(stream),
+                Ok((stream, _)) => {
+                    // Accepted fds inherit O_NONBLOCK from the listener;
+                    // reads must block for set_read_timeout to apply.
+                    let _ = stream.set_nonblocking(false);
+                    self.serve_connection(stream);
+                }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(10));
                 }
@@ -244,10 +261,9 @@ impl ControlServer {
 
     fn serve_connection(&self, stream: UnixStream) {
         let status = Arc::clone(&self.status);
-        let stop = Arc::clone(&self.stop);
         let stopping = Arc::clone(&self.stopping);
         thread::spawn(move || {
-            let _ = handle_connection(stream, status, stop, stopping);
+            let _ = handle_connection(stream, status, stopping);
         });
     }
 
@@ -270,19 +286,26 @@ impl Drop for ControlServer {
 }
 
 /// Bind the control socket, taking over only a stale socket with unchanged
-/// device/inode identity. Any responsive daemon counts as live.
-pub fn listen_for_control<F, S>(get_status: F, stop: S) -> Result<ControlServer>
+/// device/inode identity. Any daemon answering status without an error
+/// payload counts as live.
+///
+/// `stopping` is shared with the daemon: any shutdown path (stop command,
+/// signal, idle release) sets it, and the server then refuses status so a
+/// racing `start` never mistakes a draining daemon for a live one.
+pub fn listen_for_control<F>(get_status: F, stopping: Arc<AtomicBool>) -> Result<ControlServer>
 where
     F: Fn() -> Value + Send + Sync + 'static,
-    S: Fn() + Send + Sync + 'static,
 {
-    listen_for_control_at(control_socket(), get_status, stop)
+    listen_for_control_at(control_socket(), get_status, stopping)
 }
 
-pub fn listen_for_control_at<F, S>(path: PathBuf, get_status: F, stop: S) -> Result<ControlServer>
+pub fn listen_for_control_at<F>(
+    path: PathBuf,
+    get_status: F,
+    stopping: Arc<AtomicBool>,
+) -> Result<ControlServer>
 where
     F: Fn() -> Value + Send + Sync + 'static,
-    S: Fn() + Send + Sync + 'static,
 {
     let parent = path
         .parent()
@@ -293,7 +316,8 @@ where
         Ok(listener) => listener,
         Err(error) if error.raw_os_error() == Some(libc::EADDRINUSE) => {
             let before = identity(&path)?;
-            if request_at(&path, Command::Status, Duration::from_millis(500)).is_ok() {
+            if live_status(request_at(&path, Command::Status, Duration::from_millis(500))).is_some()
+            {
                 bail!("Micro bridge is already running");
             }
             if before.is_none() || identity(&path)? != before {
@@ -313,15 +337,13 @@ where
         path,
         owned,
         status: Arc::new(get_status),
-        stop: Arc::new(stop),
-        stopping: Arc::new(AtomicBool::new(false)),
+        stopping,
     })
 }
 
 fn handle_connection(
     mut stream: UnixStream,
     status: Arc<dyn Fn() -> Value + Send + Sync>,
-    stop: Arc<dyn Fn() + Send + Sync>,
     stopping: Arc<AtomicBool>,
 ) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
@@ -337,8 +359,18 @@ fn handle_connection(
             "stop" => Some(Command::Stop),
             _ => None,
         });
+    // Flag the shutdown before replying so no status answered after the stop
+    // acknowledgement can pass for a live daemon.
+    if command == Some(Command::Stop) {
+        stopping.store(true, Ordering::Release);
+    }
     let response = match (&parsed, command) {
         (Err(_) | Ok(Value::Null), _) => json!({ "error": "invalid request" }),
+        // A stopping daemon must not answer status: a racing `start` would
+        // mistake it for a live compatible daemon and skip launching.
+        (_, Some(Command::Status)) if stopping.load(Ordering::Acquire) => {
+            json!({ "error": "Micro bridge is stopping" })
+        }
         (_, Some(Command::Status)) => status(),
         (_, Some(Command::Stop)) => json!({ "stopping": true }),
         _ => json!({ "error": "unknown command" }),
@@ -346,9 +378,6 @@ fn handle_connection(
     stream.write_all(response.to_string().as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()?;
-    if command == Some(Command::Stop) && !stopping.swap(true, Ordering::AcqRel) {
-        stop();
-    }
     Ok(())
 }
 
@@ -374,8 +403,9 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
+        // Short prefix: socket paths must stay under the 104-byte SUN_LEN.
         let dir = env::temp_dir().join(format!(
-            "herdr-micro-control-{name}-{}-{}",
+            "hm-ctl-{name}-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
@@ -385,17 +415,10 @@ mod tests {
 
     fn start_test_server(
         path: PathBuf,
-        stops: Arc<AtomicUsize>,
+        stopping: Arc<AtomicBool>,
     ) -> (Arc<ControlServer>, mpsc::Sender<()>, thread::JoinHandle<()>) {
         let server = Arc::new(
-            listen_for_control_at(
-                path,
-                || json!({ "running": true }),
-                move || {
-                    stops.fetch_add(1, Ordering::Relaxed);
-                },
-            )
-            .unwrap(),
+            listen_for_control_at(path, || json!({ "running": true }), stopping).unwrap(),
         );
         let (shutdown, shutdown_rx) = mpsc::channel();
         let runner = Arc::clone(&server);
@@ -408,7 +431,7 @@ mod tests {
         let dir = temp_dir("rust");
         let path = dir.join(SOCKET_NAME);
         let (server, shutdown, runner) =
-            start_test_server(path.clone(), Arc::new(AtomicUsize::new(0)));
+            start_test_server(path.clone(), Arc::new(AtomicBool::new(false)));
         assert_eq!(
             request_at(&path, Command::Status, Duration::from_secs(1)).unwrap(),
             json!({ "running": true })
@@ -443,8 +466,8 @@ mod tests {
     fn newline_json_client_reaches_server() {
         let dir = temp_dir("protocol-client");
         let path = dir.join(SOCKET_NAME);
-        let stops = Arc::new(AtomicUsize::new(0));
-        let (server, shutdown, runner) = start_test_server(path.clone(), stops);
+        let (server, shutdown, runner) =
+            start_test_server(path.clone(), Arc::new(AtomicBool::new(false)));
         let mut client = UnixStream::connect(&path).unwrap();
         client.write_all(b"{\"command\":\"status\"}\n").unwrap();
         assert_eq!(
@@ -463,7 +486,7 @@ mod tests {
         let dir = temp_dir("errors");
         let path = dir.join(SOCKET_NAME);
         let (server, shutdown, runner) =
-            start_test_server(path.clone(), Arc::new(AtomicUsize::new(0)));
+            start_test_server(path.clone(), Arc::new(AtomicBool::new(false)));
         for (request, expected) in [
             (
                 b"not json\n".as_slice(),
@@ -493,8 +516,8 @@ mod tests {
         let dir = temp_dir("duplicate");
         let path = dir.join(SOCKET_NAME);
         let (server, shutdown, runner) =
-            start_test_server(path.clone(), Arc::new(AtomicUsize::new(0)));
-        let error = match listen_for_control_at(path.clone(), || json!({}), || {}) {
+            start_test_server(path.clone(), Arc::new(AtomicBool::new(false)));
+        let error = match listen_for_control_at(path.clone(), || json!({}), Arc::new(AtomicBool::new(false))) {
             Ok(_) => panic!("duplicate bind succeeded"),
             Err(error) => error,
         };
@@ -512,7 +535,7 @@ mod tests {
         let path = dir.join(SOCKET_NAME);
         drop(UnixListener::bind(&path).unwrap());
         let stale = identity(&path).unwrap().unwrap();
-        let mut server = listen_for_control_at(path.clone(), || json!({}), || {}).unwrap();
+        let mut server = listen_for_control_at(path.clone(), || json!({}), Arc::new(AtomicBool::new(false))).unwrap();
         assert_ne!(identity(&path).unwrap().unwrap(), stale);
         server.close().unwrap();
         assert!(!path.exists());
@@ -520,11 +543,11 @@ mod tests {
     }
 
     #[test]
-    fn socket_is_owner_only_and_stop_is_idempotent() {
+    fn socket_is_owner_only_and_stop_sets_shared_flag() {
         let dir = temp_dir("stop");
         let path = dir.join(SOCKET_NAME);
-        let stops = Arc::new(AtomicUsize::new(0));
-        let (server, shutdown, runner) = start_test_server(path.clone(), Arc::clone(&stops));
+        let stopping = Arc::new(AtomicBool::new(false));
+        let (server, shutdown, runner) = start_test_server(path.clone(), Arc::clone(&stopping));
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
@@ -533,9 +556,9 @@ mod tests {
             request_at(&path, Command::Stop, Duration::from_secs(1)).unwrap(),
             json!({ "stopping": true })
         );
+        assert!(stopping.load(Ordering::Acquire));
         shutdown.send(()).unwrap();
         runner.join().unwrap();
-        assert_eq!(stops.load(Ordering::Relaxed), 1);
         drop(server);
         fs::remove_dir_all(dir).unwrap();
     }
@@ -550,7 +573,7 @@ mod tests {
             &path,
             move || {
                 let (server, shutdown, runner) =
-                    start_test_server(launch_path, Arc::new(AtomicUsize::new(0)));
+                    start_test_server(launch_path, Arc::new(AtomicBool::new(false)));
                 ready_tx.send((server, shutdown, runner)).unwrap();
                 Ok(())
             },
@@ -562,6 +585,88 @@ mod tests {
         shutdown.send(()).unwrap();
         drop(server);
         runner.join().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stopping_server_refuses_status() {
+        let dir = temp_dir("stopping-status");
+        let path = dir.join(SOCKET_NAME);
+        let (server, shutdown, runner) =
+            start_test_server(path.clone(), Arc::new(AtomicBool::new(false)));
+        // The flag is set before the stop response is written, so the next
+        // status is deterministically refused.
+        request_at(&path, Command::Stop, Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            request_at(&path, Command::Status, Duration::from_secs(1)).unwrap(),
+            json!({ "error": "Micro bridge is stopping" })
+        );
+        shutdown.send(()).unwrap();
+        drop(server);
+        runner.join().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn daemon_side_flag_refuses_status() {
+        let dir = temp_dir("daemon-stopping");
+        let path = dir.join(SOCKET_NAME);
+        let stopping = Arc::new(AtomicBool::new(false));
+        let (server, shutdown, runner) = start_test_server(path.clone(), Arc::clone(&stopping));
+        // A signal or idle release sets the daemon's flag without any stop
+        // command; the server must still refuse status.
+        stopping.store(true, Ordering::Release);
+        assert_eq!(
+            request_at(&path, Command::Status, Duration::from_secs(1)).unwrap(),
+            json!({ "error": "Micro bridge is stopping" })
+        );
+        shutdown.send(()).unwrap();
+        drop(server);
+        runner.join().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stopping_daemon_is_replaced_without_stop_request() {
+        let dir = temp_dir("stopping-start");
+        let path = dir.join(SOCKET_NAME);
+        let old_listener = UnixListener::bind(&path).unwrap();
+        let old_path = path.clone();
+        let old_runner = thread::spawn(move || {
+            // Answer exactly one status request, then finish the teardown.
+            // A stop request would hit the removed socket and fail the start.
+            let (mut stream, _) = old_listener.accept().unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&read_line(&mut stream).unwrap()).unwrap(),
+                json!({"command":"status"})
+            );
+            writeln!(stream, "{}", json!({"error":"Micro bridge is stopping"})).unwrap();
+            drop(old_listener);
+            fs::remove_file(old_path).unwrap();
+        });
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let launch_path = path.clone();
+        let status = start_daemon_versioned_at(
+            &path,
+            "0.9.0",
+            1,
+            move || {
+                let listener = UnixListener::bind(&launch_path).unwrap();
+                let runner = thread::spawn(move || {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    read_line(&mut stream).unwrap();
+                    writeln!(stream, "{}", json!({"version":"0.9.0", "protocol":1})).unwrap();
+                });
+                ready_tx.send(runner).unwrap();
+                Ok(())
+            },
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(status["version"], "0.9.0");
+        ready_rx.recv().unwrap().join().unwrap();
+        old_runner.join().unwrap();
+        fs::remove_file(&path).unwrap();
         fs::remove_dir_all(dir).unwrap();
     }
 

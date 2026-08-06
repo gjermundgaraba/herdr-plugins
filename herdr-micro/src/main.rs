@@ -103,18 +103,19 @@ fn start() -> Result<i32> {
             command.spawn().context("start Micro bridge")?;
             Ok(())
         },
-        Duration::from_secs(5),
+        // Must outlast a draining daemon's teardown (device close and USB
+        // release can block for ~13s); success returns as soon as it is ready.
+        Duration::from_secs(15),
     )?;
     println!("{}", serde_json::to_string(&status)?);
     Ok(0)
 }
 
 fn status() -> Result<i32> {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&request_status(Duration::from_secs(2))?)?
-    );
-    Ok(0)
+    let status = request_status(Duration::from_secs(2))?;
+    println!("{}", serde_json::to_string_pretty(&status)?);
+    // An error payload (e.g. a stopping bridge) is not a healthy status.
+    Ok(i32::from(status.get("error").is_some()))
 }
 
 fn stop() -> Result<i32> {

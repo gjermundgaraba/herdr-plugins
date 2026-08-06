@@ -462,7 +462,11 @@ fn update_micro_keymap(
     if let Some(owner) = active_owner()? {
         bail!("quit {owner} first");
     }
-    if request_status(Duration::from_millis(250)).is_ok() {
+    if let Ok(status) = request_status(Duration::from_millis(250)) {
+        // A stopping bridge still holds the device while it drains.
+        if status.get("error").is_some() {
+            bail!("the Micro bridge is still stopping; retry in a few seconds");
+        }
         bail!("stop the Micro bridge first");
     }
     let (event_tx, _events) = mpsc::channel::<DeviceEvent>();

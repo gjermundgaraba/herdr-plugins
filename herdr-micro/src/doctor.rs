@@ -151,16 +151,22 @@ pub fn doctor() -> Report {
     });
     match request_status(Duration::from_millis(750)) {
         Ok(status) => {
-            match status.get("device").and_then(serde_json::Value::as_str) {
-                Some("connected") => report.push(Level::Ok, "Micro bridge: connected"),
-                Some(device) => report.push(Level::Warn, format!("Micro bridge: {device}")),
-                None => report.push(Level::Warn, "Micro bridge returned no device status"),
+            if let Some(error) = status.get("error").and_then(serde_json::Value::as_str) {
+                report.push(Level::Warn, format!("Micro bridge: {error}"));
+            } else {
+                match status.get("device").and_then(serde_json::Value::as_str) {
+                    Some("connected") => report.push(Level::Ok, "Micro bridge: connected"),
+                    Some(device) => report.push(Level::Warn, format!("Micro bridge: {device}")),
+                    None => report.push(Level::Warn, "Micro bridge returned no device status"),
+                }
+                report_runtime_errors(&mut report, &status);
             }
-            report_runtime_errors(&mut report, &status);
         }
+        // A stopped bridge is a normal state (micro-stop, 60s idle release),
+        // not an installation failure.
         Err(error) => report.push(Level::Warn, format!("Micro bridge is not running: {error}")),
     }
-    if effort_config.as_ref().map_or(true, |config| {
+    if effort_config.as_ref().is_none_or(|config| {
         config.codex.raise.is_none() || config.codex.lower.is_none()
     }) {
         report.push(
