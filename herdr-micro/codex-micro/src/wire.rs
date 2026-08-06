@@ -88,7 +88,7 @@ mod tests {
             .is_empty());
         let mut over = Reassembler::default();
         let mut fragment = vec![CHANNEL_RPC, 61];
-        fragment.extend(std::iter::repeat(b'x').take(61));
+        fragment.extend(std::iter::repeat_n(b'x', 61));
         for _ in 0..1100 {
             over.push(&fragment);
         }

@@ -1,8 +1,8 @@
 [package]
 name = "codex-micro"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.71"
+edition = "2024"
+rust-version = "1.85"
 license = "MIT"
 description = "Device library for the Work Louder Codex Micro"
 repository = "https://github.com/gjermundgaraba/herdr-plugins"

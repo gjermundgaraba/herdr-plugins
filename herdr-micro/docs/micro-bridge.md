@@ -59,7 +59,7 @@ independently selects which action switches synthesize macOS F13–F20 events.
 | Platform | macOS only |
 | Herdr | 0.7.5 or newer |
 | Ghostty | 1.3 or newer; Automation permission required |
-| Build toolchain | Rust 1.71 or newer |
+| Build toolchain | Rust 1.85 or newer |
 | Codex Micro firmware 0.4.1 | USB physically verified |
 | Codex Micro firmware 0.6.1 | USB physically verified |
 | Effort control | Codex CLI, Claude Code, and Pi with the bundled extension |

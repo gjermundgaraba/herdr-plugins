@@ -173,7 +173,7 @@ pub fn plan_effort_change(
     };
     let repeated_keys = |key: &str| {
         let mut args = vec!["pane".into(), "send-keys".into(), pane_id.into()];
-        args.extend(std::iter::repeat(key.to_owned()).take(count));
+        args.extend(std::iter::repeat_n(key.to_owned(), count));
         args
     };
     match agent {

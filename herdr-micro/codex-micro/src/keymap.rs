@@ -36,7 +36,7 @@ where
         }
         if offset
             .checked_add(chunk.len())
-            .map_or(true, |end| end > total)
+            .is_none_or(|end| end > total)
         {
             bail!("invalid keymap chunk size");
         }

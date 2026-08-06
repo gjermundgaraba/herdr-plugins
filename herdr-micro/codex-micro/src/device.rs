@@ -1073,7 +1073,7 @@ impl Drop for UsbInterface {
 
 fn find_micro_device() -> Result<IoObject> {
     // SAFETY: static bytes are a valid NUL-terminated IOKit class name.
-    let matching = unsafe { IOServiceMatching(b"IOUSBHostDevice\0".as_ptr().cast()) }
+    let matching = unsafe { IOServiceMatching(c"IOUSBHostDevice".as_ptr().cast()) }
         .ok_or_else(|| anyhow!("IOServiceMatching failed"))?;
     // SAFETY: CFMutableDictionary is a CFDictionary subtype with identical ownership.
     let matching = unsafe { CFRetained::cast_unchecked::<CFDictionary>(matching) };

@@ -9,7 +9,7 @@ dial, and joystick to the focused Codex, Claude Code, or Pi agent.
 - macOS and a Codex Micro
 - [Herdr](https://herdr.dev/docs/install/) 0.7.5 or newer
 - Ghostty 1.3 or newer
-- Rust 1.71 or newer when building from source
+- Rust 1.85 or newer when building from source
 - Work Louder Input for the one-time Layer 2 setup
 - Administrator access for the one-time privileged USB-helper installation
 - macOS Automation permission for Ghostty inspection

@@ -778,7 +778,7 @@ fn activated_listener() -> Result<UnixListener> {
     Ok(listener)
 }
 
-extern "C" {
+unsafe extern "C" {
     fn launch_activate_socket(name: *const c_char, fds: *mut *mut c_int, cnt: *mut usize) -> c_int;
 }
 
