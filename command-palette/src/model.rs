@@ -1,6 +1,6 @@
 use herdr_client::AgentStatus;
 use nucleo_matcher::{
-    Config, Matcher, Utf32Str,
+    Config, Matcher, Utf32String,
     pattern::{CaseMatching, Normalization, Pattern},
 };
 use serde_json::Value;
@@ -126,34 +126,60 @@ pub struct Picker {
     pub scroll: usize,
     pub visible_rows: usize,
     filtered: Vec<usize>,
+    haystacks: Vec<Utf32String>,
+    matcher: Matcher,
 }
 
 impl Picker {
     pub fn new(items: Vec<Item>, filter: Filter) -> Self {
         let mut picker = Self {
-            items,
+            items: Vec::new(),
             query: String::new(),
             filter,
             selected: 0,
             scroll: 0,
             visible_rows: 0,
             filtered: Vec::new(),
+            haystacks: Vec::new(),
+            matcher: Matcher::new(Config::DEFAULT),
         };
-        picker.refilter();
+        picker.set_items(items);
         picker
     }
 
-    pub fn rows(&self) -> Vec<&Item> {
-        self.filtered
-            .iter()
-            .filter_map(|index| self.items.get(*index))
-            .collect()
+    pub fn set_items(&mut self, items: Vec<Item>) {
+        self.haystacks = items.iter().map(haystack).collect();
+        self.items = items;
+        self.refilter();
+    }
+
+    pub fn len(&self) -> usize {
+        self.filtered.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.filtered.is_empty()
+    }
+
+    pub fn row(&self, index: usize) -> Option<&Item> {
+        self.items.get(*self.filtered.get(index)?)
     }
 
     pub fn selected_item(&self) -> Option<&Item> {
-        self.filtered
-            .get(self.selected)
-            .and_then(|index| self.items.get(*index))
+        self.row(self.selected)
+    }
+
+    pub fn needs_spinner(&self) -> bool {
+        let end = self.len().min(self.scroll + self.visible_rows);
+        (self.scroll..end)
+            .filter_map(|index| self.row(index))
+            .any(|item| {
+                item.kind == Kind::Agent
+                    && item
+                        .agent_status
+                        .as_ref()
+                        .is_some_and(|status| status.as_str() == AgentStatus::WORKING)
+            })
     }
 
     pub fn set_filter(&mut self, filter: Filter) {
@@ -181,26 +207,17 @@ impl Picker {
             );
         } else {
             let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
-            let mut matcher = Matcher::new(Config::DEFAULT);
             for (index, item) in self.items.iter().enumerate() {
                 if self.filter != Filter::All && item.kind.filter() != self.filter {
                     continue;
                 }
-                let haystack = format!(
-                    "{} {} {} {} {}",
-                    item.title,
-                    item.subtitle,
-                    item.detail,
-                    item.kind.label(),
-                    item.keys.join(" ")
-                );
-                let mut buf = Vec::new();
-                if let Some(score) = pattern.score(Utf32Str::new(&haystack, &mut buf), &mut matcher)
+                if let Some(score) =
+                    pattern.score(self.haystacks[index].slice(..), &mut self.matcher)
                 {
                     matches.push((index, score));
                 }
             }
-            matches.sort_by(|(left_index, left_score), (right_index, right_score)| {
+            matches.sort_unstable_by(|(left_index, left_score), (right_index, right_score)| {
                 right_score.cmp(left_score).then_with(|| {
                     self.items[*left_index]
                         .title
@@ -233,6 +250,18 @@ impl Picker {
     }
 }
 
+fn haystack(item: &Item) -> Utf32String {
+    format!(
+        "{} {} {} {} {}",
+        item.title,
+        item.subtitle,
+        item.detail,
+        item.kind.label(),
+        item.keys.join(" ")
+    )
+    .into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,13 +291,40 @@ mod tests {
         );
         picker.query = "api fix".into();
         picker.refilter();
-        assert_eq!(picker.rows()[0].title, "Claude API fixer");
+        assert_eq!(picker.row(0).unwrap().title, "Claude API fixer");
 
         picker.set_filter(Filter::Workspaces);
-        assert!(picker.rows().is_empty());
+        assert!(picker.is_empty());
         picker.query = "api".into();
         picker.refilter();
-        assert_eq!(picker.rows()[0].title, "api");
+        assert_eq!(picker.row(0).unwrap().title, "api");
+    }
+
+    #[test]
+    fn arriving_items_keep_the_active_query() {
+        let mut picker = Picker::new(vec![item(Kind::Workspace, "api")], Filter::All);
+        picker.query = "split".into();
+        picker.refilter();
+        assert!(picker.is_empty());
+
+        picker.set_items(vec![
+            item(Kind::Workspace, "api"),
+            item(Kind::NativeAction, "Split pane"),
+        ]);
+        assert_eq!(picker.len(), 1);
+        assert_eq!(picker.row(0).unwrap().title, "Split pane");
+    }
+
+    #[test]
+    fn spinner_needed_only_when_working_agent_visible() {
+        let mut working = item(Kind::Agent, "worker");
+        working.agent_status = Some("working".into());
+        let mut picker = Picker::new(vec![item(Kind::Workspace, "api"), working], Filter::All);
+
+        picker.visible_rows = 1;
+        assert!(!picker.needs_spinner());
+        picker.visible_rows = 2;
+        assert!(picker.needs_spinner());
     }
 
     #[test]

@@ -7,8 +7,8 @@ use std::{
     collections::HashMap,
     fs, io,
     path::Path,
-    process::Command,
     process::ExitCode,
+    sync::mpsc::{Receiver, TryRecvError},
     time::{Duration, Instant},
 };
 
@@ -27,6 +27,8 @@ enum Mode {
 }
 
 const SPINNER_TICK: Duration = Duration::from_millis(100);
+const SOURCE_POLL: Duration = Duration::from_millis(15);
+const IDLE_POLL: Duration = Duration::from_secs(1);
 const PLUGIN_ID: &str = "gjermundgaraba.herdr-command-palette";
 
 fn main() -> ExitCode {
@@ -44,15 +46,12 @@ fn main() -> ExitCode {
         Ok(client) => client,
         Err(error) => return fail_visibly(&error.to_string()),
     };
-    let items = match sources::collect(&client) {
-        Ok(items) => items,
-        Err(error) => return fail_visibly(&error),
-    };
+    let sources = sources::spawn(client);
     let filter = match initial_filter() {
         Ok(filter) => filter,
         Err(error) => return fail_visibly(&error),
     };
-    let mut picker = Picker::new(items, filter);
+    let mut picker = Picker::new(Vec::new(), filter);
     let mut mode = match initial_mode() {
         Ok(mode) => mode,
         Err(error) => return fail_visibly(&error),
@@ -60,7 +59,7 @@ fn main() -> ExitCode {
 
     let mut terminal = ratatui::init();
     let _ = crossterm::execute!(io::stdout(), EnableMouseCapture);
-    let selection = run(&mut terminal, &mut picker, &mut mode);
+    let selection = run(&mut terminal, &mut picker, &mut mode, &sources);
     let _ = crossterm::execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
 
@@ -104,31 +103,30 @@ fn maybe_open_action() -> Option<ExitCode> {
         Err(error) => return Some(fail_visibly(&error)),
     };
 
-    let mut command =
-        Command::new(std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".into()));
-    command.args([
-        "plugin",
-        "pane",
-        "open",
-        "--plugin",
-        PLUGIN_ID,
-        "--entrypoint",
-        "palette",
-    ]);
-    if let Some(filter) = filter {
-        command
-            .arg("--env")
-            .arg(format!("HERDR_COMMAND_PALETTE_FILTER={filter}"));
-    }
-    command.arg("--env").arg(match mode {
-        Mode::Direct => "HERDR_COMMAND_PALETTE_MODE=direct",
-        Mode::VimNormal | Mode::VimSearch => "HERDR_COMMAND_PALETTE_MODE=vim",
-    });
-
-    Some(match command.status() {
-        Ok(status) if status.success() => ExitCode::SUCCESS,
-        Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+    let result = herdr_client::Client::from_env()
+        .and_then(|client| client.call_value("plugin.pane.open", &open_params(filter, mode)));
+    Some(match result {
+        Ok(_) => ExitCode::SUCCESS,
         Err(error) => fail_visibly(&format!("failed to open palette: {error}")),
+    })
+}
+
+fn open_params(filter: Option<&str>, mode: Mode) -> serde_json::Value {
+    let mut env = serde_json::Map::new();
+    if let Some(filter) = filter {
+        env.insert("HERDR_COMMAND_PALETTE_FILTER".into(), filter.into());
+    }
+    env.insert(
+        "HERDR_COMMAND_PALETTE_MODE".into(),
+        match mode {
+            Mode::Direct => "direct".into(),
+            Mode::VimNormal | Mode::VimSearch => "vim".into(),
+        },
+    );
+    serde_json::json!({
+        "plugin_id": PLUGIN_ID,
+        "entrypoint": "palette",
+        "env": env,
     })
 }
 
@@ -183,46 +181,106 @@ fn run(
     terminal: &mut ratatui::DefaultTerminal,
     picker: &mut Picker,
     mode: &mut Mode,
+    sources: &Receiver<sources::SourceUpdate>,
 ) -> io::Result<Option<model::Dispatch>> {
+    let mut slots: [Option<Vec<model::Item>>; sources::SLOTS] = Default::default();
+    let mut loading = true;
     let mut spinner_frame = 0;
     let mut next_spinner_frame = Instant::now() + SPINNER_TICK;
+    let mut dirty = true;
     loop {
-        terminal.draw(|frame| ui::render(picker, *mode, spinner_frame, frame))?;
-        if event::poll(next_spinner_frame.saturating_duration_since(Instant::now()))? {
-            match event::read()? {
-                Event::Key(key) if key.is_press() => {
-                    if let Some(outcome) = handle_key(picker, mode, key) {
-                        return Ok(outcome);
-                    }
+        let mut items_changed = false;
+        loop {
+            match sources.try_recv() {
+                Ok((slot, Ok(items))) => {
+                    slots[slot] = Some(items);
+                    items_changed = true;
                 }
-                Event::Mouse(mouse) => {
-                    let rects = ui::rects(terminal.size()?.into());
-                    match mouse.kind {
-                        MouseEventKind::Moved => {
-                            if let Some(index) = row_at(picker, rects.body, mouse.column, mouse.row)
-                            {
-                                picker.selected = index;
-                                picker.ensure_selection_visible();
-                            }
-                        }
-                        MouseEventKind::Down(MouseButton::Left) => {
-                            if let Some(index) = row_at(picker, rects.body, mouse.column, mouse.row)
-                            {
-                                picker.selected = index;
-                                if let Some(item) = picker.selected_item() {
-                                    return Ok(Some(item.dispatch.clone()));
-                                }
-                            }
-                        }
-                        MouseEventKind::ScrollDown => picker.move_selection(3),
-                        MouseEventKind::ScrollUp => picker.move_selection(-3),
-                        _ => {}
-                    }
+                Ok((_, Err(error))) => return Err(io::Error::other(error)),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    loading = false;
+                    break;
                 }
-                _ => {}
             }
         }
-        advance_spinner_frame(Instant::now(), &mut spinner_frame, &mut next_spinner_frame);
+        if items_changed {
+            loading = slots.iter().any(Option::is_none);
+            picker.set_items(slots.iter().flatten().flatten().cloned().collect());
+            dirty = true;
+        }
+
+        if dirty {
+            terminal.draw(|frame| ui::render(picker, *mode, spinner_frame, loading, frame))?;
+            dirty = false;
+        }
+
+        let spinner_active = picker.needs_spinner();
+        let timeout = if loading {
+            SOURCE_POLL
+        } else if spinner_active {
+            next_spinner_frame.saturating_duration_since(Instant::now())
+        } else {
+            IDLE_POLL
+        };
+        if event::poll(timeout)? {
+            // Drain every queued event before redrawing so fast typing and
+            // held-key repeat cost one refilter each but only one draw.
+            loop {
+                match event::read()? {
+                    Event::Key(key) if key.is_press() => {
+                        if let Some(outcome) = handle_key(picker, mode, key) {
+                            return Ok(outcome);
+                        }
+                        dirty = true;
+                    }
+                    Event::Mouse(mouse) => {
+                        let rects = ui::rects(terminal.size()?.into());
+                        match mouse.kind {
+                            MouseEventKind::Moved => {
+                                if let Some(index) =
+                                    row_at(picker, rects.body, mouse.column, mouse.row)
+                                    && index != picker.selected
+                                {
+                                    picker.selected = index;
+                                    picker.ensure_selection_visible();
+                                    dirty = true;
+                                }
+                            }
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                if let Some(index) =
+                                    row_at(picker, rects.body, mouse.column, mouse.row)
+                                {
+                                    picker.selected = index;
+                                    if let Some(item) = picker.selected_item() {
+                                        return Ok(Some(item.dispatch.clone()));
+                                    }
+                                }
+                            }
+                            MouseEventKind::ScrollDown => {
+                                picker.move_selection(3);
+                                dirty = true;
+                            }
+                            MouseEventKind::ScrollUp => {
+                                picker.move_selection(-3);
+                                dirty = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                    Event::Resize(..) => dirty = true,
+                    _ => {}
+                }
+                if !event::poll(Duration::ZERO)? {
+                    break;
+                }
+            }
+        }
+        if spinner_active
+            && advance_spinner_frame(Instant::now(), &mut spinner_frame, &mut next_spinner_frame)
+        {
+            dirty = true;
+        }
     }
 }
 
@@ -230,10 +288,13 @@ fn advance_spinner_frame(
     now: Instant,
     spinner_frame: &mut usize,
     next_spinner_frame: &mut Instant,
-) {
+) -> bool {
     if now >= *next_spinner_frame {
         *spinner_frame = spinner_frame.wrapping_add(1);
         *next_spinner_frame = now + SPINNER_TICK;
+        true
+    } else {
+        false
     }
 }
 
@@ -270,7 +331,7 @@ fn handle_key(
             picker.ensure_selection_visible();
         }
         (KeyCode::End, _) => {
-            picker.selected = picker.rows().len().saturating_sub(1);
+            picker.selected = picker.len().saturating_sub(1);
             picker.ensure_selection_visible();
         }
         (KeyCode::Tab, KeyModifiers::SHIFT) | (KeyCode::BackTab, _) => picker.cycle_filter(-1),
@@ -311,7 +372,7 @@ fn row_at(picker: &Picker, body: ratatui::layout::Rect, column: u16, row: u16) -
         return None;
     }
     let index = picker.scroll + ((row - body.y) / ui::ROW_HEIGHT) as usize;
-    (index < picker.rows().len()).then_some(index)
+    (index < picker.len()).then_some(index)
 }
 
 fn fail_visibly(message: &str) -> ExitCode {
@@ -388,10 +449,38 @@ mod tests {
         let mut spinner_frame = 0;
         let mut next_spinner_frame = now;
 
-        advance_spinner_frame(now, &mut spinner_frame, &mut next_spinner_frame);
+        assert!(advance_spinner_frame(
+            now,
+            &mut spinner_frame,
+            &mut next_spinner_frame
+        ));
 
         assert_eq!(spinner_frame, 1);
         assert!(next_spinner_frame > now);
+        assert!(!advance_spinner_frame(
+            now,
+            &mut spinner_frame,
+            &mut next_spinner_frame
+        ));
+    }
+
+    #[test]
+    fn open_params_pass_filter_and_mode_through_env() {
+        assert_eq!(
+            open_params(Some("agents"), Mode::VimNormal),
+            json!({
+                "plugin_id": PLUGIN_ID,
+                "entrypoint": "palette",
+                "env": {
+                    "HERDR_COMMAND_PALETTE_FILTER": "agents",
+                    "HERDR_COMMAND_PALETTE_MODE": "vim",
+                },
+            })
+        );
+        assert_eq!(
+            open_params(None, Mode::Direct)["env"],
+            json!({ "HERDR_COMMAND_PALETTE_MODE": "direct" })
+        );
     }
 
     #[test]

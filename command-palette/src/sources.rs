@@ -1,4 +1,13 @@
-use std::{cmp::Reverse, collections::HashMap, process::Command};
+use std::{
+    cmp::Reverse,
+    collections::HashMap,
+    fs,
+    path::PathBuf,
+    process::Command,
+    sync::mpsc::{Receiver, Sender, channel},
+    thread,
+    time::UNIX_EPOCH,
+};
 
 use herdr_client::{
     AgentStatus, Client, PluginInvocationContext, SessionSnapshot, herdr_config_path,
@@ -37,27 +46,78 @@ struct NativeBinding {
     keys: Vec<String>,
 }
 
-pub fn collect(client: &Client) -> Result<Vec<Item>, String> {
-    let snapshot = client.snapshot().map_err(|error| error.to_string())?;
+/// Item batches arrive tagged with a slot index so the merged list keeps a
+/// stable display order regardless of which source finishes first.
+pub const SLOTS: usize = 3;
+
+pub type SourceUpdate = (usize, Result<Vec<Item>, String>);
+
+pub fn spawn(client: Client) -> Receiver<SourceUpdate> {
+    let (tx, rx) = channel();
+    thread::spawn(move || collect_into(client, &tx));
+    rx
+}
+
+fn collect_into(client: Client, tx: &Sender<SourceUpdate>) {
     let context = invocation_context();
-    let plugin_keys = load_plugin_keybindings();
-    let mut items = Vec::new();
+    let keys_table = thread::spawn(host_keys_table);
+    let default_bindings = thread::spawn(load_default_bindings);
+    let plugin_list = {
+        let client = client.clone();
+        thread::spawn(move || {
+            client
+                .call::<_, PluginActionList>("plugin.action.list", &json!({}))
+                .map_err(|error| error.to_string())
+        })
+    };
 
-    items.extend(workspaces(&snapshot));
-    items.extend(agents(&snapshot));
-    items.extend(tabs(&snapshot));
-    items.extend(panes(&snapshot));
-    items.extend(native_actions(&snapshot, context.as_ref())?);
-    items.extend(plugin_actions(client, context.as_ref(), &plugin_keys)?);
+    let snapshot = match client.snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let _ = tx.send((0, Err(error.to_string())));
+            return;
+        }
+    };
+    let mut session = workspaces(&snapshot);
+    session.extend(agents(&snapshot));
+    session.extend(tabs(&snapshot));
+    session.extend(panes(&snapshot));
+    let _ = tx.send((0, Ok(session)));
 
-    Ok(items)
+    let keys_table = keys_table.join().ok().flatten();
+    let bindings = default_bindings
+        .join()
+        .unwrap_or_else(|_| Err("native bindings thread panicked".into()));
+    let _ = tx.send((
+        1,
+        native_actions(bindings, keys_table.as_ref(), &snapshot, context.as_ref()),
+    ));
+
+    let plugin_list = plugin_list
+        .join()
+        .unwrap_or_else(|_| Err("plugin action thread panicked".into()));
+    let plugin_keys = load_plugin_keybindings(keys_table.as_ref());
+    let _ = tx.send((
+        2,
+        plugin_list.map(|list| plugin_actions(list, context.as_ref(), &plugin_keys)),
+    ));
 }
 
 fn native_actions(
+    bindings: Result<Vec<NativeBinding>, String>,
+    keys_table: Option<&Map<String, Value>>,
     snapshot: &SessionSnapshot,
     context: Option<&PluginInvocationContext>,
 ) -> Result<Vec<Item>, String> {
-    Ok(load_native_bindings()?
+    let mut bindings = bindings?;
+    if let Some(table) = keys_table {
+        for binding in &mut bindings {
+            if let Some(keys) = table.get(&binding.action).and_then(parse_keys) {
+                binding.keys = keys;
+            }
+        }
+    }
+    Ok(bindings
         .into_iter()
         .filter_map(|binding| {
             let dispatch = native_dispatch(&binding.action, snapshot, context)?;
@@ -75,14 +135,11 @@ fn native_actions(
 }
 
 fn plugin_actions(
-    client: &Client,
+    result: PluginActionList,
     context: Option<&PluginInvocationContext>,
     keybindings: &HashMap<String, Vec<String>>,
-) -> Result<Vec<Item>, String> {
-    let result: PluginActionList = client
-        .call("plugin.action.list", &json!({}))
-        .map_err(|error| error.to_string())?;
-    Ok(result
+) -> Vec<Item> {
+    result
         .actions
         .into_iter()
         .filter(|action| action.plugin_id != PLUGIN_ID)
@@ -106,7 +163,7 @@ fn plugin_actions(
                 ),
             }
         })
-        .collect())
+        .collect()
 }
 
 fn workspaces(snapshot: &SessionSnapshot) -> Vec<Item> {
@@ -474,17 +531,9 @@ fn invocation_context() -> Option<PluginInvocationContext> {
         .and_then(|raw| serde_json::from_str(&raw).ok())
 }
 
-fn load_native_bindings() -> Result<Vec<NativeBinding>, String> {
+fn load_default_bindings() -> Result<Vec<NativeBinding>, String> {
     let herdr = std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".into());
-    let output = Command::new(herdr)
-        .arg("--default-config")
-        .output()
-        .map_err(|error| format!("could not run herdr --default-config: {error}"))?;
-    if !output.status.success() {
-        return Err("herdr --default-config failed".into());
-    }
-    let text = String::from_utf8(output.stdout)
-        .map_err(|error| format!("default config is not UTF-8: {error}"))?;
+    let text = default_config_text(&herdr)?;
     let mut bindings = parse_default_bindings(&text);
     for action in SAFE_API_ACTIONS {
         if !bindings.iter().any(|binding| binding.action == action) {
@@ -494,19 +543,81 @@ fn load_native_bindings() -> Result<Vec<NativeBinding>, String> {
             });
         }
     }
-
-    if let Some(table) = host_keys_table() {
-        for binding in &mut bindings {
-            if let Some(keys) = table.get(&binding.action).and_then(parse_keys) {
-                binding.keys = keys;
-            }
-        }
-    }
     Ok(bindings)
 }
 
+/// The default config only changes with the Herdr binary, so cache its output
+/// keyed by the binary's path, size, and mtime.
+fn default_config_text(herdr: &str) -> Result<String, String> {
+    let cache = cache_slot(herdr);
+    if let Some((path, key)) = &cache
+        && let Ok(cached) = fs::read_to_string(path)
+        && let Some((cached_key, text)) = cached.split_once('\n')
+        && cached_key == key
+    {
+        return Ok(text.into());
+    }
+    let output = Command::new(herdr)
+        .arg("--default-config")
+        .output()
+        .map_err(|error| format!("could not run herdr --default-config: {error}"))?;
+    if !output.status.success() {
+        return Err("herdr --default-config failed".into());
+    }
+    let text = String::from_utf8(output.stdout)
+        .map_err(|error| format!("default config is not UTF-8: {error}"))?;
+    if let Some((path, key)) = &cache {
+        let _ = fs::write(path, format!("{key}\n{text}"));
+    }
+    Ok(text)
+}
+
+fn cache_slot(herdr: &str) -> Option<(PathBuf, String)> {
+    let state_dir = std::env::var_os("HERDR_PLUGIN_STATE_DIR")?;
+    let meta = fs::metadata(herdr).ok()?;
+    let mtime = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    Some((
+        PathBuf::from(state_dir).join("default-config.cache"),
+        format!(
+            "{herdr}|{}|{}.{}",
+            meta.len(),
+            mtime.as_secs(),
+            mtime.subsec_nanos()
+        ),
+    ))
+}
+
 fn parse_default_bindings(text: &str) -> Vec<NativeBinding> {
-    let mut bindings = Vec::new();
+    let lines = binding_lines(text);
+    let doc: String = lines
+        .iter()
+        .map(|(name, value)| format!("{name} = {value}\n"))
+        .collect();
+    match toml::from_str::<Value>(&doc) {
+        Ok(table) => lines
+            .into_iter()
+            .map(|(name, _)| NativeBinding {
+                action: name.into(),
+                keys: table.get(name).and_then(parse_keys).unwrap_or_default(),
+            })
+            .collect(),
+        // A malformed or duplicate line poisons the combined document; fall
+        // back to per-line parsing so only the bad line is dropped.
+        Err(_) => lines
+            .into_iter()
+            .filter_map(|(name, value)| {
+                let parsed = toml::from_str::<Value>(&format!("value = {value}")).ok()?;
+                Some(NativeBinding {
+                    action: name.into(),
+                    keys: parsed.get("value").and_then(parse_keys).unwrap_or_default(),
+                })
+            })
+            .collect(),
+    }
+}
+
+fn binding_lines(text: &str) -> Vec<(&str, &str)> {
+    let mut lines = Vec::new();
     let mut in_keys = false;
     for raw in text.lines() {
         let line = raw.trim_start();
@@ -532,23 +643,18 @@ fn parse_default_bindings(text: &str) -> Vec<NativeBinding> {
         {
             continue;
         }
-        let Ok(value) = toml::from_str::<Value>(&format!("value = {}", raw_value.trim())) else {
-            continue;
-        };
-        let keys = value.get("value").and_then(parse_keys).unwrap_or_default();
-        bindings.push(NativeBinding {
-            action: name.into(),
-            keys,
-        });
+        lines.push((name, raw_value.trim()));
     }
-    bindings
+    lines
 }
 
-fn load_plugin_keybindings() -> HashMap<String, Vec<String>> {
-    let Some(table) = host_keys_table() else {
-        return HashMap::new();
-    };
-    let Some(commands) = table.get("command").and_then(Value::as_array) else {
+fn load_plugin_keybindings(
+    keys_table: Option<&Map<String, Value>>,
+) -> HashMap<String, Vec<String>> {
+    let Some(commands) = keys_table
+        .and_then(|table| table.get("command"))
+        .and_then(Value::as_array)
+    else {
         return HashMap::new();
     };
     let mut result: HashMap<String, Vec<String>> = HashMap::new();
@@ -689,6 +795,21 @@ mod tests {
         assert_eq!(parsed[0].action, "help");
         assert!(parsed[1].keys.is_empty());
         assert_eq!(parsed[2].keys, ["prefix+v", "ctrl+alt+v"]);
+    }
+
+    #[test]
+    fn malformed_binding_line_only_drops_itself() {
+        let parsed = parse_default_bindings(
+            "[keys]\n# help = \"prefix+?\"\n# broken = not valid\n# zoom = \"prefix+z\"\n",
+        );
+        assert_eq!(
+            parsed
+                .iter()
+                .map(|binding| binding.action.as_str())
+                .collect::<Vec<_>>(),
+            ["help", "zoom"]
+        );
+        assert_eq!(parsed[1].keys, ["prefix+z"]);
     }
 
     #[test]
