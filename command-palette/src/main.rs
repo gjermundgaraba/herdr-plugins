@@ -221,8 +221,10 @@ fn run(
             next_spinner_frame.saturating_duration_since(Instant::now())
         } else {
             // Nothing time-based remains once sources are done and no spinner
-            // is visible; block until input. crossterm/mio clamp huge timeouts.
-            Duration::MAX
+            // is visible; effectively block until input. Duration::MAX is out:
+            // mio clamps it to tv_sec = i64::MAX, which macOS kevent rejects
+            // with EINVAL.
+            Duration::from_secs(3600)
         };
         if event::poll(timeout)? {
             // Drain every queued event before redrawing so fast typing and
