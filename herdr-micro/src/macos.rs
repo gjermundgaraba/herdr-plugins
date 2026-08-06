@@ -12,11 +12,14 @@ use objc2_core_foundation::{
     CFDictionary, CFNumber, CFRunLoop, CFString, CFType, CGPoint, kCFRunLoopDefaultMode,
 };
 use objc2_core_graphics::{
-    CGEvent, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton, CGPreflightPostEventAccess,
-    CGScrollEventUnit, CGWarpMouseCursorPosition, CGWindowListCopyWindowInfo, CGWindowListOption,
-    kCGNullWindowID, kCGWindowBounds, kCGWindowLayer, kCGWindowName, kCGWindowOwnerPID,
+    CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton,
+    CGPreflightPostEventAccess, CGScrollEventUnit, CGWarpMouseCursorPosition,
+    CGWindowListCopyWindowInfo, CGWindowListOption, kCGNullWindowID, kCGWindowBounds,
+    kCGWindowLayer, kCGWindowName, kCGWindowOwnerPID,
 };
 use serde::Serialize;
+
+use crate::config::Modifier;
 
 const SCROLL_TARGET_UNAVAILABLE: &str = "frontmost scroll target unavailable";
 
@@ -44,27 +47,30 @@ pub fn post_event_access() -> Result<()> {
     }
 }
 
-pub fn post_function_key(key: &str, down: bool) -> Result<()> {
+/// Post a tap (down then up) of a virtual keycode with the given modifiers.
+pub fn post_key(keycode: u16, modifiers: &[Modifier]) -> Result<()> {
     post_event_access()?;
-    let keycode = function_key_code(key).ok_or_else(|| anyhow!("unsupported macOS key: {key}"))?;
-    let event = CGEvent::new_keyboard_event(None, keycode, down)
-        .ok_or_else(|| anyhow!("could not create {key} event"))?;
-    CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+    let flags = modifiers.iter().fold(CGEventFlags(0), |flags, modifier| {
+        flags
+            | match modifier {
+                Modifier::Cmd => CGEventFlags::MaskCommand,
+                Modifier::Shift => CGEventFlags::MaskShift,
+                Modifier::Alt => CGEventFlags::MaskAlternate,
+                Modifier::Ctrl => CGEventFlags::MaskControl,
+                Modifier::Fn => CGEventFlags::MaskSecondaryFn,
+            }
+    });
+    for down in [true, false] {
+        let event = CGEvent::new_keyboard_event(None, keycode, down)
+            .ok_or_else(|| anyhow!("could not create keycode {keycode} event"))?;
+        // Only add to the default flags: CGEvent derives required masks (e.g.
+        // secondary-fn on F-keys) that hotkey listeners match on.
+        if !flags.is_empty() {
+            CGEvent::set_flags(Some(&event), CGEvent::flags(Some(&event)) | flags);
+        }
+        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+    }
     Ok(())
-}
-
-fn function_key_code(key: &str) -> Option<CGKeyCode> {
-    Some(match key {
-        "F13" => 0x69,
-        "F14" => 0x6B,
-        "F15" => 0x71,
-        "F16" => 0x6A,
-        "F17" => 0x40,
-        "F18" => 0x4F,
-        "F19" => 0x50,
-        "F20" => 0x5A,
-        _ => return None,
-    })
 }
 
 pub fn frontmost() -> Result<Frontmost> {
@@ -277,12 +283,5 @@ mod tests {
         assert!(!usable_window_for(42, Some(1.0), Some(42.0)));
         assert!(!usable_window_for(42, Some(0.0), Some(7.0)));
         assert!(!usable_window_for(42, None, Some(42.0)));
-    }
-
-    #[test]
-    fn maps_only_macos_function_keycodes() {
-        assert_eq!(function_key_code("F13"), Some(0x69));
-        assert_eq!(function_key_code("F20"), Some(0x5A));
-        assert_eq!(function_key_code("F21"), None);
     }
 }

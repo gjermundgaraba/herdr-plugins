@@ -17,7 +17,7 @@ use std::{
 use crate::{
     actions::{HERDR_LAYER, layer_identity},
     config::{
-        Controls, config_path, function_key_number, load_controls, load_effort, load_lighting,
+        Controls, config_path, load_controls, load_effort, load_lighting,
         provision_controls, provision_effort, provision_lighting,
     },
     control::{ensure_state_dir, request_status},
@@ -173,16 +173,10 @@ fn is_blank_layer(layer: &Value) -> bool {
 
 /// Copies the compatible Layer 1 layout into blank or previously managed Layer 2.
 pub fn configure_micro(keymap: &mut Value) -> Result<()> {
-    configure_micro_with_hid(
-        keymap,
-        &crate::config::default_controls().action_device_keys,
-    )
+    configure_micro_with_hid(keymap, &crate::config::default_controls())
 }
 
-fn configure_micro_with_hid(
-    keymap: &mut Value,
-    hid_keys: &std::collections::BTreeMap<u8, Option<String>>,
-) -> Result<()> {
+fn configure_micro_with_hid(keymap: &mut Value, controls: &Controls) -> Result<()> {
     let managed_process = layer_identity(HERDR_LAYER).process;
     let mut managed_ids: Vec<Value> = keymap
         .get("linkedApps")
@@ -252,7 +246,7 @@ fn configure_micro_with_hid(
             .get_mut("layout")
             .ok_or_else(|| anyhow!("Layer {HERDR_LAYER} layout is missing"))?;
         reset_hid_codes(target)?;
-        set_hid_codes(target, hid_keys)?;
+        set_hid_codes(target, controls)?;
     }
 
     let linked = keymap
@@ -365,40 +359,26 @@ fn reset_hid_codes(layout: &mut Value) -> Result<()> {
         let value = layout
             .pointer_mut(pointer)
             .ok_or_else(|| anyhow!("Layer 2 key slot {slot} is missing"))?;
-        let current = value
+        value
             .as_str()
             .ok_or_else(|| anyhow!("Layer 2 key slot {slot} must be a key code"))?;
-        if current != stock
-            && current != "KC_NONE"
-            && current
-                .strip_prefix("KC_")
-                .and_then(function_key_number)
-                .is_none()
-        {
-            bail!("Layer 2 key slot {slot} has unexpected code {current}");
-        }
         *value = Value::String(stock.into());
     }
     Ok(())
 }
 
-fn set_hid_codes(
-    layout: &mut Value,
-    hid_keys: &std::collections::BTreeMap<u8, Option<String>>,
-) -> Result<()> {
+fn set_hid_codes(layout: &mut Value, controls: &Controls) -> Result<()> {
+    let enabled = crate::config::enabled_buttons(controls);
     for (button, pointer, _) in BUTTON_KEY_SLOTS {
         let slot = layout
             .pointer_mut(pointer)
             .ok_or_else(|| anyhow!("Layer 2 button {button} is missing"))?;
-        *slot = Value::String(
-            match hid_keys
-                .get(&button)
-                .ok_or_else(|| anyhow!("button HID key {button} is missing"))?
-            {
-                Some(key) => format!("KC_{key}"),
-                None => "KC_NONE".into(),
-            },
-        );
+        let index = usize::from(button) - 1;
+        *slot = Value::String(if enabled[index] {
+            format!("KC_{}", crate::device::ACTION_KEYS[index].1)
+        } else {
+            "KC_NONE".into()
+        });
     }
     Ok(())
 }
@@ -514,7 +494,7 @@ fn update_micro_keymap(
 pub fn setup_micro() -> Result<SetupReport> {
     let (controls, effort, lighting, parsed_controls) = provision_and_validate_configs()?;
     let (firmware, backup) = update_micro_keymap(|keymap| {
-        configure_micro_with_hid(keymap, &parsed_controls.action_device_keys)
+        configure_micro_with_hid(keymap, &parsed_controls)
     })?;
     Ok(SetupReport {
         firmware,
@@ -736,15 +716,19 @@ mod tests {
             Some(&json!(["KV_OAI_AG00", "KV_OAI_AG01"]))
         );
         assert_eq!(
-            keymap.pointer("/profiles/0/layers/1/layout/keymap/3/0"),
-            Some(&json!("KC_F19"))
+            keymap.pointer("/profiles/0/layers/1/layout/keymap/2/2"),
+            Some(&json!("KC_F23"))
+        );
+        assert_eq!(
+            keymap.pointer("/profiles/0/layers/1/layout/keymap/3/2"),
+            Some(&json!("KC_STOP"))
         );
         assert_eq!(
             keymap.pointer("/profiles/0/layers/1/layout/keymap/2/0"),
-            Some(&json!("KC_F20"))
+            Some(&json!("KC_NONE"))
         );
         assert_eq!(
-            keymap.pointer("/profiles/0/layers/1/layout/keymap/3/1"),
+            keymap.pointer("/profiles/0/layers/1/layout/keymap/3/0"),
             Some(&json!("KC_NONE"))
         );
         let configured = keymap.clone();
@@ -765,6 +749,10 @@ mod tests {
     fn prefers_the_existing_managed_profile_and_activates_it() {
         let source = oai_layout();
         let blank = blank_layer();
+        // A managed layer restored from an old backup: legacy button codes must
+        // reset cleanly, never brick setup.
+        let mut restored = oai_layout();
+        *restored.pointer_mut("/keymap/3/0").unwrap() = json!("KC_F19");
         let mut keymap = json!({
             "activeProfileId": 1,
             "linkedApps": [
@@ -774,7 +762,7 @@ mod tests {
             "profiles": [
                 {"id": 0, "layers": [
                     {"layout": source},
-                    {"linkedAppId": 10, "layout": oai_layout()}
+                    {"linkedAppId": 10, "layout": restored}
                 ]},
                 {"id": 1, "layers": [
                     {"layout": oai_layout()},
@@ -791,6 +779,14 @@ mod tests {
         assert_eq!(
             keymap.pointer("/profiles/0/layers/1/layout/keymap/1/3"),
             Some(&json!("KV_OAI_AG05"))
+        );
+        assert_eq!(
+            keymap.pointer("/profiles/0/layers/1/layout/keymap/3/0"),
+            Some(&json!("KC_NONE"))
+        );
+        assert_eq!(
+            keymap.pointer("/profiles/0/layers/1/layout/keymap/2/2"),
+            Some(&json!("KC_F23"))
         );
         assert_eq!(
             keymap.pointer("/profiles/1/layers/1/linkedAppId"),

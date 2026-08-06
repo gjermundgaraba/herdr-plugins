@@ -13,7 +13,7 @@ dial, and joystick to the focused Codex, Claude Code, or Pi agent.
 - Work Louder Input for the one-time Layer 2 setup
 - Administrator access for the one-time privileged USB-helper installation
 - macOS Automation permission for Ghostty inspection
-- macOS Accessibility permission for configured F-key output and optional scrolling
+- macOS Accessibility permission for configured `key` bindings and scrolling
 - [Hunk](https://www.hunk.dev/) only for the optional `diff` action
 
 The bridge uses an unsupported proprietary device protocol. See the
@@ -73,37 +73,42 @@ herdr plugin link . --enabled
    herdr plugin config-dir gjermundgaraba.herdr-micro
    ```
 
-   - `controls.json`: Agent-key output, action-key mappings, dial, joystick, gestures, and per-agent actions
+   - `controls.json`: button bindings, dial, joystick, gestures, and per-agent actions
    - `lighting.json`: state colors/effects and aggregate lighting zones
    - `effort.json`: user-configured Codex effort shortcuts
 
-Run **Configure Micro controls** in Herdr to open `controls.json`. Action
-changes are validated and reloaded while the bridge runs. `agentMacosKeys` maps
-the six independently lit OAI Agent keys to macOS F13–F20 events. `actionDeviceKeys`
-maps the seven action switches to on-device F13–F24 codes; `null` disables an
-action switch. `actionMacosKeys` explicitly chooses which action switches also emit
-macOS F13–F20 events. Synthetic macOS outputs must be unique across both macOS
-maps; action-device outputs must also be unique.
-The stock wide keycap spans switches 5 and 6, so switch 6 is disabled:
+Run **Configure Micro controls** in Herdr to open `controls.json`. Binding
+changes are validated and reloaded while the bridge runs. `buttons` maps the
+seven action switches to bindings; `null` disables a switch. Each bound switch
+uses a fixed internal HID code that macOS maps to no virtual keycode, so an
+uncaptured Micro cannot type anything. Agent presses focus their slot directly
+through Herdr. The only way a button reaches macOS is an explicit `key`
+binding, which taps a configured key system-wide from any frontmost app while
+the bridge owns the device (useful for app hotkeys such as dictation):
+
+```json
+"5": { "action": "key", "key": "F19" }
+```
+
+Names cover F13–F20; `keycode` accepts any macOS virtual keycode (0–127)
+instead of `key`, and optional `modifiers` adds any of `cmd`, `shift`, `alt`,
+`ctrl`, and `fn`.
+The stock wide keycap spans switches 5 and 6, so switch 6 stays unbound:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "buttons": {},
-  "agentMacosKeys": { "1": "F13", "2": "F14", "3": "F15", "4": "F16", "5": "F17", "6": "F18" },
-  "actionDeviceKeys": { "1": "F20", "2": "F21", "3": "F22", "4": "F23", "5": "F19", "6": null, "7": "F24" },
-  "actionMacosKeys": { "1": null, "2": null, "3": null, "4": null, "5": "F19", "6": null, "7": null },
   "dial": {},
   "joystick": { "engageDistance": 0.75, "releaseDistance": 0.3 }
 }
 ```
 
 The privileged helper captures the USB-connected Micro so ChatGPT cannot also
-receive Layer 2 events. The unprivileged bridge mirrors Agent F-keys and
-only the action keys selected by `actionMacosKeys` back into macOS. `agentMacosKeys`
-and `actionMacosKeys` reload live. Changes to `actionDeviceKeys` alter the device keymap: stop
-the bridge, run **Set up Micro Layer 2** again, then restart it. Every changed
-keymap is backed up and verified before setup succeeds.
+receive Layer 2 events. Binding a previously unbound switch (or the reverse)
+alters the device keymap: stop the bridge, run **Set up Micro Layer 2** again,
+then restart it. Every changed keymap is backed up and verified before setup
+succeeds.
 
 ## Effort controls
 

@@ -32,6 +32,50 @@ pub enum Action {
         direction: VerticalDirection,
         percent: f64,
     },
+    Key {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        keycode: Option<u16>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        modifiers: Vec<Modifier>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Modifier {
+    Cmd,
+    Shift,
+    Alt,
+    Ctrl,
+    Fn,
+}
+
+fn named_keycode(name: &str) -> Option<u16> {
+    Some(match name {
+        "F13" => 0x69,
+        "F14" => 0x6B,
+        "F15" => 0x71,
+        "F16" => 0x6A,
+        "F17" => 0x40,
+        "F18" => 0x4F,
+        "F19" => 0x50,
+        "F20" => 0x5A,
+        _ => return None,
+    })
+}
+
+/// The macOS virtual keycode a `key` action posts.
+pub fn key_action_code(key: Option<&str>, keycode: Option<u16>) -> Result<u16, String> {
+    match (key, keycode) {
+        (Some(name), None) => {
+            named_keycode(name).ok_or_else(|| format!("unknown key name: {name}"))
+        }
+        (None, Some(code)) if code <= 0x7F => Ok(code),
+        (None, Some(code)) => Err(format!("keycode {code} must be at most 127")),
+        _ => Err("key action requires exactly one of key or keycode".into()),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,12 +140,8 @@ impl Binding {
 /// Firmware labels are reversed: `ENC_CC` means clockwise and `ENC_CW` means counterclockwise.
 pub fn key_binding(config: &Controls, key: &str, action: i64) -> Option<Binding> {
     if matches!(action, 0 | 1) {
-        if let Some(button) = config
-            .action_device_keys
-            .iter()
-            .find_map(|(button, hid_key)| (hid_key.as_deref() == Some(key)).then_some(button))
-        {
-            return config.buttons.get(button).cloned().flatten();
+        if let Some(button) = device_button(key) {
+            return config.buttons.get(&button).cloned().flatten();
         }
         if key == "ENC_CLK" {
             return config.dial.press.clone();
@@ -117,11 +157,25 @@ pub fn key_binding(config: &Controls, key: &str, action: i64) -> Option<Binding>
 #[derive(Clone, Debug, PartialEq)]
 pub struct Controls {
     pub buttons: std::collections::BTreeMap<u8, Option<Binding>>,
-    pub agent_macos_keys: std::collections::BTreeMap<u8, String>,
-    pub action_device_keys: std::collections::BTreeMap<u8, Option<String>>,
-    pub action_macos_keys: std::collections::BTreeMap<u8, Option<String>>,
     pub dial: Dial,
     pub joystick: Joystick,
+}
+
+pub fn device_button(key: &str) -> Option<u8> {
+    let index = codex_micro::ACTION_KEYS
+        .iter()
+        .position(|(_, name)| *name == key)?;
+    Some(index as u8 + 1)
+}
+
+/// A switch is live exactly when its button is bound.
+pub fn enabled_buttons(controls: &Controls) -> [bool; 7] {
+    std::array::from_fn(|index| {
+        controls
+            .buttons
+            .get(&(index as u8 + 1))
+            .is_some_and(Option::is_some)
+    })
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct Dial {
@@ -145,21 +199,9 @@ pub fn default_controls() -> Controls {
 
 pub fn parse_controls(value: &Value) -> Result<Controls, String> {
     let root = object(value, "control configuration")?;
-    fields(
-        root,
-        &[
-            "version",
-            "buttons",
-            "agentMacosKeys",
-            "actionDeviceKeys",
-            "actionMacosKeys",
-            "dial",
-            "joystick",
-        ],
-        "control",
-    )?;
-    if root.get("version") != Some(&Value::from(1)) {
-        return Err("version must be 1".into());
+    fields(root, &["version", "buttons", "dial", "joystick"], "control")?;
+    if root.get("version") != Some(&Value::from(2)) {
+        return Err("version must be 2".into());
     }
     let buttons = object(req(root, "buttons")?, "buttons")?;
     let mut parsed_buttons = std::collections::BTreeMap::new();
@@ -170,84 +212,6 @@ pub fn parse_controls(value: &Value) -> Result<Controls, String> {
             .filter(|n| (1..=7).contains(n))
             .ok_or_else(|| format!("invalid button: {key}"))?;
         parsed_buttons.insert(id, parse_binding(binding, &format!("buttons.{key}"))?);
-    }
-    let mut used_macos_keys = std::collections::BTreeSet::new();
-    let agent_macos_keys = object(req(root, "agentMacosKeys")?, "agentMacosKeys")?;
-    let mut parsed_agent_macos_keys = std::collections::BTreeMap::new();
-    for (slot, key) in agent_macos_keys {
-        let slot = slot
-            .parse::<u8>()
-            .ok()
-            .filter(|slot| (1..=6).contains(slot))
-            .ok_or_else(|| format!("invalid Agent slot: {slot}"))?;
-        let key = key
-            .as_str()
-            .filter(|key| function_key_number(key).is_some_and(|number| number <= 20))
-            .ok_or_else(|| format!("agentMacosKeys.{slot} must be F13 through F20"))?;
-        if !used_macos_keys.insert(key.to_owned()) {
-            return Err(format!("duplicate macOS key: {key}"));
-        }
-        parsed_agent_macos_keys.insert(slot, key.to_owned());
-    }
-    if parsed_agent_macos_keys.len() != 6 {
-        return Err("agentMacosKeys must define slots 1 through 6".into());
-    }
-    let mut used_device_keys = std::collections::BTreeSet::new();
-    let action_device_keys = object(req(root, "actionDeviceKeys")?, "actionDeviceKeys")?;
-    let mut parsed_action_device_keys = std::collections::BTreeMap::new();
-    for (button, key) in action_device_keys {
-        let button = button
-            .parse::<u8>()
-            .ok()
-            .filter(|button| (1..=7).contains(button))
-            .ok_or_else(|| format!("invalid HID button: {button}"))?;
-        let key = match key {
-            Value::Null => None,
-            Value::String(key) if function_key_number(key).is_some() => Some(key.clone()),
-            _ => {
-                return Err(format!(
-                    "actionDeviceKeys.{button} must be null or F13 through F24"
-                ));
-            }
-        };
-        if let Some(key) = &key {
-            if !used_device_keys.insert(key.clone()) {
-                return Err(format!("duplicate action device key: {key}"));
-            }
-        }
-        parsed_action_device_keys.insert(button, key);
-    }
-    if parsed_action_device_keys.len() != 7 {
-        return Err("actionDeviceKeys must define buttons 1 through 7".into());
-    }
-    let action_macos_keys = object(req(root, "actionMacosKeys")?, "actionMacosKeys")?;
-    let mut parsed_action_macos_keys = std::collections::BTreeMap::new();
-    for (button, key) in action_macos_keys {
-        let button = button
-            .parse::<u8>()
-            .ok()
-            .filter(|button| (1..=7).contains(button))
-            .ok_or_else(|| format!("invalid macOS button: {button}"))?;
-        let key = match key {
-            Value::Null => None,
-            Value::String(key) if function_key_number(key).is_some_and(|number| number <= 20) => {
-                Some(key.clone())
-            }
-            _ => {
-                return Err(format!(
-                    "actionMacosKeys.{button} must be null or F13 through F20"
-                ));
-            }
-        };
-        if let Some(key) = &key {
-            if !used_macos_keys.insert(key.clone()) {
-                return Err(format!("duplicate macOS key: {key}"));
-            }
-        }
-        parsed_action_macos_keys.insert(button, key);
-    }
-    if parsed_action_macos_keys.len() != 7 {
-        return Err("actionMacosKeys must define buttons 1 through 7".into());
     }
     let dial_v = object(req(root, "dial")?, "dial")?;
     fields(dial_v, &["clockwise", "counterclockwise", "press"], "dial")?;
@@ -273,9 +237,6 @@ pub fn parse_controls(value: &Value) -> Result<Controls, String> {
     }
     Ok(Controls {
         buttons: parsed_buttons,
-        agent_macos_keys: parsed_agent_macos_keys,
-        action_device_keys: parsed_action_device_keys,
-        action_macos_keys: parsed_action_macos_keys,
         dial: Dial {
             clockwise: parse_action_or_null(
                 dial_v.get("clockwise").unwrap_or(&Value::Null),
@@ -307,11 +268,6 @@ pub fn parse_controls(value: &Value) -> Result<Controls, String> {
     })
 }
 
-pub fn function_key_number(key: &str) -> Option<u8> {
-    let number = key.strip_prefix('F')?.parse::<u8>().ok()?;
-    ((13..=24).contains(&number) && key == format!("F{number}")).then_some(number)
-}
-
 fn parse_binding(value: &Value, label: &str) -> Result<Option<Binding>, String> {
     if value.is_null() {
         return Ok(None);
@@ -334,10 +290,15 @@ fn parse_binding(value: &Value, label: &str) -> Result<Option<Binding>, String> 
             {
                 return Err(format!("{label}.byAgent.{agent} cannot contain byAgent"));
             }
-            by_agent.insert(
-                agent.clone(),
-                parse_action_or_null(action, &format!("{label}.byAgent.{agent}"))?,
-            );
+            let parsed = parse_action_or_null(action, &format!("{label}.byAgent.{agent}"))?;
+            // Key taps are system-wide and fire without a focused agent, so an
+            // agent-conditional key has nothing coherent to condition on.
+            if matches!(parsed, Some(Action::Key { .. })) {
+                return Err(format!(
+                    "{label}.byAgent.{agent} cannot contain a key action"
+                ));
+            }
+            by_agent.insert(agent.clone(), parsed);
         }
         return Ok(Some(Binding::ByAgent(by_agent)));
     }
@@ -394,6 +355,9 @@ fn validate_action(action: &Action, label: &str) -> Result<(), String> {
                 "{label}.percent must be greater than 0 and at most 100"
             ))
         }
+        Action::Key { key, keycode, .. } => key_action_code(key.as_deref(), *keycode)
+            .map(|_| ())
+            .map_err(|error| format!("{label}: {error}")),
         _ => Ok(()),
     }
 }
@@ -615,7 +579,7 @@ pub fn load_lighting(path: &Path) -> Result<LightingConfig, String> {
     parse_lighting(read_json(path)?)
 }
 fn controls_json() -> Value {
-    serde_json::json!({"version":1,"buttons":{"1":null,"2":null,"3":{"byAgent":{"codex":{"action":"fast"},"pi":{"action":"fast"},"default":null}},"4":{"action":"prompt","prompt":"/copy","submit":true},"5":null,"6":null,"7":{"action":"submit"}},"agentMacosKeys":{"1":"F13","2":"F14","3":"F15","4":"F16","5":"F17","6":"F18"},"actionDeviceKeys":{"1":"F20","2":"F21","3":"F22","4":"F23","5":"F19","6":null,"7":"F24"},"actionMacosKeys":{"1":null,"2":null,"3":null,"4":null,"5":"F19","6":null,"7":null},"dial":{"clockwise":{"action":"effort","direction":"raise"},"counterclockwise":{"action":"effort","direction":"lower"},"press":{"action":"prompt","prompt":"/model","submit":true}},"joystick":{"engageDistance":0.75,"releaseDistance":0.3,"up":{"action":"scroll","direction":"up","percent":50},"down":{"action":"scroll","direction":"down","percent":50},"left":{"action":"focus-pane","direction":"left"},"right":{"action":"focus-pane","direction":"right"}}})
+    serde_json::json!({"version":2,"buttons":{"1":null,"2":null,"3":{"byAgent":{"codex":{"action":"fast"},"pi":{"action":"fast"},"default":null}},"4":{"action":"prompt","prompt":"/copy","submit":true},"5":null,"6":null,"7":{"action":"submit"}},"dial":{"clockwise":{"action":"effort","direction":"raise"},"counterclockwise":{"action":"effort","direction":"lower"},"press":{"action":"prompt","prompt":"/model","submit":true}},"joystick":{"engageDistance":0.75,"releaseDistance":0.3,"up":{"action":"scroll","direction":"up","percent":50},"down":{"action":"scroll","direction":"down","percent":50},"left":{"action":"focus-pane","direction":"left"},"right":{"action":"focus-pane","direction":"right"}}})
 }
 fn read_json(path: &Path) -> Result<Value, String> {
     serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
@@ -627,12 +591,6 @@ mod tests {
     #[test]
     fn controls_reject_unknown_fields_and_map_reversed_dial_labels() {
         let controls = default_controls();
-        assert_eq!(controls.agent_macos_keys[&1], "F13");
-        assert_eq!(controls.agent_macos_keys[&6], "F18");
-        assert_eq!(controls.action_device_keys[&5].as_deref(), Some("F19"));
-        assert_eq!(controls.action_device_keys[&6], None);
-        assert_eq!(controls.action_macos_keys[&5].as_deref(), Some("F19"));
-        assert_eq!(controls.action_macos_keys[&1], None);
         for action in [-1, 0, 1, 2, 3] {
             assert!(matches!(
                 key_binding(&controls, "ENC_CC", action),
@@ -642,40 +600,65 @@ mod tests {
             ));
         }
         assert!(key_binding(&controls, "ACT10", 1).is_none());
-        assert_eq!(
-            key_binding(&controls, "F20", 1),
-            controls.buttons[&1].clone()
-        );
-        let mut remapped = controls_json();
-        remapped["agentMacosKeys"]["3"] = serde_json::json!("F20");
-        let remapped = parse_controls(&remapped).unwrap();
-        assert_eq!(remapped.agent_macos_keys[&3], "F20");
-        assert_eq!(remapped.action_device_keys[&1].as_deref(), Some("F20"));
-        let mut duplicate = controls_json();
-        duplicate["actionDeviceKeys"]["1"] = serde_json::json!("F21");
-        assert!(parse_controls(&duplicate).is_err());
-        let mut duplicate_output = controls_json();
-        duplicate_output["actionMacosKeys"]["1"] = serde_json::json!("F13");
-        assert!(parse_controls(&duplicate_output).is_err());
-        let mut missing = controls_json();
-        missing["agentMacosKeys"]
-            .as_object_mut()
-            .unwrap()
-            .remove("6");
-        assert!(parse_controls(&missing).is_err());
-        let mut invalid = controls_json();
-        invalid["agentMacosKeys"]["1"] = serde_json::json!("F21");
-        assert!(parse_controls(&invalid).is_err());
+        assert!(key_binding(&controls, "F20", 1).is_none());
         assert_eq!(
             key_binding(&controls, "F24", 1),
+            controls.buttons[&4].clone()
+        );
+        assert_eq!(
+            key_binding(&controls, "STOP", 1),
             controls.buttons[&7].clone()
         );
+        assert_eq!(device_button("F21"), Some(1));
+        assert_eq!(device_button("EXECUTE"), Some(5));
+        assert_eq!(device_button("F13"), None);
+        assert_eq!(
+            enabled_buttons(&controls),
+            [false, false, true, true, false, false, true]
+        );
+        let mut rebound = controls.clone();
+        rebound.buttons.insert(5, controls.buttons[&7].clone());
+        assert_ne!(enabled_buttons(&rebound), enabled_buttons(&controls));
+        let mut old_version = controls_json();
+        old_version["version"] = serde_json::json!(1);
+        assert!(parse_controls(&old_version).is_err());
+        let mut stale = controls_json();
+        stale["actionDeviceKeys"] = serde_json::json!({});
+        assert!(parse_controls(&stale).is_err());
         let mut extra = controls_json();
         extra["dial"]["extra"] = Value::Bool(true);
         assert!(parse_controls(&extra).is_err());
         let mut bad_button = controls_json();
         bad_button["buttons"]["8"] = Value::Null;
         assert!(parse_controls(&bad_button).is_err());
+    }
+    #[test]
+    fn key_actions_resolve_names_or_raw_keycodes() {
+        let mut named = controls_json();
+        named["buttons"]["5"] = serde_json::json!({"action":"key","key":"F19"});
+        let named = parse_controls(&named).unwrap();
+        assert!(matches!(
+            named.buttons[&5],
+            Some(Binding::Action(Action::Key { .. }))
+        ));
+        let mut raw = controls_json();
+        raw["buttons"]["5"] =
+            serde_json::json!({"action":"key","keycode":80,"modifiers":["cmd","shift"]});
+        assert!(parse_controls(&raw).is_ok());
+        for invalid in [
+            serde_json::json!({"action":"key"}),
+            serde_json::json!({"action":"key","key":"F19","keycode":80}),
+            serde_json::json!({"action":"key","key":"F99"}),
+            serde_json::json!({"action":"key","keycode":300}),
+            serde_json::json!({"action":"key","keycode":80,"modifiers":["hyper"]}),
+            serde_json::json!({"byAgent":{"codex":{"action":"key","key":"F19"}}}),
+        ] {
+            let mut bad = controls_json();
+            bad["buttons"]["5"] = invalid;
+            assert!(parse_controls(&bad).is_err());
+        }
+        assert_eq!(key_action_code(Some("F19"), None), Ok(0x50));
+        assert_eq!(key_action_code(None, Some(0x50)), Ok(0x50));
     }
     #[test]
     fn validates_effort_and_lighting() {

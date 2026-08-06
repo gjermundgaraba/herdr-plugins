@@ -40,8 +40,19 @@ pub const MICRO_PRODUCT_ID: i32 = 0x8360;
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 pub const DEVICE_OPEN_TIMEOUT: Duration = Duration::from_secs(7);
 const KEYBOARD_REPORT_ID: u32 = 1;
-const F13_USAGE: u8 = 0x68;
-const F24_USAGE: u8 = 0x73;
+
+/// The complete action-switch key contract, indexed by button number minus one.
+/// Every HID usage here is one macOS maps to no virtual keycode, so an
+/// uncaptured Micro cannot type anything.
+pub const ACTION_KEYS: [(u8, &str); 7] = [
+    (0x70, "F21"),
+    (0x71, "F22"),
+    (0x72, "F23"),
+    (0x73, "F24"),
+    (0x74, "EXECUTE"),
+    (0x77, "SELECT"),
+    (0x78, "STOP"),
+];
 const INTERFACE_NUMBER: i64 = 0;
 const INTERRUPT_ENDPOINT: u8 = 0x81;
 const CONTROL_TIMEOUT_MS: u32 = 2_000;
@@ -253,7 +264,7 @@ struct Owner {
     command_rx: Arc<Mutex<Receiver<Command>>>,
     event_tx: Sender<DeviceEvent>,
     reassembler: Reassembler,
-    function_keys_down: BTreeSet<u8>,
+    function_keys_down: BTreeSet<&'static str>,
     pending: HashMap<u64, Pending>,
     closed: Arc<AtomicBool>,
     read_pending: bool,
@@ -472,15 +483,15 @@ impl Owner {
     fn handle_report(&mut self, report_id: u32, report: &[u8]) {
         if report_id == KEYBOARD_REPORT_ID {
             if let Some(next) = function_keys(report) {
-                for usage in self.function_keys_down.difference(&next) {
+                for name in self.function_keys_down.difference(&next) {
                     let _ = self.event_tx.send(DeviceEvent::Key {
-                        key: function_key_name(*usage),
+                        key: (*name).into(),
                         action: 0,
                     });
                 }
-                for usage in next.difference(&self.function_keys_down) {
+                for name in next.difference(&self.function_keys_down) {
                     let _ = self.event_tx.send(DeviceEvent::Key {
-                        key: function_key_name(*usage),
+                        key: (*name).into(),
                         action: 1,
                     });
                 }
@@ -598,7 +609,7 @@ unsafe extern "C-unwind" fn read_callback(context: *mut c_void, result: i32, len
     });
 }
 
-fn function_keys(report: &[u8]) -> Option<BTreeSet<u8>> {
+fn function_keys(report: &[u8]) -> Option<BTreeSet<&'static str>> {
     let report = match report {
         [id, payload @ ..] if *id == KEYBOARD_REPORT_ID as u8 && payload.len() >= 8 => payload,
         _ => return None,
@@ -606,14 +617,13 @@ fn function_keys(report: &[u8]) -> Option<BTreeSet<u8>> {
     Some(
         report[2..8]
             .iter()
-            .copied()
-            .filter(|usage| (F13_USAGE..=F24_USAGE).contains(usage))
+            .filter_map(|usage| {
+                ACTION_KEYS
+                    .iter()
+                    .find_map(|(code, name)| (code == usage).then_some(*name))
+            })
             .collect(),
     )
-}
-
-fn function_key_name(usage: u8) -> String {
-    format!("F{}", usage - F13_USAGE + 13)
 }
 
 struct IoObject(io_object_t);
@@ -1291,29 +1301,17 @@ mod tests {
     }
 
     #[test]
-    fn reads_function_keys_from_id_prefixed_keyboard_reports() {
-        let expected = BTreeSet::from([F13_USAGE, F24_USAGE]);
+    fn reads_action_keys_from_id_prefixed_keyboard_reports() {
         assert_eq!(
-            function_keys(&[
-                KEYBOARD_REPORT_ID as u8,
-                0,
-                0,
-                F13_USAGE,
-                F24_USAGE,
-                0,
-                0,
-                0,
-                0
-            ]),
-            Some(expected)
+            function_keys(&[KEYBOARD_REPORT_ID as u8, 0, 0, 0x70, 0x78, 0, 0, 0, 0]),
+            Some(BTreeSet::from(["F21", "STOP"]))
         );
-        assert_eq!(
-            function_keys(&[0, 0, F13_USAGE, F24_USAGE, 0, 0, 0, 0]),
-            None
-        );
+        assert_eq!(function_keys(&[0, 0, 0x70, 0x78, 0, 0, 0, 0]), None);
         assert_eq!(function_keys(&[0; 7]), None);
-        assert_eq!(function_key_name(F13_USAGE), "F13");
-        assert_eq!(function_key_name(F24_USAGE), "F24");
+        assert_eq!(
+            function_keys(&[KEYBOARD_REPORT_ID as u8, 0, 0, 0x68, 0x74, 0x7E, 0, 0, 0]),
+            Some(BTreeSet::from(["EXECUTE"]))
+        );
     }
 
     #[test]

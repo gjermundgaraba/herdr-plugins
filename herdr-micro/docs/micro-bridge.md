@@ -45,12 +45,13 @@ Layer routing is fixed:
 | Unrelated application | Preserve the last applicable layer; dispatch nothing |
 
 Layer 2 retains `KV_OAI_AG00` through `KV_OAI_AG05`; those private codes are
-required for six-way status lighting. The seven action switches may use unique
-F13–F24 codes or be disabled. The double-width action key spans two switches,
-so one half is disabled by default. `micro-setup` applies and verifies the
-managed keymap. `agentMacosKeys` configures the macOS F13–F20 events synthesized
-for Agent presses without changing their on-device OAI identity. `actionMacosKeys`
-independently selects which action switches synthesize macOS F13–F20 events.
+required for six-way status lighting. Each bound action switch uses a fixed
+internal code from F21–F24/EXECUTE/SELECT/STOP (HID usages macOS maps to no
+virtual keycode, so an uncaptured Micro cannot type anything); unbound switches
+are disabled. The double-width action key spans two switches, so one half is
+unbound by default. `micro-setup` applies and verifies the managed keymap.
+Agent presses focus their slot directly through Herdr; action switches
+dispatch bindings internally.
 
 ## Compatibility
 
@@ -78,11 +79,14 @@ independently selects which action switches synthesize macOS F13–F20 events.
   action changes the keymap; it requires a blank or previously managed Layer 2,
   creates a backup, and verifies the full read-back.
 - Controls target the captured Herdr session and pane. `scroll` additionally
-  rechecks the focused Ghostty UUID before posting wheel events.
-- CoreGraphics output requires Accessibility permission. Agent keys and action
-  switches explicitly selected by `actionMacosKeys` synthesize their configured
-  F13–F20 press/release events. Other action-switch HID codes remain internal
-  to the bridge. `scroll` posts targeted wheel events and restores the cursor.
+  rechecks the focused Ghostty UUID before posting wheel events. `key`
+  bindings are the deliberate exception: they tap system-wide from any
+  frontmost application while the bridge owns the device.
+- CoreGraphics output requires Accessibility permission and is used only for
+  `scroll`, which posts targeted wheel events and restores the cursor, and for
+  explicitly configured `key` bindings, which tap their configured keycode.
+  No other keyboard events are synthesized; all switch HID codes remain
+  internal to the bridge.
 - A selected-session failure does not fall back to another session. Controlled
   shutdown and 60 seconds without any Herdr session blank the LEDs.
 
@@ -96,8 +100,8 @@ independently selects which action switches synthesize macOS F13–F20 events.
   5 and 6. Perimeter lighting is an aggregate zone.
 - Aggregate-zone synchronization flags exist in the protocol but have not been
   physically verified.
-- Modifier/chord synthesis, voice control, eight-way joystick sectors, and
-  analog pointer mode are not implemented.
+- Voice control, eight-way joystick sectors, and analog pointer mode are not
+  implemented.
 - The bridge requires a USB connection; Bluetooth would reintroduce shared HID
   delivery and duplicate ChatGPT input.
 - Claude effort changes require an empty prompt. Existing Pi sessions need

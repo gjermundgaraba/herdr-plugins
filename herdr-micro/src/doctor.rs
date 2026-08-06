@@ -73,17 +73,6 @@ fn pi_extension() -> Option<PathBuf> {
         .map(|home| PathBuf::from(home).join(".pi/agent/extensions/herdr-micro-effort.ts"))
 }
 
-fn report_runtime_errors(report: &mut Report, status: &serde_json::Value) {
-    for (field, label) in [
-        ("deviceError", "Micro device runtime error"),
-        ("outputError", "macOS output runtime error"),
-    ] {
-        if let Some(error) = status.get(field).and_then(serde_json::Value::as_str) {
-            report.push(Level::Warn, format!("{label}: {error}"));
-        }
-    }
-}
-
 pub fn doctor() -> Report {
     let mut report = Report::default();
     check(&mut report, "Rust executable", || {
@@ -159,7 +148,9 @@ pub fn doctor() -> Report {
                     Some(device) => report.push(Level::Warn, format!("Micro bridge: {device}")),
                     None => report.push(Level::Warn, "Micro bridge returned no device status"),
                 }
-                report_runtime_errors(&mut report, &status);
+                if let Some(error) = status.get("deviceError").and_then(serde_json::Value::as_str) {
+                    report.push(Level::Warn, format!("Micro device runtime error: {error}"));
+                }
             }
         }
         // A stopped bridge is a normal state (micro-stop, 60s idle release),
@@ -215,19 +206,4 @@ mod tests {
         assert_eq!(report.render(), "[ok] one\n[warn] two\n[fail] three");
     }
 
-    #[test]
-    fn runtime_errors_are_reported_separately() {
-        let mut report = Report::default();
-        report_runtime_errors(
-            &mut report,
-            &serde_json::json!({
-                "deviceError": "USB restoration failed",
-                "outputError": "CGEvent post failed",
-            }),
-        );
-        assert_eq!(
-            report.render(),
-            "[warn] Micro device runtime error: USB restoration failed\n[warn] macOS output runtime error: CGEvent post failed"
-        );
-    }
 }

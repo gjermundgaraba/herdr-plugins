@@ -6,6 +6,6 @@ pub mod keymap;
 pub mod wire;
 
 pub use device::{
-    DEFAULT_REQUEST_TIMEOUT, DEVICE_OPEN_TIMEOUT, DeviceEvent, MICRO_PRODUCT_ID, MICRO_VENDOR_ID,
-    MicroDevice,
+    ACTION_KEYS, DEFAULT_REQUEST_TIMEOUT, DEVICE_OPEN_TIMEOUT, DeviceEvent, MICRO_PRODUCT_ID,
+    MICRO_VENDOR_ID, MicroDevice,
 };

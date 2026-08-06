@@ -29,7 +29,7 @@ pub const HID_MAX_LINE_BYTES: usize = 64 * 1024;
 pub const HID_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const HELPER_LABEL: &str = "dev.herdr.herdr-micro-hid";
 // Increment whenever privileged helper code changes.
-pub const HELPER_VERSION: &str = "2";
+pub const HELPER_VERSION: &str = "4";
 const HID_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const HELPER_SHUTDOWN_TIMEOUT: Duration = DEVICE_OPEN_TIMEOUT;
 static HELPER_SHUTDOWN: AtomicBool = AtomicBool::new(false);

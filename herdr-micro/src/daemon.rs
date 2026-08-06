@@ -5,7 +5,7 @@ use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     env,
     sync::{
         Arc, Mutex, OnceLock,
@@ -22,9 +22,9 @@ use crate::{
         layer_identity, parse_agents, plan_effort_change, prompt_args, scroll_plan, submit_args,
     },
     config::{
-        Action, AgentStatus, Binding, Controls, Direction, EffortDirection, VerticalDirection,
-        config_path, key_binding, load_controls, load_effort, load_lighting, provision_controls,
-        provision_effort, provision_lighting,
+        Action, AgentStatus, Binding, Controls, Direction, EffortDirection, Modifier,
+        VerticalDirection, config_path, key_binding, load_controls, load_effort, load_lighting,
+        provision_controls, provision_effort, provision_lighting,
     },
     control::listen_for_control,
     device::DeviceEvent,
@@ -51,17 +51,6 @@ const NO_SESSIONS_SHUTDOWN: Duration = Duration::from_secs(60);
 const WORK_QUEUE_CAPACITY: usize = 16;
 const LATENCY_TRACE_ENV: &str = "HERDR_MICRO_LATENCY_TRACE";
 pub const DAEMON_PROTOCOL_VERSION: u32 = 1;
-
-fn runtime_controls(
-    active_device_keys: &BTreeMap<u8, Option<String>>,
-    mut next: Controls,
-) -> (Controls, bool) {
-    let pending = next.action_device_keys != *active_device_keys;
-    if pending {
-        next.action_device_keys.clone_from(active_device_keys);
-    }
-    (next, pending)
-}
 
 fn log(message: impl AsRef<str>) {
     eprintln!(
@@ -144,7 +133,6 @@ struct State {
     ghostty: Option<GhosttyState>,
     active_layer: Option<usize>,
     last_device_error: String,
-    output_errors: BTreeMap<String, String>,
     last_herdr_error: String,
     last_frontmost_error: String,
     last_controls_error: String,
@@ -169,17 +157,9 @@ impl State {
     }
 
     fn status(&self) -> Value {
-        let output_error = (!self.output_errors.is_empty()).then(|| {
-            self.output_errors
-                .values()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("; ")
-        });
         json!({
             "device": if self.owner.is_some() { "yielded" } else { &self.device_state },
             "deviceError": (!self.last_device_error.is_empty()).then_some(&self.last_device_error),
-            "outputError": output_error,
             "owner": self.owner,
             "session": self.selected_session,
             "routing": if self.routing_ready { "ready" } else if self.selected_session.is_some() { "unavailable" } else { "none" },
@@ -253,18 +233,10 @@ impl InputContext {
 struct InputState {
     gestures: GestureDispatcher,
     last_joystick_sector: Option<u8>,
-    emitted_keys: HashMap<String, String>,
-    pending_releases: HashSet<String>,
-    next_release_retry: Option<Instant>,
 }
 
 enum InputNotice {
     Disconnected(String),
-    Output {
-        source: String,
-        edge: &'static str,
-        error: Option<String>,
-    },
 }
 
 #[derive(Clone)]
@@ -400,6 +372,7 @@ fn action_name(action: &Action) -> &'static str {
         Action::Effort { .. } => "effort",
         Action::FocusPane { .. } => "focus-pane",
         Action::Scroll { .. } => "scroll",
+        Action::Key { .. } => "key",
     }
 }
 
@@ -548,6 +521,9 @@ fn execute_action(
                 mappings,
             );
         }
+        // Key actions cannot reach the worker: top-level keys execute inline in
+        // queue_binding and byAgent keys are rejected at parse.
+        Action::Key { .. } => bail!("key action routed to the session worker"),
     }
     Ok(true)
 }
@@ -678,6 +654,11 @@ fn action_worker(
     }
 }
 
+fn execute_key(key: Option<&str>, keycode: Option<u16>, modifiers: &[Modifier]) -> Result<()> {
+    let code = crate::config::key_action_code(key, keycode).map_err(|error| anyhow!(error))?;
+    macos::post_key(code, modifiers)
+}
+
 fn queue_binding(
     sender: &SyncSender<Work>,
     binding: Binding,
@@ -686,6 +667,20 @@ fn queue_binding(
     target: Option<Agent>,
     generation: u64,
 ) {
+    // Key taps are system-wide by nature: fire from any frontmost app while
+    // the bridge owns the device, and never wait on the action queue.
+    if let Binding::Action(Action::Key {
+        key,
+        keycode,
+        modifiers,
+    }) = &binding
+    {
+        match execute_key(key.as_deref(), *keycode, modifiers) {
+            Ok(()) => log(format!("{source}: key tap")),
+            Err(error) => log(format!("{source} key tap failed: {error:#}")),
+        }
+        return;
+    }
     match session {
         Some(session) => {
             let work = Work::Binding {
@@ -731,107 +726,6 @@ fn agent_slot(key: &str) -> Option<usize> {
         .filter(|index| *index < SLOT_COUNT)
 }
 
-fn emitted_function_key<'a>(controls: &'a Controls, source: &'a str) -> Option<&'a str> {
-    agent_slot(source)
-        .and_then(|index| {
-            controls
-                .agent_macos_keys
-                .get(&u8::try_from(index + 1).ok()?)
-        })
-        .map(String::as_str)
-        .or_else(|| {
-            let button = controls
-                .action_device_keys
-                .iter()
-                .find_map(|(button, key)| (key.as_deref() == Some(source)).then_some(button))?;
-            controls.action_macos_keys.get(button)?.as_deref()
-        })
-}
-
-fn emit_key_edge(
-    state: &mut InputState,
-    context: &InputContext,
-    routing_generation: &AtomicU64,
-    notices: &Sender<InputNotice>,
-    source: &str,
-    key: Option<&str>,
-    down: bool,
-) {
-    if down {
-        let Some(key) = key else { return };
-        if state.pending_releases.contains(source) {
-            release_emitted_key(state, notices, source);
-        }
-        if state.emitted_keys.contains_key(source)
-            || context.selected(routing_generation).is_none()
-            || !macos::frontmost_bundle_is(crate::actions::GHOSTTY_PROCESS)
-        {
-            return;
-        }
-        match macos::post_function_key(key, true) {
-            Ok(()) => {
-                state.emitted_keys.insert(source.into(), key.into());
-                state.pending_releases.remove(source);
-                let _ = notices.send(InputNotice::Output {
-                    source: source.into(),
-                    edge: "emission",
-                    error: None,
-                });
-            }
-            Err(error) => {
-                let _ = notices.send(InputNotice::Output {
-                    source: source.into(),
-                    edge: "emission",
-                    error: Some(error.to_string()),
-                });
-            }
-        }
-        return;
-    }
-    release_emitted_key(state, notices, source);
-}
-
-fn release_emitted_key(state: &mut InputState, notices: &Sender<InputNotice>, source: &str) {
-    let Some(key) = state.emitted_keys.get(source).cloned() else {
-        return;
-    };
-    match macos::post_function_key(&key, false) {
-        Ok(()) => {
-            state.emitted_keys.remove(source);
-            state.pending_releases.remove(source);
-            if state.pending_releases.is_empty() {
-                state.next_release_retry = None;
-            }
-            let _ = notices.send(InputNotice::Output {
-                source: source.into(),
-                edge: "release",
-                error: None,
-            });
-        }
-        Err(error) => {
-            state.pending_releases.insert(source.into());
-            state.next_release_retry = Some(Instant::now() + Duration::from_millis(250));
-            let _ = notices.send(InputNotice::Output {
-                source: source.into(),
-                edge: "release",
-                error: Some(error.to_string()),
-            });
-        }
-    }
-}
-
-fn output_failure(state: &mut State, source: &str, edge: &str, error: String) {
-    let message = format!("{source} macOS key {edge} failed: {error}");
-    if state.output_errors.get(source) != Some(&message) {
-        log(&message);
-        state.output_errors.insert(source.into(), message);
-    }
-}
-
-fn output_succeeded(state: &mut State, source: &str) {
-    state.output_errors.remove(source);
-}
-
 fn device_failure(state: &mut State, context: &str, error: String) {
     state.device_state = "helper-error".into();
     if state.last_device_error != error {
@@ -844,21 +738,6 @@ fn device_disconnected(state: &mut State, error: String) {
     device_failure(state, "device disconnected", error);
     state.device_restore_pending = true;
     state.next_device_open = Some(Instant::now());
-}
-
-fn release_emitted_keys(state: &mut InputState, notices: &Sender<InputNotice>) {
-    for source in state.emitted_keys.keys().cloned().collect::<Vec<_>>() {
-        release_emitted_key(state, notices, &source);
-    }
-}
-
-fn retry_failed_releases(state: &mut InputState, notices: &Sender<InputNotice>, now: Instant) {
-    if !state.next_release_retry.is_some_and(|due| now >= due) {
-        return;
-    }
-    for source in state.pending_releases.clone() {
-        release_emitted_key(state, notices, &source);
-    }
 }
 
 fn handle_device_event(
@@ -874,7 +753,6 @@ fn handle_device_event(
         DeviceEvent::Disconnected { error } => {
             state.gestures.clear();
             state.last_joystick_sector = None;
-            release_emitted_keys(state, notices);
             let _ = notices.send(InputNotice::Disconnected(error));
         }
         DeviceEvent::Joystick { angle, distance } => {
@@ -905,17 +783,6 @@ fn handle_device_event(
             }
         }
         DeviceEvent::Key { key, action } => {
-            if matches!(action, 0 | 1) {
-                emit_key_edge(
-                    state,
-                    context,
-                    routing_generation,
-                    notices,
-                    &key,
-                    emitted_function_key(controls, &key),
-                    action == 1,
-                );
-            }
             if let Some(index) = agent_slot(&key) {
                 if action == 1 {
                     let session = context.selected(routing_generation);
@@ -1007,17 +874,10 @@ fn input_worker(
         if current.generation != previous.generation || current.generation != generation {
             state.gestures.clear();
             state.last_joystick_sector = None;
-            release_emitted_keys(&mut state, &notices);
         } else if current.controls != previous.controls {
-            if current.controls.agent_macos_keys != previous.controls.agent_macos_keys
-                || current.controls.action_macos_keys != previous.controls.action_macos_keys
-            {
-                release_emitted_keys(&mut state, &notices);
-            }
             state.gestures.clear();
         }
         previous = current.clone();
-        retry_failed_releases(&mut state, &notices, Instant::now());
         handle_fired(
             &work,
             current.target.clone(),
@@ -1052,7 +912,6 @@ fn input_worker(
         }
     }
     state.gestures.clear();
-    release_emitted_keys(&mut state, &notices);
 }
 
 fn send_lighting(device: &HidClient, state: &mut State) -> Result<()> {
@@ -1552,22 +1411,6 @@ fn apply_input_notice(state: &mut State, notice: InputNotice) -> bool {
             device_disconnected(state, error);
             true
         }
-        InputNotice::Output {
-            source,
-            edge,
-            error: Some(error),
-        } => {
-            output_failure(state, &source, edge, error);
-            false
-        }
-        InputNotice::Output {
-            source,
-            error: None,
-            ..
-        } => {
-            output_succeeded(state, &source);
-            false
-        }
     }
 }
 
@@ -1580,7 +1423,7 @@ pub fn run_daemon() -> Result<()> {
     provision_effort(&config_path("effort.json")).map_err(|error| anyhow!(error))?;
     provision_lighting(&config_path("lighting.json")).map_err(|error| anyhow!(error))?;
     let mut controls = load_controls(&controls_path).map_err(|error| anyhow!(error))?;
-    let active_device_keys = controls.action_device_keys.clone();
+    let startup_enabled_buttons = crate::config::enabled_buttons(&controls);
     let (device_tx, device_rx) = mpsc::channel();
     let (input_notice_tx, input_notice_rx) = mpsc::channel();
     let (work_tx, work_rx) = mpsc::sync_channel(WORK_QUEUE_CAPACITY);
@@ -1656,11 +1499,10 @@ pub fn run_daemon() -> Result<()> {
             state_due = now + REFRESH_INTERVAL;
             match load_controls(&controls_path) {
                 Ok(next) => {
-                    let (next, device_keys_pending) = runtime_controls(&active_device_keys, next);
                     controls = next;
-                    if device_keys_pending {
+                    if crate::config::enabled_buttons(&controls) != startup_enabled_buttons {
                         let pending =
-                            "action HID key changes require micro-setup and a bridge restart";
+                            "button enable changes require micro-setup and a bridge restart";
                         if state.last_controls_error != pending {
                             log(format!("control configuration pending: {pending}"));
                         }
@@ -1786,11 +1628,7 @@ mod tests {
         }];
         let status = state.status();
         assert!(status["deviceError"].is_null());
-        assert!(status["outputError"].is_null());
         state.last_device_error = "USB restoration failed".into();
-        state
-            .output_errors
-            .insert("AG00".into(), "CGEvent post failed".into());
         let status = state.status();
         assert_eq!(status["routing"], "ready");
         assert_eq!(
@@ -1800,22 +1638,7 @@ mod tests {
         assert_eq!(status["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(status["protocol"], DAEMON_PROTOCOL_VERSION);
         assert_eq!(status["deviceError"], "USB restoration failed");
-        assert_eq!(status["outputError"], "CGEvent post failed");
-        assert_eq!(status.as_object().unwrap().len(), 15);
-    }
-
-    #[test]
-    fn output_error_clears_only_for_the_recovered_source() {
-        let mut state = State::new();
-        output_failure(&mut state, "AG00", "release", "denied".into());
-        output_failure(&mut state, "AG01", "release", "denied".into());
-        output_succeeded(&mut state, "AG01");
-        assert_eq!(
-            state.status()["outputError"],
-            "AG00 macOS key release failed: denied"
-        );
-        output_succeeded(&mut state, "AG00");
-        assert!(state.status()["outputError"].is_null());
+        assert_eq!(status.as_object().unwrap().len(), 14);
     }
 
     #[test]
@@ -1932,17 +1755,10 @@ mod tests {
     }
 
     #[test]
-    fn oai_agent_keys_map_to_configured_macos_keys() {
-        let mut controls = crate::config::default_controls();
+    fn oai_agent_keys_map_to_slots() {
         assert_eq!(agent_slot("AG00"), Some(0));
         assert_eq!(agent_slot("AG05"), Some(5));
         assert_eq!(agent_slot("AG06"), None);
-        assert_eq!(emitted_function_key(&controls, "AG00"), Some("F13"));
-        assert_eq!(emitted_function_key(&controls, "F19"), Some("F19"));
-        assert_eq!(emitted_function_key(&controls, "F20"), None);
-        assert_eq!(emitted_function_key(&controls, "F24"), None);
-        controls.action_macos_keys.insert(2, Some("F20".into()));
-        assert_eq!(emitted_function_key(&controls, "F21"), Some("F20"));
     }
 
     #[test]
@@ -1954,16 +1770,4 @@ mod tests {
         assert_ne!(queued, state.routing_generation());
     }
 
-    #[test]
-    fn hid_key_reload_waits_for_a_restart() {
-        let initial = crate::config::default_controls();
-        let active = initial.action_device_keys.clone();
-        let mut changed = initial.clone();
-        changed.action_device_keys.insert(5, Some("F17".into()));
-        changed.agent_macos_keys.insert(1, "F19".into());
-        let (runtime, pending) = runtime_controls(&active, changed.clone());
-        assert!(pending);
-        assert_eq!(runtime.agent_macos_keys, changed.agent_macos_keys);
-        assert_eq!(runtime.action_device_keys, initial.action_device_keys);
-    }
 }
