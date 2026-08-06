@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::{
-    AgentInfo, EventEnvelope, EventSubscription, PaneInfo, PingResult, SessionSnapshot, TabInfo,
-    WorkspaceInfo,
+    AgentInfo, EventEnvelope, EventSubscription, LayoutDescription, LayoutExportParams,
+    LayoutSetSplitRatioParams, PaneInfo, PingResult, SessionSnapshot, TabInfo, WorkspaceInfo,
 };
 
 type LocalStream = interprocess::local_socket::Stream;
@@ -118,6 +118,19 @@ impl Client {
     pub fn pane(&self, pane_id: &str) -> Result<PaneInfo, Error> {
         let result: PaneResult = self.call("pane.get", &json!({ "pane_id": pane_id }))?;
         Ok(result.pane)
+    }
+
+    pub fn export_layout(&self, params: &LayoutExportParams) -> Result<LayoutDescription, Error> {
+        let result: LayoutResult = self.call("layout.export", params)?;
+        Ok(result.layout)
+    }
+
+    pub fn set_split_ratio(
+        &self,
+        params: &LayoutSetSplitRatioParams,
+    ) -> Result<LayoutDescription, Error> {
+        let result: LayoutResult = self.call("layout.set_split_ratio", params)?;
+        Ok(result.layout)
     }
 
     pub fn agents(&self) -> Result<Vec<AgentInfo>, Error> {
@@ -313,6 +326,11 @@ struct AgentListResult {
     #[serde(rename = "type")]
     _kind: String,
     agents: Vec<AgentInfo>,
+}
+
+#[derive(Deserialize)]
+struct LayoutResult {
+    layout: LayoutDescription,
 }
 
 #[derive(Deserialize)]

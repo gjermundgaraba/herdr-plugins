@@ -22,16 +22,16 @@ For local development:
 
 ```sh
 cd /path/to/herdr-plugins/equalize-splits
-go build -o equalize-splits .
+cargo build --release --locked
 herdr plugin link "$PWD"
 ```
 
 No keybinding or configuration is required. Requires Herdr >= 0.7.5. Installing
-from GitHub requires `go` to build the binary.
+from GitHub requires `cargo` to build the binary.
 
 ## Development
 
 ```sh
-go test ./...
+cargo test
 herdr plugin log list --plugin gjermundgaraba.herdr-equalize-splits
 ```

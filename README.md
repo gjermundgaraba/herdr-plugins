@@ -34,7 +34,4 @@ Each plugin directory above is independent and has its own `herdr-plugin.toml`.
 
 ## Plugin clients
 
-Reusable typed socket clients live under [`sdk/`](sdk):
-
-- [`sdk/rust`](sdk/rust) — synchronous Rust client
-- [`sdk/go`](sdk/go) — context-aware Go client
+A reusable typed socket client lives under [`sdk/rust`](sdk/rust).

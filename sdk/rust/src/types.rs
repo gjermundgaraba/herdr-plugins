@@ -228,6 +228,73 @@ pub struct PaneLayoutSplit {
     pub rect: PaneLayoutRect,
 }
 
+/// One node in a portable layout tree (`layout.export` / `layout.apply`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum LayoutNode {
+    Pane(LayoutPane),
+    Split(LayoutSplit),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct LayoutPane {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub env: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LayoutSplit {
+    pub direction: SplitDirection,
+    pub ratio: f64,
+    pub first: Box<LayoutNode>,
+    pub second: Box<LayoutNode>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SplitDirection {
+    Right,
+    Down,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LayoutDescription {
+    pub workspace_id: String,
+    pub tab_id: String,
+    #[serde(default)]
+    pub zoomed: bool,
+    #[serde(default)]
+    pub focused_pane_id: String,
+    pub root: LayoutNode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct LayoutExportParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct LayoutSetSplitRatioParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
+    /// Split to resize: `false` descends into `first`, `true` into `second`.
+    pub path: Vec<bool>,
+    pub ratio: f64,
+}
+
 /// Lifecycle and filtered-subscription events share this envelope shape.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EventEnvelope {
