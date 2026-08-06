@@ -25,31 +25,31 @@ struct Echo {
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct State {
-    server_fingerprint: String,
+    server_generation: String,
     entries: Vec<String>,
     cursor: usize,
     echoes: Vec<Echo>,
 }
 
 impl State {
-    fn fresh(server_fingerprint: String) -> Self {
+    fn fresh(server_generation: String) -> Self {
         Self {
-            server_fingerprint,
+            server_generation,
             entries: Vec::new(),
             cursor: 0,
             echoes: Vec::new(),
         }
     }
 
-    fn load(raw: &[u8], server_fingerprint: String) -> Self {
+    fn load(raw: &[u8], server_generation: String) -> Self {
         serde_json::from_slice(raw)
             .ok()
             .filter(|state: &Self| {
-                state.server_fingerprint == server_fingerprint
+                state.server_generation == server_generation
                     && ((state.entries.is_empty() && state.cursor == 0)
                         || state.cursor < state.entries.len())
             })
-            .unwrap_or_else(|| Self::fresh(server_fingerprint))
+            .unwrap_or_else(|| Self::fresh(server_generation))
     }
 
     fn expire_echoes(&mut self, now: u64) {
@@ -154,13 +154,16 @@ fn run() -> Result<(), String> {
     };
     let event_pane_id =
         event.and_then(|event| event.data.get("pane_id")?.as_str().map(ToOwned::to_owned));
-    let state_file = state_dir.join("history.json");
-    let Some(_lock) = acquire_lock(&state_dir.join("lock"), Instant::now() + LOCK_BUDGET)? else {
+    let session_dir = session_state_dir(&state_dir, &socket_path);
+    fs::create_dir_all(&session_dir)
+        .map_err(|error| format!("cannot create {}: {error}", session_dir.display()))?;
+    let state_file = session_dir.join("history.json");
+    let Some(_lock) = acquire_lock(&session_dir.join("lock"), Instant::now() + LOCK_BUDGET)? else {
         eprintln!("lock acquire timed out; dropping invocation");
         return Ok(());
     };
 
-    let mut state = read_state(&state_file, fingerprint(&socket_path)?)?;
+    let mut state = read_state(&state_file, server_generation(&socket_path)?)?;
     state.expire_echoes(now_ms());
 
     match mode {
@@ -211,7 +214,19 @@ fn jump(
 }
 
 #[cfg(unix)]
-fn fingerprint(socket_path: &Path) -> Result<String, String> {
+fn session_state_dir(state_dir: &Path, socket_path: &Path) -> std::path::PathBuf {
+    use std::{fmt::Write as _, os::unix::ffi::OsStrExt};
+
+    let bytes = socket_path.as_os_str().as_bytes();
+    let mut key = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut key, "{byte:02x}").unwrap();
+    }
+    state_dir.join("sessions").join(key)
+}
+
+#[cfg(unix)]
+fn server_generation(socket_path: &Path) -> Result<String, String> {
     use std::os::unix::fs::MetadataExt;
 
     fs::metadata(socket_path)
@@ -227,11 +242,11 @@ fn fingerprint(socket_path: &Path) -> Result<String, String> {
         .map_err(|error| format!("cannot inspect {}: {error}", socket_path.display()))
 }
 
-fn read_state(path: &Path, server_fingerprint: String) -> Result<State, String> {
+fn read_state(path: &Path, server_generation: String) -> Result<State, String> {
     match fs::read(path) {
-        Ok(raw) => Ok(State::load(&raw, server_fingerprint)),
+        Ok(raw) => Ok(State::load(&raw, server_generation)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Ok(State::fresh(server_fingerprint))
+            Ok(State::fresh(server_generation))
         }
         Err(error) => Err(format!("cannot read {}: {error}", path.display())),
     }
@@ -256,7 +271,7 @@ fn save(path: &Path, state: &State) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    const FINGERPRINT: &str = "dev:ino:ctime:ctime_nsec";
+    const GENERATION: &str = "dev:ino:ctime:ctime_nsec";
 
     #[test]
     fn records_visits_and_truncates_forward_history() {
@@ -327,23 +342,33 @@ mod tests {
         assert!(state.echoes.is_empty());
 
         let raw = serde_json::to_vec(&visited(&["A", "B"])).unwrap();
-        assert_eq!(State::load(&raw, FINGERPRINT.into()).cursor, 1);
+        assert_eq!(State::load(&raw, GENERATION.into()).cursor, 1);
         assert_eq!(
             State::load(&raw, "other".into()),
             State::fresh("other".into())
         );
-        assert_eq!(State::load(b"not json", FINGERPRINT.into()), fresh());
+        assert_eq!(State::load(b"not json", GENERATION.into()), fresh());
     }
 
     #[test]
-    fn lock_is_released_only_when_its_owner_drops() {
-        let path = temp_path("lock");
+    fn locks_are_isolated_by_session_and_released_on_drop() {
+        let root = temp_path("locks");
+        let first = session_state_dir(&root, Path::new("/tmp/first.sock"));
+        let second = session_state_dir(&root, Path::new("/tmp/second.sock"));
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+
+        let path = first.join("lock");
         let owner = acquire_lock(&path, Instant::now()).unwrap().unwrap();
         assert!(acquire_lock(&path, Instant::now()).unwrap().is_none());
+        let other = acquire_lock(&second.join("lock"), Instant::now())
+            .unwrap()
+            .unwrap();
         drop(owner);
         let successor = acquire_lock(&path, Instant::now()).unwrap().unwrap();
+        drop(other);
         drop(successor);
-        fs::remove_file(path).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -362,9 +387,9 @@ mod tests {
     #[test]
     fn state_read_defaults_only_when_missing() {
         let path = temp_path("state");
-        assert_eq!(read_state(&path, FINGERPRINT.into()).unwrap(), fresh());
+        assert_eq!(read_state(&path, GENERATION.into()).unwrap(), fresh());
         fs::create_dir(&path).unwrap();
-        assert!(read_state(&path, FINGERPRINT.into()).is_err());
+        assert!(read_state(&path, GENERATION.into()).is_err());
         fs::remove_dir(path).unwrap();
     }
 
@@ -377,7 +402,7 @@ mod tests {
     }
 
     fn fresh() -> State {
-        State::fresh(FINGERPRINT.into())
+        State::fresh(GENERATION.into())
     }
 
     fn temp_path(name: &str) -> std::path::PathBuf {

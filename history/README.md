@@ -52,6 +52,7 @@ switches workspace and tab automatically. Focus events caused by the plugin's ow
 jumps carry no origin marker, so each jump pre-registers its target as an expected
 "echo" that the next record consumes instead of recording. History resets when the
 server socket identity changes, because pane ids recycle across server restarts.
+Concurrent Herdr sessions use separate state files and locks keyed by socket path.
 
 ## Development
 
@@ -61,5 +62,5 @@ cargo build --release --locked                             # linked executable
 herdr plugin log list --plugin gjermundgaraba.herdr-history  # per-invocation logs
 ```
 
-By default, state lives at
-`~/.local/state/herdr/plugins/gjermundgaraba.herdr-history/history.json`.
+By default, state lives under
+`~/.local/state/herdr/plugins/gjermundgaraba.herdr-history/sessions/`.
