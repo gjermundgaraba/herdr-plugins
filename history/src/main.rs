@@ -1,8 +1,7 @@
 use std::{
-    fs::{self, File, OpenOptions, TryLockError},
+    fs,
     path::Path,
     process::ExitCode,
-    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -12,8 +11,6 @@ use serde_json::json;
 
 const MAX_ENTRIES: usize = 100;
 const ECHO_TTL_MS: u64 = 1_500;
-const LOCK_RETRY: Duration = Duration::from_millis(10);
-const LOCK_BUDGET: Duration = Duration::from_secs(3);
 const SOCKET_TIMEOUT: Duration = Duration::from_millis(500);
 const JUMP_BUDGET: Duration = Duration::from_secs(1);
 
@@ -104,26 +101,6 @@ enum Mode {
     Jump(isize),
 }
 
-fn acquire_lock(path: &Path, deadline: Instant) -> Result<Option<File>, String> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-        .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
-    loop {
-        match file.try_lock() {
-            Ok(()) => return Ok(Some(file)),
-            Err(TryLockError::WouldBlock) if Instant::now() < deadline => thread::sleep(LOCK_RETRY),
-            Err(TryLockError::WouldBlock) => return Ok(None),
-            Err(TryLockError::Error(error)) => {
-                return Err(format!("cannot lock {}: {error}", path.display()));
-            }
-        }
-    }
-}
-
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -158,10 +135,16 @@ fn run() -> Result<(), String> {
     fs::create_dir_all(&session_dir)
         .map_err(|error| format!("cannot create {}: {error}", session_dir.display()))?;
     let state_file = session_dir.join("history.json");
-    let Some(_lock) = acquire_lock(&session_dir.join("lock"), Instant::now() + LOCK_BUDGET)? else {
-        eprintln!("lock acquire timed out; dropping invocation");
-        return Ok(());
-    };
+    let lock_path = session_dir.join("lock");
+    let lock = fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| format!("cannot open {}: {error}", lock_path.display()))?;
+    lock.lock()
+        .map_err(|error| format!("cannot lock {}: {error}", lock_path.display()))?;
 
     let mut state = read_state(&state_file, server_generation(&socket_path)?)?;
     state.expire_echoes(now_ms());
@@ -348,27 +331,6 @@ mod tests {
             State::fresh("other".into())
         );
         assert_eq!(State::load(b"not json", GENERATION.into()), fresh());
-    }
-
-    #[test]
-    fn locks_are_isolated_by_session_and_released_on_drop() {
-        let root = temp_path("locks");
-        let first = session_state_dir(&root, Path::new("/tmp/first.sock"));
-        let second = session_state_dir(&root, Path::new("/tmp/second.sock"));
-        fs::create_dir_all(&first).unwrap();
-        fs::create_dir_all(&second).unwrap();
-
-        let path = first.join("lock");
-        let owner = acquire_lock(&path, Instant::now()).unwrap().unwrap();
-        assert!(acquire_lock(&path, Instant::now()).unwrap().is_none());
-        let other = acquire_lock(&second.join("lock"), Instant::now())
-            .unwrap()
-            .unwrap();
-        drop(owner);
-        let successor = acquire_lock(&path, Instant::now()).unwrap().unwrap();
-        drop(other);
-        drop(successor);
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
