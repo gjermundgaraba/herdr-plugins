@@ -10,16 +10,16 @@ command = ["cargo", "build", "--release", "--locked"]
 
 [[events]]
 on = "pane.focused"
-command = ["./target/release/herdr-history"]
+command = ["../target/release/herdr-history"]
 
 [[actions]]
 id = "back"
 title = "History back"
 description = "Jump to the previously focused pane (vim ctrl+o)"
-command = ["./target/release/herdr-history"]
+command = ["../target/release/herdr-history"]
 
 [[actions]]
 id = "forward"
 title = "History forward"
 description = "Jump forward in focus history (vim ctrl+i)"
-command = ["./target/release/herdr-history"]
+command = ["../target/release/herdr-history"]

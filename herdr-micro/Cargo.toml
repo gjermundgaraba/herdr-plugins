@@ -1,25 +1,20 @@
 [package]
 name = "herdr-micro"
 version = "0.1.0"
-edition = "2024"
-rust-version = "1.85"
-license = "MIT"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 description = "Control Herdr from a Work Louder Codex Micro"
 repository = "https://github.com/gjermundgaraba/herdr-plugins"
 
-[workspace]
-members = ["codex-micro"]
-default-members = [".", "codex-micro"]
-resolver = "2"
-
 [dependencies]
-anyhow = "1.0.104"
+anyhow.workspace = true
 codex-micro = { path = "codex-micro" }
-libc = "0.2.183"
+libc.workspace = true
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSRunningApplication", "NSWorkspace", "libc"] }
-objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["CFArray", "CFDictionary", "CFNumber", "CFRunLoop", "CFSet", "CFString"] }
+objc2-core-foundation = { workspace = true, features = ["CFArray", "CFDictionary", "CFNumber", "CFRunLoop", "CFSet", "CFString"] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["CGError", "CGEvent", "CGEventSource", "CGEventTypes", "CGRemoteOperation", "CGWindow"] }
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde.workspace = true
+serde_json.workspace = true
 signal-hook = "0.4.4"

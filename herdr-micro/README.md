@@ -39,9 +39,9 @@ git clone https://github.com/gjermundgaraba/herdr-plugins.git
 cd herdr-plugins/herdr-micro
 cargo build --release --locked
 mkdir -p bin
-install -m 750 target/release/herdr-micro bin/.herdr-micro.new
+install -m 750 ../target/release/herdr-micro bin/.herdr-micro.new
 mv -f bin/.herdr-micro.new bin/herdr-micro
-install -m 750 target/release/herdr-micro-hid bin/.herdr-micro-hid.new
+install -m 750 ../target/release/herdr-micro-hid bin/.herdr-micro-hid.new
 mv -f bin/.herdr-micro-hid.new bin/herdr-micro-hid
 sudo ./bin/herdr-micro install-helper
 herdr plugin link . --enabled

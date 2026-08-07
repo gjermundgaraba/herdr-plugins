@@ -19,4 +19,4 @@ command = ["sh", "-c", "exec \"$HERDR_BIN_PATH\" plugin pane open --plugin gjerm
 id = "terminal"
 title = "terminal"
 placement = "popup"
-command = ["./target/release/popup-terminal"]
+command = ["../target/release/popup-terminal"]

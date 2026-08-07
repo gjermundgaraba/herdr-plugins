@@ -1,18 +1,18 @@
 [package]
 name = "codex-micro"
 version = "0.1.0"
-edition = "2024"
-rust-version = "1.85"
-license = "MIT"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 description = "Device library for the Work Louder Codex Micro"
 repository = "https://github.com/gjermundgaraba/herdr-plugins"
 publish = false
 
 [dependencies]
-anyhow = "1.0.104"
+anyhow.workspace = true
 base64 = "0.23.0"
-libc = "0.2.183"
-objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["CFArray", "CFDate", "CFDictionary", "CFNumber", "CFRunLoop", "CFSet", "CFString"] }
+libc.workspace = true
+objc2-core-foundation = { workspace = true, features = ["CFArray", "CFDate", "CFDictionary", "CFNumber", "CFRunLoop", "CFSet", "CFString"] }
 objc2-io-kit = { version = "0.3.2", default-features = false, features = ["AppleUSBDefinitions", "IOUSBHostFamilyDefinitions", "IOUSBLib", "USB", "USBSpec", "libc", "objc2", "std", "usb"] }
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde.workspace = true
+serde_json.workspace = true

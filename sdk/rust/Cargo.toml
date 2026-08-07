@@ -1,12 +1,12 @@
 [package]
 name = "herdr-client"
 version = "0.1.0"
-edition = "2024"
-rust-version = "1.85"
-license = "Apache-2.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 description = "Typed, synchronous client for the Herdr plugin socket API"
 
 [dependencies]
 interprocess = "2.4.2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde.workspace = true
+serde_json.workspace = true

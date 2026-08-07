@@ -12,19 +12,19 @@ command = ["cargo", "build", "--release", "--locked"]
 id = "open"
 title = "Command palette"
 description = "Search actions, workspaces, tabs, panes, and agents"
-command = ["./target/release/herdr-command-palette"]
+command = ["../target/release/herdr-command-palette"]
 
 [[actions]]
 id = "agents"
 title = "Agents"
 description = "Attention-ranked agent palette"
-command = ["./target/release/herdr-command-palette"]
+command = ["../target/release/herdr-command-palette"]
 
 [[actions]]
 id = "workspaces"
 title = "Workspaces"
 description = "Workspace palette"
-command = ["./target/release/herdr-command-palette"]
+command = ["../target/release/herdr-command-palette"]
 
 [[panes]]
 id = "palette"
@@ -32,4 +32,4 @@ title = "command palette"
 placement = "popup"
 width = "88%"
 height = "80%"
-command = ["./target/release/herdr-command-palette"]
+command = ["../target/release/herdr-command-palette"]

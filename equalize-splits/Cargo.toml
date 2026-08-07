@@ -1,16 +1,13 @@
 [package]
 name = "herdr-equalize-splits"
 version = "0.3.0"
-edition = "2024"
-rust-version = "1.89"
-license = "Apache-2.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 description = "Automatically equalize Herdr pane sizes after splits and closes"
 
 [dependencies]
-herdr-client = { path = "../sdk/rust" }
+herdr-client.workspace = true
 
 [dev-dependencies]
-serde_json = "1"
-
-[profile.release]
-strip = true
+serde_json.workspace = true

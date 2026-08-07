@@ -12,13 +12,13 @@ command = ["cargo", "build", "--release", "--locked"]
 command = ["mkdir", "-p", "bin"]
 
 [[build]]
-command = ["install", "-m", "750", "target/release/herdr-micro", "bin/.herdr-micro.new"]
+command = ["install", "-m", "750", "../target/release/herdr-micro", "bin/.herdr-micro.new"]
 
 [[build]]
 command = ["mv", "-f", "bin/.herdr-micro.new", "bin/herdr-micro"]
 
 [[build]]
-command = ["install", "-m", "750", "target/release/herdr-micro-hid", "bin/.herdr-micro-hid.new"]
+command = ["install", "-m", "750", "../target/release/herdr-micro-hid", "bin/.herdr-micro-hid.new"]
 
 [[build]]
 command = ["mv", "-f", "bin/.herdr-micro-hid.new", "bin/herdr-micro-hid"]

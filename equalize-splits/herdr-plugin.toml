@@ -10,12 +10,12 @@ command = ["cargo", "build", "--release", "--locked"]
 
 [[events]]
 on = "pane.created"
-command = ["./target/release/herdr-equalize-splits"]
+command = ["../target/release/herdr-equalize-splits"]
 
 [[events]]
 on = "pane.closed"
-command = ["./target/release/herdr-equalize-splits"]
+command = ["../target/release/herdr-equalize-splits"]
 
 [[events]]
 on = "pane.exited"
-command = ["./target/release/herdr-equalize-splits"]
+command = ["../target/release/herdr-equalize-splits"]
