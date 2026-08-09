@@ -56,7 +56,11 @@ impl Client {
         P: Serialize + ?Sized,
         R: DeserializeOwned,
     {
-        serde_json::from_value(self.call_value(method, params)?).map_err(Error::Json)
+        let id = self.request_id();
+        let mut stream = self.connect()?;
+        self.set_timeouts(&stream)?;
+        write_request(&mut stream, &id, method, params)?;
+        read_response(&mut BufReader::new(stream), &id)
     }
 
     /// Call any Herdr socket method without requiring a result type.
@@ -64,11 +68,7 @@ impl Client {
     where
         P: Serialize + ?Sized,
     {
-        let id = self.request_id();
-        let mut stream = self.connect()?;
-        self.set_timeouts(&stream)?;
-        write_request(&mut stream, &id, method, params)?;
-        read_response(&mut BufReader::new(stream), &id)
+        self.call(method, params)
     }
 
     pub fn ping(&self) -> Result<PingResult, Error> {
@@ -151,13 +151,17 @@ impl Client {
         )?;
 
         let mut reader = BufReader::new(stream);
-        let ack: SubscriptionStarted =
-            serde_json::from_value(read_response(&mut reader, &id)?).map_err(Error::Json)?;
+        let ack: SubscriptionStarted = read_response(&mut reader, &id)?;
         if ack.kind != "subscription_started" {
             return Err(Error::UnexpectedResult(ack.kind));
         }
-        clear_recv_timeout_best_effort(reader.get_ref())?;
-        Ok(Subscription { reader })
+        if self.timeout.is_some() {
+            set_timeout_best_effort(reader.get_ref(), TimeoutKind::Recv, None)?;
+        }
+        Ok(Subscription {
+            reader,
+            pending: Vec::new(),
+        })
     }
 
     fn request_id(&self) -> String {
@@ -183,13 +187,32 @@ impl Client {
 
 pub struct Subscription {
     reader: BufReader<LocalStream>,
+    pending: Vec<u8>,
 }
 
 impl Subscription {
+    pub fn set_receive_timeout(&self, timeout: Duration) -> Result<(), Error> {
+        self.reader
+            .get_ref()
+            .set_recv_timeout(Some(timeout))
+            .map_err(Error::Io)
+    }
+
     pub fn next_event(&mut self) -> Result<Option<EventEnvelope>, Error> {
-        let Some(value) = read_json_line::<Value, _>(&mut self.reader)? else {
+        let read = self.reader.read_until(b'\n', &mut self.pending)?;
+        if read == 0 && self.pending.is_empty() {
             return Ok(None);
-        };
+        }
+        if !self.pending.ends_with(b"\n") {
+            self.pending.clear();
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "incomplete NDJSON frame",
+            )));
+        }
+        let value = serde_json::from_slice::<Value>(&self.pending).map_err(Error::Json);
+        self.pending.clear();
+        let value = value?;
         if let Some(error) = value.get("error") {
             return Err(Error::Api(
                 serde_json::from_value(error.clone()).map_err(Error::Json)?,
@@ -278,11 +301,9 @@ struct Request<'a, P: ?Sized> {
 }
 
 #[derive(Deserialize)]
-struct Response {
+struct Response<R> {
     id: String,
-    #[serde(default)]
-    result: Option<Value>,
-    #[serde(default)]
+    result: Option<R>,
     error: Option<ApiError>,
 }
 
@@ -351,8 +372,11 @@ fn write_request<P: Serialize + ?Sized>(
     Ok(())
 }
 
-fn read_response<R: BufRead>(reader: &mut R, expected_id: &str) -> Result<Value, Error> {
-    let response = read_json_line::<Response, _>(reader)?.ok_or(Error::EmptyResponse)?;
+fn read_response<T: DeserializeOwned, R: BufRead>(
+    reader: &mut R,
+    expected_id: &str,
+) -> Result<T, Error> {
+    let response = read_json_line::<Response<T>, _>(reader)?.ok_or(Error::EmptyResponse)?;
     if response.id != expected_id {
         return Err(Error::MismatchedResponseId {
             expected: expected_id.to_owned(),
@@ -412,19 +436,44 @@ fn set_timeout_best_effort(
     }
 }
 
-fn clear_recv_timeout_best_effort(stream: &LocalStream) -> Result<(), Error> {
-    set_timeout_best_effort(stream, TimeoutKind::Recv, None)
-}
-
 #[cfg(all(test, unix))]
 mod tests {
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::thread;
 
     use super::*;
 
     fn socket_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("herdr-client-{name}-{}.sock", std::process::id()))
+    }
+
+    fn subscription_server(
+        name: &str,
+        send: impl FnOnce(&mut UnixStream) + Send + 'static,
+    ) -> (PathBuf, thread::JoinHandle<()>) {
+        let path = socket_path(name);
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind test socket");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().expect("clone stream"))
+                .read_line(&mut request)
+                .expect("read request");
+            let request: Value = serde_json::from_str(&request).expect("parse request");
+            assert_eq!(request["method"], "events.subscribe");
+            writeln!(
+                stream,
+                "{}",
+                json!({
+                    "id": request["id"],
+                    "result": { "type": "subscription_started" }
+                })
+            )
+            .expect("write ack");
+            send(&mut stream);
+        });
+        (path, server)
     }
 
     #[test]
@@ -447,8 +496,8 @@ mod tests {
                     "id": request["id"],
                     "result": {
                         "type": "pong",
-                        "version": "0.7.5",
-                        "protocol": 17
+                        "version": "0.8.0",
+                        "protocol": 19
                     }
                 })
             )
@@ -456,8 +505,8 @@ mod tests {
         });
 
         let ping = Client::new(&path).ping().expect("ping");
-        assert_eq!(ping.version, "0.7.5");
-        assert_eq!(ping.protocol, 17);
+        assert_eq!(ping.version, "0.8.0");
+        assert_eq!(ping.protocol, 19);
         server.join().expect("server thread");
         let _ = std::fs::remove_file(path);
     }
@@ -466,7 +515,7 @@ mod tests {
     fn api_errors_keep_the_server_code() {
         let line = br#"{"id":"x","error":{"code":"not_found","message":"pane not found"}}
 "#;
-        let error = read_response(&mut &line[..], "x").expect_err("error response");
+        let error = read_response::<Value, _>(&mut &line[..], "x").expect_err("error response");
         match error {
             Error::Api(error) => assert_eq!(error.code, "not_found"),
             other => panic!("unexpected error: {other}"),
@@ -475,26 +524,7 @@ mod tests {
 
     #[test]
     fn subscriptions_keep_reading_after_the_ack() {
-        let path = socket_path("subscribe");
-        let _ = std::fs::remove_file(&path);
-        let listener = UnixListener::bind(&path).expect("bind test socket");
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept request");
-            let mut request = String::new();
-            BufReader::new(stream.try_clone().expect("clone stream"))
-                .read_line(&mut request)
-                .expect("read request");
-            let request: Value = serde_json::from_str(&request).expect("parse request");
-            assert_eq!(request["method"], "events.subscribe");
-            writeln!(
-                stream,
-                "{}",
-                json!({
-                    "id": request["id"],
-                    "result": { "type": "subscription_started" }
-                })
-            )
-            .expect("write ack");
+        let (path, server) = subscription_server("subscribe", |stream| {
             writeln!(
                 stream,
                 "{}",
@@ -515,6 +545,92 @@ mod tests {
             .expect("event before close");
         assert_eq!(event.event, "pane.focused");
         assert_eq!(event.data["pane_id"], "w1:p1");
+        server.join().expect("server thread");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn subscription_timeout_preserves_a_partial_event() {
+        let (path, server) = subscription_server("subscription-timeout", |stream| {
+            stream
+                .write_all(b"{\"event\":\"pane.focused\",\"data\":{\"type\":\"pane_focused\",\"pane_id\":\"w1:p1\",\"label\":\"\xc3")
+                .expect("write partial event");
+            stream.flush().expect("flush partial event");
+            thread::sleep(Duration::from_millis(100));
+            stream.write_all(b"\xa9\"}}\n").expect("finish event");
+        });
+
+        let mut subscription = Client::new(&path)
+            .subscribe(&[EventSubscription::new("pane.focused")])
+            .expect("subscribe");
+        subscription
+            .set_receive_timeout(Duration::from_millis(20))
+            .expect("set timeout");
+        assert!(matches!(
+            subscription.next_event(),
+            Err(Error::Io(error))
+                if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)
+        ));
+        subscription
+            .set_receive_timeout(Duration::from_secs(1))
+            .expect("extend timeout");
+        let event = subscription
+            .next_event()
+            .expect("read completed event")
+            .expect("event before close");
+        assert_eq!(event.data["pane_id"], "w1:p1");
+        assert_eq!(event.data["label"], "é");
+        server.join().expect("server thread");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn malformed_subscription_event_does_not_poison_the_next_line() {
+        let (path, server) = subscription_server("subscription-malformed", |stream| {
+            writeln!(stream, "not json").expect("write malformed event");
+            writeln!(
+                stream,
+                "{}",
+                json!({
+                    "event": "pane.focused",
+                    "data": { "type": "pane_focused", "pane_id": "w1:p1" }
+                })
+            )
+            .expect("write valid event");
+        });
+
+        let mut subscription = Client::new(&path)
+            .subscribe(&[EventSubscription::new("pane.focused")])
+            .expect("subscribe");
+        assert!(matches!(subscription.next_event(), Err(Error::Json(_))));
+        assert_eq!(
+            subscription
+                .next_event()
+                .expect("read valid event")
+                .expect("event before close")
+                .data["pane_id"],
+            "w1:p1"
+        );
+        server.join().expect("server thread");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn subscription_rejects_an_incomplete_frame_at_eof() {
+        let (path, server) = subscription_server("subscription-incomplete", |stream| {
+            stream
+                .write_all(br#"{"event":"pane.focused""#)
+                .expect("write partial event");
+        });
+
+        let mut subscription = Client::new(&path)
+            .subscribe(&[EventSubscription::new("pane.focused")])
+            .expect("subscribe");
+        assert!(matches!(
+            subscription.next_event(),
+            Err(Error::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof
+        ));
+        assert!(subscription.next_event().expect("read EOF").is_none());
         server.join().expect("server thread");
         let _ = std::fs::remove_file(path);
     }

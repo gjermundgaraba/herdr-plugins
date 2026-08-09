@@ -333,11 +333,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "codex-micro",
+ "herdr-client",
  "libc",
  "objc2",
  "objc2-app-kit",
  "objc2-core-foundation",
  "objc2-core-graphics",
+ "objc2-foundation",
  "serde",
  "serde_json",
  "signal-hook 0.4.4",

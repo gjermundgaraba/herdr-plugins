@@ -1,24 +1,239 @@
-//! Small, CLI-only Herdr client helpers.  The bridge deliberately does not
-//! retain a socket connection: every call is scoped to one selected session.
+//! Herdr session discovery and direct socket access.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
+use herdr_client::{AgentInfo, Client, Error as ClientError, EventSubscription, SessionSnapshot};
 use serde::Deserialize;
-use serde_json::Value;
 use std::{
-    collections::BTreeMap,
+    collections::HashSet,
     env,
-    ffi::OsString,
     io::Read,
+    path::PathBuf,
     process::{Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::Sender,
+    },
     thread,
     time::{Duration, Instant},
 };
 
 pub const DEFAULT_HERDR_BIN: &str = "herdr";
-
-pub type Environment = BTreeMap<OsString, OsString>;
-
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const MIN_HERDR_PROTOCOL: u32 = 19;
+const SUBSCRIPTION_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Session {
+    pub name: String,
+    pub socket_path: PathBuf,
+}
+
+impl Session {
+    pub fn client(&self) -> Client {
+        Client::new(&self.socket_path).with_timeout(COMMAND_TIMEOUT)
+    }
+}
+
+#[derive(Debug)]
+pub enum SessionUpdate {
+    Agents {
+        session: String,
+        generation: u64,
+        agents: Vec<AgentInfo>,
+    },
+    Unavailable {
+        session: String,
+        generation: u64,
+        error: String,
+    },
+}
+
+pub struct SessionWorker {
+    pub generation: u64,
+    active: Arc<AtomicBool>,
+    thread: thread::Thread,
+}
+
+impl Drop for SessionWorker {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+        self.thread.unpark();
+    }
+}
+
+pub fn spawn_session_worker(
+    session: Session,
+    generation: u64,
+    updates: Sender<SessionUpdate>,
+    stopping: Arc<AtomicBool>,
+) -> SessionWorker {
+    let active = Arc::new(AtomicBool::new(true));
+    let worker_active = Arc::clone(&active);
+    let worker = thread::spawn(move || {
+        let mut retry = Duration::from_millis(250);
+        while worker_active.load(Ordering::Acquire) && !stopping.load(Ordering::Acquire) {
+            let client = session.client();
+            let mut connected = false;
+            let result = follow_session(
+                &client,
+                &session.name,
+                generation,
+                &updates,
+                &worker_active,
+                &stopping,
+                &mut connected,
+            );
+            if !worker_active.load(Ordering::Acquire) || stopping.load(Ordering::Acquire) {
+                break;
+            }
+            let _ = updates.send(SessionUpdate::Unavailable {
+                session: session.name.clone(),
+                generation,
+                error: result
+                    .err()
+                    .map(|error| error.to_string())
+                    .unwrap_or_else(|| "Herdr subscription ended".into()),
+            });
+            if connected {
+                retry = Duration::from_millis(250);
+            }
+            thread::park_timeout(retry);
+            retry = (retry * 2).min(Duration::from_secs(5));
+        }
+    });
+    let thread = worker.thread().clone();
+    drop(worker);
+    SessionWorker {
+        generation,
+        active,
+        thread,
+    }
+}
+
+fn follow_session(
+    client: &Client,
+    session: &str,
+    generation: u64,
+    updates: &Sender<SessionUpdate>,
+    active: &AtomicBool,
+    stopping: &AtomicBool,
+    connected: &mut bool,
+) -> Result<()> {
+    while active.load(Ordering::Acquire) && !stopping.load(Ordering::Acquire) {
+        let before = current_snapshot(client)?;
+        let subscribed_panes = pane_ids(&before);
+        let subscriptions = session_subscriptions(subscribed_panes.iter().map(String::as_str));
+        let mut subscription = client.subscribe(&subscriptions)?;
+        subscription.set_receive_timeout(SUBSCRIPTION_POLL_INTERVAL)?;
+        let snapshot = current_snapshot(client)?;
+        let current_panes = pane_ids(&snapshot);
+        send_agents(session, generation, updates, snapshot.agents)?;
+        *connected = true;
+        if current_panes != subscribed_panes {
+            thread::park_timeout(SUBSCRIPTION_POLL_INTERVAL);
+            continue;
+        }
+        loop {
+            match subscription.next_event() {
+                Ok(Some(_)) => {}
+                Ok(None) => return Ok(()),
+                Err(ClientError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    if !active.load(Ordering::Acquire) || stopping.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let snapshot = current_snapshot(client)?;
+            let current_panes = pane_ids(&snapshot);
+            send_agents(session, generation, updates, snapshot.agents)?;
+            if current_panes != subscribed_panes {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn current_snapshot(client: &Client) -> Result<SessionSnapshot> {
+    validate_snapshot(client.snapshot()?)
+}
+
+fn validate_snapshot(snapshot: SessionSnapshot) -> Result<SessionSnapshot> {
+    if snapshot.protocol < MIN_HERDR_PROTOCOL {
+        bail!(
+            "Herdr protocol {} is unsupported; expected at least {}",
+            snapshot.protocol,
+            MIN_HERDR_PROTOCOL
+        );
+    }
+    if snapshot
+        .panes
+        .iter()
+        .any(|pane| pane.pane_id.is_empty() || pane.terminal_id.is_empty())
+        || snapshot
+            .agents
+            .iter()
+            .any(|agent| agent.pane_id.is_empty() || agent.terminal_id.is_empty())
+    {
+        bail!("Herdr returned empty pane or terminal identity");
+    }
+    Ok(snapshot)
+}
+
+fn pane_ids(snapshot: &SessionSnapshot) -> HashSet<String> {
+    snapshot
+        .panes
+        .iter()
+        .map(|pane| pane.pane_id.clone())
+        .collect()
+}
+
+fn session_subscriptions<'a>(pane_ids: impl Iterator<Item = &'a str>) -> Vec<EventSubscription> {
+    let mut subscriptions: Vec<_> = [
+        "workspace.created",
+        "workspace.closed",
+        "workspace.focused",
+        "tab.created",
+        "tab.closed",
+        "tab.focused",
+        "pane.created",
+        "pane.closed",
+        "pane.focused",
+        "pane.moved",
+        "pane.exited",
+        "pane.agent_detected",
+    ]
+    .into_iter()
+    .map(EventSubscription::new)
+    .collect();
+    subscriptions.extend(pane_ids.map(|pane_id| {
+        EventSubscription::new("pane.agent_status_changed").filter("pane_id", pane_id)
+    }));
+    subscriptions
+}
+
+fn send_agents(
+    session: &str,
+    generation: u64,
+    updates: &Sender<SessionUpdate>,
+    agents: Vec<AgentInfo>,
+) -> Result<()> {
+    updates
+        .send(SessionUpdate::Agents {
+            session: session.into(),
+            generation,
+            agents,
+        })
+        .map_err(|_| anyhow::anyhow!("Micro daemon stopped"))
+}
 
 pub fn herdr_bin() -> String {
     env::var_os("HERDR_BIN_PATH")
@@ -27,59 +242,57 @@ pub fn herdr_bin() -> String {
         .unwrap_or_else(|| DEFAULT_HERDR_BIN.to_owned())
 }
 
-/// Caller routing context must not leak into session discovery. Plugin config
-/// variables intentionally survive because they are not caller context.
-pub fn is_routing_context(key: &OsString) -> bool {
-    let key = key.to_string_lossy();
-    key == "HERDR_SOCKET_PATH"
-        || key == "HERDR_SESSION"
-        || matches!(
-            key.as_ref(),
-            "HERDR_PANE_ID" | "HERDR_TAB_ID" | "HERDR_WORKSPACE_ID"
-        )
-        || key.starts_with("HERDR_ACTIVE_")
-        || key.starts_with("HERDR_PLUGIN_CONTEXT")
-        || key.starts_with("HERDR_PLUGIN_ACTION")
-        || key.starts_with("HERDR_PLUGIN_EVENT")
-        || key.starts_with("HERDR_PLUGIN_ENTRYPOINT")
+pub fn discover_sessions() -> Result<Vec<Session>> {
+    let mut command = Command::new(herdr_bin());
+    command
+        .args(["session", "list", "--json"])
+        .env_remove("HERDR_SOCKET_PATH")
+        .env_remove("HERDR_SESSION")
+        .env_remove("HERDR_PANE_ID")
+        .env_remove("HERDR_TAB_ID")
+        .env_remove("HERDR_WORKSPACE_ID")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    parse_sessions(&run_command_with_timeout(&mut command, COMMAND_TIMEOUT)?)
 }
 
-pub fn current_environment() -> Environment {
-    env::vars_os().collect()
-}
-
-pub fn discovery_environment(base: &Environment) -> Environment {
-    base.iter()
-        .filter(|(key, _)| !is_routing_context(key))
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect()
-}
-
-pub fn session_environment(session: &str, base: &Environment) -> Environment {
-    let mut result = discovery_environment(base);
-    result.insert(OsString::from("HERDR_SESSION"), OsString::from(session));
-    result
-}
-
-pub fn run_command(bin: &str, args: &[String], env: Option<&Environment>) -> Result<String> {
-    run_command_with_timeout(bin, args, env, COMMAND_TIMEOUT)
-}
-
-pub fn run_command_with_timeout(
-    bin: &str,
-    args: &[String],
-    env: Option<&Environment>,
-    timeout: Duration,
-) -> Result<String> {
-    let mut command = Command::new(bin);
-    command.args(args);
-    if let Some(env) = env {
-        command.env_clear().envs(env);
+fn parse_sessions(output: &str) -> Result<Vec<Session>> {
+    #[derive(Deserialize)]
+    struct RawSession {
+        name: String,
+        running: bool,
+        socket_path: PathBuf,
     }
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[derive(Deserialize)]
+    struct Sessions {
+        sessions: Vec<RawSession>,
+    }
+
+    let sessions: Sessions =
+        serde_json::from_str(output).context("Herdr returned invalid session list")?;
+    let mut sessions: Vec<_> = sessions
+        .sessions
+        .into_iter()
+        .filter(|session| session.running)
+        .map(|session| {
+            if session.name.is_empty() || session.socket_path.as_os_str().is_empty() {
+                bail!("Herdr returned invalid session list");
+            }
+            Ok(Session {
+                name: session.name,
+                socket_path: session.socket_path,
+            })
+        })
+        .collect::<Result<_>>()?;
+    sessions.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(sessions)
+}
+
+fn run_command_with_timeout(command: &mut Command, timeout: Duration) -> Result<String> {
+    let program = command.get_program().to_string_lossy().into_owned();
     let mut child = command
         .spawn()
-        .with_context(|| format!("failed to run {bin}"))?;
+        .with_context(|| format!("failed to run {program}"))?;
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
     let out_reader = thread::spawn(move || {
@@ -94,18 +307,13 @@ pub fn run_command_with_timeout(
     });
     let started = Instant::now();
     let (status, timed_out) = loop {
-        if let Some(status) = child
-            .try_wait()
-            .with_context(|| format!("wait for {bin}"))?
-        {
+        if let Some(status) = child.try_wait().context("wait for Herdr session list")? {
             break (status, false);
         }
         if started.elapsed() >= timeout {
             let _ = child.kill();
             break (
-                child
-                    .wait()
-                    .with_context(|| format!("reap timed out {bin}"))?,
+                child.wait().context("reap timed out Herdr session list")?,
                 true,
             );
         }
@@ -116,120 +324,209 @@ pub fn run_command_with_timeout(
     let detail = String::from_utf8_lossy(&stderr).trim().to_owned();
     if timed_out {
         bail!(
-            "{bin} {} timed out after {}s{}",
-            args.join(" "),
-            timeout.as_secs_f64(),
-            if detail.is_empty() {
-                String::new()
-            } else {
-                format!(": {detail}")
-            }
+            "Herdr session discovery timed out after {}s",
+            timeout.as_secs_f64()
         );
     }
     if !status.success() {
-        let status = status.code().unwrap_or(-1);
-        bail!(
-            "{bin} {} exited with status {status}{}",
-            args.join(" "),
-            if detail.is_empty() {
-                String::new()
-            } else {
-                format!(": {detail}")
-            }
-        );
+        bail!("Herdr session discovery failed: {detail}");
     }
     Ok(String::from_utf8_lossy(&stdout).into_owned())
 }
 
-pub fn run_json(bin: &str, args: &[String], env: Option<&Environment>) -> Result<Value> {
-    serde_json::from_str(&run_command(bin, args, env)?).context("Herdr returned invalid JSON")
-}
-
-pub fn discover_sessions_with<F>(base: &Environment, mut run: F) -> Result<Vec<String>>
-where
-    F: FnMut(&str, &[String], Option<&Environment>) -> Result<String>,
-{
-    let args = vec!["session".into(), "list".into(), "--json".into()];
-    let output = run(&herdr_bin(), &args, Some(&discovery_environment(base)))?;
-    let value = serde_json::from_str(&output).context("Herdr returned invalid JSON")?;
-    #[derive(Deserialize)]
-    struct Session {
-        name: String,
-        running: bool,
-    }
-    #[derive(Deserialize)]
-    struct Sessions {
-        sessions: Vec<Session>,
-    }
-    let sessions: Sessions = serde_json::from_value(value)
-        .map_err(|_| anyhow!("Herdr returned invalid session list"))?;
-    Ok(sessions
-        .sessions
-        .into_iter()
-        .filter(|session| session.running)
-        .map(|session| session.name)
-        .collect())
-}
-
-pub fn discover_sessions(base: &Environment) -> Result<Vec<String>> {
-    discover_sessions_with(base, run_command)
-}
-
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{BufRead, BufReader, Write},
+        os::unix::net::{UnixListener, UnixStream},
+        sync::mpsc,
+    };
+
     use super::*;
-    use std::os::unix::ffi::OsStringExt;
+
+    fn read_request(stream: &UnixStream) -> serde_json::Value {
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    fn reply(stream: &mut UnixStream, request: &serde_json::Value, result: serde_json::Value) {
+        writeln!(
+            stream,
+            "{}",
+            serde_json::json!({ "id": request["id"], "result": result })
+        )
+        .unwrap();
+    }
+
+    fn snapshot(agents: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "type": "session_snapshot",
+            "snapshot": {
+                "version": "0.8.0",
+                "protocol": MIN_HERDR_PROTOCOL,
+                "workspaces": [],
+                "tabs": [],
+                "panes": [{
+                    "pane_id": "w1:p1",
+                    "terminal_id": "term1",
+                    "workspace_id": "w1",
+                    "tab_id": "w1:t1",
+                    "focused": true,
+                    "agent_status": "idle",
+                    "revision": 1
+                }],
+                "layouts": [],
+                "agents": agents
+            }
+        })
+    }
 
     #[test]
-    fn removes_only_inherited_routing_context() {
-        let base = Environment::from([
-            ("PATH".into(), "/bin".into()),
-            ("HERDR_CONFIG_PATH".into(), "/tmp/herdr.toml".into()),
-            ("HERDR_SOCKET_PATH".into(), "/tmp/old.sock".into()),
-            ("HERDR_SESSION".into(), "default".into()),
-            ("HERDR_WORKSPACE_ID".into(), "w1".into()),
-            ("HERDR_TAB_ID".into(), "w1:t1".into()),
-            ("HERDR_PANE_ID".into(), "w1:p1".into()),
-            ("HERDR_ACTIVE_PANE_CWD".into(), "/tmp".into()),
-            ("HERDR_PLUGIN_CONTEXT_JSON".into(), "{}".into()),
-            ("HERDR_PLUGIN_CONFIG_DIR".into(), "/tmp/config".into()),
-        ]);
-        let expected = Environment::from([
-            ("PATH".into(), "/bin".into()),
-            ("HERDR_CONFIG_PATH".into(), "/tmp/herdr.toml".into()),
-            ("HERDR_PLUGIN_CONFIG_DIR".into(), "/tmp/config".into()),
-        ]);
-        assert_eq!(discovery_environment(&base), expected);
-        let mut selected = expected;
-        selected.insert("HERDR_SESSION".into(), "werk".into());
-        assert_eq!(session_environment("werk", &base), selected);
-
-        let non_utf8 = OsString::from_vec(vec![b'X', 0xff]);
+    fn discovery_keeps_running_sessions_sorted_with_exact_socket_paths() {
+        let sessions = parse_sessions(
+            r#"{"sessions":[{"name":"werk","running":true,"socket_path":"/tmp/named.sock"},{"name":"old","running":false,"socket_path":"/tmp/old.sock"},{"name":"default","running":true,"socket_path":"/tmp/default.sock"}]}"#,
+        )
+        .unwrap();
         assert_eq!(
-            discovery_environment(&Environment::from([(non_utf8.clone(), "value".into())]))
-                .get(&non_utf8),
-            Some(&OsString::from("value"))
+            sessions,
+            [
+                Session {
+                    name: "default".into(),
+                    socket_path: "/tmp/default.sock".into()
+                },
+                Session {
+                    name: "werk".into(),
+                    socket_path: "/tmp/named.sock".into()
+                },
+            ]
         );
     }
 
     #[test]
-    fn commands_are_killed_at_the_deadline() {
-        let started = Instant::now();
-        let error =
-            run_command_with_timeout("/bin/sleep", &["1".into()], None, Duration::from_millis(10))
-                .unwrap_err();
-        assert!(error.to_string().contains("timed out"));
-        assert!(started.elapsed() < Duration::from_millis(500));
+    fn agent_status_subscriptions_are_scoped_to_panes() {
+        let subscriptions = session_subscriptions(["w1:p1"].into_iter());
+        let status = subscriptions
+            .iter()
+            .find(|subscription| subscription.kind == "pane.agent_status_changed")
+            .unwrap();
+        assert_eq!(status.filters.get("pane_id"), Some(&"w1:p1".into()));
     }
 
     #[test]
-    fn session_discovery_keeps_running_names() {
-        let base = Environment::new();
-        let result = discover_sessions_with(&base, |_bin, _args, env| {
-            assert!(!env.unwrap().contains_key(&OsString::from("HERDR_SESSION")));
-            Ok(r#"{"sessions":[{"name":"default","running":true},{"name":"old","running":false}]}"#.into())
-        })
+    fn subscription_bootstraps_then_refreshes_agents_after_an_event() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-micro-follow-session-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut before, _) = listener.accept().unwrap();
+            let request = read_request(&before);
+            assert_eq!(request["method"], "session.snapshot");
+            reply(&mut before, &request, snapshot(serde_json::json!([])));
+
+            let (mut subscription, _) = listener.accept().unwrap();
+            let request = read_request(&subscription);
+            assert_eq!(request["method"], "events.subscribe");
+            reply(
+                &mut subscription,
+                &request,
+                serde_json::json!({ "type": "subscription_started" }),
+            );
+
+            let (mut after_subscribe, _) = listener.accept().unwrap();
+            let request = read_request(&after_subscribe);
+            reply(
+                &mut after_subscribe,
+                &request,
+                snapshot(serde_json::json!([])),
+            );
+            writeln!(
+                subscription,
+                "{}",
+                serde_json::json!({
+                    "event": "pane.agent_status_changed",
+                    "data": { "pane_id": "w1:p1" }
+                })
+            )
+            .unwrap();
+
+            let (mut after_event, _) = listener.accept().unwrap();
+            let request = read_request(&after_event);
+            reply(
+                &mut after_event,
+                &request,
+                snapshot(serde_json::json!([{
+                    "terminal_id": "term1",
+                    "agent": "codex",
+                    "agent_status": "working",
+                    "workspace_id": "w1",
+                    "tab_id": "w1:t1",
+                    "pane_id": "w1:p1",
+                    "focused": true,
+                    "revision": 2
+                }])),
+            );
+        });
+
+        let (updates, received) = mpsc::channel();
+        let active = AtomicBool::new(true);
+        let stopping = AtomicBool::new(false);
+        let mut connected = false;
+        follow_session(
+            &Client::new(&path).with_timeout(Duration::from_secs(1)),
+            "default",
+            7,
+            &updates,
+            &active,
+            &stopping,
+            &mut connected,
+        )
         .unwrap();
-        assert_eq!(result, ["default"]);
+
+        let agent_counts: Vec<_> = received
+            .try_iter()
+            .map(|update| match update {
+                SessionUpdate::Agents { agents, .. } => agents.len(),
+                SessionUpdate::Unavailable { .. } => unreachable!(),
+            })
+            .collect();
+        assert!(connected);
+        assert_eq!(agent_counts, [0, 1]);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn snapshots_require_nonempty_routing_identities() {
+        let snapshot = |protocol: u32, pane_id: &str, terminal_id: &str| {
+            serde_json::from_value::<SessionSnapshot>(serde_json::json!({
+                "version": "0.8.0",
+                "protocol": protocol,
+                "workspaces": [],
+                "tabs": [],
+                "panes": [{
+                    "pane_id": pane_id,
+                    "terminal_id": terminal_id,
+                    "workspace_id": "w1",
+                    "tab_id": "w1:t1",
+                    "focused": true,
+                    "agent_status": "idle",
+                    "revision": 1
+                }],
+                "layouts": [],
+                "agents": []
+            }))
+            .unwrap()
+        };
+        assert!(validate_snapshot(snapshot(MIN_HERDR_PROTOCOL, "w1:p1", "term1")).is_ok());
+        assert!(validate_snapshot(snapshot(MIN_HERDR_PROTOCOL + 1, "w1:p1", "term1")).is_ok());
+        assert!(validate_snapshot(snapshot(MIN_HERDR_PROTOCOL - 1, "w1:p1", "term1")).is_err());
+        assert!(validate_snapshot(snapshot(MIN_HERDR_PROTOCOL, "", "term1")).is_err());
+        assert!(validate_snapshot(snapshot(MIN_HERDR_PROTOCOL, "w1:p1", "")).is_err());
     }
 }

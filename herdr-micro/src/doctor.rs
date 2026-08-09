@@ -4,13 +4,13 @@ use anyhow::Result;
 use std::{env, fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Command, time::Duration};
 
 use crate::{
-    config::{config_path, load_controls, load_effort, load_lighting},
+    config::{config_path, load, requires_accessibility},
     control::request_status,
     ghostty::inspect_ghostty,
     helper_install,
     hid::HELPER_VERSION,
     macos::{frontmost, post_event_access},
-    setup::plugin_root,
+    setup::{PI_EXTENSION, plugin_root},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -69,8 +69,7 @@ fn check(report: &mut Report, label: &str, f: impl FnOnce() -> Result<String>) {
 }
 
 fn pi_extension() -> Option<PathBuf> {
-    env::var_os("HOME")
-        .map(|home| PathBuf::from(home).join(".pi/agent/extensions/herdr-micro-effort.ts"))
+    env::var_os("HOME").map(|home| PathBuf::from(home).join(PI_EXTENSION))
 }
 
 pub fn doctor() -> Report {
@@ -87,12 +86,31 @@ pub fn doctor() -> Report {
         helper_install::verify_installed()?;
         Ok(format!("version {HELPER_VERSION}"))
     });
-    match post_event_access() {
-        Ok(()) => report.push(Level::Ok, "macOS event output"),
-        Err(_) => report.push(
-            Level::Fail,
-            "macOS event output is denied; enable Accessibility for Herdr or its terminal host",
-        ),
+    let config_path = config_path();
+    let config = match load(&config_path) {
+        Ok(config) => {
+            report.push(
+                Level::Ok,
+                format!("configuration: {}", config_path.display()),
+            );
+            Some(config)
+        }
+        Err(error) => {
+            report.push(Level::Fail, format!("configuration: {error}"));
+            None
+        }
+    };
+    if config
+        .as_ref()
+        .is_some_and(|config| requires_accessibility(&config.controls))
+    {
+        match post_event_access() {
+            Ok(()) => report.push(Level::Ok, "macOS event output"),
+            Err(_) => report.push(
+                Level::Fail,
+                "macOS event output is denied; enable Accessibility for Herdr or its terminal host",
+            ),
+        }
     }
     match frontmost() {
         Ok(current) => report.push(
@@ -105,39 +123,15 @@ pub fn doctor() -> Report {
         ),
     }
     match inspect_ghostty() {
-        Ok(ghostty) => report.push(
+        Ok(terminals) => report.push(
             Level::Ok,
             format!(
-                "Ghostty Automation: {} terminal(s) visible",
-                ghostty.terminals.len()
+                "Ghostty native bridge: {} terminal(s) visible",
+                terminals.len()
             ),
         ),
-        Err(error) => report.push(Level::Fail, format!("Ghostty Automation: {error}")),
+        Err(error) => report.push(Level::Fail, format!("Ghostty native bridge: {error}")),
     }
-    let controls = config_path("controls.json");
-    check(&mut report, "control configuration", || {
-        load_controls(&controls).map_err(anyhow::Error::msg)?;
-        Ok(controls.display().to_string())
-    });
-    let effort = config_path("effort.json");
-    let effort_config = match load_effort(&effort) {
-        Ok(config) => {
-            report.push(
-                Level::Ok,
-                format!("effort configuration: {}", effort.display()),
-            );
-            Some(config)
-        }
-        Err(error) => {
-            report.push(Level::Fail, format!("effort configuration: {error}"));
-            None
-        }
-    };
-    let lighting = config_path("lighting.json");
-    check(&mut report, "lighting configuration", || {
-        load_lighting(&lighting).map_err(anyhow::Error::msg)?;
-        Ok(lighting.display().to_string())
-    });
     match request_status(Duration::from_millis(750)) {
         Ok(status) => {
             if let Some(error) = status.get("error").and_then(serde_json::Value::as_str) {
@@ -148,7 +142,10 @@ pub fn doctor() -> Report {
                     Some(device) => report.push(Level::Warn, format!("Micro bridge: {device}")),
                     None => report.push(Level::Warn, "Micro bridge returned no device status"),
                 }
-                if let Some(error) = status.get("deviceError").and_then(serde_json::Value::as_str) {
+                if let Some(error) = status
+                    .get("deviceError")
+                    .and_then(serde_json::Value::as_str)
+                {
                     report.push(Level::Warn, format!("Micro device runtime error: {error}"));
                 }
             }
@@ -157,13 +154,15 @@ pub fn doctor() -> Report {
         // not an installation failure.
         Err(error) => report.push(Level::Warn, format!("Micro bridge is not running: {error}")),
     }
-    if effort_config
-        .as_ref()
-        .is_none_or(|config| config.codex.raise.is_none() || config.codex.lower.is_none())
-    {
+    if config.as_ref().is_some_and(|config| {
+        config.effort.codex.raise.is_none() || config.effort.codex.lower.is_none()
+    }) {
         report.push(
             Level::Warn,
-            format!("Codex effort shortcuts are unset in {}", effort.display()),
+            format!(
+                "Codex effort shortcuts are unset in {}",
+                config_path.display()
+            ),
         );
     }
     match pi_extension() {
@@ -205,5 +204,4 @@ mod tests {
         assert!(report.failed());
         assert_eq!(report.render(), "[ok] one\n[warn] two\n[fail] three");
     }
-
 }

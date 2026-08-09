@@ -93,14 +93,6 @@ pub fn request_at(path: &Path, command: Command, timeout: Duration) -> Result<Va
     serde_json::from_slice(&line).context("parse Micro bridge response")
 }
 
-/// Return a running daemon's status, otherwise launch it and poll until ready.
-pub fn start_daemon<F>(launch: F, ready_timeout: Duration) -> Result<Value>
-where
-    F: FnOnce() -> Result<()>,
-{
-    start_daemon_at(&control_socket(), launch, ready_timeout)
-}
-
 /// Return a compatible daemon when one is live; otherwise stop the old one
 /// before starting this executable.
 pub fn start_daemon_versioned<F>(
@@ -152,57 +144,17 @@ where
     launch()?;
     let deadline = Instant::now() + ready_timeout;
     loop {
-        if let Ok(status) = request_at(path, Command::Status, Duration::from_millis(250)) {
-            if status.get("version").and_then(Value::as_str) == Some(version)
-                && status.get("protocol").and_then(Value::as_u64) == Some(u64::from(protocol))
-            {
-                return Ok(status);
-            }
+        if let Ok(status) = request_at(path, Command::Status, Duration::from_millis(250))
+            && status.get("version").and_then(Value::as_str) == Some(version)
+            && status.get("protocol").and_then(Value::as_u64) == Some(u64::from(protocol))
+        {
+            return Ok(status);
         }
         if Instant::now() >= deadline {
             bail!("Micro bridge did not start; see {}", log_file().display());
         }
         thread::sleep(Duration::from_millis(50));
     }
-}
-
-pub fn start_daemon_at<F>(path: &Path, launch: F, ready_timeout: Duration) -> Result<Value>
-where
-    F: FnOnce() -> Result<()>,
-{
-    if let Some(status) = live_status(request_at(
-        path,
-        Command::Status,
-        Duration::from_millis(500),
-    )) {
-        return Ok(status);
-    }
-
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("control socket has no parent"))?;
-    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    launch()?;
-    let deadline = Instant::now() + ready_timeout;
-    loop {
-        if let Some(status) = live_status(request_at(
-            path,
-            Command::Status,
-            Duration::from_millis(250),
-        )) {
-            return Ok(status);
-        }
-        if Instant::now() >= deadline {
-            bail!("Micro bridge did not start; see {}", log_file().display());
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-}
-
-/// A daemon that answers a status request with an error payload (e.g. while
-/// stopping) does not count as live.
-fn live_status(result: Result<Value>) -> Option<Value> {
-    result.ok().filter(|status| status.get("error").is_none())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -321,14 +273,12 @@ where
         Ok(listener) => listener,
         Err(error) if error.raw_os_error() == Some(libc::EADDRINUSE) => {
             let before = identity(&path)?;
-            if live_status(request_at(
-                &path,
-                Command::Status,
-                Duration::from_millis(500),
-            ))
-            .is_some()
-            {
-                bail!("Micro bridge is already running");
+            match UnixStream::connect(&path) {
+                Ok(_) => bail!("Micro bridge socket is already active"),
+                Err(error) if error.raw_os_error() == Some(libc::ECONNREFUSED) => {}
+                Err(error) => {
+                    return Err(error).with_context(|| format!("connect {}", path.display()));
+                }
             }
             if before.is_none() || identity(&path)? != before {
                 bail!("Micro bridge socket changed during startup");
@@ -534,7 +484,7 @@ mod tests {
             Ok(_) => panic!("duplicate bind succeeded"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("already running"));
+        assert!(error.to_string().contains("already active"));
         request_at(&path, Command::Stop, Duration::from_secs(1)).unwrap();
         shutdown.send(()).unwrap();
         drop(server);
@@ -575,31 +525,6 @@ mod tests {
         shutdown.send(()).unwrap();
         runner.join().unwrap();
         drop(server);
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn start_waits_for_readiness() {
-        let dir = temp_dir("start");
-        let path = dir.join(SOCKET_NAME);
-        let (ready_tx, ready_rx) = mpsc::channel();
-        let launch_path = path.clone();
-        let result = start_daemon_at(
-            &path,
-            move || {
-                let (server, shutdown, runner) =
-                    start_test_server(launch_path, Arc::new(AtomicBool::new(false)));
-                ready_tx.send((server, shutdown, runner)).unwrap();
-                Ok(())
-            },
-            Duration::from_secs(1),
-        );
-        assert_eq!(result.unwrap(), json!({ "running": true }));
-        let (server, shutdown, runner) = ready_rx.recv().unwrap();
-        request_at(&path, Command::Stop, Duration::from_secs(1)).unwrap();
-        shutdown.send(()).unwrap();
-        drop(server);
-        runner.join().unwrap();
         fs::remove_dir_all(dir).unwrap();
     }
 

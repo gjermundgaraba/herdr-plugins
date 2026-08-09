@@ -1,98 +1,239 @@
-use anyhow::{Context, Result, anyhow, bail};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use anyhow::{Result, anyhow, bail};
+use objc2::{class, msg_send, rc::Retained, runtime::AnyObject};
+use serde::Serialize;
+use std::cell::RefCell;
+use std::ffi::{CStr, CString, c_char};
 use std::thread;
 use std::time::Duration;
 
-use crate::herdr::{Environment, herdr_bin, run_command, run_json, session_environment};
+use crate::{actions::GHOSTTY_PROCESS, herdr::Session};
 
-pub const GHOSTTY_STATE_SCRIPT: &str = r#"
-const app = Application("Ghostty");
-const frontmost = app.frontmost();
-const terminals = app.terminals().map((terminal) => ({
-  id: terminal.id(),
-  name: terminal.name(),
-}));
-let focusedTerminalId = null;
-if (frontmost && app.windows().length > 0) {
-  const tab = app.windows()[0].selectedTab();
-  focusedTerminalId = tab.focusedTerminal().id();
+#[link(name = "ScriptingBridge", kind = "framework")]
+unsafe extern "C" {}
+
+const APPLE_EVENT_TIMEOUT_TICKS: libc::c_long = 5 * 60;
+const SCROLL_MOMENTUM_NONE: i32 = i32::from_be_bytes(*b"SMno");
+
+thread_local! {
+    static GHOSTTY: RefCell<Option<Retained<AnyObject>>> = const { RefCell::new(None) };
 }
-JSON.stringify({ frontmost, focusedTerminalId, terminals });
-"#;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GhosttyTerminal {
     pub id: String,
     pub name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GhosttyState {
-    pub frontmost: bool,
-    pub focused_terminal_id: Option<String>,
-    pub terminals: Vec<GhosttyTerminal>,
+fn ns_string(value: &CStr) -> Result<Retained<AnyObject>> {
+    // SAFETY: NSString copies the valid, NUL-terminated UTF-8 string.
+    let string: Option<Retained<AnyObject>> =
+        unsafe { msg_send![class!(NSString), stringWithUTF8String: value.as_ptr()] };
+    string.ok_or_else(|| anyhow!("could not create native string"))
 }
 
-pub fn parse_ghostty_state(stdout: &str) -> Result<GhosttyState> {
-    let state: GhosttyState =
-        serde_json::from_str(stdout).context("Ghostty returned invalid terminal state")?;
-    if state
-        .terminals
-        .iter()
-        .any(|terminal| terminal.id.is_empty())
-    {
-        bail!("Ghostty returned invalid terminal state");
+fn ghostty_application() -> Result<Retained<AnyObject>> {
+    GHOSTTY.with_borrow_mut(|cached| {
+        if let Some(app) = cached {
+            return Ok(app.clone());
+        }
+        let bundle_id = CString::new(GHOSTTY_PROCESS).expect("static bundle ID contains NUL");
+        let bundle = ns_string(&bundle_id)?;
+        // SAFETY: This is the documented ScriptingBridge application factory.
+        let app: Option<Retained<AnyObject>> =
+            unsafe { msg_send![class!(SBApplication), applicationWithBundleIdentifier: &*bundle] };
+        let app = app.ok_or_else(|| anyhow!("Ghostty scripting bridge unavailable"))?;
+        // SAFETY: SBApplication.timeout is a signed long measured in 1/60-second ticks.
+        unsafe {
+            let _: () = msg_send![&*app, setTimeout: APPLE_EVENT_TIMEOUT_TICKS];
+        }
+        *cached = Some(app.clone());
+        Ok(app)
+    })
+}
+
+fn require_selector(receiver: &AnyObject, selector: objc2::runtime::Sel) -> Result<()> {
+    // SAFETY: respondsToSelector: is an NSObject protocol method and does not invoke `selector`.
+    let responds: bool = unsafe { msg_send![receiver, respondsToSelector: selector] };
+    if !responds {
+        bail!(
+            "Ghostty does not support selector {}",
+            selector.name().to_string_lossy()
+        )
     }
-    Ok(state)
+    Ok(())
 }
 
-pub fn inspect_ghostty() -> Result<GhosttyState> {
-    let args: Vec<String> = ["-l", "JavaScript", "-e", GHOSTTY_STATE_SCRIPT]
-        .map(str::to_owned)
-        .into();
-    parse_ghostty_state(&run_command("/usr/bin/osascript", &args, None)?)
+fn object(
+    receiver: &AnyObject,
+    selector: objc2::runtime::Sel,
+) -> Result<Option<Retained<AnyObject>>> {
+    require_selector(receiver, selector)?;
+    // SAFETY: Callers use object-valued selectors from Ghostty's current SDEF.
+    Ok(unsafe { objc2::msg_send![receiver, performSelector: selector] })
+}
+
+fn array_items(array: &AnyObject) -> Result<Vec<Retained<AnyObject>>> {
+    // SAFETY: ScriptingBridge element arrays and KVC results implement NSArray's API.
+    let count: usize = unsafe { msg_send![array, count] };
+    (0..count)
+        .map(|index| {
+            let item: Option<Retained<AnyObject>> =
+                unsafe { msg_send![array, objectAtIndex: index] };
+            item.ok_or_else(|| anyhow!("Ghostty returned an invalid object list"))
+        })
+        .collect()
+}
+
+fn string(object: &AnyObject) -> Result<String> {
+    // SAFETY: Ghostty's SDEF declares these values as text (NSString).
+    let value: *const c_char = unsafe { msg_send![object, UTF8String] };
+    if value.is_null() {
+        bail!("Ghostty returned invalid text")
+    }
+    // SAFETY: NSString's UTF8String is NUL-terminated and lives with `object`.
+    Ok(unsafe { CStr::from_ptr(value) }
+        .to_string_lossy()
+        .into_owned())
+}
+
+fn string_property(
+    receiver: &AnyObject,
+    selector: objc2::runtime::Sel,
+    label: &str,
+) -> Result<String> {
+    let value = object(receiver, selector)?
+        .ok_or_else(|| anyhow!("Ghostty returned no terminal {label}"))?;
+    string(&value)
+}
+
+fn terminal_topology(terminals: &AnyObject) -> Result<Vec<GhosttyTerminal>> {
+    array_items(terminals)?
+        .into_iter()
+        .map(|item| {
+            let id = string_property(&item, objc2::sel!(id), "ID")?;
+            if id.is_empty() {
+                bail!("Ghostty returned invalid terminal state")
+            }
+            Ok(GhosttyTerminal {
+                id,
+                name: string_property(&item, objc2::sel!(name), "name")?,
+            })
+        })
+        .collect()
+}
+
+fn focused_id(app: &AnyObject) -> Result<Option<String>> {
+    let Some(window) = object(app, objc2::sel!(frontWindow))? else {
+        return Ok(None);
+    };
+    let tab = object(&window, objc2::sel!(selectedTab))?
+        .ok_or_else(|| anyhow!("Ghostty returned no selected tab"))?;
+    let terminal = object(&tab, objc2::sel!(focusedTerminal))?
+        .ok_or_else(|| anyhow!("Ghostty returned no focused terminal"))?;
+    let id = string_property(&terminal, objc2::sel!(id), "ID")?;
+    if id.is_empty() {
+        bail!("Ghostty returned an empty focused terminal ID")
+    }
+    Ok(Some(id))
+}
+
+pub fn inspect_ghostty() -> Result<Vec<GhosttyTerminal>> {
+    objc2::rc::autoreleasepool(|_| {
+        let app = ghostty_application()?;
+        let terminals = object(&app, objc2::sel!(terminals))?
+            .ok_or_else(|| anyhow!("Ghostty returned no terminals"))?;
+        terminal_topology(&terminals)
+    })
 }
 
 pub fn focused_terminal_id() -> Result<String> {
-    let script = r#"tell application "Ghostty"
-if not frontmost then error "Ghostty is not frontmost"
-get id of focused terminal of selected tab of front window
-end tell"#;
-    let output = run_command("/usr/bin/osascript", &["-e".into(), script.into()], None)?;
-    let id = output.trim();
-    if id.is_empty() {
-        bail!("Ghostty returned an empty focused terminal ID");
-    }
-    Ok(id.into())
+    objc2::rc::autoreleasepool(|_| {
+        let app = ghostty_application()?;
+        focused_id(&app)?.ok_or_else(|| anyhow!("Ghostty returned no focused terminal ID"))
+    })
 }
 
-fn set_session_title(session_name: &str, title: Option<&str>, base: &Environment) -> Result<()> {
-    let mut args = vec!["terminal".into(), "title".into()];
-    match title {
-        Some(title) => args.extend(["set".into(), title.into()]),
-        None => args.push("clear".into()),
+fn scripting_result(app: &AnyObject, action: &str) -> Result<()> {
+    if let Some(error) = object(app, objc2::sel!(lastError))? {
+        let description = object(&error, objc2::sel!(description))?
+            .ok_or_else(|| anyhow!("Ghostty rejected the {action}"))?;
+        bail!("Ghostty rejected the {action}: {}", string(&description)?)
     }
-    let value = run_json(
-        &herdr_bin(),
-        &args,
-        Some(&session_environment(session_name, base)),
-    )?;
-    if value.pointer("/result/changed").and_then(Value::as_bool) != Some(true) {
-        bail!("Herdr session {session_name} did not change a terminal title");
+    Ok(())
+}
+
+pub fn scroll_terminal(terminal_id: &str, x: f64, y: f64, notches: i32) -> Result<()> {
+    objc2::rc::autoreleasepool(|_| {
+        if terminal_id.is_empty() {
+            bail!("cannot scroll an unidentified Ghostty terminal")
+        }
+        let app = ghostty_application()?;
+        let terminals = object(&app, objc2::sel!(terminals))?
+            .ok_or_else(|| anyhow!("Ghostty returned no terminals"))?;
+        let terminal_id = CString::new(terminal_id)
+            .map_err(|_| anyhow!("Ghostty terminal ID contains invalid text"))?;
+        let terminal_id = ns_string(&terminal_id)?;
+        // SAFETY: SBElementArray.objectWithID: returns the exact terminal specifier for this UUID.
+        let terminal: Option<Retained<AnyObject>> =
+            unsafe { msg_send![&*terminals, objectWithID: &*terminal_id] };
+        let terminal = terminal.ok_or_else(|| anyhow!("Ghostty terminal is unavailable"))?;
+
+        require_selector(&app, objc2::sel!(sendMousePositionX:y:modifiers:to:))?;
+        // SAFETY: Ghostty's generated position binding accepts double, double,
+        // optional NSString, and GhosttyTerminal parameters.
+        unsafe {
+            let _: () = msg_send![
+                &*app,
+                sendMousePositionX: x,
+                y: y,
+                modifiers: None::<&AnyObject>,
+                to: &*terminal
+            ];
+        }
+        scripting_result(&app, "mouse position")?;
+
+        require_selector(&app, objc2::sel!(sendMouseScrollX:y:precision:momentum:to:))?;
+        // SAFETY: Ghostty 1.3's generated binding is
+        // `sendMouseScrollX:y:precision:momentum:to:` with double, double, BOOL,
+        // GhosttyScrollMomentum (signed int), and GhosttyTerminal parameters.
+        unsafe {
+            let _: () = msg_send![
+                &*app,
+                sendMouseScrollX: 0.0_f64,
+                y: f64::from(notches),
+                precision: false,
+                momentum: SCROLL_MOMENTUM_NONE,
+                to: &*terminal
+            ];
+        }
+        scripting_result(&app, "scroll event")
+    })
+}
+
+fn set_session_title(session: &Session, title: Option<&str>) -> Result<()> {
+    let client = session.client();
+    let value = match title {
+        Some(title) => client.call_value(
+            "client.window_title.set",
+            &serde_json::json!({ "title": title }),
+        )?,
+        None => client.call_value("client.window_title.clear", &serde_json::json!({}))?,
+    };
+    if value.get("changed").and_then(serde_json::Value::as_bool) != Some(true) {
+        bail!(
+            "Herdr session {} did not change a terminal title",
+            session.name
+        );
     }
     Ok(())
 }
 
 fn find_token<I>(inspect: &mut I, token: &str) -> Result<Option<GhosttyTerminal>>
 where
-    I: FnMut() -> Result<GhosttyState>,
+    I: FnMut() -> Result<Vec<GhosttyTerminal>>,
 {
     for attempt in 0..10 {
-        let state = inspect()?;
-        let matches: Vec<_> = state
-            .terminals
+        let matches: Vec<_> = inspect()?
             .into_iter()
             .filter(|terminal| terminal.name == token)
             .collect();
@@ -109,6 +250,24 @@ where
     Ok(None)
 }
 
+fn wait_for_title<I>(inspect: &mut I, terminal_id: &str, title: &str) -> Result<bool>
+where
+    I: FnMut() -> Result<Vec<GhosttyTerminal>>,
+{
+    for attempt in 0..10 {
+        if inspect()?
+            .iter()
+            .any(|terminal| terminal.id == terminal_id && terminal.name == title)
+        {
+            return Ok(true);
+        }
+        if attempt != 9 {
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+    Ok(false)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionTerminalMapping {
@@ -123,7 +282,7 @@ pub fn probe_session_terminals_with<I, S, T>(
     mut create_token: T,
 ) -> Result<Vec<SessionTerminalMapping>>
 where
-    I: FnMut() -> Result<GhosttyState>,
+    I: FnMut() -> Result<Vec<GhosttyTerminal>>,
     S: FnMut(&str, Option<&str>) -> Result<()>,
     T: FnMut(&str) -> String,
 {
@@ -131,7 +290,6 @@ where
     for session_name in sessions {
         let before = inspect()?;
         let originals: std::collections::BTreeMap<_, _> = before
-            .terminals
             .iter()
             .map(|terminal| (terminal.id.clone(), terminal.name.clone()))
             .collect();
@@ -153,14 +311,7 @@ where
                 .any(|mapping: &SessionTerminalMapping| mapping.terminal_id == terminal.id);
             set_title(session_name, Some(original))?;
             restored = true;
-            if inspect()?
-                .terminals
-                .iter()
-                .find(|candidate| candidate.id == terminal.id)
-                .map(|candidate| &candidate.name)
-                != Some(original)
-            {
-                let _ = set_title(session_name, None);
+            if !wait_for_title(&mut inspect, &terminal.id, original)? {
                 bail!("failed to restore {session_name} terminal title");
             }
             Ok((terminal, duplicate))
@@ -188,14 +339,21 @@ where
     Ok(mappings)
 }
 
-pub fn probe_session_terminals(
-    sessions: &[String],
-    base: &Environment,
-) -> Result<Vec<SessionTerminalMapping>> {
+pub fn probe_session_terminals(sessions: &[Session]) -> Result<Vec<SessionTerminalMapping>> {
+    let names: Vec<_> = sessions
+        .iter()
+        .map(|session| session.name.clone())
+        .collect();
     probe_session_terminals_with(
-        sessions,
+        &names,
         inspect_ghostty,
-        |session, title| set_session_title(session, title, base),
+        |name, title| {
+            let session = sessions
+                .iter()
+                .find(|session| session.name == name)
+                .ok_or_else(|| anyhow!("unknown Herdr session {name}"))?;
+            set_session_title(session, title)
+        },
         |session| format!("__herdr_micro_{session}_{}__", unique_token()),
     )
 }
@@ -212,37 +370,29 @@ fn unique_token() -> String {
     )
 }
 
-pub fn focused_session(
-    mappings: &[SessionTerminalMapping],
-    state: &GhosttyState,
-) -> Option<String> {
-    if !state.frontmost {
-        return None;
-    }
-    let id = state.focused_terminal_id.as_deref()?;
-    mappings
-        .iter()
-        .find(|mapping| mapping.terminal_id == id)
-        .map(|mapping| mapping.session_name.clone())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::RefCell;
 
-    fn state(terminals: Vec<(&str, &str)>) -> GhosttyState {
-        GhosttyState {
-            frontmost: true,
-            focused_terminal_id: Some("personal-terminal".into()),
-            terminals: terminals
-                .into_iter()
-                .map(|(id, name)| GhosttyTerminal {
-                    id: id.into(),
-                    name: name.into(),
-                })
-                .collect(),
-        }
+    fn state(terminals: Vec<(&str, &str)>) -> Vec<GhosttyTerminal> {
+        terminals
+            .into_iter()
+            .map(|(id, name)| GhosttyTerminal {
+                id: id.into(),
+                name: name.into(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rejects_missing_scripting_selector() {
+        let object: Retained<AnyObject> = unsafe { msg_send![class!(NSObject), new] };
+        let error = require_selector(&object, objc2::sel!(missingGhosttySelector)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Ghostty does not support selector missingGhosttySelector"
+        );
     }
 
     #[test]
@@ -336,37 +486,65 @@ mod tests {
     }
 
     #[test]
-    fn validates_state_and_only_routes_frontmost_terminal() {
-        let state = parse_ghostty_state(
-            r#"{"frontmost":true,"focusedTerminalId":"p","terminals":[{"id":"p","name":"x"}]}"#,
-        )
-        .unwrap();
-        let unfocused = parse_ghostty_state(r#"{"frontmost":false,"terminals":[]}"#).unwrap();
-        assert_eq!(unfocused.focused_terminal_id, None);
-        assert!(parse_ghostty_state(r#"{"frontmost":true,"terminals":null}"#).is_err());
+    fn waits_for_asynchronous_title_restoration() {
+        let mut inspections = 0;
         assert!(
-            parse_ghostty_state(
-                r#"{"frontmost":true,"focusedTerminalId":null,"terminals":[{"id":"","name":"x"}]}"#
+            wait_for_title(
+                &mut || {
+                    inspections += 1;
+                    Ok(state(vec![(
+                        "terminal",
+                        if inspections == 1 {
+                            "probe"
+                        } else {
+                            "original"
+                        },
+                    )]))
+                },
+                "terminal",
+                "original",
             )
-            .is_err()
+            .unwrap()
         );
-        let mapping = vec![SessionTerminalMapping {
-            session_name: "default".into(),
-            terminal_id: "p".into(),
-        }];
+        assert_eq!(inspections, 2);
+    }
+
+    #[test]
+    fn does_not_clear_an_exact_restore_that_times_out() {
+        let calls = RefCell::new(Vec::new());
+        let mut inspections = 0;
+        let error = probe_session_terminals_with(
+            &["default".into()],
+            || {
+                inspections += 1;
+                Ok(state(vec![(
+                    "terminal",
+                    if inspections == 1 {
+                        "original"
+                    } else {
+                        "probe"
+                    },
+                )]))
+            },
+            |session, title| {
+                calls
+                    .borrow_mut()
+                    .push((session.to_owned(), title.map(str::to_owned)));
+                Ok(())
+            },
+            |_| "probe".into(),
+        )
+        .unwrap_err();
         assert_eq!(
-            focused_session(&mapping, &state).as_deref(),
-            Some("default")
+            error.to_string(),
+            "failed to restore default terminal title"
         );
         assert_eq!(
-            focused_session(
-                &mapping,
-                &GhosttyState {
-                    frontmost: false,
-                    ..state
-                }
-            ),
-            None
+            calls.into_inner(),
+            [
+                ("default".into(), Some("probe".into())),
+                ("default".into(), Some("original".into()))
+            ]
         );
     }
 }

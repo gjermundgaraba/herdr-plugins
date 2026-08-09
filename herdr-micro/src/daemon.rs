@@ -2,13 +2,13 @@
 //! Herdr parsing, gestures, and macOS operations live in their small modules.
 
 use anyhow::{Result, anyhow, bail};
+use herdr_client::{AgentInfo, SessionSnapshot};
 use serde_json::{Value, json};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use std::{
     collections::{HashMap, HashSet},
-    env,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError},
     },
@@ -18,39 +18,41 @@ use std::{
 
 use crate::{
     actions::{
-        Agent, automatic_layer, diff_pane_args, execute_effort_plan, fast_mode_plan,
-        layer_identity, parse_agents, plan_effort_change, prompt_args, scroll_plan, submit_args,
+        GHOSTTY_PROCESS, automatic_layer, focus_agent, focus_pane, layer_identity, open_diff,
+        plan_effort_change, prompt as send_prompt, scroll_plan, submit,
     },
     config::{
-        Action, AgentStatus, Binding, Controls, Direction, EffortDirection, Modifier,
-        VerticalDirection, config_path, key_binding, load_controls, load_effort, load_lighting,
-        provision_controls, provision_effort, provision_lighting,
+        Action, Binding, Config, Controls, Direction, EffortConfig, EffortDirection, Modifier,
+        VerticalDirection, config_path, enabled_buttons, key_action_code, key_binding, load,
+        provision,
     },
     control::listen_for_control,
     device::DeviceEvent,
     gestures::{Fired, GestureDispatcher},
     ghostty::{
-        GhosttyState, SessionTerminalMapping, focused_session, focused_terminal_id,
-        inspect_ghostty, probe_session_terminals,
+        SessionTerminalMapping, focused_terminal_id, probe_session_terminals, scroll_terminal,
     },
     herdr::{
-        Environment, current_environment, discover_sessions, herdr_bin, run_command, run_json,
-        session_environment,
+        Session, SessionUpdate, SessionWorker, current_snapshot, discover_sessions,
+        spawn_session_worker,
     },
-    hid::HidClient,
+    hid::{HidClient, connection_error_state},
     macos,
     protocol::{
-        SLOT_COUNT, aggregate_lighting, assign_slots, device_owner, joystick_event, slot_lighting,
+        INPUT_BUNDLE_ID, SLOT_COUNT, aggregate_lighting, assign_slots, device_owner,
+        joystick_event, slot_lighting,
     },
 };
 
-const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
-const ROUTING_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+const CONFIG_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const SESSION_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const SESSION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+const MAPPING_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const ROUTING_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 const DEVICE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const NO_SESSIONS_SHUTDOWN: Duration = Duration::from_secs(60);
 const WORK_QUEUE_CAPACITY: usize = 16;
-const LATENCY_TRACE_ENV: &str = "HERDR_MICRO_LATENCY_TRACE";
-pub const DAEMON_PROTOCOL_VERSION: u32 = 1;
+pub const DAEMON_PROTOCOL_VERSION: u32 = 2;
 
 fn log(message: impl AsRef<str>) {
     eprintln!(
@@ -58,43 +60,6 @@ fn log(message: impl AsRef<str>) {
         format_timestamp(SystemTime::now()),
         message.as_ref()
     );
-}
-
-fn latency_trace_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env::var_os(LATENCY_TRACE_ENV).is_some())
-}
-
-fn trace_latency(stage: &'static str, kind: Option<&'static str>, elapsed: Duration) {
-    if latency_trace_enabled() {
-        log(format!(
-            "latency stage={stage}{} micros={}",
-            kind.map_or_else(String::new, |kind| format!(" kind={kind}")),
-            elapsed.as_micros()
-        ));
-    }
-}
-
-struct LatencySpan {
-    stage: &'static str,
-    kind: Option<&'static str>,
-    started: Instant,
-}
-
-impl LatencySpan {
-    fn new(stage: &'static str, kind: Option<&'static str>) -> Self {
-        Self {
-            stage,
-            kind,
-            started: Instant::now(),
-        }
-    }
-}
-
-impl Drop for LatencySpan {
-    fn drop(&mut self) {
-        trace_latency(self.stage, self.kind, self.started.elapsed());
-    }
 }
 
 fn format_timestamp(time: SystemTime) -> String {
@@ -119,25 +84,27 @@ fn format_timestamp(time: SystemTime) -> String {
 
 #[derive(Default)]
 struct State {
-    sessions: Vec<String>,
+    config: Config,
+    sessions: Vec<Session>,
+    session_agents: HashMap<String, Vec<AgentInfo>>,
     mappings: Vec<SessionTerminalMapping>,
     selected_session: Option<String>,
     routing_ready: bool,
     routing_generation: Arc<AtomicU64>,
     session_slots: HashMap<String, Vec<Option<String>>>,
-    agents: Vec<Agent>,
+    agents: Vec<AgentInfo>,
     slots: Vec<Option<String>>,
     device_state: String,
     owner: Option<String>,
     frontmost: Option<macos::Frontmost>,
-    ghostty: Option<GhosttyState>,
+    focused_terminal: Option<String>,
     active_layer: Option<usize>,
     last_device_error: String,
     last_herdr_error: String,
     last_frontmost_error: String,
     last_controls_error: String,
-    last_lighting_error: String,
     last_routing_error: String,
+    last_lighting_error: String,
     last_lighting: String,
     last_focused_app: String,
     managed_aggregate_zones: HashSet<String>,
@@ -148,8 +115,9 @@ struct State {
 }
 
 impl State {
-    fn new() -> Self {
+    fn new(config: Config) -> Self {
         Self {
+            config,
             slots: vec![None; SLOT_COUNT],
             device_state: "starting".into(),
             ..Self::default()
@@ -165,7 +133,7 @@ impl State {
             "routing": if self.routing_ready { "ready" } else if self.selected_session.is_some() { "unavailable" } else { "none" },
             "version": env!("CARGO_PKG_VERSION"),
             "protocol": DAEMON_PROTOCOL_VERSION,
-            "sessions": self.sessions,
+            "sessions": self.sessions.iter().map(|session| &session.name).collect::<Vec<_>>(),
             "sessionMappings": self.mappings.iter().map(|mapping| json!({
                 "session": mapping.session_name,
                 "terminal": mapping.terminal_id,
@@ -177,7 +145,7 @@ impl State {
                 "process": frontmost.process,
                 "title": frontmost.title,
             })),
-            "focusedTerminal": self.ghostty.as_ref().and_then(|state| state.focused_terminal_id.as_ref()),
+            "focusedTerminal": self.focused_terminal,
             "slots": self.slots.iter().map(|id| id.as_ref().and_then(|id| {
                 self.agents.iter().find(|agent| agent.terminal_id == *id).map(|agent| json!({
                     "pane": agent.pane_id,
@@ -203,18 +171,22 @@ impl State {
 #[derive(Clone)]
 struct InputContext {
     controls: Controls,
-    session: Option<String>,
-    target: Option<Agent>,
-    slots: Vec<Option<Agent>>,
+    effort: EffortConfig,
+    session: Option<Session>,
+    terminal: Option<String>,
+    target: Option<AgentInfo>,
+    slots: Vec<Option<AgentInfo>>,
     routing_ready: bool,
     generation: u64,
 }
 
 impl InputContext {
-    fn new(controls: Controls) -> Self {
+    fn new(config: &Config) -> Self {
         Self {
-            controls,
+            controls: config.controls.clone(),
+            effort: config.effort.clone(),
             session: None,
+            terminal: None,
             target: None,
             slots: vec![None; SLOT_COUNT],
             routing_ready: false,
@@ -222,9 +194,9 @@ impl InputContext {
         }
     }
 
-    fn selected(&self, routing_generation: &AtomicU64) -> Option<String> {
+    fn selected(&self, routing_generation: &AtomicU64) -> Option<(Session, String)> {
         (self.routing_ready && self.generation == routing_generation.load(Ordering::Acquire))
-            .then(|| self.session.clone())
+            .then(|| self.session.clone().zip(self.terminal.clone()))
             .flatten()
     }
 }
@@ -244,17 +216,18 @@ enum Work {
     Binding {
         binding: Box<Binding>,
         source: String,
-        session: String,
-        target: Option<Agent>,
+        session: Session,
+        terminal: String,
+        effort: EffortConfig,
+        target: Option<(String, String, Option<String>)>,
         generation: u64,
-        queued_at: Instant,
     },
     FocusSlot {
         pane_id: String,
         source: String,
-        session: String,
+        session: Session,
+        terminal: String,
         generation: u64,
-        queued_at: Instant,
     },
 }
 
@@ -265,28 +238,14 @@ impl Work {
         }
     }
 
-    fn queued_at(&self) -> Instant {
-        match self {
-            Self::Binding { queued_at, .. } | Self::FocusSlot { queued_at, .. } => *queued_at,
-        }
-    }
-
-    fn kind(&self) -> &'static str {
-        match self {
-            Self::Binding { binding, .. } => match binding.as_ref() {
-                Binding::Action(action) => action_name(action),
-                _ => "binding",
-            },
-            Self::FocusSlot { .. } => "focus-slot",
-        }
-    }
-
     fn same_effort(&self, other: &Self) -> bool {
         match (self, other) {
             (
                 Self::Binding {
                     binding: first,
                     session: first_session,
+                    terminal: first_terminal,
+                    effort: first_effort,
                     target: first_target,
                     generation: first_generation,
                     ..
@@ -294,6 +253,8 @@ impl Work {
                 Self::Binding {
                     binding: second,
                     session: second_session,
+                    terminal: second_terminal,
+                    effort: second_effort,
                     target: second_target,
                     generation: second_generation,
                     ..
@@ -309,8 +270,9 @@ impl Work {
                 ) => {
                     first_direction == second_direction
                         && first_session == second_session
-                        && agent_identity(first_target.as_ref())
-                            == agent_identity(second_target.as_ref())
+                        && first_terminal == second_terminal
+                        && first_effort == second_effort
+                        && first_target == second_target
                         && first_generation == second_generation
                 }
                 _ => false,
@@ -320,46 +282,26 @@ impl Work {
     }
 }
 
-fn list_agents(session: &str, base: &Environment) -> Result<Vec<Agent>> {
-    let _latency = LatencySpan::new("agent-list", None);
-    let args = vec!["agent".into(), "list".into()];
-    parse_agents(&run_json(
-        &herdr_bin(),
-        &args,
-        Some(&session_environment(session, base)),
-    )?)
-}
-
-fn require_agent(agent: Option<&Agent>) -> Result<&Agent> {
+fn require_agent(agent: Option<&AgentInfo>) -> Result<&AgentInfo> {
     agent.ok_or_else(|| anyhow!("no focused Herdr agent"))
 }
 
-fn agent_identity(agent: Option<&Agent>) -> Option<(&str, &str, &str)> {
+fn agent_identity(agent: Option<&AgentInfo>) -> Option<(String, String, Option<String>)> {
     agent.map(|agent| {
         (
-            agent.terminal_id.as_str(),
-            agent.pane_id.as_str(),
-            agent.agent.as_str(),
+            agent.terminal_id.clone(),
+            agent.pane_id.clone(),
+            agent.agent.clone(),
         )
     })
 }
 
-fn ready_agent(agent: Option<&Agent>) -> Result<&Agent> {
+fn ready_agent(agent: Option<&AgentInfo>) -> Result<&AgentInfo> {
     let agent = require_agent(agent)?;
-    if matches!(agent.agent_status, AgentStatus::Idle | AgentStatus::Done) {
+    if matches!(agent.agent_status.as_str(), "idle" | "done") {
         Ok(agent)
     } else {
-        bail!("focused agent is {}", agent_status_name(agent.agent_status))
-    }
-}
-
-fn agent_status_name(status: AgentStatus) -> &'static str {
-    match status {
-        AgentStatus::Idle => "idle",
-        AgentStatus::Working => "working",
-        AgentStatus::Blocked => "blocked",
-        AgentStatus::Done => "done",
-        AgentStatus::Unknown => "unknown",
+        bail!("focused agent is {}", agent.agent_status)
     }
 }
 
@@ -376,123 +318,163 @@ fn action_name(action: &Action) -> &'static str {
     }
 }
 
-fn run_herdr_json(args: Vec<String>, session: &str, base: &Environment) -> Result<Value> {
-    run_json(
-        &herdr_bin(),
-        &args,
-        Some(&session_environment(session, base)),
-    )
+struct DispatchLease<'a> {
+    session: &'a Session,
+    terminal: &'a str,
+    generation: u64,
+    routing_generation: &'a AtomicU64,
 }
 
-fn run_herdr(args: Vec<String>, session: &str, base: &Environment) -> Result<()> {
-    run_command(
-        &herdr_bin(),
-        &args,
-        Some(&session_environment(session, base)),
-    )
-    .map(|_| ())
+impl DispatchLease<'_> {
+    fn ensure(&self) -> Result<String> {
+        if self.generation != self.routing_generation.load(Ordering::Acquire) {
+            bail!("stale Herdr routing")
+        }
+        if !macos::frontmost_bundle_is(GHOSTTY_PROCESS) {
+            bail!("Herdr session is no longer frontmost")
+        }
+        let terminal = focused_terminal_id()?;
+        if self.generation != self.routing_generation.load(Ordering::Acquire)
+            || !macos::frontmost_bundle_is(GHOSTTY_PROCESS)
+        {
+            bail!("stale Herdr routing")
+        }
+        if terminal != self.terminal {
+            bail!("Herdr session is no longer frontmost")
+        }
+        Ok(terminal)
+    }
 }
 
 fn execute_scroll(
     direction: VerticalDirection,
     percent: f64,
     expected_pane: &str,
-    session: &str,
-    base: &Environment,
-    mappings: &Arc<Mutex<Vec<SessionTerminalMapping>>>,
+    snapshot: &SessionSnapshot,
+    lease: &DispatchLease<'_>,
 ) -> Result<bool> {
-    if !session_is_frontmost(session, mappings)? {
-        log(format!("scroll ignored: {session} is not frontmost"));
+    if snapshot.focused_pane_id.as_deref() != Some(expected_pane) {
+        log(format!(
+            "scroll ignored: focused pane changed in {}",
+            lease.session.name
+        ));
         return Ok(false);
     }
-    let pane = run_herdr_json(vec!["pane".into(), "current".into()], session, base)?;
-    if pane.pointer("/result/pane/pane_id").and_then(Value::as_str) != Some(expected_pane) {
-        log(format!("scroll ignored: focused pane changed in {session}"));
-        return Ok(false);
-    }
-    let layout = run_herdr_json(vec!["pane".into(), "layout".into()], session, base)?;
+    let pane = snapshot
+        .panes
+        .iter()
+        .find(|pane| pane.pane_id == expected_pane)
+        .ok_or_else(|| anyhow!("focused pane disappeared"))?;
+    let layout = snapshot
+        .layouts
+        .iter()
+        .find(|layout| layout.workspace_id == pane.workspace_id && layout.tab_id == pane.tab_id)
+        .ok_or_else(|| anyhow!("focused pane layout unavailable"))?;
     let plan = scroll_plan(
-        pane.pointer("/result/pane").unwrap_or(&Value::Null),
-        layout.pointer("/result/layout").unwrap_or(&Value::Null),
+        pane,
+        layout,
         match direction {
             VerticalDirection::Up => "up",
             VerticalDirection::Down => "down",
         },
         percent,
     )?;
-    if !session_is_frontmost(session, mappings)? {
-        log(format!("scroll ignored: {session} is no longer frontmost"));
-        return Ok(false);
-    }
-    let frontmost = macos::frontmost()?;
-    macos::scroll(
+    let cell = lease
+        .session
+        .client()
+        .call_value("pane.graphics.info", &json!({ "pane_id": expected_pane }))?;
+    let cell_width = cell
+        .get("cell_width_px")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("Herdr host cell width is unavailable"))?;
+    let cell_height = cell
+        .get("cell_height_px")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("Herdr host cell height is unavailable"))?;
+    let scale = macos::frontmost_window_scale()?;
+    let terminal = lease.ensure()?;
+    scroll_terminal(
+        &terminal,
+        plan.column * cell_width as f64 / scale,
+        plan.row * cell_height as f64 / scale,
         i32::try_from(plan.notches).map_err(|_| anyhow!("scroll distance is too large"))?,
-        plan.x,
-        plan.y,
-        &frontmost.process,
     )?;
     log(format!(
-        "scrolled {} {percent}% in {session}/{}",
+        "scrolled {} {percent}% in {}/{}",
         match direction {
             VerticalDirection::Up => "up",
             VerticalDirection::Down => "down",
         },
+        lease.session.name,
         plan.pane_id
     ));
     Ok(true)
 }
 
-fn session_is_frontmost(
-    session: &str,
-    mappings: &Arc<Mutex<Vec<SessionTerminalMapping>>>,
-) -> Result<bool> {
-    if !macos::frontmost_bundle_is(crate::actions::GHOSTTY_PROCESS) {
-        return Ok(false);
-    }
-    let terminal = focused_terminal_id()?;
-    let mappings = mappings.lock().unwrap_or_else(|error| error.into_inner());
-    Ok(mappings
-        .iter()
-        .any(|mapping| mapping.session_name == session && mapping.terminal_id == terminal))
-}
-
 fn execute_action(
     action: &Action,
-    current: Option<&Agent>,
-    session: &str,
-    base: &Environment,
-    mappings: &Arc<Mutex<Vec<SessionTerminalMapping>>>,
+    current: Option<&AgentInfo>,
+    snapshot: &SessionSnapshot,
+    effort: &EffortConfig,
     repeat: usize,
+    lease: &DispatchLease<'_>,
 ) -> Result<bool> {
+    let client = lease.session.client();
     match action {
         Action::Prompt { prompt, submit } => {
-            let args = prompt_args(prompt, submit.unwrap_or(true), ready_agent(current)?)?;
-            run_herdr(args, session, base)?;
+            let current = ready_agent(current)?;
+            lease.ensure()?;
+            send_prompt(&client, prompt, submit.unwrap_or(true), current)?;
         }
         Action::Diff => {
-            run_herdr(diff_pane_args(require_agent(current)?)?, session, base)?;
+            let current = require_agent(current)?;
+            lease.ensure()?;
+            open_diff(&client, current)?;
         }
         Action::Fast => {
-            for args in fast_mode_plan(ready_agent(current)?)? {
-                run_herdr(args, session, base)?;
+            let current = ready_agent(current)?;
+            match current.agent.as_deref().unwrap_or_default() {
+                "codex" => {
+                    lease.ensure()?;
+                    send_prompt(&client, "/fast", true, current)?;
+                }
+                "pi" => {
+                    lease.ensure()?;
+                    send_prompt(&client, "/fast", false, current)?;
+                    lease.ensure()?;
+                    submit(&client, current)?;
+                }
+                other => bail!(
+                    "unsupported focused agent: {}",
+                    if other.is_empty() { "none" } else { other }
+                ),
             }
         }
         Action::Submit => {
-            run_herdr(submit_args(require_agent(current)?)?, session, base)?;
+            let current = require_agent(current)?;
+            lease.ensure()?;
+            submit(&client, current)?;
         }
         Action::Effort { direction } => {
             let current = require_agent(current)?;
-            let effort =
-                load_effort(&config_path("effort.json")).map_err(|error| anyhow!(error))?;
             let direction = match direction {
                 EffortDirection::Raise => "raise",
                 EffortDirection::Lower => "lower",
             };
-            let plan =
-                plan_effort_change(&current.agent, direction, &current.pane_id, &effort, repeat)?;
-            execute_effort_plan(&herdr_bin(), &plan, |bin, args| {
-                run_command(bin, args, Some(&session_environment(session, base))).map(|_| ())
-            })?;
+            let plan = plan_effort_change(
+                current.agent.as_deref().unwrap_or_default(),
+                direction,
+                &current.pane_id,
+                effort,
+                repeat,
+            )?;
+            for step in plan {
+                lease.ensure()?;
+                client.call_value(step.method, &step.params)?;
+                if let Some(ms) = step.wait_after_ms {
+                    thread::sleep(Duration::from_millis(ms));
+                }
+            }
         }
         Action::FocusPane { direction } => {
             let direction = match direction {
@@ -502,23 +484,20 @@ fn execute_action(
                 Direction::Right => "right",
             };
             let pane = require_agent(current)?.pane_id.clone();
-            run_herdr(
-                ["pane", "focus", "--direction", direction, "--pane", &pane]
-                    .map(str::to_owned)
-                    .into(),
-                session,
-                base,
-            )?;
-            log(format!("joystick focus {direction}: {session}/{pane}"));
+            lease.ensure()?;
+            focus_pane(&client, &pane, direction)?;
+            log(format!(
+                "joystick focus {direction}: {}/{pane}",
+                lease.session.name
+            ));
         }
         Action::Scroll { direction, percent } => {
             return execute_scroll(
                 *direction,
                 *percent,
                 &require_agent(current)?.pane_id,
-                session,
-                base,
-                mappings,
+                snapshot,
+                lease,
             );
         }
         // Key actions cannot reach the worker: top-level keys execute inline in
@@ -530,8 +509,6 @@ fn execute_action(
 
 fn action_worker(
     receiver: Receiver<Work>,
-    base: Environment,
-    mappings: Arc<Mutex<Vec<SessionTerminalMapping>>>,
     routing_generation: Arc<AtomicU64>,
     stopping: Arc<AtomicBool>,
 ) {
@@ -545,9 +522,6 @@ fn action_worker(
             Ok(work) => work,
             Err(_) => continue,
         };
-        let kind = work.kind();
-        trace_latency("queue", Some(kind), work.queued_at().elapsed());
-        let _action_latency = LatencySpan::new("action", Some(kind));
         let mut repeat = 1;
         while let Ok(next) = receiver.try_recv() {
             if work.same_effort(&next) {
@@ -562,26 +536,34 @@ fn action_worker(
             log("control ignored: stale Herdr routing");
             continue;
         }
-        let session = match &work {
-            Work::Binding { session, .. } | Work::FocusSlot { session, .. } => session,
-        };
-        match session_is_frontmost(session, &mappings) {
-            Ok(true) => {}
-            Ok(false) => {
-                log("control ignored: Herdr session is no longer frontmost");
-                continue;
+        let (session_info, terminal) = match &work {
+            Work::Binding {
+                session, terminal, ..
             }
+            | Work::FocusSlot {
+                session, terminal, ..
+            } => (session.clone(), terminal.clone()),
+        };
+        let snapshot = match current_snapshot(&session_info.client()) {
+            Ok(snapshot) => snapshot,
             Err(error) => {
                 log(format!(
-                    "control ignored: could not verify Herdr routing: {error}"
+                    "control failed: refresh {}: {error:#}",
+                    session_info.name
                 ));
                 continue;
             }
-        }
+        };
         if generation != routing_generation.load(Ordering::Acquire) {
             log("control ignored: stale Herdr routing");
             continue;
         }
+        let lease = DispatchLease {
+            session: &session_info,
+            terminal: &terminal,
+            generation,
+            routing_generation: &routing_generation,
+        };
         let result = match work {
             Work::FocusSlot {
                 pane_id,
@@ -589,14 +571,15 @@ fn action_worker(
                 session,
                 ..
             } => {
-                let _command_latency = LatencySpan::new("command", Some("focus-slot"));
-                let result = run_herdr(
-                    vec!["agent".into(), "focus".into(), pane_id.clone()],
-                    &session,
-                    &base,
-                );
+                let result = if snapshot.agents.iter().any(|agent| agent.pane_id == pane_id) {
+                    lease
+                        .ensure()
+                        .and_then(|_| focus_agent(&session_info.client(), &pane_id))
+                } else {
+                    Err(anyhow!("Agent slot pane disappeared"))
+                };
                 if result.is_ok() {
-                    log(format!("{source}: focused {session}/{pane_id}"));
+                    log(format!("{source}: focused {}/{pane_id}", session.name));
                 }
                 result
             }
@@ -604,49 +587,45 @@ fn action_worker(
                 binding,
                 source,
                 session,
+                effort,
                 target,
                 ..
-            } => {
-                // This lookup belongs in the serialized worker: it is the last
-                // possible moment before delivery, not the physical event time.
-                (|| {
-                    let agents = list_agents(&session, &base)?;
-                    if generation != routing_generation.load(Ordering::Acquire) {
-                        log(format!("{source} ignored: stale Herdr routing"));
-                        return Ok(());
-                    }
-                    let current = agents.iter().find(|agent| agent.focused);
-                    if agent_identity(current) != agent_identity(target.as_ref()) {
-                        log(format!("{source} ignored: focused pane changed"));
-                        return Ok(());
-                    }
-                    let Some(action) =
-                        binding.resolve(current.map(|agent| agent.agent.as_str()).unwrap_or(""))
-                    else {
-                        return Ok(());
-                    };
-                    let executed = {
-                        let _command_latency =
-                            LatencySpan::new("command", Some(action_name(&action)));
-                        execute_action(&action, current, &session, &base, &mappings, repeat)
-                    }?;
-                    if executed {
-                        log(format!(
-                            "{source}: {}{} in {session}{}",
-                            action_name(&action),
-                            if repeat > 1 {
-                                format!(" x{repeat}")
-                            } else {
-                                String::new()
-                            },
-                            current
-                                .map(|agent| format!(" for {} in {}", agent.agent, agent.pane_id))
-                                .unwrap_or_default()
-                        ));
-                    }
-                    Ok(())
-                })()
-            }
+            } => (|| {
+                let current = snapshot.agents.iter().find(|agent| agent.focused);
+                if agent_identity(current) != target {
+                    log(format!("{source} ignored: focused pane changed"));
+                    return Ok(());
+                }
+                let Some(action) = binding.resolve(
+                    current
+                        .and_then(|agent| agent.agent.as_deref())
+                        .unwrap_or(""),
+                ) else {
+                    return Ok(());
+                };
+                let executed =
+                    execute_action(&action, current, &snapshot, &effort, repeat, &lease)?;
+                if executed {
+                    log(format!(
+                        "{source}: {}{} in {}{}",
+                        action_name(&action),
+                        if repeat > 1 {
+                            format!(" x{repeat}")
+                        } else {
+                            String::new()
+                        },
+                        session.name,
+                        current
+                            .map(|agent| format!(
+                                " for {} in {}",
+                                agent.agent.as_deref().unwrap_or("unknown"),
+                                agent.pane_id
+                            ))
+                            .unwrap_or_default()
+                    ));
+                }
+                Ok(())
+            })(),
         };
         if let Err(error) = result {
             log(format!("control failed: {error:#}"));
@@ -655,7 +634,7 @@ fn action_worker(
 }
 
 fn execute_key(key: Option<&str>, keycode: Option<u16>, modifiers: &[Modifier]) -> Result<()> {
-    let code = crate::config::key_action_code(key, keycode).map_err(|error| anyhow!(error))?;
+    let code = key_action_code(key, keycode).map_err(|error| anyhow!(error))?;
     macos::post_key(code, modifiers)
 }
 
@@ -663,8 +642,9 @@ fn queue_binding(
     sender: &SyncSender<Work>,
     binding: Binding,
     source: String,
-    session: Option<String>,
-    target: Option<Agent>,
+    route: Option<(Session, String)>,
+    effort: &EffortConfig,
+    target: Option<AgentInfo>,
     generation: u64,
 ) {
     // Key taps are system-wide by nature: fire from any frontmost app while
@@ -681,15 +661,16 @@ fn queue_binding(
         }
         return;
     }
-    match session {
-        Some(session) => {
+    match route {
+        Some((session, terminal)) => {
             let work = Work::Binding {
                 binding: Box::new(binding),
                 source,
                 session,
-                target,
+                terminal,
+                effort: effort.clone(),
+                target: agent_identity(target.as_ref()),
                 generation,
-                queued_at: Instant::now(),
             };
             if let Err(error) = sender.try_send(work) {
                 log(match error {
@@ -704,18 +685,25 @@ fn queue_binding(
 
 fn handle_fired(
     sender: &SyncSender<Work>,
-    target: Option<Agent>,
-    generation: u64,
+    context: &InputContext,
+    routing_generation: &AtomicU64,
     fired: Vec<Fired>,
 ) {
     for fired in fired {
+        let route = context.selected(routing_generation).filter(|(session, _)| {
+            fired
+                .context
+                .as_deref()
+                .is_some_and(|name| name == session.name)
+        });
         queue_binding(
             sender,
             Binding::Action(fired.action),
             fired.source,
-            fired.context,
-            target.clone(),
-            generation,
+            route,
+            &context.effort,
+            context.target.clone(),
+            context.generation,
         );
     }
 }
@@ -777,6 +765,7 @@ fn handle_device_event(
                     Binding::Action(action),
                     format!("joystick {}", next.direction.unwrap()),
                     context.selected(routing_generation),
+                    &context.effort,
                     context.target.clone(),
                     context.generation,
                 );
@@ -788,13 +777,13 @@ fn handle_device_event(
                     let session = context.selected(routing_generation);
                     let agent = context.slots[index].as_ref();
                     match (session, agent) {
-                        (Some(session), Some(agent)) => {
+                        (Some((session, terminal)), Some(agent)) => {
                             let work = Work::FocusSlot {
                                 pane_id: agent.pane_id.clone(),
                                 source: key,
                                 session,
+                                terminal,
                                 generation: context.generation,
-                                queued_at: Instant::now(),
                             };
                             if let Err(error) = worker.try_send(work) {
                                 log(match error {
@@ -812,6 +801,7 @@ fn handle_device_event(
             }
             let binding = key_binding(controls, &key, action);
             let captured = context.selected(routing_generation);
+            let gesture_context = captured.as_ref().map(|(session, _)| session.name.clone());
             if matches!(key.as_str(), "ENC_CC" | "ENC_CW") {
                 if let Some(binding) = binding {
                     queue_binding(
@@ -819,6 +809,7 @@ fn handle_device_event(
                         binding,
                         key,
                         captured,
+                        &context.effort,
                         context.target.clone(),
                         context.generation,
                     );
@@ -827,13 +818,13 @@ fn handle_device_event(
                 match binding.as_ref() {
                     Some(Binding::Gesture(_)) => handle_fired(
                         worker,
-                        context.target.clone(),
-                        context.generation,
+                        context,
+                        routing_generation,
                         state.gestures.handle(
                             key,
                             binding.as_ref(),
                             action == 1,
-                            captured,
+                            gesture_context,
                             Instant::now(),
                         ),
                     ),
@@ -842,6 +833,7 @@ fn handle_device_event(
                         binding.unwrap(),
                         key,
                         captured,
+                        &context.effort,
                         context.target.clone(),
                         context.generation,
                     ),
@@ -852,89 +844,77 @@ fn handle_device_event(
     }
 }
 
+fn refresh_input_context(
+    shared: &Mutex<Arc<InputContext>>,
+    context: &mut Arc<InputContext>,
+    state: &mut InputState,
+    routing_generation: &AtomicU64,
+) {
+    let next = Arc::clone(&shared.lock().unwrap_or_else(|error| error.into_inner()));
+    if next.generation != context.generation
+        || next.generation != routing_generation.load(Ordering::Acquire)
+    {
+        state.gestures.clear();
+        state.last_joystick_sector = None;
+    } else if next.controls != context.controls {
+        state.gestures.clear();
+    }
+    *context = next;
+}
+
 fn input_worker(
     receiver: Receiver<DeviceEvent>,
-    context: Arc<Mutex<InputContext>>,
+    shared: Arc<Mutex<Arc<InputContext>>>,
     routing_generation: Arc<AtomicU64>,
     work: SyncSender<Work>,
     notices: Sender<InputNotice>,
     stopping: Arc<AtomicBool>,
 ) {
     let mut state = InputState::default();
-    let mut previous = context
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .clone();
+    let mut context = Arc::clone(&shared.lock().unwrap_or_else(|error| error.into_inner()));
     while !stopping.load(Ordering::Acquire) {
-        let current = context
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone();
-        let generation = routing_generation.load(Ordering::Acquire);
-        if current.generation != previous.generation || current.generation != generation {
-            state.gestures.clear();
-            state.last_joystick_sector = None;
-        } else if current.controls != previous.controls {
-            state.gestures.clear();
-        }
-        previous = current.clone();
+        refresh_input_context(&shared, &mut context, &mut state, &routing_generation);
         handle_fired(
             &work,
-            current.target.clone(),
-            current.generation,
+            &context,
+            &routing_generation,
             state.gestures.drain_due(Instant::now()),
         );
-        let wait = state
-            .gestures
-            .next_deadline()
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-            .unwrap_or(Duration::from_millis(20))
-            .min(Duration::from_millis(20));
-        match receiver.recv_timeout(wait) {
-            Ok(event) => {
-                let kind = match &event {
-                    DeviceEvent::Key { .. } => "key",
-                    DeviceEvent::Joystick { .. } => "joystick",
-                    DeviceEvent::Disconnected { .. } => "disconnect",
-                };
-                let _latency = LatencySpan::new("input", Some(kind));
-                handle_device_event(
-                    event,
-                    &mut state,
-                    &current,
-                    &routing_generation,
-                    &work,
-                    &notices,
-                );
+        let event = match state.gestures.next_deadline() {
+            Some(deadline) => {
+                match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(event) => Some(event),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
             }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
+            None => match receiver.recv() {
+                Ok(event) => Some(event),
+                Err(_) => break,
+            },
+        };
+        if let Some(event) = event {
+            refresh_input_context(&shared, &mut context, &mut state, &routing_generation);
+            handle_device_event(
+                event,
+                &mut state,
+                &context,
+                &routing_generation,
+                &work,
+                &notices,
+            );
         }
     }
     state.gestures.clear();
 }
 
 fn send_lighting(device: &HidClient, state: &mut State) -> Result<()> {
-    let _latency = LatencySpan::new("lighting", None);
-    let config = match load_lighting(&config_path("lighting.json")) {
-        Ok(config) => {
-            state.last_lighting_error.clear();
-            config
-        }
-        Err(error) => {
-            if state.last_lighting_error != error {
-                state.last_lighting_error = error.clone();
-                log(format!("lighting configuration failed: {error}"));
-            }
-            return Ok(());
-        }
-    };
-    let slots_value: Vec<_> = slot_lighting(&state.slots, &state.agents, &config)
+    let slots_value: Vec<_> = slot_lighting(&state.slots, &state.agents, &state.config.lighting)
         .into_iter()
         .enumerate()
         .map(|(id, light)| json!({"id":id,"c":light.c,"b":light.b,"e":light.e,"s":light.s}))
         .collect();
-    let mut aggregate = aggregate_lighting(&state.slots, &state.agents, &config);
+    let mut aggregate = aggregate_lighting(&state.slots, &state.agents, &state.config.lighting);
     let next_zones: HashSet<_> = aggregate.keys().cloned().collect();
     for zone in &state.managed_aggregate_zones {
         if !next_zones.contains(zone) {
@@ -977,7 +957,6 @@ fn send_lighting(device: &HidClient, state: &mut State) -> Result<()> {
 }
 
 fn close_device(device: &mut Option<HidClient>, state: &mut State, blank: bool) {
-    let _latency = LatencySpan::new("device-close", None);
     state.last_lighting.clear();
     let restore_was_pending = state.device_restore_pending;
     let Some(mut device) = device.take() else {
@@ -1065,16 +1044,18 @@ fn routing_failure(state: &mut State, message: impl Into<String>) {
 
 fn refresh_sessions(
     state: &mut State,
-    base: &Environment,
     device: Option<&HidClient>,
-    mappings: &Arc<Mutex<Vec<SessionTerminalMapping>>>,
+    workers: &mut HashMap<String, SessionWorker>,
+    worker_generation: &mut u64,
+    updates: &Sender<SessionUpdate>,
+    stopping: &Arc<AtomicBool>,
 ) -> Result<bool> {
-    let _latency = LatencySpan::new("sessions", None);
-    let discovered = match discover_sessions(base) {
+    let discovered = match discover_sessions() {
         Ok(sessions) => sessions,
         Err(error) => {
-            routing_failure(state, error.to_string());
             state.revoke_routing();
+            state.mappings.clear();
+            routing_failure(state, error.to_string());
             return Err(error);
         }
     };
@@ -1085,69 +1066,100 @@ fn refresh_sessions(
         state.no_sessions_at = None;
     }
     let changed = discovered != state.sessions;
+    let names: HashSet<_> = discovered
+        .iter()
+        .map(|session| session.name.as_str())
+        .collect();
+    workers.retain(|name, _| names.contains(name.as_str()));
+    for session in &discovered {
+        let replace = !workers.contains_key(&session.name)
+            || state
+                .sessions
+                .iter()
+                .find(|current| current.name == session.name)
+                != Some(session);
+        if replace {
+            state.session_agents.remove(&session.name);
+            *worker_generation += 1;
+            workers.insert(
+                session.name.clone(),
+                spawn_session_worker(
+                    session.clone(),
+                    *worker_generation,
+                    updates.clone(),
+                    Arc::clone(stopping),
+                ),
+            );
+        }
+    }
+    state
+        .session_agents
+        .retain(|name, _| names.contains(name.as_str()));
+    state
+        .session_slots
+        .retain(|name, _| names.contains(name.as_str()));
     state.sessions = discovered;
     if state
         .selected_session
         .as_ref()
-        .is_some_and(|session| !state.sessions.contains(session))
+        .is_some_and(|name| !state.sessions.iter().any(|session| session.name == *name))
     {
         select_session(device, state, None)?;
     }
+    if state
+        .selected_session
+        .as_ref()
+        .is_some_and(|name| !state.session_agents.contains_key(name))
+    {
+        apply_selected_agents(state, device)?;
+    }
     if changed {
         state.mappings.clear();
-        *mappings.lock().unwrap_or_else(|error| error.into_inner()) = Vec::new();
-        let _ = refresh_mappings(state, base, mappings)?;
+        refresh_mappings(state);
     }
     Ok(state
         .no_sessions_at
         .is_some_and(|at| now.duration_since(at) >= NO_SESSIONS_SHUTDOWN))
 }
 
-fn refresh_mappings(
-    state: &mut State,
-    base: &Environment,
-    mappings: &Arc<Mutex<Vec<SessionTerminalMapping>>>,
-) -> Result<bool> {
+fn refresh_mappings(state: &mut State) {
     state.next_mapping_probe = None;
     if state.sessions.is_empty() {
+        state.revoke_routing();
         state.mappings.clear();
-        *mappings.lock().unwrap_or_else(|error| error.into_inner()) = Vec::new();
-        return Ok(true);
+        return;
     }
-    state.revoke_routing();
-    match probe_session_terminals(&state.sessions, base) {
+    match probe_session_terminals(&state.sessions) {
         Ok(found) => {
-            state.mappings = found;
-            *mappings.lock().unwrap_or_else(|error| error.into_inner()) = state.mappings.clone();
+            let changed = state.mappings != found;
+            if changed {
+                state.revoke_routing();
+                state.mappings = found;
+            }
+            state.next_mapping_probe = Some(Instant::now() + MAPPING_REFRESH_INTERVAL);
             state.last_routing_error.clear();
-            log(format!(
-                "Herdr sessions mapped: {}",
-                state
-                    .mappings
-                    .iter()
-                    .map(|mapping| format!("{}={}", mapping.session_name, mapping.terminal_id))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
+            if changed {
+                log(format!(
+                    "Herdr sessions mapped: {}",
+                    state
+                        .mappings
+                        .iter()
+                        .map(|mapping| format!("{}={}", mapping.session_name, mapping.terminal_id))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
         }
         Err(error) => {
+            state.revoke_routing();
             state.mappings.clear();
-            *mappings.lock().unwrap_or_else(|error| error.into_inner()) = Vec::new();
-            state.next_mapping_probe = Some(Instant::now() + REFRESH_INTERVAL);
+            state.next_mapping_probe = Some(Instant::now() + MAPPING_REFRESH_INTERVAL);
             routing_failure(state, error.to_string());
-            return Ok(false);
         }
     }
-    Ok(true)
 }
 
-fn refresh_routing(
-    state: &mut State,
-    base: &Environment,
-    device: Option<&HidClient>,
-    mappings: &Arc<Mutex<Vec<SessionTerminalMapping>>>,
-) -> Result<bool> {
-    let _latency = LatencySpan::new("routing", None);
+fn refresh_routing(state: &mut State, device: Option<&HidClient>) -> Result<bool> {
     let Some(frontmost_process) = state
         .frontmost
         .as_ref()
@@ -1156,48 +1168,42 @@ fn refresh_routing(
         state.revoke_routing();
         return Ok(false);
     };
-    if frontmost_process != crate::actions::GHOSTTY_PROCESS {
-        state.ghostty = None;
+    if frontmost_process != GHOSTTY_PROCESS {
+        let changed = state.focused_terminal.take().is_some();
+        let previous_layer = state.active_layer;
+        state.next_mapping_probe = None;
         state.revoke_routing();
         select_layer(
             device,
             state,
             automatic_layer(Some(&frontmost_process), None),
         )?;
-        return Ok(false);
+        return Ok(changed || previous_layer != state.active_layer);
     }
-    match inspect_ghostty() {
-        Ok(mut ghostty) => {
-            let mapping_stale = state.mappings.len() != state.sessions.len()
-                || state.mappings.iter().any(|mapping| {
-                    !ghostty
-                        .terminals
-                        .iter()
-                        .any(|terminal| terminal.id == mapping.terminal_id)
-                });
-            if mapping_stale
-                && state
-                    .next_mapping_probe
-                    .is_none_or(|due| Instant::now() >= due)
-            {
-                if !refresh_mappings(state, base, mappings)? {
-                    state.revoke_routing();
-                    return Ok(false);
-                }
-                ghostty = match inspect_ghostty() {
-                    Ok(ghostty) => ghostty,
-                    Err(error) => {
-                        routing_failure(state, error.to_string());
-                        state.revoke_routing();
-                        return Ok(false);
-                    }
-                };
+    match focused_terminal_id() {
+        Ok(terminal) => {
+            let terminal_changed = state.focused_terminal.as_deref() != Some(&terminal);
+            let previous_layer = state.active_layer;
+            state.focused_terminal = Some(terminal.clone());
+            let mut session = state
+                .mappings
+                .iter()
+                .find(|mapping| mapping.terminal_id == terminal)
+                .map(|mapping| mapping.session_name.clone());
+            if terminal_changed && session.is_none() {
+                refresh_mappings(state);
+                session = state
+                    .mappings
+                    .iter()
+                    .find(|mapping| mapping.terminal_id == terminal)
+                    .map(|mapping| mapping.session_name.clone());
             }
-            let session = focused_session(&state.mappings, &ghostty);
-            state.ghostty = Some(ghostty);
-            let Some(session) = session.filter(|session| state.sessions.contains(session)) else {
+            let Some(session) =
+                session.filter(|name| state.sessions.iter().any(|session| session.name == *name))
+            else {
+                state.next_mapping_probe.get_or_insert(Instant::now());
                 state.revoke_routing();
-                return Ok(false);
+                return Ok(terminal_changed);
             };
             select_session(device, state, Some(session.clone()))?;
             select_layer(
@@ -1206,7 +1212,8 @@ fn refresh_routing(
                 automatic_layer(Some(&frontmost_process), Some(&session)),
             )?;
             state.last_routing_error.clear();
-            return Ok(true);
+            apply_selected_agents(state, device)?;
+            return Ok(terminal_changed || previous_layer != state.active_layer);
         }
         Err(error) => {
             routing_failure(state, error.to_string());
@@ -1216,16 +1223,21 @@ fn refresh_routing(
     Ok(false)
 }
 
-fn refresh_agents(state: &mut State, base: &Environment, device: Option<&HidClient>) -> Result<()> {
-    let _latency = LatencySpan::new("agents", None);
+fn apply_selected_agents(state: &mut State, device: Option<&HidClient>) -> Result<()> {
     let Some(session) = state.selected_session.clone() else {
         return Ok(());
     };
-    match list_agents(&session, base) {
-        Ok(agents) => {
-            if state.selected_session.as_deref() != Some(&session) {
-                return Ok(());
-            }
+    let (available, agents) = match state.session_agents.get(&session) {
+        Some(agents) => (true, (*agents != state.agents).then(|| agents.clone())),
+        None => (false, None),
+    };
+    if available && agents.is_none() {
+        state.routing_ready = true;
+        state.last_herdr_error.clear();
+        return Ok(());
+    }
+    match agents {
+        Some(agents) => {
             if agent_identity(state.agents.iter().find(|agent| agent.focused))
                 != agent_identity(agents.iter().find(|agent| agent.focused))
             {
@@ -1246,10 +1258,7 @@ fn refresh_agents(state: &mut State, base: &Environment, device: Option<&HidClie
                 send_lighting(device, state)?;
             }
         }
-        Err(error) => {
-            if state.selected_session.as_deref() != Some(&session) {
-                return Ok(());
-            }
+        None => {
             let had_state = state.routing_ready
                 || !state.agents.is_empty()
                 || state.slots.iter().any(Option::is_some);
@@ -1262,41 +1271,110 @@ fn refresh_agents(state: &mut State, base: &Environment, device: Option<&HidClie
                     send_lighting(device, state)?;
                 }
             }
-            if state.last_herdr_error != error.to_string() {
-                state.last_herdr_error = error.to_string();
-                log(format!("Herdr session {session} unavailable: {error}"));
-            }
         }
     }
     Ok(())
 }
 
-fn refresh_frontmost(state: &mut State) {
-    let _latency = LatencySpan::new("frontmost", None);
-    match macos::frontmost() {
-        Ok(frontmost) => {
-            state.frontmost = Some(frontmost);
-            state.last_frontmost_error.clear();
+fn apply_session_update(
+    state: &mut State,
+    update: SessionUpdate,
+    workers: &HashMap<String, SessionWorker>,
+    device: Option<&HidClient>,
+) -> Result<bool> {
+    let (session, generation) = match &update {
+        SessionUpdate::Agents {
+            session,
+            generation,
+            ..
         }
-        Err(error) if state.last_frontmost_error != error.to_string() => {
-            state.frontmost = None;
-            state.revoke_routing();
-            state.last_frontmost_error = error.to_string();
-            log(format!("frontmost window unavailable: {error}"));
+        | SessionUpdate::Unavailable {
+            session,
+            generation,
+            ..
+        } => (session, *generation),
+    };
+    if workers.get(session).map(|worker| worker.generation) != Some(generation) {
+        return Ok(false);
+    }
+    match update {
+        SessionUpdate::Agents {
+            session, agents, ..
+        } => {
+            state.session_agents.insert(session.clone(), agents);
+            if state.routing_ready
+                && state.owner.is_none()
+                && state.selected_session.as_deref() == Some(&session)
+                && state
+                    .frontmost
+                    .as_ref()
+                    .is_some_and(|frontmost| frontmost.process == GHOSTTY_PROCESS)
+            {
+                state.last_herdr_error.clear();
+                apply_selected_agents(state, device)?;
+            }
+            Ok(false)
         }
-        Err(_) => {
-            state.frontmost = None;
-            state.revoke_routing();
+        SessionUpdate::Unavailable { session, error, .. } => {
+            let became_unavailable = state.session_agents.remove(&session).is_some();
+            if state.selected_session.as_deref() == Some(&session) {
+                apply_selected_agents(state, device)?;
+                if state.last_herdr_error != error {
+                    state.last_herdr_error = error.clone();
+                    log(format!("Herdr session {session} unavailable: {error}"));
+                }
+            }
+            Ok(became_unavailable)
         }
     }
 }
 
-fn refresh_owner(state: &mut State, device: &mut Option<HidClient>) {
+fn refresh_frontmost(state: &mut State) -> bool {
+    match macos::frontmost_pid() {
+        Ok(pid) if state.frontmost.as_ref().is_some_and(|app| app.pid == pid) => return false,
+        Ok(_) => {}
+        Err(error) => {
+            let changed = state.frontmost.take().is_some();
+            state.revoke_routing();
+            if state.last_frontmost_error != error.to_string() {
+                state.last_frontmost_error = error.to_string();
+                log(format!("frontmost window unavailable: {error}"));
+            }
+            return changed;
+        }
+    }
+    match macos::frontmost() {
+        Ok(frontmost) => {
+            let changed = state.frontmost.as_ref() != Some(&frontmost);
+            state.frontmost = Some(frontmost);
+            state.last_frontmost_error.clear();
+            changed
+        }
+        Err(error) if state.last_frontmost_error != error.to_string() => {
+            let changed = state.frontmost.take().is_some();
+            state.revoke_routing();
+            state.last_frontmost_error = error.to_string();
+            log(format!("frontmost window unavailable: {error}"));
+            changed
+        }
+        Err(_) => {
+            let changed = state.frontmost.take().is_some();
+            state.revoke_routing();
+            changed
+        }
+    }
+}
+
+fn refresh_owner(state: &mut State, device: &mut Option<HidClient>) -> bool {
     let frontmost = state
         .frontmost
         .as_ref()
         .map(|frontmost| frontmost.process.clone());
-    let owner = device_owner(frontmost.as_deref()).map(str::to_owned);
+    let owner = device_owner(
+        macos::bundle_is_running(INPUT_BUNDLE_ID),
+        frontmost.as_deref(),
+    )
+    .map(str::to_owned);
     if owner != state.owner {
         state.owner = owner;
         if let Some(owner) = &state.owner {
@@ -1307,6 +1385,9 @@ fn refresh_owner(state: &mut State, device: &mut Option<HidClient>) {
             log("device owner cleared");
             state.next_device_open = None;
         }
+        true
+    } else {
+        false
     }
 }
 
@@ -1314,15 +1395,14 @@ fn open_device(
     device: &mut Option<HidClient>,
     event_tx: &Sender<DeviceEvent>,
     state: &mut State,
-) -> Result<()> {
-    let _latency = LatencySpan::new("device-open", None);
+) -> Result<bool> {
     if device.is_some()
         || (state.owner.is_some() && !state.device_restore_pending)
         || state
             .next_device_open
             .is_some_and(|deadline| Instant::now() < deadline)
     {
-        return Ok(());
+        return Ok(false);
     }
     state.next_device_open = None;
     match HidClient::connect(event_tx.clone()) {
@@ -1360,56 +1440,91 @@ fn open_device(
         Err(error) => {
             state.next_device_open = Some(Instant::now() + DEVICE_RETRY_INTERVAL);
             let message = error.to_string();
-            state.device_state = if message.contains("not found") {
-                "absent"
-            } else if message.contains("helper") {
-                "helper-error"
-            } else {
-                "busy"
-            }
-            .into();
+            state.device_state = connection_error_state(&error).into();
             if state.last_device_error != message {
                 state.last_device_error = message.clone();
                 log(format!("device open failed: {message}"));
             }
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 fn publish(status: &Arc<Mutex<Value>>, state: &State) {
     *status.lock().unwrap_or_else(|error| error.into_inner()) = state.status();
 }
 
-fn publish_input(context: &Arc<Mutex<InputContext>>, state: &State, controls: &Controls) {
-    let agents_by_id: HashMap<_, _> = state
-        .agents
-        .iter()
-        .map(|agent| (agent.terminal_id.as_str(), agent))
-        .collect();
-    *context.lock().unwrap_or_else(|error| error.into_inner()) = InputContext {
-        controls: controls.clone(),
-        session: state.selected_session.clone(),
-        target: state.agents.iter().find(|agent| agent.focused).cloned(),
+fn update_input_context(context: &Mutex<Arc<InputContext>>, state: &State) {
+    let target = state.agents.iter().find(|agent| agent.focused);
+    let session = state
+        .selected_session
+        .as_ref()
+        .and_then(|name| state.sessions.iter().find(|session| session.name == *name));
+    *context.lock().unwrap_or_else(|error| error.into_inner()) = Arc::new(InputContext {
+        controls: state.config.controls.clone(),
+        effort: state.config.effort.clone(),
+        session: session.cloned(),
+        terminal: state.focused_terminal.clone(),
+        target: target.cloned(),
         slots: state
             .slots
             .iter()
             .map(|id| {
                 id.as_deref()
-                    .and_then(|id| agents_by_id.get(id))
-                    .map(|agent| (*agent).clone())
+                    .and_then(|id| state.agents.iter().find(|agent| agent.terminal_id == id))
+                    .cloned()
             })
             .collect(),
         routing_ready: state.routing_ready,
         generation: state.routing_generation(),
-    };
+    });
 }
 
-fn apply_input_notice(state: &mut State, notice: InputNotice) -> bool {
-    match notice {
-        InputNotice::Disconnected(error) => {
-            device_disconnected(state, error);
-            true
+fn handle_input_notice(
+    state: &mut State,
+    device: &mut Option<HidClient>,
+    notice: InputNotice,
+) -> bool {
+    if device.is_none() {
+        return false;
+    }
+    let InputNotice::Disconnected(error) = notice;
+    device_disconnected(state, error);
+    state.revoke_routing();
+    close_device(device, state, false);
+    true
+}
+
+fn apply_config_load(
+    state: &mut State,
+    loaded: std::result::Result<Config, String>,
+    startup_enabled_buttons: [bool; 7],
+) -> bool {
+    match loaded {
+        Ok(next) => {
+            let pending = (enabled_buttons(&next.controls) != startup_enabled_buttons)
+                .then_some("button enable changes require micro-setup and a bridge restart");
+            let error_changed = state.last_controls_error != pending.unwrap_or_default();
+            if error_changed {
+                if let Some(pending) = pending {
+                    log(format!("control configuration pending: {pending}"));
+                }
+                state.last_controls_error = pending.unwrap_or_default().into();
+            }
+            let config_changed = state.config != next;
+            if config_changed {
+                state.config = next;
+                state.last_lighting.clear();
+            }
+            config_changed
+        }
+        Err(error) => {
+            if state.last_controls_error == error {
+                return false;
+            }
+            state.last_controls_error = error.clone();
+            log(format!("control configuration failed: {error}"));
+            false
         }
     }
 }
@@ -1417,28 +1532,23 @@ fn apply_input_notice(state: &mut State, notice: InputNotice) -> bool {
 /// Run the bridge in the foreground.  `main`/the start action owns process
 /// detachment; this function deliberately owns only the live daemon.
 pub fn run_daemon() -> Result<()> {
-    let base = current_environment();
-    let controls_path = config_path("controls.json");
-    provision_controls(&controls_path).map_err(|error| anyhow!(error))?;
-    provision_effort(&config_path("effort.json")).map_err(|error| anyhow!(error))?;
-    provision_lighting(&config_path("lighting.json")).map_err(|error| anyhow!(error))?;
-    let mut controls = load_controls(&controls_path).map_err(|error| anyhow!(error))?;
-    let startup_enabled_buttons = crate::config::enabled_buttons(&controls);
+    let config_path = config_path();
+    provision(&config_path).map_err(|error| anyhow!(error))?;
+    let config = load(&config_path).map_err(|error| anyhow!(error))?;
+    let startup_enabled_buttons = enabled_buttons(&config.controls);
     let (device_tx, device_rx) = mpsc::channel();
     let (input_notice_tx, input_notice_rx) = mpsc::channel();
     let (work_tx, work_rx) = mpsc::sync_channel(WORK_QUEUE_CAPACITY);
-    let mappings = Arc::new(Mutex::new(Vec::new()));
+    let (session_update_tx, session_update_rx) = mpsc::channel();
     let stopping = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(SIGINT, Arc::clone(&stopping))?;
     signal_hook::flag::register(SIGTERM, Arc::clone(&stopping))?;
-    let mut state = State::new();
-    let input_context = Arc::new(Mutex::new(InputContext::new(controls.clone())));
+    let mut state = State::new(config);
+    let input_context = Arc::new(Mutex::new(Arc::new(InputContext::new(&state.config))));
     let worker = thread::spawn({
-        let mappings = Arc::clone(&mappings);
-        let base = base.clone();
         let routing_generation = Arc::clone(&state.routing_generation);
         let stopping = Arc::clone(&stopping);
-        move || action_worker(work_rx, base, mappings, routing_generation, stopping)
+        move || action_worker(work_rx, routing_generation, stopping)
     });
     let input = thread::spawn({
         let context = Arc::clone(&input_context);
@@ -1475,114 +1585,148 @@ pub fn run_daemon() -> Result<()> {
     });
     let mut device = None;
     let mut routing_due = Instant::now();
-    let mut state_due = Instant::now();
+    let mut config_due = Instant::now();
+    let mut sessions_due = Instant::now();
     let mut sessions_ready = true;
+    let mut session_workers = HashMap::new();
+    let mut worker_generation = 0;
     log("bridge started");
-    if latency_trace_enabled() {
-        log("latency trace started");
-    }
     while !stopping.load(Ordering::Acquire) {
         let mut changed = false;
         while let Ok(notice) = input_notice_rx.try_recv() {
-            if matches!(notice, InputNotice::Disconnected(_)) && device.is_none() {
-                continue;
-            }
-            if apply_input_notice(&mut state, notice) {
-                state.revoke_routing();
-                close_device(&mut device, &mut state, false);
+            changed |= handle_input_notice(&mut state, &mut device, notice);
+        }
+        while let Ok(update) = session_update_rx.try_recv() {
+            match apply_session_update(&mut state, update, &session_workers, device.as_ref()) {
+                Ok(true) => {
+                    sessions_due = sessions_due.min(Instant::now() + SESSION_RETRY_INTERVAL);
+                }
+                Ok(false) => {}
+                Err(error) => log(format!("Herdr session update failed: {error:#}")),
             }
             changed = true;
         }
         let now = Instant::now();
-        let refresh_state = now >= state_due;
-        if refresh_state {
-            state_due = now + REFRESH_INTERVAL;
-            match load_controls(&controls_path) {
-                Ok(next) => {
-                    controls = next;
-                    if crate::config::enabled_buttons(&controls) != startup_enabled_buttons {
-                        let pending =
-                            "button enable changes require micro-setup and a bridge restart";
-                        if state.last_controls_error != pending {
-                            log(format!("control configuration pending: {pending}"));
+        if now >= config_due {
+            config_due = now + CONFIG_REFRESH_INTERVAL;
+            changed |= apply_config_load(&mut state, load(&config_path), startup_enabled_buttons);
+            if let Some(device) = device.as_ref() {
+                match send_lighting(device, &mut state) {
+                    Ok(()) => state.last_lighting_error.clear(),
+                    Err(error) => {
+                        let error = format!("{error:#}");
+                        if state.last_lighting_error != error {
+                            log(format!("lighting update failed: {error}"));
+                            state.last_lighting_error = error;
                         }
-                        state.last_controls_error = pending.into();
-                    } else {
-                        state.last_controls_error.clear();
                     }
                 }
-                Err(error) if state.last_controls_error != error => {
-                    state.last_controls_error = error.clone();
-                    log(format!("control configuration failed: {error}"));
-                }
-                Err(_) => {}
             }
+        }
+        if now >= sessions_due {
+            sessions_due = now + SESSION_REFRESH_INTERVAL;
             if state.owner.is_none() {
-                sessions_ready =
-                    match refresh_sessions(&mut state, &base, device.as_ref(), &mappings) {
-                        Ok(shutdown) => {
-                            if shutdown {
-                                log("No Herdr sessions for 60 seconds; releasing device");
-                                stopping.store(true, Ordering::Release);
-                            }
-                            true
+                sessions_ready = match refresh_sessions(
+                    &mut state,
+                    device.as_ref(),
+                    &mut session_workers,
+                    &mut worker_generation,
+                    &session_update_tx,
+                    &stopping,
+                ) {
+                    Ok(shutdown) => {
+                        if shutdown {
+                            log("No Herdr sessions for 60 seconds; releasing device");
+                            stopping.store(true, Ordering::Release);
                         }
-                        Err(error) => {
-                            log(format!("refresh failed: {error:#}"));
-                            false
-                        }
-                    };
+                        true
+                    }
+                    Err(error) => {
+                        log(format!("refresh failed: {error:#}"));
+                        sessions_due = now + SESSION_RETRY_INTERVAL;
+                        false
+                    }
+                };
             }
+            changed = true;
+        }
+        if state.owner.is_none()
+            && state
+                .next_mapping_probe
+                .is_some_and(|deadline| now >= deadline)
+        {
+            refresh_mappings(&mut state);
             changed = true;
         }
         if now >= routing_due {
             routing_due = now + ROUTING_REFRESH_INTERVAL;
-            let previous_session = state.selected_session.clone();
-            refresh_frontmost(&mut state);
-            refresh_owner(&mut state, &mut device);
+            let input_generation = state.routing_generation();
+            let input_ready = state.routing_ready;
+            let previous_owner = state.owner.clone();
+            changed |= refresh_frontmost(&mut state);
+            changed |= refresh_owner(&mut state, &mut device);
+            if previous_owner.is_some() && state.owner.is_none() {
+                sessions_due = now;
+            }
             if state.owner.is_none() && sessions_ready {
-                let routing_ready =
-                    match refresh_routing(&mut state, &base, device.as_ref(), &mappings) {
-                        Ok(ready) => ready,
-                        Err(error) => {
-                            state.revoke_routing();
-                            log(format!("refresh failed: {error:#}"));
-                            false
-                        }
-                    };
-                if let Err(error) = open_device(&mut device, &device_tx, &mut state) {
-                    log(format!("refresh failed: {error:#}"));
+                match refresh_routing(&mut state, device.as_ref()) {
+                    Ok(routing_changed) => changed |= routing_changed,
+                    Err(error) => {
+                        state.revoke_routing();
+                        changed = true;
+                        log(format!("refresh failed: {error:#}"));
+                    }
                 }
-                if routing_ready
-                    && (refresh_state
-                        || previous_session != state.selected_session
-                        || !state.routing_ready)
-                {
-                    if let Err(error) = refresh_agents(&mut state, &base, device.as_ref()) {
+                match open_device(&mut device, &device_tx, &mut state) {
+                    Ok(device_changed) => changed |= device_changed,
+                    Err(error) => {
+                        changed = true;
                         log(format!("refresh failed: {error:#}"));
                     }
                 }
             }
             if state.owner.is_some() && state.device_restore_pending {
-                if let Err(error) = open_device(&mut device, &device_tx, &mut state) {
-                    log(format!("native HID recovery failed: {error:#}"));
+                match open_device(&mut device, &device_tx, &mut state) {
+                    Ok(device_changed) => changed |= device_changed,
+                    Err(error) => {
+                        changed = true;
+                        log(format!("native HID recovery failed: {error:#}"));
+                    }
                 }
             }
-            changed = true;
+            changed |= input_generation != state.routing_generation()
+                || input_ready != state.routing_ready;
+        }
+        if sessions_ready
+            && state
+                .frontmost
+                .as_ref()
+                .is_some_and(|frontmost| frontmost.process == GHOSTTY_PROCESS)
+            && state.focused_terminal.as_ref().is_some_and(|terminal| {
+                !state
+                    .mappings
+                    .iter()
+                    .any(|mapping| mapping.terminal_id == *terminal)
+            })
+        {
+            sessions_due = sessions_due.min(
+                state
+                    .next_mapping_probe
+                    .unwrap_or(now + SESSION_RETRY_INTERVAL),
+            );
         }
         if changed {
-            publish_input(&input_context, &state, &controls);
+            update_input_context(&input_context, &state);
             publish(&status, &state);
         }
-        let deadline = routing_due.min(state_due);
+        let deadline = routing_due
+            .min(config_due)
+            .min(sessions_due)
+            .min(state.next_mapping_probe.unwrap_or(sessions_due));
         match input_notice_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
             Ok(notice) => {
-                if !matches!(notice, InputNotice::Disconnected(_)) || device.is_some() {
-                    if apply_input_notice(&mut state, notice) {
-                        state.revoke_routing();
-                        close_device(&mut device, &mut state, false);
-                    }
-                    publish_input(&input_context, &state, &controls);
+                if handle_input_notice(&mut state, &mut device, notice) {
+                    update_input_context(&input_context, &state);
                     publish(&status, &state);
                 }
             }
@@ -1594,6 +1738,7 @@ pub fn run_daemon() -> Result<()> {
     state.revoke_routing();
     stopping.store(true, Ordering::Release);
     close_device(&mut device, &mut state, true);
+    drop(device_tx);
     let _ = input.join();
     publish(&status, &state);
     drop(work_tx);
@@ -1607,6 +1752,29 @@ pub fn run_daemon() -> Result<()> {
 mod tests {
     use super::*;
 
+    fn agent(terminal: &str, pane: &str, kind: &str) -> AgentInfo {
+        serde_json::from_value(json!({
+            "terminal_id": terminal,
+            "agent": kind,
+            "agent_status": "idle",
+            "workspace_id": "w1",
+            "tab_id": "w1:t1",
+            "pane_id": pane,
+            "focused": true,
+            "state_change_seq": 1,
+            "cwd": "/tmp",
+            "revision": 1
+        }))
+        .unwrap()
+    }
+
+    fn session(name: &str) -> Session {
+        Session {
+            name: name.into(),
+            socket_path: format!("/tmp/{name}.sock").into(),
+        }
+    }
+
     #[test]
     fn timestamps_are_utc_iso_8601() {
         assert_eq!(format_timestamp(UNIX_EPOCH), "1970-01-01T00:00:00.000Z");
@@ -1618,10 +1786,13 @@ mod tests {
 
     #[test]
     fn status_matches_the_control_contract() {
-        let mut state = State::new();
+        let mut state = State::new(Config::default());
         state.selected_session = Some("work".into());
         state.routing_ready = true;
-        state.sessions = vec!["work".into()];
+        state.sessions = vec![Session {
+            name: "work".into(),
+            socket_path: "/tmp/herdr.sock".into(),
+        }];
         state.mappings = vec![SessionTerminalMapping {
             session_name: "work".into(),
             terminal_id: "t1".into(),
@@ -1643,7 +1814,7 @@ mod tests {
 
     #[test]
     fn unexpected_disconnect_requests_immediate_native_restore() {
-        let mut state = State::new();
+        let mut state = State::new(Config::default());
         let before = Instant::now();
         device_disconnected(&mut state, "helper died".into());
         assert!(state.device_restore_pending);
@@ -1658,18 +1829,13 @@ mod tests {
     #[test]
     fn key_events_capture_the_ready_session_without_hardware() {
         let (sender, receiver) = mpsc::sync_channel(1);
-        let target = Agent {
-            terminal_id: "terminal".into(),
-            pane_id: "pane".into(),
-            agent: "codex".into(),
-            agent_status: AgentStatus::Idle,
-            state_change_seq: 1,
-            focused: true,
-            cwd: "/tmp".into(),
-        };
+        let target = agent("terminal", "pane", "codex");
+        let config = Config::default();
         let context = InputContext {
-            controls: crate::config::default_controls(),
-            session: Some("work".into()),
+            controls: config.controls,
+            effort: config.effort,
+            session: Some(session("work")),
+            terminal: Some("terminal".into()),
             target: Some(target),
             slots: vec![None; SLOT_COUNT],
             routing_ready: true,
@@ -1680,7 +1846,7 @@ mod tests {
         let (notices, _) = mpsc::channel();
         handle_device_event(
             DeviceEvent::Key {
-                key: "F24".into(),
+                key: "ACT09".into(),
                 action: 1,
             },
             &mut state,
@@ -1693,65 +1859,14 @@ mod tests {
             Work::Binding {
                 session, target, ..
             } => {
-                assert_eq!(session, "work");
+                assert_eq!(session.name, "work");
                 assert_eq!(
-                    agent_identity(target.as_ref()),
-                    Some(("terminal", "pane", "codex"))
+                    target,
+                    Some(("terminal".into(), "pane".into(), Some("codex".into())))
                 );
             }
             _ => panic!("expected configured binding"),
         }
-    }
-
-    #[test]
-    fn input_thread_dispatches_without_the_refresh_loop() {
-        let (events, event_rx) = mpsc::channel();
-        let (work_tx, work_rx) = mpsc::sync_channel(1);
-        let (notices, _) = mpsc::channel();
-        let stopping = Arc::new(AtomicBool::new(false));
-        let routing_generation = Arc::new(AtomicU64::new(0));
-        let context = Arc::new(Mutex::new(InputContext {
-            controls: crate::config::default_controls(),
-            session: Some("work".into()),
-            target: Some(Agent {
-                terminal_id: "terminal".into(),
-                pane_id: "pane".into(),
-                agent: "codex".into(),
-                agent_status: AgentStatus::Idle,
-                state_change_seq: 1,
-                focused: true,
-                cwd: "/tmp".into(),
-            }),
-            slots: vec![None; SLOT_COUNT],
-            routing_ready: true,
-            generation: 0,
-        }));
-        let input = thread::spawn({
-            let stopping = Arc::clone(&stopping);
-            let routing_generation = Arc::clone(&routing_generation);
-            move || {
-                input_worker(
-                    event_rx,
-                    context,
-                    routing_generation,
-                    work_tx,
-                    notices,
-                    stopping,
-                )
-            }
-        });
-        events
-            .send(DeviceEvent::Key {
-                key: "F24".into(),
-                action: 1,
-            })
-            .unwrap();
-        assert!(matches!(
-            work_rx.recv_timeout(Duration::from_millis(100)),
-            Ok(Work::Binding { session, .. }) if session == "work"
-        ));
-        stopping.store(true, Ordering::Release);
-        input.join().unwrap();
     }
 
     #[test]
@@ -1763,11 +1878,82 @@ mod tests {
 
     #[test]
     fn revoking_routing_invalidates_queued_work() {
-        let mut state = State::new();
+        let mut state = State::new(Config::default());
         state.routing_ready = true;
         let queued = state.routing_generation();
         state.revoke_routing();
         assert_ne!(queued, state.routing_generation());
     }
 
+    #[test]
+    fn selected_session_requires_a_live_snapshot() {
+        let mut state = State::new(Config::default());
+        state.selected_session = Some("work".into());
+        state
+            .session_agents
+            .insert("work".into(), vec![agent("terminal", "pane", "codex")]);
+
+        apply_selected_agents(&mut state, None).unwrap();
+        assert!(state.routing_ready);
+        state.session_agents.clear();
+        apply_selected_agents(&mut state, None).unwrap();
+        assert!(!state.routing_ready);
+        assert!(state.agents.is_empty());
+    }
+
+    #[test]
+    fn live_session_unavailability_requests_one_discovery() {
+        let mut state = State::new(Config::default());
+        state.session_agents.insert("work".into(), Vec::new());
+        let stopping = Arc::new(AtomicBool::new(true));
+        let (updates, _) = mpsc::channel();
+        let worker = spawn_session_worker(session("work"), 7, updates, Arc::clone(&stopping));
+        let workers = HashMap::from([("work".into(), worker)]);
+        let unavailable = || SessionUpdate::Unavailable {
+            session: "work".into(),
+            generation: 7,
+            error: "closed".into(),
+        };
+
+        assert!(apply_session_update(&mut state, unavailable(), &workers, None).unwrap());
+        assert!(!apply_session_update(&mut state, unavailable(), &workers, None).unwrap());
+    }
+
+    #[test]
+    fn owner_refresh_reports_only_real_transitions() {
+        let mut state = State::new(Config::default());
+        state.frontmost = Some(macos::Frontmost {
+            app_name: "ChatGPT".into(),
+            process: crate::actions::CHATGPT_BUNDLE_IDS[0].into(),
+            pid: 1,
+            title: String::new(),
+        });
+        let mut device = None;
+
+        assert!(refresh_owner(&mut state, &mut device));
+        assert!(!refresh_owner(&mut state, &mut device));
+    }
+
+    #[test]
+    fn config_load_reports_only_config_changes() {
+        let config = Config::default();
+        let enabled = enabled_buttons(&config.controls);
+        let mut state = State::new(config.clone());
+
+        assert!(!apply_config_load(&mut state, Ok(config.clone()), enabled));
+        assert!(!apply_config_load(
+            &mut state,
+            Err("invalid config".into()),
+            enabled
+        ));
+        assert!(!apply_config_load(
+            &mut state,
+            Err("invalid config".into()),
+            enabled
+        ));
+        assert!(!apply_config_load(&mut state, Ok(config.clone()), enabled));
+        let mut changed = config;
+        changed.lighting.focused_brightness /= 2.0;
+        assert!(apply_config_load(&mut state, Ok(changed), enabled));
+    }
 }

@@ -1,10 +1,6 @@
-use std::path::PathBuf;
-
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
-
-use crate::{DEFAULT_REQUEST_TIMEOUT, MicroDevice};
 
 const READ_CHUNK: usize = 512;
 const WRITE_CHUNK: usize = 384;
@@ -23,7 +19,7 @@ fn keymap_chunk(value: Value) -> Result<(Vec<u8>, usize)> {
     Ok((STANDARD.decode(data).context("invalid keymap data")?, total))
 }
 
-pub fn read_keymap_with<F>(mut read: F) -> Result<Vec<u8>>
+fn read_keymap_with<F>(mut read: F) -> Result<Vec<u8>>
 where
     F: FnMut(usize) -> Result<Value>,
 {
@@ -48,37 +44,16 @@ where
     }
 }
 
-pub trait Requester {
-    fn request(
-        &self,
-        method: &str,
-        params: Option<Value>,
-        timeout: std::time::Duration,
-    ) -> Result<Value>;
-}
-
-impl Requester for MicroDevice {
-    fn request(
-        &self,
-        method: &str,
-        params: Option<Value>,
-        timeout: std::time::Duration,
-    ) -> Result<Value> {
-        MicroDevice::request(self, method, params, timeout)
-    }
-}
-
-pub fn read_keymap(device: &impl Requester) -> Result<Vec<u8>> {
+pub fn read_keymap(request: impl Fn(&str, Option<Value>) -> Result<Value>) -> Result<Vec<u8>> {
     read_keymap_with(|offset| {
-        device.request(
+        request(
             "fs.readbin",
             Some(json!({ "file": "keymap.json", "offset": offset, "len": READ_CHUNK })),
-            DEFAULT_REQUEST_TIMEOUT,
         )
     })
 }
 
-pub fn write_keymap_chunks_with<F>(bytes: &[u8], mut write: F) -> Result<()>
+fn write_keymap_chunks_with<F>(bytes: &[u8], mut write: F) -> Result<()>
 where
     F: FnMut(usize, &[u8], bool) -> Result<()>,
 {
@@ -92,69 +67,23 @@ where
     Ok(())
 }
 
-pub fn write_keymap(device: &impl Requester, bytes: &[u8]) -> Result<()> {
+pub fn write_keymap(
+    request: impl Fn(&str, Option<Value>) -> Result<Value>,
+    bytes: &[u8],
+) -> Result<()> {
     write_keymap_chunks_with(bytes, |offset, data, completed| {
-        device
-            .request(
-                "fs.writebin",
-                Some(json!({
-                    "file": "keymap.json",
-                    "offset": offset,
-                    "data": STANDARD.encode(data),
-                    "append": true,
-                    "completed": completed,
-                })),
-                DEFAULT_REQUEST_TIMEOUT,
-            )
-            .map(|_| ())
+        request(
+            "fs.writebin",
+            Some(json!({
+                "file": "keymap.json",
+                "offset": offset,
+                "data": STANDARD.encode(data),
+                "append": true,
+                "completed": completed,
+            })),
+        )
+        .map(|_| ())
     })
-}
-
-pub fn update_keymap_with<B, R, W>(
-    before: &[u8],
-    after: &[u8],
-    backup: B,
-    mut read: R,
-    mut write: W,
-) -> Result<Option<PathBuf>>
-where
-    B: FnOnce(&[u8]) -> Result<PathBuf>,
-    R: FnMut() -> Result<Vec<u8>>,
-    W: FnMut(&[u8]) -> Result<()>,
-{
-    if before == after {
-        return Ok(None);
-    }
-    let backup = backup(before)?;
-    let updated = write(after).and_then(|()| {
-        if read()? == after {
-            Ok(())
-        } else {
-            bail!("keymap read-back failed")
-        }
-    });
-    if let Err(error) = updated {
-        let restored = write(before).and_then(|()| {
-            if read()? == before {
-                Ok(())
-            } else {
-                bail!("restored keymap read-back failed")
-            }
-        });
-        return match restored {
-            Ok(()) => Err(error).with_context(|| {
-                format!(
-                    "keymap update failed; original keymap was restored; backup: {}",
-                    backup.display()
-                )
-            }),
-            Err(recovery) => Err(anyhow!(
-                "keymap update failed: {error}; automatic restore failed: {recovery}; recover from backup: {}",
-                backup.display()
-            )),
-        };
-    }
-    Ok(Some(backup))
 }
 
 #[cfg(test)]
@@ -180,48 +109,5 @@ mod tests {
             chunks,
             [(0, 384, false), (384, 384, false), (768, 32, true)]
         );
-    }
-
-    #[test]
-    fn update_failure_restores_original_and_names_backup() {
-        let backup = PathBuf::from("/tmp/keymap-backup.json");
-        let mut writes = Vec::new();
-        let mut reads = [b"wrong".to_vec(), b"before".to_vec()].into_iter();
-        let error = update_keymap_with(
-            b"before",
-            b"after",
-            |_| Ok(backup.clone()),
-            || Ok(reads.next().unwrap()),
-            |bytes| {
-                writes.push(bytes.to_vec());
-                Ok(())
-            },
-        )
-        .unwrap_err();
-        assert_eq!(writes, vec![b"after".to_vec(), b"before".to_vec()]);
-        assert!(error.to_string().contains("/tmp/keymap-backup.json"));
-        assert!(error.to_string().contains("restored"));
-    }
-
-    #[test]
-    fn failed_restore_still_names_backup() {
-        let backup = PathBuf::from("/tmp/keymap-backup.json");
-        let mut writes = 0;
-        let error = update_keymap_with(
-            b"before",
-            b"after",
-            |_| Ok(backup.clone()),
-            || Ok(b"wrong".to_vec()),
-            |_| {
-                writes += 1;
-                if writes == 2 {
-                    bail!("device disappeared")
-                }
-                Ok(())
-            },
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("automatic restore failed"));
-        assert!(error.to_string().contains("/tmp/keymap-backup.json"));
     }
 }

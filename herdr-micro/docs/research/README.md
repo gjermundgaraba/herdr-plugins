@@ -38,6 +38,47 @@ For the tested stock cap and firmware, `ACT10` is therefore the stable logical
 button signal; `ACT11` is the secondary switch and can chatter, so it must not
 dispatch a second action.
 
+### Native Layer 2 action trace (2026-08-08)
+
+After programming Layer 2 with native OAI action codes under exclusive USB
+capture, physical `ACT12` submitted to the focused Codex pane. Physical
+`ACT10` produced the configured synthetic F19 tap; Handy received `fn+f19`,
+recorded, transcribed, and pasted successfully. Both inputs arrived through
+the helper's exclusive vendor-event path; no host keyboard report was involved.
+
+### USB ownership recovery and focus handoff (2026-08-04)
+
+- With the user daemon frozen, `SIGKILL` left the Micro captured and absent
+  from `hidutil` after five seconds. A fresh helper recaptured it, and a
+  controlled close restored both native HID services in 100 ms without an
+  unplug. A second forced helper death recovered in 1.09 s with helper build 2
+  while ChatGPT was frontmost; status cleared and both HID services returned.
+- Twenty-five ChatGPT/Ghostty round trips reached the correct ownership state
+  in all 50 transitions. Median latency was 1.22 s, p95 was 2.24 s, and maximum
+  was 2.97 s; two transitions exceeded two seconds. The automated run did not
+  press a physical key. After the close-race fix, five further round trips
+  completed without false device errors.
+- With one-shot helper build 13 on 2026-08-09, a clean daemon stop removed both
+  processes and the next start received a fresh launchd helper PID. Killing the
+  captured helper with `SIGKILL` produced a disconnect at `11:28:21.019`, a
+  fresh device connection at `11:28:21.117`, and Layer 2 at `11:28:21.168`
+  without a replug. F19, Submit, an Agent key, one-notch effort changes, and
+  Diff all remained prompt after recovery.
+- With helper build 14, killing captured helper PID 39224 produced a disconnect
+  at `16:32:48.577`, a fresh helper and device connection 94 ms later, and
+  Layer 2 after 145 ms without a replug. F19, Submit, Agent focus and lighting,
+  effort, Diff, and vertical and horizontal scrolling all passed afterward.
+
+### Clean-break latency evidence (2026-08-07)
+
+A local native ScriptingBridge microbenchmark cached the Ghostty application
+proxy and ran the exact focused-terminal UUID query planned for routing. With
+50 ms between calls, observed calls were approximately 0.8–1.2 ms. The same
+query in an unpaced burst took approximately 16.9 ms per call, showing that
+the result is rate-sensitive. This was one local-machine experiment, not a
+distribution or p95 measurement; it establishes feasibility at the proposed
+polling cadence, not a performance guarantee.
+
 ## Tested version boundaries
 
 | Component | Physically tested result |
@@ -46,7 +87,7 @@ dispatch a second action.
 | Codex Micro firmware 0.6.1 | USB passed; BLE passed after pairing a fresh host slot |
 | Work Louder Input 0.17.2 | OAI-enabled Layer 2 clone and read-back passed |
 | Work Louder Input 0.18.0 | Firmware 0.6.1 update and retained keymap passed |
-| Herdr 0.7.5 | Agent targeting and effort actions passed |
+| Herdr 0.8.0 | Direct snapshots, subscriptions, targeting, and effort actions passed |
 | Codex CLI 0.145.0 | `high → xhigh → high` passed |
 | Claude Code 2.1.220 | `xhigh → high → xhigh` passed |
 | Pi 0.82.1 | `medium → high → medium` passed with the bundled extension |

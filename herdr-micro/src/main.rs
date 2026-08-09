@@ -1,13 +1,8 @@
 use anyhow::{Context, Result, bail};
 use herdr_micro::{
-    actions::{execute_effort_plan, plan_effort_change},
-    config::{config_path, default_effort, load_effort},
     control::{ensure_state_dir, log_file, request_status, request_stop, start_daemon_versioned},
-    daemon, doctor, helper_install,
-    herdr::{herdr_bin, run_command},
-    setup,
+    daemon, doctor, helper_install, setup,
 };
-use serde_json::{Value, json};
 use std::{
     env,
     ffi::OsString,
@@ -18,7 +13,7 @@ use std::{
     time::Duration,
 };
 
-const USAGE: &str = "usage: herdr-micro <start|herdr-status|doctor|effort raise|lower|status|configure-controls|setup-pi-effort|stop|setup|install-helper|uninstall-helper>";
+const USAGE: &str = "usage: herdr-micro <start|doctor|status|configure|setup-pi-effort|stop|setup|install-helper|uninstall-helper>";
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
@@ -43,12 +38,10 @@ fn run(args: Vec<OsString>) -> Result<i32> {
             daemon::run_daemon()?;
             Ok(0)
         }
-        "herdr-status" if rest.is_empty() => setup::forward_herdr_status(),
         "doctor" if rest.is_empty() => Ok(doctor::run_doctor()),
-        "effort" => effort(rest),
         "status" if rest.is_empty() => status(),
-        "configure-controls" if rest.is_empty() => {
-            println!("{}", setup::configure_controls()?.display());
+        "configure" if rest.is_empty() => {
+            println!("{}", setup::configure()?.display());
             Ok(0)
         }
         "setup-pi-effort" if rest.is_empty() => setup_pi_effort(),
@@ -126,41 +119,6 @@ fn stop() -> Result<i32> {
     Ok(0)
 }
 
-fn effort(args: &[OsString]) -> Result<i32> {
-    let Some(direction) = args.first().and_then(|arg| arg.to_str()) else {
-        bail!("usage: herdr-micro effort <raise|lower>");
-    };
-    if args.len() != 1 || !matches!(direction, "raise" | "lower") {
-        bail!("usage: herdr-micro effort <raise|lower>");
-    }
-    let context: Value = serde_json::from_str(
-        &env::var("HERDR_PLUGIN_CONTEXT_JSON").unwrap_or_else(|_| "{}".into()),
-    )
-    .context("parse HERDR_PLUGIN_CONTEXT_JSON")?;
-    let agent = context
-        .get("focused_pane_agent")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let pane_id = context
-        .get("focused_pane_id")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let config = if agent == "codex" {
-        load_effort(&config_path("effort.json")).map_err(anyhow::Error::msg)?
-    } else {
-        default_effort()
-    };
-    let plan = plan_effort_change(agent, direction, pane_id, &config, 1)?;
-    execute_effort_plan(&herdr_bin(), &plan, |bin, args| {
-        run_command(bin, args, None).map(|_| ())
-    })?;
-    println!(
-        "{}",
-        json!({ "agent": agent, "direction": direction, "paneId": pane_id })
-    );
-    Ok(0)
-}
-
 fn setup_pi_effort() -> Result<i32> {
     let result = setup::setup_pi_effort()?;
     if result.unchanged {
@@ -192,8 +150,6 @@ fn setup_micro() -> Result<i32> {
         "Firmware {}: compatible OAI keymap detected",
         report.firmware
     );
-    println!("Controls: {}", report.controls.display());
-    println!("Effort: {}", report.effort.display());
-    println!("Lighting: {}", report.lighting.display());
+    println!("Config: {}", report.config.display());
     Ok(0)
 }

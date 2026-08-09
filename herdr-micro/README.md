@@ -7,13 +7,14 @@ dial, and joystick to the focused Codex, Claude Code, or Pi agent.
 ## Requirements
 
 - macOS and a Codex Micro
-- [Herdr](https://herdr.dev/docs/install/) 0.7.5 or newer
+- [Herdr](https://herdr.dev/docs/install/) 0.8.0 or newer
+- Herdr `[experimental].kitty_graphics = true` for exact pane scrolling
 - Ghostty 1.3 or newer
-- Rust 1.85 or newer when building from source
+- Rust 1.89 or newer when building from source
 - Work Louder Input for the one-time Layer 2 setup
 - Administrator access for the one-time privileged USB-helper installation
 - macOS Automation permission for Ghostty inspection
-- macOS Accessibility permission for configured `key` bindings and scrolling
+- macOS Accessibility permission for configured `key` bindings
 - [Hunk](https://www.hunk.dev/) only for the optional `diff` action
 
 The bridge uses an unsupported proprietary device protocol. See the
@@ -73,11 +74,9 @@ herdr plugin link . --enabled
    herdr plugin config-dir gjermundgaraba.herdr-micro
    ```
 
-   - `controls.json`: button bindings, dial, joystick, gestures, and per-agent actions
-   - `lighting.json`: state colors/effects and aggregate lighting zones
-   - `effort.json`: user-configured Codex effort shortcuts
+   `config.json` contains controls, effort shortcuts, and lighting.
 
-Run **Configure Micro controls** in Herdr to open `controls.json`. Binding
+Run **Configure Herdr Micro** in Herdr to open `config.json`. Binding
 changes are validated and reloaded while the bridge runs. `buttons` maps the
 seven action switches to bindings; `null` disables a switch. Each bound switch
 uses a fixed internal HID code that macOS maps to no virtual keycode, so an
@@ -93,16 +92,9 @@ the bridge owns the device (useful for app hotkeys such as dictation):
 Names cover F13–F20; `keycode` accepts any macOS virtual keycode (0–127)
 instead of `key`, and optional `modifiers` adds any of `cmd`, `shift`, `alt`,
 `ctrl`, and `fn`.
-The stock wide keycap spans switches 5 and 6, so switch 6 stays unbound:
-
-```json
-{
-  "version": 2,
-  "buttons": {},
-  "dial": {},
-  "joystick": { "engageDistance": 0.75, "releaseDistance": 0.3 }
-}
-```
+The stock wide keycap spans switches 5 and 6, so `controls.buttons["6"]`
+stays `null` by default. All four top-level fields—`version`, `controls`,
+`effort`, and `lighting`—are required.
 
 The privileged helper captures the USB-connected Micro so ChatGPT cannot also
 receive Layer 2 events. Binding a previously unbound switch (or the reverse)
@@ -128,11 +120,11 @@ increase_reasoning_effort = "ctrl-shift-t"
 decrease_reasoning_effort = "ctrl-t"
 ```
 
-Match those shortcuts in the plugin's `effort.json`; it uses `+`, not Codex's
-`-` syntax:
+Match those shortcuts in `config.json` under `effort`; it uses `+`, not
+Codex's `-` syntax:
 
 ```json
-{"codex":{"raise":"ctrl+shift+t","lower":"ctrl+t"}}
+{"effort":{"codex":{"raise":"ctrl+shift+t","lower":"ctrl+t"}}}
 ```
 
 Claude Code uses its native `/effort` picker. See [effort control](docs/effort-control.md)
@@ -140,9 +132,10 @@ for operational boundaries.
 
 ## Routing and operation
 
-One bridge serves the default and named Herdr sessions. It maps each running
-session to its Ghostty terminal UUID and routes all lighting and controls only
-through the focused mapped session.
+One bridge serves the default and named Herdr sessions. Native ScriptingBridge
+queries map each running session to its Ghostty terminal UUID. Herdr snapshots
+and subscriptions drive routing and lighting, and actions use direct socket
+requests to the focused mapped session.
 
 - Codex desktop frontmost: Layer 1 and device ownership yielded to Codex
 - Mapped Ghostty terminal frontmost: Layer 2 and the matching Herdr session
@@ -158,9 +151,10 @@ herdr plugin log list --plugin gjermundgaraba.herdr-micro --limit 20
 
 Quit Work Louder Input while the bridge runs and keep the Micro connected by
 USB. The helper owns the device while Layer 2 is active, then restores the
-normal macOS HID driver when the bridge yields to ChatGPT/Codex. It blanks the
-LEDs on controlled shutdown and stops after 60 seconds without a running Herdr
-session.
+normal macOS HID driver when the bridge yields to ChatGPT/Codex. The user
+daemon blanks the LEDs and stops after 60 seconds without a running Herdr
+session; the disconnected helper restores native HID ownership and exits.
+launchd starts a fresh helper for the next device lease.
 
 Herdr v1 has no plugin teardown hook. Run `micro-stop` before updating. Ordinary
 plugin updates keep using the installed helper; rerun `install-helper` only

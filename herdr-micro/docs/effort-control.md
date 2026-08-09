@@ -9,10 +9,9 @@ thinking effort without typing into the frontmost macOS application?
 
 ## Design
 
-Herdr supplies `focused_pane_id` and `focused_pane_agent` in
-`HERDR_PLUGIN_CONTEXT_JSON`. The action freezes those values, builds one
-agent-specific plan, and sends every operation to that exact pane through
-`HERDR_BIN_PATH`.
+The bridge freezes the focused agent and pane from its subscribed Herdr session
+snapshot, builds one agent-specific plan, and sends every operation directly to
+that exact pane through Herdr's socket API.
 
 | Agent | Mechanism | Readback |
 |---|---|---|
@@ -22,7 +21,8 @@ agent-specific plan, and sends every operation to that exact pane through
 
 ## Boundary
 
-- Codex shortcuts are intentionally user-configurable in `effort.json`.
+- Codex shortcuts are intentionally user-configurable under `effort` in
+  `config.json`.
 - Claude persists `low` through `xhigh`; `max` is session-only.
 - Invoke Claude effort changes from an empty prompt; its public interface has no
   direct relative-effort action, so the integration types `/effort`.

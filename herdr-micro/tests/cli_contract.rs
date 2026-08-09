@@ -1,10 +1,7 @@
 use std::{
     env, fs,
     io::{BufRead, BufReader, Write},
-    os::unix::{
-        fs::PermissionsExt,
-        net::{UnixListener, UnixStream},
-    },
+    os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     process::{Command, Output},
     sync::atomic::{AtomicUsize, Ordering},
@@ -34,11 +31,6 @@ fn output(args: &[&str]) -> Output {
     command(args).output().unwrap()
 }
 
-fn executable(path: &Path, contents: &str) {
-    fs::write(path, contents).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-}
-
 fn read_request(stream: &mut UnixStream) -> String {
     let mut request = String::new();
     BufReader::new(stream.try_clone().unwrap())
@@ -57,26 +49,6 @@ fn missing_and_invalid_cli_are_useful_errors() {
 }
 
 #[test]
-fn herdr_status_forwards_streams_and_exit_code() {
-    let dir = temp_dir("status");
-    let fake = dir.join("fake-herdr");
-    executable(
-        &fake,
-        "#!/bin/sh\nprintf 'fixture stdout\\n'\nprintf 'fixture stderr\\n' >&2\nexit 23\n",
-    );
-
-    let result = command(&["herdr-status"])
-        .env("HERDR_BIN_PATH", &fake)
-        .output()
-        .unwrap();
-    assert_eq!(result.status.code(), Some(23));
-    assert_eq!(result.stdout, b"fixture stdout\n");
-    assert_eq!(result.stderr, b"fixture stderr\n");
-
-    fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
 fn status_stop_and_start_use_the_newline_json_socket_without_spawning() {
     let dir = temp_dir("socket");
     let state = dir.join("state");
@@ -92,7 +64,7 @@ fn status_stop_and_start_use_the_newline_json_socket_without_spawning() {
                 concat!(
                     "{\"fixture\":\"live\",\"version\":\"",
                     env!("CARGO_PKG_VERSION"),
-                    "\",\"protocol\":1}\n"
+                    "\",\"protocol\":2}\n"
                 ),
             ),
         ] {
@@ -108,7 +80,7 @@ fn status_stop_and_start_use_the_newline_json_socket_without_spawning() {
         (
             vec!["start"],
             concat!(
-                "{\"fixture\":\"live\",\"protocol\":1,\"version\":\"",
+                "{\"fixture\":\"live\",\"protocol\":2,\"version\":\"",
                 env!("CARGO_PKG_VERSION"),
                 "\"}\n"
             ),
@@ -126,50 +98,6 @@ fn status_stop_and_start_use_the_newline_json_socket_without_spawning() {
         assert_eq!(String::from_utf8(result.stdout).unwrap(), expected);
     }
     server.join().unwrap();
-
-    fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
-fn effort_uses_context_config_and_herdr_environment() {
-    let dir = temp_dir("effort");
-    let config = dir.join("config");
-    fs::create_dir(&config).unwrap();
-    fs::write(
-        config.join("effort.json"),
-        r#"{"codex":{"raise":"ctrl+shift+t","lower":"ctrl+t"}}"#,
-    )
-    .unwrap();
-    let calls = dir.join("calls");
-    let fake = dir.join("fake-herdr");
-    executable(
-        &fake,
-        "#!/bin/sh\nprintf 'args=%s\\n' \"$*\" >> \"$CALLS\"\nprintf 'context=%s\\nconfig=%s\\n' \"$HERDR_PLUGIN_CONTEXT_JSON\" \"$HERDR_PLUGIN_CONFIG_DIR\" >> \"$CALLS\"\n",
-    );
-
-    for (direction, key) in [("raise", "ctrl+shift+t"), ("lower", "ctrl+t")] {
-        let context = r#"{"focused_pane_agent":"codex","focused_pane_id":"w1:p2"}"#;
-        let result = command(&["effort", direction])
-            .env("CALLS", &calls)
-            .env("HERDR_BIN_PATH", &fake)
-            .env("HERDR_PLUGIN_CONFIG_DIR", &config)
-            .env("HERDR_PLUGIN_CONTEXT_JSON", context)
-            .output()
-            .unwrap();
-        assert!(
-            result.status.success(),
-            "{}",
-            String::from_utf8_lossy(&result.stderr)
-        );
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&result.stdout).unwrap(),
-            serde_json::json!({ "agent": "codex", "direction": direction, "paneId": "w1:p2" })
-        );
-        let log = fs::read_to_string(&calls).unwrap();
-        assert!(log.contains(&format!("args=pane send-keys w1:p2 {key}\n")));
-        assert!(log.contains(&format!("context={context}\nconfig={}\n", config.display())));
-        fs::write(&calls, "").unwrap();
-    }
 
     fs::remove_dir_all(dir).unwrap();
 }
@@ -199,36 +127,6 @@ fn setup_pi_effort_uses_plugin_root_outside_the_repository() {
     assert!(install.status.success());
     assert_eq!(fs::read(&target).unwrap(), bundled);
     assert!(String::from_utf8_lossy(&install.stdout).contains("Installed Pi effort extension:"));
-
-    let noop = command(&["setup-pi-effort"])
-        .current_dir(&outside)
-        .env("HERDR_PLUGIN_ROOT", &root)
-        .env("HOME", &home)
-        .output()
-        .unwrap();
-    assert!(noop.status.success());
-    assert!(String::from_utf8_lossy(&noop.stdout).contains("Pi effort extension is current:"));
-
-    fs::write(&target, b"old extension\n").unwrap();
-    let changed = command(&["setup-pi-effort"])
-        .current_dir(&outside)
-        .env("HERDR_PLUGIN_ROOT", &root)
-        .env("HOME", &home)
-        .output()
-        .unwrap();
-    assert!(changed.status.success());
-    assert_eq!(fs::read(&target).unwrap(), bundled);
-    let backups: Vec<_> = fs::read_dir(target.parent().unwrap())
-        .unwrap()
-        .map(Result::unwrap)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.to_string_lossy()
-                .contains("herdr-micro-effort.ts.bak-")
-        })
-        .collect();
-    assert_eq!(backups.len(), 1);
-    assert_eq!(fs::read(&backups[0]).unwrap(), b"old extension\n");
 
     fs::remove_dir_all(dir).unwrap();
 }

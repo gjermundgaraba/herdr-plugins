@@ -20,6 +20,8 @@ use crate::hid::{HELPER_LABEL, HELPER_VERSION, HID_LAUNCH_SOCKET_NAME, hid_socke
 pub const HELPER_BINARY_NAME: &str = "herdr-micro-hid";
 pub const HELPER_PATH: &str = "/Library/PrivilegedHelperTools/dev.herdr.herdr-micro-hid";
 pub const PLIST_PATH: &str = "/Library/LaunchDaemons/dev.herdr.herdr-micro-hid.plist";
+// One in-flight request, Layer 1 recovery, native close, and one second of margin.
+const HELPER_EXIT_TIMEOUT_SECONDS: u64 = 16;
 const BOOTSTRAP_RETRY_DELAYS: [Duration; 5] = [
     Duration::from_millis(100),
     Duration::from_millis(250),
@@ -225,7 +227,7 @@ fn render_plist(uid: libc::uid_t) -> String {
   <key>ThrottleInterval</key>
   <integer>1</integer>
   <key>ExitTimeOut</key>
-  <integer>10</integer>
+  <integer>{HELPER_EXIT_TIMEOUT_SECONDS}</integer>
   <key>Umask</key>
   <integer>63</integer>
 </dict>
@@ -438,7 +440,9 @@ mod tests {
         assert!(plist.contains("<key>SockPathOwner</key>\n      <integer>501</integer>"));
         assert!(plist.contains("<key>SockPathMode</key>\n      <integer>384</integer>"));
         assert!(plist.contains("<key>ThrottleInterval</key>\n  <integer>1</integer>"));
-        assert!(plist.contains("<key>ExitTimeOut</key>\n  <integer>10</integer>"));
+        assert!(plist.contains(&format!(
+            "<key>ExitTimeOut</key>\n  <integer>{HELPER_EXIT_TIMEOUT_SECONDS}</integer>"
+        )));
         assert!(plist.contains("<key>Umask</key>\n  <integer>63</integer>"));
         assert!(!plist.contains("KeepAlive"));
         assert!(!plist.contains("RunAtLoad"));

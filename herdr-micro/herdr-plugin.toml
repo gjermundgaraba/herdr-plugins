@@ -1,7 +1,7 @@
 id = "gjermundgaraba.herdr-micro"
 name = "Herdr Micro"
 version = "0.1.0"
-min_herdr_version = "0.7.5"
+min_herdr_version = "0.8.0"
 description = "Control Herdr from a Work Louder Codex Micro."
 platforms = ["macos"]
 
@@ -35,24 +35,9 @@ height = "90%"
 command = ["hunk", "diff", "--watch"]
 
 [[actions]]
-id = "status"
-title = "Show Herdr status"
-command = ["bin/herdr-micro", "herdr-status"]
-
-[[actions]]
 id = "doctor"
 title = "Check Herdr Micro setup"
 command = ["bin/herdr-micro", "doctor"]
-
-[[actions]]
-id = "effort-raise"
-title = "Raise focused agent effort"
-command = ["bin/herdr-micro", "effort", "raise"]
-
-[[actions]]
-id = "effort-lower"
-title = "Lower focused agent effort"
-command = ["bin/herdr-micro", "effort", "lower"]
 
 [[actions]]
 id = "micro-start"
@@ -65,9 +50,9 @@ title = "Show Micro bridge status"
 command = ["bin/herdr-micro", "status"]
 
 [[actions]]
-id = "micro-configure-controls"
-title = "Configure Micro controls"
-command = ["bin/herdr-micro", "configure-controls"]
+id = "micro-configure"
+title = "Configure Herdr Micro"
+command = ["bin/herdr-micro", "configure"]
 
 [[actions]]
 id = "setup-pi-effort"

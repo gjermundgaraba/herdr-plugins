@@ -123,6 +123,18 @@ pub enum Binding {
     Gesture(GestureBinding),
 }
 
+impl<'de> Deserialize<'de> for Binding {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        parse_binding(&value, "binding")
+            .map_err(serde::de::Error::custom)?
+            .ok_or_else(|| serde::de::Error::custom("binding must not be null"))
+    }
+}
+
 impl Binding {
     pub fn resolve(&self, agent: &str) -> Option<Action> {
         match self {
@@ -134,6 +146,25 @@ impl Binding {
                 .flatten(),
             Self::Gesture(_) => None,
         }
+    }
+}
+
+fn binding_requires_accessibility(binding: &Binding) -> bool {
+    match binding {
+        Binding::Action(action) => matches!(action, Action::Key { .. }),
+        Binding::ByAgent(actions) => actions
+            .values()
+            .flatten()
+            .any(|action| matches!(action, Action::Key { .. })),
+        Binding::Gesture(gesture) => [
+            &gesture.tap,
+            &gesture.double_tap,
+            &gesture.hold,
+            &gesture.release,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|action| matches!(action, Action::Key { .. })),
     }
 }
 
@@ -154,18 +185,27 @@ pub fn key_binding(config: &Controls, key: &str, action: i64) -> Option<Binding>
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Controls {
     pub buttons: std::collections::BTreeMap<u8, Option<Binding>>,
     pub dial: Dial,
     pub joystick: Joystick,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct Config {
+    pub controls: Controls,
+    pub effort: EffortConfig,
+    pub lighting: LightingConfig,
+}
+
 pub fn device_button(key: &str) -> Option<u8> {
-    let index = codex_micro::ACTION_KEYS
-        .iter()
-        .position(|(_, name)| *name == key)?;
-    Some(index as u8 + 1)
+    key.strip_prefix("ACT")?
+        .parse::<u8>()
+        .ok()?
+        .checked_sub(5)
+        .filter(|button| (1..=7).contains(button))
 }
 
 /// A switch is live exactly when its button is bound.
@@ -177,13 +217,39 @@ pub fn enabled_buttons(controls: &Controls) -> [bool; 7] {
             .is_some_and(Option::is_some)
     })
 }
-#[derive(Clone, Debug, PartialEq)]
+
+pub fn requires_accessibility(controls: &Controls) -> bool {
+    controls
+        .buttons
+        .values()
+        .flatten()
+        .any(binding_requires_accessibility)
+        || controls
+            .dial
+            .press
+            .as_ref()
+            .is_some_and(binding_requires_accessibility)
+        || [
+            controls.dial.clockwise.as_ref(),
+            controls.dial.counterclockwise.as_ref(),
+            controls.joystick.up.as_ref(),
+            controls.joystick.down.as_ref(),
+            controls.joystick.left.as_ref(),
+            controls.joystick.right.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|action| matches!(action, Action::Key { .. }))
+}
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Dial {
     pub clockwise: Option<Action>,
     pub counterclockwise: Option<Action>,
     pub press: Option<Binding>,
 }
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Joystick {
     pub engage_distance: f64,
     pub release_distance: f64,
@@ -193,79 +259,33 @@ pub struct Joystick {
     pub right: Option<Action>,
 }
 
-pub fn default_controls() -> Controls {
-    parse_controls(&controls_json()).unwrap()
-}
-
-pub fn parse_controls(value: &Value) -> Result<Controls, String> {
-    let root = object(value, "control configuration")?;
-    fields(root, &["version", "buttons", "dial", "joystick"], "control")?;
-    if root.get("version") != Some(&Value::from(2)) {
-        return Err("version must be 2".into());
+fn parse_controls(value: &Value) -> Result<Controls, String> {
+    let controls: Controls =
+        serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
+    if controls.buttons.keys().any(|id| !(1..=7).contains(id)) {
+        return Err("button IDs must be integers from 1 to 7".into());
     }
-    let buttons = object(req(root, "buttons")?, "buttons")?;
-    let mut parsed_buttons = std::collections::BTreeMap::new();
-    for (key, binding) in buttons {
-        let id = key
-            .parse::<u8>()
-            .ok()
-            .filter(|n| (1..=7).contains(n))
-            .ok_or_else(|| format!("invalid button: {key}"))?;
-        parsed_buttons.insert(id, parse_binding(binding, &format!("buttons.{key}"))?);
-    }
-    let dial_v = object(req(root, "dial")?, "dial")?;
-    fields(dial_v, &["clockwise", "counterclockwise", "press"], "dial")?;
-    let joystick_v = object(req(root, "joystick")?, "joystick")?;
-    fields(
-        joystick_v,
-        &[
-            "engageDistance",
-            "releaseDistance",
-            "up",
-            "down",
-            "left",
-            "right",
-        ],
-        "joystick",
-    )?;
-    let engage = number(req(joystick_v, "engageDistance")?)?;
-    let release = number(req(joystick_v, "releaseDistance")?)?;
-    if !(release >= 0.0 && release < engage && engage <= 1.0) {
+    if !(controls.joystick.release_distance >= 0.0
+        && controls.joystick.release_distance < controls.joystick.engage_distance
+        && controls.joystick.engage_distance <= 1.0)
+    {
         return Err(
             "joystick distances must satisfy 0 <= releaseDistance < engageDistance <= 1".into(),
         );
     }
-    Ok(Controls {
-        buttons: parsed_buttons,
-        dial: Dial {
-            clockwise: parse_action_or_null(
-                dial_v.get("clockwise").unwrap_or(&Value::Null),
-                "dial.clockwise",
-            )?,
-            counterclockwise: parse_action_or_null(
-                dial_v.get("counterclockwise").unwrap_or(&Value::Null),
-                "dial.counterclockwise",
-            )?,
-            press: parse_binding(dial_v.get("press").unwrap_or(&Value::Null), "dial.press")?,
-        },
-        joystick: Joystick {
-            engage_distance: engage,
-            release_distance: release,
-            up: parse_action_or_null(joystick_v.get("up").unwrap_or(&Value::Null), "joystick.up")?,
-            down: parse_action_or_null(
-                joystick_v.get("down").unwrap_or(&Value::Null),
-                "joystick.down",
-            )?,
-            left: parse_action_or_null(
-                joystick_v.get("left").unwrap_or(&Value::Null),
-                "joystick.left",
-            )?,
-            right: parse_action_or_null(
-                joystick_v.get("right").unwrap_or(&Value::Null),
-                "joystick.right",
-            )?,
-        },
-    })
+    for (label, action) in [
+        ("dial.clockwise", &controls.dial.clockwise),
+        ("dial.counterclockwise", &controls.dial.counterclockwise),
+        ("joystick.up", &controls.joystick.up),
+        ("joystick.down", &controls.joystick.down),
+        ("joystick.left", &controls.joystick.left),
+        ("joystick.right", &controls.joystick.right),
+    ] {
+        if let Some(action) = action {
+            validate_action(action, label)?;
+        }
+    }
+    Ok(controls)
 }
 
 fn parse_binding(value: &Value, label: &str) -> Result<Option<Binding>, String> {
@@ -377,11 +397,6 @@ fn fields(
         .find(|key| !allowed.contains(&key.as_str()))
         .map_or(Ok(()), |key| Err(format!("unknown {label} field: {key}")))
 }
-fn number(v: &Value) -> Result<f64, String> {
-    v.as_f64()
-        .filter(|n| n.is_finite())
-        .ok_or_else(|| "must be a finite number".into())
-}
 fn valid_agent(agent: &str) -> bool {
     agent == "default" || {
         let mut chars = agent.chars();
@@ -401,15 +416,7 @@ pub struct EffortKeys {
     pub raise: Option<String>,
     pub lower: Option<String>,
 }
-pub fn default_effort() -> EffortConfig {
-    EffortConfig {
-        codex: EffortKeys {
-            raise: None,
-            lower: None,
-        },
-    }
-}
-pub fn parse_effort(value: Value) -> Result<EffortConfig, String> {
+fn parse_effort(value: Value) -> Result<EffortConfig, String> {
     let codex = value
         .get("codex")
         .and_then(Value::as_object)
@@ -485,10 +492,7 @@ pub struct LightingConfig {
     pub ambient: Option<String>,
     pub keys: Option<String>,
 }
-pub fn default_lighting() -> LightingConfig {
-    serde_json::from_value(serde_json::json!({"states":{"blocked":{"color":"#ffaa00","brightness":1,"effect":"solid","speed":0},"done":{"color":"#22cc55","brightness":1,"effect":"solid","speed":0},"working":{"color":"#2277ff","brightness":1,"effect":"breath","speed":0.35},"idle":{"color":"#ffffff","brightness":0.25,"effect":"solid","speed":0},"unknown":{"color":"#ffffff","brightness":0.08,"effect":"solid","speed":0}},"focusedBrightness":1,"ambient":"status","keys":null})).unwrap()
-}
-pub fn parse_lighting(value: Value) -> Result<LightingConfig, String> {
+fn parse_lighting(value: Value) -> Result<LightingConfig, String> {
     let config: LightingConfig = serde_json::from_value(value).map_err(|e| e.to_string())?;
     if config.states.len() != 5 {
         return Err("unknown lighting state".into());
@@ -536,7 +540,7 @@ fn is_hex(v: &str) -> bool {
     v.len() == 7 && v.starts_with('#') && v[1..].bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-pub fn config_path(name: &str) -> PathBuf {
+pub fn config_path() -> PathBuf {
     env::var_os("HERDR_PLUGIN_CONFIG_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -546,7 +550,7 @@ pub fn config_path(name: &str) -> PathBuf {
                 .join(".config/herdr/plugins/config")
                 .join(PLUGIN_ID)
         })
-        .join(name)
+        .join("config.json")
 }
 fn ensure_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
     if let Some(parent) = path.parent() {
@@ -560,26 +564,59 @@ fn ensure_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
     }
     Ok(())
 }
-pub fn provision_controls(path: &Path) -> Result<(), String> {
-    ensure_json(path, &controls_json()).map_err(|error| error.to_string())
+pub fn provision(path: &Path) -> Result<(), String> {
+    ensure_json(path, &config_json()).map_err(|error| error.to_string())
 }
-pub fn provision_effort(path: &Path) -> Result<(), String> {
-    ensure_json(path, &default_effort()).map_err(|error| error.to_string())
+
+pub fn load(path: &Path) -> Result<Config, String> {
+    parse_config(&read_json(path)?)
 }
-pub fn provision_lighting(path: &Path) -> Result<(), String> {
-    ensure_json(path, &default_lighting()).map_err(|error| error.to_string())
+
+impl Default for Config {
+    fn default() -> Self {
+        parse_config(&config_json()).expect("built-in configuration must be valid")
+    }
 }
-pub fn load_controls(path: &Path) -> Result<Controls, String> {
-    parse_controls(&read_json(path)?)
+
+fn parse_config(value: &Value) -> Result<Config, String> {
+    let root = object(value, "configuration")?;
+    fields(
+        root,
+        &["version", "controls", "effort", "lighting"],
+        "configuration",
+    )?;
+    if root.get("version") != Some(&Value::from(1)) {
+        return Err("version must be 1".into());
+    }
+    Ok(Config {
+        controls: parse_controls(req(root, "controls")?)?,
+        effort: parse_effort(req(root, "effort")?.clone())?,
+        lighting: parse_lighting(req(root, "lighting")?.clone())?,
+    })
 }
-pub fn load_effort(path: &Path) -> Result<EffortConfig, String> {
-    parse_effort(read_json(path)?)
-}
-pub fn load_lighting(path: &Path) -> Result<LightingConfig, String> {
-    parse_lighting(read_json(path)?)
-}
-fn controls_json() -> Value {
-    serde_json::json!({"version":2,"buttons":{"1":null,"2":null,"3":{"byAgent":{"codex":{"action":"fast"},"pi":{"action":"fast"},"default":null}},"4":{"action":"prompt","prompt":"/copy","submit":true},"5":null,"6":null,"7":{"action":"submit"}},"dial":{"clockwise":{"action":"effort","direction":"raise"},"counterclockwise":{"action":"effort","direction":"lower"},"press":{"action":"prompt","prompt":"/model","submit":true}},"joystick":{"engageDistance":0.75,"releaseDistance":0.3,"up":{"action":"scroll","direction":"up","percent":50},"down":{"action":"scroll","direction":"down","percent":50},"left":{"action":"focus-pane","direction":"left"},"right":{"action":"focus-pane","direction":"right"}}})
+
+fn config_json() -> Value {
+    serde_json::json!({
+        "version": 1,
+        "controls": {
+            "buttons": {"1":null,"2":null,"3":{"byAgent":{"codex":{"action":"fast"},"pi":{"action":"fast"},"default":null}},"4":{"action":"prompt","prompt":"/copy","submit":true},"5":null,"6":null,"7":{"action":"submit"}},
+            "dial":{"clockwise":{"action":"effort","direction":"raise"},"counterclockwise":{"action":"effort","direction":"lower"},"press":{"action":"prompt","prompt":"/model","submit":true}},
+            "joystick":{"engageDistance":0.75,"releaseDistance":0.3,"up":{"action":"scroll","direction":"up","percent":50},"down":{"action":"scroll","direction":"down","percent":50},"left":{"action":"focus-pane","direction":"left"},"right":{"action":"focus-pane","direction":"right"}}
+        },
+        "effort": {"codex":{"raise":null,"lower":null}},
+        "lighting": {
+            "states": {
+                "blocked":{"color":"#ffaa00","brightness":1,"effect":"solid","speed":0},
+                "done":{"color":"#22cc55","brightness":1,"effect":"solid","speed":0},
+                "working":{"color":"#2277ff","brightness":1,"effect":"breath","speed":0.35},
+                "idle":{"color":"#ffffff","brightness":0.25,"effect":"solid","speed":0},
+                "unknown":{"color":"#ffffff","brightness":0.08,"effect":"solid","speed":0}
+            },
+            "focusedBrightness":1,
+            "ambient":"status",
+            "keys":null
+        },
+    })
 }
 fn read_json(path: &Path) -> Result<Value, String> {
     serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
@@ -588,9 +625,10 @@ fn read_json(path: &Path) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn controls_reject_unknown_fields_and_map_reversed_dial_labels() {
-        let controls = default_controls();
+        let controls = Config::default().controls;
         for action in [-1, 0, 1, 2, 3] {
             assert!(matches!(
                 key_binding(&controls, "ENC_CC", action),
@@ -599,18 +637,16 @@ mod tests {
                 }))
             ));
         }
-        assert!(key_binding(&controls, "ACT10", 1).is_none());
+        assert_eq!(device_button("ACT06"), Some(1));
+        assert_eq!(device_button("ACT10"), Some(5));
+        assert_eq!(device_button("ACT12"), Some(7));
+        assert_eq!(device_button("ACT13"), None);
         assert!(key_binding(&controls, "F20", 1).is_none());
         assert_eq!(
-            key_binding(&controls, "F24", 1),
-            controls.buttons[&4].clone()
-        );
-        assert_eq!(
-            key_binding(&controls, "STOP", 1),
+            key_binding(&controls, "ACT12", 1),
             controls.buttons[&7].clone()
         );
-        assert_eq!(device_button("F21"), Some(1));
-        assert_eq!(device_button("EXECUTE"), Some(5));
+        assert_eq!(device_button("F21"), None);
         assert_eq!(device_button("F13"), None);
         assert_eq!(
             enabled_buttons(&controls),
@@ -619,32 +655,39 @@ mod tests {
         let mut rebound = controls.clone();
         rebound.buttons.insert(5, controls.buttons[&7].clone());
         assert_ne!(enabled_buttons(&rebound), enabled_buttons(&controls));
-        let mut old_version = controls_json();
-        old_version["version"] = serde_json::json!(1);
-        assert!(parse_controls(&old_version).is_err());
-        let mut stale = controls_json();
-        stale["actionDeviceKeys"] = serde_json::json!({});
-        assert!(parse_controls(&stale).is_err());
-        let mut extra = controls_json();
-        extra["dial"]["extra"] = Value::Bool(true);
-        assert!(parse_controls(&extra).is_err());
-        let mut bad_button = controls_json();
-        bad_button["buttons"]["8"] = Value::Null;
-        assert!(parse_controls(&bad_button).is_err());
+        let mut wrong_version = config_json();
+        wrong_version["version"] = serde_json::json!(2);
+        assert!(parse_config(&wrong_version).is_err());
+        let mut stale = config_json();
+        stale["controls"]["actionDeviceKeys"] = serde_json::json!({});
+        assert!(parse_config(&stale).is_err());
+        let mut extra = config_json();
+        extra["controls"]["dial"]["extra"] = Value::Bool(true);
+        assert!(parse_config(&extra).is_err());
+        let mut gesture_extra = config_json();
+        gesture_extra["controls"]["buttons"]["1"] =
+            serde_json::json!({"tap":{"action":"submit"},"unexpected":true});
+        assert!(parse_config(&gesture_extra).is_err());
+        let mut bad_button = config_json();
+        bad_button["controls"]["buttons"]["8"] = Value::Null;
+        assert!(parse_config(&bad_button).is_err());
     }
+
     #[test]
     fn key_actions_resolve_names_or_raw_keycodes() {
-        let mut named = controls_json();
-        named["buttons"]["5"] = serde_json::json!({"action":"key","key":"F19"});
-        let named = parse_controls(&named).unwrap();
+        assert!(!requires_accessibility(&Config::default().controls));
+        let mut named = config_json();
+        named["controls"]["buttons"]["5"] = serde_json::json!({"action":"key","key":"F19"});
+        let named = parse_config(&named).unwrap().controls;
+        assert!(requires_accessibility(&named));
         assert!(matches!(
             named.buttons[&5],
             Some(Binding::Action(Action::Key { .. }))
         ));
-        let mut raw = controls_json();
-        raw["buttons"]["5"] =
+        let mut raw = config_json();
+        raw["controls"]["buttons"]["5"] =
             serde_json::json!({"action":"key","keycode":80,"modifiers":["cmd","shift"]});
-        assert!(parse_controls(&raw).is_ok());
+        assert!(parse_config(&raw).is_ok());
         for invalid in [
             serde_json::json!({"action":"key"}),
             serde_json::json!({"action":"key","key":"F19","keycode":80}),
@@ -653,38 +696,46 @@ mod tests {
             serde_json::json!({"action":"key","keycode":80,"modifiers":["hyper"]}),
             serde_json::json!({"byAgent":{"codex":{"action":"key","key":"F19"}}}),
         ] {
-            let mut bad = controls_json();
-            bad["buttons"]["5"] = invalid;
-            assert!(parse_controls(&bad).is_err());
+            let mut bad = config_json();
+            bad["controls"]["buttons"]["5"] = invalid;
+            assert!(parse_config(&bad).is_err());
         }
         assert_eq!(key_action_code(Some("F19"), None), Ok(0x50));
         assert_eq!(key_action_code(None, Some(0x50)), Ok(0x50));
     }
+
     #[test]
     fn validates_effort_and_lighting() {
-        assert!(parse_effort(serde_json::json!({"codex":{"raise":null,"lower":"x"}})).is_ok());
-        assert!(parse_effort(serde_json::json!({"codex":{"raise":" "}})).is_err());
-        assert!(parse_effort(serde_json::json!({"codex":{"raise":null}})).is_err());
-        assert!(parse_lighting(serde_json::to_value(default_lighting()).unwrap()).is_ok());
-        assert!(parse_lighting(
-            serde_json::json!({"states":{},"focusedBrightness":1,"ambient":"status","keys":null})
-        )
-        .is_err());
+        let mut valid = config_json();
+        valid["effort"] = serde_json::json!({"codex":{"raise":null,"lower":"x"}});
+        assert!(parse_config(&valid).is_ok());
+        let mut blank = config_json();
+        blank["effort"] = serde_json::json!({"codex":{"raise":" ","lower":null}});
+        assert!(parse_config(&blank).is_err());
+        let mut missing = config_json();
+        missing["effort"] = serde_json::json!({"codex":{"raise":null}});
+        assert!(parse_config(&missing).is_err());
+        let mut lighting = config_json();
+        lighting["lighting"] =
+            serde_json::json!({"states":{},"focusedBrightness":1,"ambient":"status","keys":null});
+        assert!(parse_config(&lighting).is_err());
     }
+
     #[test]
     fn loading_is_pure_and_provisioning_creates_private_defaults() {
         let root = env::temp_dir().join(format!("herdr-micro-config-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
-        let path = root.join("controls.json");
-        assert!(load_controls(&path).is_err());
+        let path = root.join("config.json");
+        assert!(load(&path).is_err());
         assert!(!path.exists());
-        provision_controls(&path).unwrap();
+        provision(&path).unwrap();
+        assert_eq!(load(&path).unwrap(), Config::default());
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        load_controls(&path).unwrap();
+        load(&path).unwrap();
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o644

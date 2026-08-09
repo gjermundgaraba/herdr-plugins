@@ -1,10 +1,12 @@
 use crate::{
-    actions::{Agent, CHATGPT_BUNDLE_IDS},
+    actions::CHATGPT_BUNDLE_IDS,
     config::{AgentStatus, Light, LightingConfig},
 };
+use herdr_client::AgentInfo;
 use std::collections::{HashMap, HashSet};
 
 pub const SLOT_COUNT: usize = 6;
+pub const INPUT_BUNDLE_ID: &str = "it.focusense.input-app";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct JoystickEvent {
@@ -12,32 +14,26 @@ pub struct JoystickEvent {
     pub direction: Option<&'static str>,
 }
 
-pub fn device_owner(frontmost_bundle: Option<&str>) -> Option<&'static str> {
-    device_owner_with_bundles(&crate::macos::running_bundle_ids(), frontmost_bundle)
-}
-
-pub fn device_owner_with_bundles(
-    running_bundles: &[String],
-    frontmost_bundle: Option<&str>,
-) -> Option<&'static str> {
-    if bundle_is_running(running_bundles, "it.focusense.input-app") {
+pub fn device_owner(input_running: bool, frontmost_bundle: Option<&str>) -> Option<&'static str> {
+    if input_running {
         return Some("Input");
     }
-
-    let frontmost_openai =
-        frontmost_bundle.is_some_and(|bundle| CHATGPT_BUNDLE_IDS.contains(&bundle));
-    let chatgpt_running = CHATGPT_BUNDLE_IDS
-        .iter()
-        .any(|bundle| bundle_is_running(running_bundles, bundle));
-    (frontmost_openai && chatgpt_running).then_some("ChatGPT")
+    frontmost_bundle
+        .is_some_and(|bundle| CHATGPT_BUNDLE_IDS.contains(&bundle))
+        .then_some("ChatGPT")
 }
 
-fn bundle_is_running(bundles: &[String], expected: &str) -> bool {
-    bundles.iter().any(|bundle| bundle == expected)
+fn status(agent: &AgentInfo) -> AgentStatus {
+    match agent.agent_status.as_str() {
+        "idle" => AgentStatus::Idle,
+        "working" => AgentStatus::Working,
+        "blocked" => AgentStatus::Blocked,
+        "done" => AgentStatus::Done,
+        _ => AgentStatus::Unknown,
+    }
 }
-
-fn priority(status: AgentStatus) -> u8 {
-    match status {
+fn priority(agent: &AgentInfo) -> u8 {
+    match status(agent) {
         AgentStatus::Unknown => 0,
         AgentStatus::Idle => 1,
         AgentStatus::Working => 2,
@@ -45,14 +41,14 @@ fn priority(status: AgentStatus) -> u8 {
         AgentStatus::Blocked => 4,
     }
 }
-fn compare(a: &Agent, b: &Agent) -> std::cmp::Ordering {
-    priority(b.agent_status)
-        .cmp(&priority(a.agent_status))
+fn compare(a: &AgentInfo, b: &AgentInfo) -> std::cmp::Ordering {
+    priority(b)
+        .cmp(&priority(a))
         .then_with(|| b.state_change_seq.cmp(&a.state_change_seq))
 }
-pub fn assign_slots(previous: &[Option<String>], agents: &[Agent]) -> Vec<Option<String>> {
-    let mut sorted = agents.to_vec();
-    sorted.sort_by(compare);
+pub fn assign_slots(previous: &[Option<String>], agents: &[AgentInfo]) -> Vec<Option<String>> {
+    let mut sorted: Vec<_> = agents.iter().collect();
+    sorted.sort_by(|a, b| compare(a, b));
     let by_id: HashMap<_, _> = agents
         .iter()
         .map(|agent| (agent.terminal_id.as_str(), agent))
@@ -73,7 +69,7 @@ pub fn assign_slots(previous: &[Option<String>], agents: &[Agent]) -> Vec<Option
         }
         if let Some(empty) = slots.iter().position(Option::is_none) {
             slots[empty] = Some(candidate.terminal_id.clone());
-            slotted.insert(candidate.terminal_id);
+            slotted.insert(candidate.terminal_id.clone());
             continue;
         }
         let victim = (1..SLOT_COUNT).fold(0, |victim, index| {
@@ -88,18 +84,18 @@ pub fn assign_slots(previous: &[Option<String>], agents: &[Agent]) -> Vec<Option
             }
         });
         let displaced = by_id[slots[victim].as_ref().unwrap().as_str()];
-        if priority(candidate.agent_status) <= priority(displaced.agent_status) {
+        if priority(candidate) <= priority(displaced) {
             break;
         }
         slotted.remove(&displaced.terminal_id);
         slots[victim] = Some(candidate.terminal_id.clone());
-        slotted.insert(candidate.terminal_id);
+        slotted.insert(candidate.terminal_id.clone());
     }
     slots
 }
 pub fn slot_lighting(
     slots: &[Option<String>],
-    agents: &[Agent],
+    agents: &[AgentInfo],
     config: &LightingConfig,
 ) -> Vec<Light> {
     let by_id: HashMap<_, _> = agents.iter().map(|a| (a.terminal_id.as_str(), a)).collect();
@@ -109,7 +105,7 @@ pub fn slot_lighting(
             slot.as_ref()
                 .and_then(|id| by_id.get(id.as_str()))
                 .map(|a| {
-                    let mut l = config.light(a.agent_status);
+                    let mut l = config.light(status(a));
                     if a.focused {
                         l.b = l.b.max(config.focused_brightness);
                     }
@@ -126,7 +122,7 @@ pub fn slot_lighting(
 }
 pub fn aggregate_lighting(
     slots: &[Option<String>],
-    agents: &[Agent],
+    agents: &[AgentInfo],
     config: &LightingConfig,
 ) -> HashMap<String, Light> {
     let by_id: HashMap<_, _> = agents.iter().map(|a| (a.terminal_id.as_str(), a)).collect();
@@ -135,7 +131,7 @@ pub fn aggregate_lighting(
         .flatten()
         .filter_map(|id| by_id.get(id.as_str()))
         .min_by(|a, b| compare(a, b));
-    let light = best.map(|a| config.light(a.agent_status)).unwrap_or(Light {
+    let light = best.map(|a| config.light(status(a))).unwrap_or(Light {
         c: 0,
         b: 0.0,
         e: 0,
@@ -186,27 +182,18 @@ pub fn joystick_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::default_lighting;
-    fn agent(id: &str, status: AgentStatus) -> Agent {
-        Agent {
-            terminal_id: id.into(),
-            pane_id: String::new(),
-            agent: String::new(),
-            agent_status: status,
-            state_change_seq: 0,
-            focused: false,
-            cwd: String::new(),
-        }
+    use crate::config::Config;
+    use serde_json::json;
+    fn agent(id: &str, status: &str) -> AgentInfo {
+        serde_json::from_value(json!({
+            "terminal_id":id, "agent_status":status, "workspace_id":"w1",
+            "tab_id":"w1:t1", "pane_id":"w1:p1", "focused":false, "revision":1
+        }))
+        .unwrap()
     }
     #[test]
     fn sticky_slots_lighting_and_joystick() {
-        let slots = assign_slots(
-            &[],
-            &[
-                agent("idle", AgentStatus::Idle),
-                agent("working", AgentStatus::Working),
-            ],
-        );
+        let slots = assign_slots(&[], &[agent("idle", "idle"), agent("working", "working")]);
         assert_eq!(slots[..2], [Some("working".into()), Some("idle".into())]);
         assert_eq!(
             joystick_event(0.25, 0.9, Some(0), 0.75, 0.3).direction,
@@ -216,11 +203,8 @@ mod tests {
         assert_eq!(
             slot_lighting(
                 &slots,
-                &[
-                    agent("idle", AgentStatus::Idle),
-                    agent("working", AgentStatus::Working)
-                ],
-                &default_lighting()
+                &[agent("idle", "idle"), agent("working", "working")],
+                &Config::default().lighting
             )
             .len(),
             SLOT_COUNT
@@ -228,23 +212,17 @@ mod tests {
     }
     #[test]
     fn device_owners_use_bundle_identity() {
-        assert_eq!(
-            device_owner_with_bundles(&["it.focusense.input-app".into()], None),
-            Some("Input")
-        );
+        assert_eq!(device_owner(true, None), Some("Input"));
 
         assert_eq!(
-            device_owner_with_bundles(&["com.openai.codex".into()], Some("com.openai.codex")),
+            device_owner(false, Some("com.openai.codex")),
             Some("ChatGPT")
         );
         assert_eq!(
-            device_owner_with_bundles(&["com.openai.chat".into()], Some("com.openai.chat")),
+            device_owner(false, Some("com.openai.chat")),
             Some("ChatGPT")
         );
-        assert_eq!(
-            device_owner_with_bundles(&["com.openai.codex".into()], Some("com.example.other")),
-            None
-        );
+        assert_eq!(device_owner(false, Some("com.example.other")), None);
     }
 
     #[test]

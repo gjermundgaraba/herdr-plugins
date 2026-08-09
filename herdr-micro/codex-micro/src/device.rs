@@ -4,12 +4,12 @@
 //! commands and waits for replies, so callbacks never outlive their storage.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::HashMap,
     ffi::{CStr, c_void},
     pin::Pin,
     ptr::{self, NonNull},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender, SyncSender, TryRecvError},
     },
@@ -35,30 +35,17 @@ use serde_json::Value;
 
 use crate::wire::{REPORT_ID, REPORT_SIZE, Reassembler, encode_message};
 
-pub const MICRO_VENDOR_ID: i32 = 0x303A;
-pub const MICRO_PRODUCT_ID: i32 = 0x8360;
+const MICRO_VENDOR_ID: i32 = 0x303A;
+const MICRO_PRODUCT_ID: i32 = 0x8360;
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
-pub const DEVICE_OPEN_TIMEOUT: Duration = Duration::from_secs(7);
-const KEYBOARD_REPORT_ID: u32 = 1;
-
-/// The complete action-switch key contract, indexed by button number minus one.
-/// Every HID usage here is one macOS maps to no virtual keycode, so an
-/// uncaptured Micro cannot type anything.
-pub const ACTION_KEYS: [(u8, &str); 7] = [
-    (0x70, "F21"),
-    (0x71, "F22"),
-    (0x72, "F23"),
-    (0x73, "F24"),
-    (0x74, "EXECUTE"),
-    (0x77, "SELECT"),
-    (0x78, "STOP"),
-];
+const DEVICE_OPEN_TIMEOUT: Duration = Duration::from_secs(7);
 const INTERFACE_NUMBER: i64 = 0;
 const INTERRUPT_ENDPOINT: u8 = 0x81;
 const CONTROL_TIMEOUT_MS: u32 = 2_000;
 const HID_SET_REPORT_REQUEST_TYPE: u8 = 0x21; // host-to-device, class, interface
 const HID_SET_REPORT: u8 = 0x09;
 const HID_OUTPUT_REPORT: u16 = 2;
+static NATIVE_WATCHDOG_USERS: Mutex<usize> = Mutex::new(0);
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -102,22 +89,36 @@ pub struct MicroDevice {
     command_tx: Sender<Command>,
     next_request_id: AtomicU64,
     closed: Arc<AtomicBool>,
+    terminal_error: Arc<OnceLock<String>>,
     owner: Option<JoinHandle<Result<()>>>,
 }
 
 impl MicroDevice {
+    pub const NATIVE_WATCHDOG_TIMEOUT: Duration = DEVICE_OPEN_TIMEOUT
+        .saturating_add(DEFAULT_REQUEST_TIMEOUT)
+        .saturating_add(Duration::from_secs(1));
+
     /// Exclusively captures the USB Micro and completes `device.status`.
     pub fn open_exclusive(event_tx: Sender<DeviceEvent>) -> Result<Self> {
+        let _watchdog = NativeWatchdog::start();
         let (command_tx, command_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let closed = Arc::new(AtomicBool::new(false));
+        let terminal_error = Arc::new(OnceLock::new());
         let owner_closed = Arc::clone(&closed);
+        let owner_terminal_error = Arc::clone(&terminal_error);
         let owner_event_tx = event_tx.clone();
         let owner = thread::Builder::new()
             .name("codex-micro-usb".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    owner_main(command_rx, event_tx, ready_tx, owner_closed)
+                    owner_main(
+                        command_rx,
+                        event_tx,
+                        ready_tx,
+                        owner_closed,
+                        owner_terminal_error,
+                    )
                 }));
                 match result {
                     Ok(result) => {
@@ -143,6 +144,7 @@ impl MicroDevice {
                 command_tx,
                 next_request_id: AtomicU64::new(1),
                 closed,
+                terminal_error,
                 owner: Some(owner),
             }),
             Ok(Err(error)) => {
@@ -166,16 +168,11 @@ impl MicroDevice {
                 params,
                 reply: reply_tx,
             })
-            .map_err(|_| anyhow!("device disconnected"))?;
-        await_send_reply(reply_rx, DEFAULT_REQUEST_TIMEOUT)
+            .map_err(|_| self.disconnected_error())?;
+        await_send_reply(reply_rx, DEFAULT_REQUEST_TIMEOUT, &self.terminal_error)
     }
 
-    pub fn request(
-        &self,
-        method: impl Into<String>,
-        params: Option<Value>,
-        timeout: Duration,
-    ) -> Result<Value> {
+    pub fn request(&self, method: impl Into<String>, params: Option<Value>) -> Result<Value> {
         self.ensure_open()?;
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
@@ -184,17 +181,24 @@ impl MicroDevice {
                 id,
                 method: method.into(),
                 params,
-                deadline: Instant::now() + timeout,
+                deadline: Instant::now() + DEFAULT_REQUEST_TIMEOUT,
                 reply: reply_tx,
             })
-            .map_err(|_| anyhow!("device disconnected"))?;
+            .map_err(|_| self.disconnected_error())?;
         reply_rx
-            .recv_timeout(timeout + Duration::from_millis(100))
-            .map_err(|_| anyhow!("request {id} timed out"))?
+            .recv_timeout(DEFAULT_REQUEST_TIMEOUT + Duration::from_millis(100))
+            .map_err(|_| {
+                self.terminal_error
+                    .get()
+                    .cloned()
+                    .map(anyhow::Error::msg)
+                    .unwrap_or_else(|| anyhow!("request {id} timed out"))
+            })?
             .map_err(|error| anyhow!(error))
     }
 
     pub fn close(&mut self) -> Result<()> {
+        let _watchdog = self.owner.as_ref().map(|_| NativeWatchdog::start());
         if !self.closed.swap(true, Ordering::AcqRel) {
             let _ = self.command_tx.send(Command::Close);
         }
@@ -207,19 +211,35 @@ impl MicroDevice {
 
     fn ensure_open(&self) -> Result<()> {
         if self.closed.load(Ordering::Acquire) {
-            bail!("device disconnected")
+            return Err(self.disconnected_error());
         }
         Ok(())
+    }
+
+    fn disconnected_error(&self) -> anyhow::Error {
+        anyhow!(
+            self.terminal_error
+                .get()
+                .map_or("device disconnected", String::as_str)
+                .to_owned()
+        )
     }
 }
 
 fn await_send_reply(
     reply_rx: Receiver<std::result::Result<(), String>>,
     timeout: Duration,
+    terminal_error: &OnceLock<String>,
 ) -> Result<()> {
     reply_rx
         .recv_timeout(timeout)
-        .map_err(|_| anyhow!("device write timed out"))?
+        .map_err(|_| {
+            terminal_error
+                .get()
+                .cloned()
+                .map(anyhow::Error::msg)
+                .unwrap_or_else(|| anyhow!("device write timed out"))
+        })?
         .map_err(|error| anyhow!(error))
 }
 
@@ -234,9 +254,10 @@ fn owner_main(
     event_tx: Sender<DeviceEvent>,
     ready_tx: SyncSender<std::result::Result<(), String>>,
     closed: Arc<AtomicBool>,
+    terminal_error: Arc<OnceLock<String>>,
 ) -> Result<()> {
     let result = (|| {
-        let mut owner = Owner::open(Arc::new(Mutex::new(command_rx)), event_tx, closed)?;
+        let mut owner = Owner::open(command_rx, event_tx, closed, terminal_error)?;
         if ready_tx.send(Ok(())).is_err() {
             owner.teardown()?;
             bail!("opener dropped")
@@ -261,22 +282,24 @@ struct Owner {
     input_buffer: Box<[u8; REPORT_SIZE]>,
     context: Option<Pin<Box<CallbackContext>>>,
     callback_rx: Receiver<CallbackEvent>,
-    command_rx: Arc<Mutex<Receiver<Command>>>,
+    command_rx: Receiver<Command>,
     event_tx: Sender<DeviceEvent>,
     reassembler: Reassembler,
-    function_keys_down: BTreeSet<&'static str>,
     pending: HashMap<u64, Pending>,
     closed: Arc<AtomicBool>,
     read_pending: bool,
     torn_down: bool,
-    terminal_error: Option<String>,
+    terminal_error: Arc<OnceLock<String>>,
+    // Last so a Drop-armed alarm covers every native field destructor.
+    watchdog: Option<NativeWatchdog>,
 }
 
 impl Owner {
     fn open(
-        command_rx: Arc<Mutex<Receiver<Command>>>,
+        command_rx: Receiver<Command>,
         event_tx: Sender<DeviceEvent>,
         closed: Arc<AtomicBool>,
+        terminal_error: Arc<OnceLock<String>>,
     ) -> Result<Self> {
         let device_service = find_micro_device()?;
         let mut device = UsbDevice::new(device_service.0)?;
@@ -333,12 +356,12 @@ impl Owner {
             command_rx,
             event_tx,
             reassembler: Reassembler::default(),
-            function_keys_down: BTreeSet::new(),
             pending: HashMap::new(),
             closed,
             read_pending: false,
             torn_down: false,
-            terminal_error: None,
+            terminal_error,
+            watchdog: None,
         };
         if let Err(error) = owner.submit_read() {
             owner
@@ -371,16 +394,13 @@ impl Owner {
         bail!("device.status timed out")
     }
 
-    fn run(&mut self) -> Result<()> {
+    fn run(mut self) -> Result<()> {
         loop {
             self.pump();
             if self.closed.load(Ordering::Acquire) {
                 break;
             }
-            let command = match self.command_rx.lock() {
-                Ok(receiver) => receiver.try_recv(),
-                Err(_) => break,
-            };
+            let command = self.command_rx.try_recv();
             match command {
                 Ok(Command::Close) | Err(TryRecvError::Disconnected) => break,
                 Ok(Command::Send {
@@ -405,11 +425,10 @@ impl Owner {
                 Err(TryRecvError::Empty) => {}
             }
         }
-        let result = self.teardown();
-        if let Some(error) = self.terminal_error.take() {
-            result?;
-            bail!(error)
-        }
+        self.watchdog = Some(NativeWatchdog::start());
+        let terminal_error = self.terminal_error.get().cloned();
+        let result = finish_owner(terminal_error, self.teardown());
+        drop(self);
         result
     }
 
@@ -424,12 +443,12 @@ impl Owner {
             let length = length.min(REPORT_SIZE);
             if length > 0 {
                 let bytes = self.input_buffer[..length].to_vec();
-                self.handle_report(bytes[0] as u32, &bytes);
+                self.handle_report(&bytes);
             }
-            if !self.closed.load(Ordering::Acquire) {
-                if let Err(error) = self.submit_read() {
-                    self.disconnect(error.to_string());
-                }
+            if !self.closed.load(Ordering::Acquire)
+                && let Err(error) = self.submit_read()
+            {
+                self.disconnect(error.to_string());
             }
         }
         let now = Instant::now();
@@ -472,52 +491,34 @@ impl Owner {
         Ok(())
     }
 
-    fn write(&self, method: String, params: Option<Value>, id: Option<u64>) -> Result<()> {
+    fn write(&mut self, method: String, params: Option<Value>, id: Option<u64>) -> Result<()> {
         for mut report in encode_message(&method, params.as_ref(), id)? {
             let payload = output_wire(&mut report)?;
-            self.device.set_output_report(payload)?;
+            if let Err(error) = self.device.set_output_report(payload) {
+                self.disconnect(error.to_string());
+                return Err(error);
+            }
         }
         Ok(())
     }
 
-    fn handle_report(&mut self, report_id: u32, report: &[u8]) {
-        if report_id == KEYBOARD_REPORT_ID {
-            if let Some(next) = function_keys(report) {
-                for name in self.function_keys_down.difference(&next) {
-                    let _ = self.event_tx.send(DeviceEvent::Key {
-                        key: (*name).into(),
-                        action: 0,
-                    });
-                }
-                for name in next.difference(&self.function_keys_down) {
-                    let _ = self.event_tx.send(DeviceEvent::Key {
-                        key: (*name).into(),
-                        action: 1,
-                    });
-                }
-                self.function_keys_down = next;
-            }
-            return;
-        }
-        if report_id != REPORT_ID as u32 {
-            return;
-        }
+    fn handle_report(&mut self, report: &[u8]) {
         for envelope in self.reassembler.push(report) {
             let Ok(envelope) = envelope else { continue };
-            if let Some(id) = envelope.get("id").and_then(Value::as_u64) {
-                if envelope.get("result").is_some() || envelope.get("error").is_some() {
-                    if let Some(pending) = self.pending.remove(&id) {
-                        let result = envelope
-                            .get("error")
-                            .map(error_message)
-                            .map(Err)
-                            .unwrap_or_else(|| {
-                                Ok(envelope.get("result").cloned().unwrap_or(Value::Null))
-                            });
-                        let _ = pending.reply.send(result);
-                    }
-                    continue;
+            if let Some(id) = envelope.get("id").and_then(Value::as_u64)
+                && (envelope.get("result").is_some() || envelope.get("error").is_some())
+            {
+                if let Some(pending) = self.pending.remove(&id) {
+                    let result = envelope
+                        .get("error")
+                        .map(error_message)
+                        .map(Err)
+                        .unwrap_or_else(|| {
+                            Ok(envelope.get("result").cloned().unwrap_or(Value::Null))
+                        });
+                    let _ = pending.reply.send(result);
                 }
+                continue;
             }
             if let Some(event) = parse_event(&envelope) {
                 let _ = self.event_tx.send(event);
@@ -526,10 +527,10 @@ impl Owner {
     }
 
     fn disconnect(&mut self, error: String) {
-        if !self.closed.swap(true, Ordering::AcqRel) {
-            self.terminal_error = Some(error.clone());
-        }
+        let error = self.terminal_error.get_or_init(|| error).clone();
+        self.closed.store(true, Ordering::Release);
         self.fail_all(&error);
+        fail_queued(&self.command_rx, &error);
     }
 
     fn fail_pending(&mut self, id: u64, error: String) {
@@ -549,12 +550,19 @@ impl Owner {
             return Ok(());
         }
         self.closed.store(true, Ordering::Release);
-        self.fail_all("device disconnected");
+        let error = self
+            .terminal_error
+            .get()
+            .map(String::as_str)
+            .unwrap_or("device disconnected")
+            .to_owned();
+        self.fail_all(&error);
+        fail_queued(&self.command_rx, &error);
         let mut errors = Vec::new();
-        if self.read_pending {
-            if let Err(error) = self.interface.abort(self.pipe) {
-                errors.push(error.to_string());
-            }
+        if self.read_pending
+            && let Err(error) = self.interface.abort(self.pipe)
+        {
+            errors.push(error.to_string());
         }
         let deadline = Instant::now() + DEFAULT_REQUEST_TIMEOUT;
         while self.read_pending && Instant::now() < deadline {
@@ -593,7 +601,40 @@ impl Owner {
 
 impl Drop for Owner {
     fn drop(&mut self) {
+        if self.watchdog.is_none() {
+            self.watchdog = Some(NativeWatchdog::start());
+        }
         let _ = self.teardown();
+    }
+}
+
+struct NativeWatchdog;
+
+impl NativeWatchdog {
+    fn start() -> Self {
+        let mut users = NATIVE_WATCHDOG_USERS.lock().unwrap();
+        if *users == 0 {
+            // SAFETY: the privileged helper installs SIGALRM with its fatal default
+            // disposition before opening the device.
+            unsafe {
+                libc::alarm(MicroDevice::NATIVE_WATCHDOG_TIMEOUT.as_secs() as libc::c_uint);
+            }
+        }
+        *users += 1;
+        Self
+    }
+}
+
+impl Drop for NativeWatchdog {
+    fn drop(&mut self) {
+        let mut users = NATIVE_WATCHDOG_USERS.lock().unwrap();
+        *users -= 1;
+        if *users == 0 {
+            // SAFETY: alarm(0) cancels the process-wide native deadline.
+            unsafe {
+                libc::alarm(0);
+            }
+        }
     }
 }
 
@@ -607,23 +648,6 @@ unsafe extern "C-unwind" fn read_callback(context: *mut c_void, result: i32, len
         result,
         length: length as usize,
     });
-}
-
-fn function_keys(report: &[u8]) -> Option<BTreeSet<&'static str>> {
-    let report = match report {
-        [id, payload @ ..] if *id == KEYBOARD_REPORT_ID as u8 && payload.len() >= 8 => payload,
-        _ => return None,
-    };
-    Some(
-        report[2..8]
-            .iter()
-            .filter_map(|usage| {
-                ACTION_KEYS
-                    .iter()
-                    .find_map(|(code, name)| (code == usage).then_some(*name))
-            })
-            .collect(),
-    )
 }
 
 struct IoObject(io_object_t);
@@ -1125,6 +1149,28 @@ fn restore_after_open_error(device: &mut UsbDevice, error: anyhow::Error) -> any
     }
 }
 
+fn finish_owner(terminal_error: Option<String>, teardown: Result<()>) -> Result<()> {
+    match (terminal_error, teardown) {
+        (Some(error), Ok(())) => Err(anyhow!(error)),
+        (Some(error), Err(teardown)) => Err(anyhow!("{error}; USB teardown failed: {teardown:#}")),
+        (None, teardown) => teardown,
+    }
+}
+
+fn fail_queued(command_rx: &Receiver<Command>, error: &str) {
+    while let Ok(command) = command_rx.try_recv() {
+        match command {
+            Command::Send { reply, .. } => {
+                let _ = reply.send(Err(error.into()));
+            }
+            Command::Request { reply, .. } => {
+                let _ = reply.send(Err(error.into()));
+            }
+            Command::Close => {}
+        }
+    }
+}
+
 fn wait_for_interface_zero(device: &UsbDevice) -> Result<IoObject> {
     let deadline = Instant::now() + DEFAULT_REQUEST_TIMEOUT;
     loop {
@@ -1301,20 +1347,6 @@ mod tests {
     }
 
     #[test]
-    fn reads_action_keys_from_id_prefixed_keyboard_reports() {
-        assert_eq!(
-            function_keys(&[KEYBOARD_REPORT_ID as u8, 0, 0, 0x70, 0x78, 0, 0, 0, 0]),
-            Some(BTreeSet::from(["F21", "STOP"]))
-        );
-        assert_eq!(function_keys(&[0, 0, 0x70, 0x78, 0, 0, 0, 0]), None);
-        assert_eq!(function_keys(&[0; 7]), None);
-        assert_eq!(
-            function_keys(&[KEYBOARD_REPORT_ID as u8, 0, 0, 0x68, 0x74, 0x7E, 0, 0, 0]),
-            Some(BTreeSet::from(["EXECUTE"]))
-        );
-    }
-
-    #[test]
     fn close_joins_an_owner_after_removal() {
         let (command_tx, _command_rx) = mpsc::channel();
         let joined = Arc::new(AtomicBool::new(false));
@@ -1323,6 +1355,7 @@ mod tests {
             command_tx,
             next_request_id: AtomicU64::new(1),
             closed: Arc::new(AtomicBool::new(true)),
+            terminal_error: Arc::new(OnceLock::new()),
             owner: Some(thread::spawn(move || {
                 thread::sleep(Duration::from_millis(20));
                 owner_joined.store(true, Ordering::Release);
@@ -1332,5 +1365,61 @@ mod tests {
         device.close().unwrap();
         assert!(joined.load(Ordering::Acquire));
         assert!(device.owner.is_none());
+    }
+
+    #[test]
+    fn terminal_failure_is_kept_with_teardown_failure() {
+        let error = finish_owner(
+            Some("HID SET_REPORT failed: 0x12345678".into()),
+            Err(anyhow!("USB device restoration failed")),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "HID SET_REPORT failed: 0x12345678; USB teardown failed: USB device restoration failed"
+        );
+    }
+
+    #[test]
+    fn queued_commands_receive_the_terminal_failure() {
+        let (command_tx, command_rx) = mpsc::channel();
+        let (send_tx, send_rx) = mpsc::sync_channel(1);
+        let (request_tx, request_rx) = mpsc::sync_channel(1);
+        command_tx
+            .send(Command::Send {
+                method: "first".into(),
+                params: None,
+                reply: send_tx,
+            })
+            .unwrap();
+        command_tx
+            .send(Command::Request {
+                id: 1,
+                method: "second".into(),
+                params: None,
+                deadline: Instant::now(),
+                reply: request_tx,
+            })
+            .unwrap();
+
+        fail_queued(&command_rx, "write failed");
+
+        assert_eq!(send_rx.recv().unwrap(), Err("write failed".into()));
+        assert_eq!(request_rx.recv().unwrap(), Err("write failed".into()));
+    }
+
+    #[test]
+    fn late_reply_disconnect_keeps_the_terminal_failure() {
+        let terminal_error = OnceLock::new();
+        terminal_error.set("write failed".into()).unwrap();
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        drop(reply_tx);
+
+        assert_eq!(
+            await_send_reply(reply_rx, Duration::ZERO, &terminal_error)
+                .unwrap_err()
+                .to_string(),
+            "write failed"
+        );
     }
 }

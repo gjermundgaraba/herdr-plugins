@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     ffi::{CString, c_char, c_int, c_void},
-    io::{self, Read, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     os::unix::{
         io::{AsRawFd, FromRawFd},
         net::{UnixListener, UnixStream},
@@ -21,17 +21,20 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::device::{DEFAULT_REQUEST_TIMEOUT, DEVICE_OPEN_TIMEOUT, DeviceEvent, MicroDevice};
+use crate::{
+    actions::layer_identity,
+    device::{DEFAULT_REQUEST_TIMEOUT, DeviceEvent, MicroDevice},
+};
 
 pub const HID_PROTOCOL_VERSION: u32 = 1;
 pub const HID_LAUNCH_SOCKET_NAME: &str = "Control";
 pub const HID_MAX_LINE_BYTES: usize = 64 * 1024;
-pub const HID_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const HELPER_LABEL: &str = "dev.herdr.herdr-micro-hid";
 // Increment whenever privileged helper code changes.
-pub const HELPER_VERSION: &str = "4";
+pub const HELPER_VERSION: &str = "14";
 const HID_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
-const HELPER_SHUTDOWN_TIMEOUT: Duration = DEVICE_OPEN_TIMEOUT;
+const HELPER_SHUTDOWN_TIMEOUT: Duration =
+    MicroDevice::NATIVE_WATCHDOG_TIMEOUT.saturating_add(Duration::from_secs(1));
 static HELPER_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn request_helper_shutdown(_signal: c_int) {
@@ -48,6 +51,56 @@ pub fn current_hid_socket_path() -> PathBuf {
 }
 
 type Reply = std::result::Result<Value, String>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HelperErrorCode {
+    Helper,
+    Unavailable,
+}
+
+impl HelperErrorCode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Helper => "helper",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "helper" => Some(Self::Helper),
+            "unavailable" => Some(Self::Unavailable),
+            _ => None,
+        }
+    }
+
+    fn device_state(self) -> &'static str {
+        match self {
+            Self::Helper => "helper-error",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct HelperConnectionError {
+    code: HelperErrorCode,
+    message: String,
+}
+
+impl std::fmt::Display for HelperConnectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for HelperConnectionError {}
+
+pub(crate) fn connection_error_state(error: &anyhow::Error) -> &'static str {
+    error
+        .downcast_ref::<HelperConnectionError>()
+        .map_or("helper-error", |error| error.code.device_state())
+}
 
 pub struct HidClient {
     writer: Arc<Mutex<UnixStream>>,
@@ -84,12 +137,12 @@ impl HidClient {
                 "helperVersion": HELPER_VERSION,
             }),
         )?;
-        let hello = read_message(&mut stream).context("read USB helper handshake")?;
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let hello = read_message(&mut reader).context("read USB helper handshake")?;
         validate_hello(&hello)?;
         stream.set_read_timeout(None)?;
         stream.set_write_timeout(Some(DEFAULT_REQUEST_TIMEOUT))?;
 
-        let read_stream = stream.try_clone()?;
         let writer = Arc::new(Mutex::new(stream));
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let closed = Arc::new(AtomicBool::new(false));
@@ -99,7 +152,7 @@ impl HidClient {
             .name("herdr-micro-hid-ipc".into())
             .spawn({
                 let event_tx = event_tx.clone();
-                move || client_reader(read_stream, event_tx, reader_pending, reader_closed)
+                move || client_reader(reader, event_tx, reader_pending, reader_closed)
             })?;
         Ok(Self {
             writer,
@@ -112,26 +165,14 @@ impl HidClient {
     }
 
     pub fn send(&self, method: impl Into<String>, params: Option<Value>) -> Result<()> {
-        self.call("send", method.into(), params, DEFAULT_REQUEST_TIMEOUT)
-            .map(|_| ())
+        self.call("send", method.into(), params).map(|_| ())
     }
 
-    pub fn request(
-        &self,
-        method: impl Into<String>,
-        params: Option<Value>,
-        timeout: Duration,
-    ) -> Result<Value> {
-        self.call("request", method.into(), params, timeout)
+    pub fn request(&self, method: impl Into<String>, params: Option<Value>) -> Result<Value> {
+        self.call("request", method.into(), params)
     }
 
-    fn call(
-        &self,
-        kind: &'static str,
-        method: String,
-        params: Option<Value>,
-        timeout: Duration,
-    ) -> Result<Value> {
+    fn call(&self, kind: &'static str, method: String, params: Option<Value>) -> Result<Value> {
         if self.closed.load(Ordering::Acquire) {
             bail!("device disconnected")
         }
@@ -153,9 +194,9 @@ impl HidClient {
             self.disconnect(error.to_string());
             return Err(error);
         }
-        let wait = timeout
+        let wait = DEFAULT_REQUEST_TIMEOUT
             .checked_add(Duration::from_millis(200))
-            .unwrap_or(timeout);
+            .unwrap_or(DEFAULT_REQUEST_TIMEOUT);
         match reply_rx.recv_timeout(wait) {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(error)) => Err(anyhow!(error)),
@@ -182,12 +223,15 @@ impl HidClient {
 
     fn disconnect(&self, error: String) {
         let notify = !self.closed.swap(true, Ordering::AcqRel);
-        if let Ok(writer) = self.writer.lock() {
-            let _ = writer.shutdown(std::net::Shutdown::Both);
-        }
+        self.shutdown_writer();
         if notify {
             let _ = self.event_tx.send(DeviceEvent::Disconnected { error });
         }
+    }
+
+    fn shutdown_writer(&self) {
+        let writer = self.writer.lock().unwrap();
+        let _ = writer.shutdown(std::net::Shutdown::Both);
     }
 
     pub fn close(&mut self) -> Result<()> {
@@ -196,19 +240,19 @@ impl HidClient {
         } else {
             Ok(())
         };
-        if let Ok(writer) = self.writer.lock() {
-            let _ = writer.shutdown(std::net::Shutdown::Both);
-        }
-        if self
+        self.shutdown_writer();
+        let joined = if self
             .reader
             .take()
             .map(JoinHandle::join)
             .transpose()
             .is_err()
         {
-            return Err(anyhow!("HID IPC reader thread panicked"));
-        }
-        result
+            Err(anyhow!("HID IPC reader thread panicked"))
+        } else {
+            Ok(())
+        };
+        combine_results([result, joined])
     }
 
     fn close_remote(&self) -> Result<()> {
@@ -240,21 +284,15 @@ impl Drop for HidClient {
     }
 }
 
-impl crate::device::keymap::Requester for HidClient {
-    fn request(&self, method: &str, params: Option<Value>, timeout: Duration) -> Result<Value> {
-        HidClient::request(self, method, params, timeout)
-    }
-}
-
 fn client_reader(
-    mut stream: UnixStream,
+    mut reader: BufReader<UnixStream>,
     event_tx: Sender<DeviceEvent>,
     pending: Arc<Mutex<HashMap<u64, SyncSender<Reply>>>>,
     closed: Arc<AtomicBool>,
 ) {
     let result = (|| -> Result<()> {
         loop {
-            let message = read_message(&mut stream)?;
+            let message = read_message(&mut reader)?;
             require_version(&message)?;
             match message.get("type").and_then(Value::as_str) {
                 Some("reply") => {
@@ -317,13 +355,19 @@ fn validate_hello(message: &Value) -> Result<()> {
             Ok(())
         }
         Some("hello") => bail!("incompatible USB helper version"),
-        Some("error") => bail!(
-            "{}",
-            message
+        Some("error") => Err(HelperConnectionError {
+            code: message
+                .get("code")
+                .and_then(Value::as_str)
+                .and_then(HelperErrorCode::parse)
+                .unwrap_or(HelperErrorCode::Helper),
+            message: message
                 .get("error")
                 .and_then(Value::as_str)
                 .unwrap_or("USB helper rejected the connection")
-        ),
+                .into(),
+        }
+        .into()),
         _ => bail!("invalid USB helper handshake"),
     }
 }
@@ -335,33 +379,33 @@ fn require_version(message: &Value) -> Result<()> {
     Ok(())
 }
 
-fn read_message(stream: &mut impl Read) -> Result<Value> {
+fn read_message(stream: &mut impl BufRead) -> Result<Value> {
     let line = read_line(stream)?;
     serde_json::from_slice(&line).context("parse HID IPC message")
 }
 
-fn read_line(stream: &mut impl Read) -> Result<Vec<u8>> {
+fn read_line(stream: &mut impl BufRead) -> Result<Vec<u8>> {
     let mut line = Vec::new();
-    let mut byte = [0_u8; 1];
-    loop {
-        match stream.read(&mut byte) {
-            Ok(0) => bail!("HID IPC connection closed"),
-            Ok(_) if byte[0] == b'\n' => return Ok(line),
-            Ok(_) if line.len() < HID_MAX_LINE_BYTES => line.push(byte[0]),
-            Ok(_) => bail!("HID IPC message exceeds {HID_MAX_LINE_BYTES} bytes"),
-            Err(error) => return Err(error.into()),
-        }
+    stream
+        .take((HID_MAX_LINE_BYTES + 1) as u64)
+        .read_until(b'\n', &mut line)?;
+    if line.last() == Some(&b'\n') {
+        line.pop();
+        return Ok(line);
     }
+    if line.len() > HID_MAX_LINE_BYTES {
+        bail!("HID IPC message exceeds {HID_MAX_LINE_BYTES} bytes")
+    }
+    bail!("HID IPC connection closed")
 }
 
 fn write_message(stream: &mut impl Write, message: &Value) -> Result<()> {
-    let bytes = serde_json::to_vec(message)?;
+    let mut bytes = serde_json::to_vec(message)?;
     if bytes.len() > HID_MAX_LINE_BYTES {
         bail!("HID IPC message exceeds {HID_MAX_LINE_BYTES} bytes")
     }
+    bytes.push(b'\n');
     stream.write_all(&bytes)?;
-    stream.write_all(b"\n")?;
-    stream.flush()?;
     Ok(())
 }
 
@@ -387,33 +431,34 @@ pub fn run_hid_server(allowed_uid: libc::uid_t) -> Result<()> {
 }
 
 fn run_server(listener: UnixListener, allowed_uid: libc::uid_t) -> Result<()> {
-    // SAFETY: the handler only stores to a lock-free atomic flag.
-    if unsafe {
-        libc::signal(
-            libc::SIGTERM,
-            request_helper_shutdown as *const () as libc::sighandler_t,
-        )
-    } == libc::SIG_ERR
-    {
-        return Err(io::Error::last_os_error()).context("install SIGTERM handler");
-    }
+    install_signal_handler(
+        libc::SIGTERM,
+        request_helper_shutdown as *const () as libc::sighandler_t,
+    )
+    .context("install SIGTERM handler")?;
+    install_signal_handler(libc::SIGALRM, libc::SIG_DFL).context("install native HID watchdog")?;
+    unblock_helper_signals()?;
     listener.set_nonblocking(true)?;
-    let active = Arc::new(AtomicBool::new(false));
-    let mut worker: Option<JoinHandle<()>> = None;
-    let mut idle_since = Instant::now();
+    let Some((mut stream, reader)) =
+        accept_authenticated_client(&listener, allowed_uid, HID_CONNECT_TIMEOUT)?
+    else {
+        return Ok(());
+    };
+    if HELPER_SHUTDOWN.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    serve_client(&mut stream, reader)
+}
+
+fn accept_authenticated_client(
+    listener: &UnixListener,
+    allowed_uid: libc::uid_t,
+    idle_timeout: Duration,
+) -> Result<Option<(UnixStream, BufReader<UnixStream>)>> {
+    let idle_deadline = Instant::now() + idle_timeout;
     loop {
-        if HELPER_SHUTDOWN.load(Ordering::Acquire) {
-            if active.load(Ordering::Acquire) {
-                thread::sleep(Duration::from_millis(20));
-                continue;
-            }
-            break;
-        }
-        if worker.as_ref().is_some_and(JoinHandle::is_finished) {
-            if worker.take().unwrap().join().is_err() {
-                return Err(anyhow!("HID client worker panicked"));
-            }
-            idle_since = Instant::now();
+        if HELPER_SHUTDOWN.load(Ordering::Acquire) || Instant::now() >= idle_deadline {
+            return Ok(None);
         }
         match listener.accept() {
             Ok((mut stream, _)) => {
@@ -423,64 +468,72 @@ fn run_server(listener: UnixListener, allowed_uid: libc::uid_t) -> Result<()> {
                 let peer = match peer_euid(&stream) {
                     Ok(peer) => peer,
                     Err(error) => {
-                        let _ = write_error(&mut stream, &error.to_string());
+                        let _ =
+                            write_error(&mut stream, HelperErrorCode::Helper, &error.to_string());
                         continue;
                     }
                 };
                 if peer != allowed_uid {
-                    let _ = write_error(&mut stream, "unauthorized HID client");
+                    let _ = write_error(
+                        &mut stream,
+                        HelperErrorCode::Helper,
+                        "unauthorized HID client",
+                    );
                     continue;
                 }
-                if active
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                    .is_err()
-                {
-                    let _ = write_error(&mut stream, "HID device is busy");
-                    continue;
-                }
-                if let Some(previous) = worker.take() {
-                    let _ = previous.join();
-                }
-                let lease = Arc::clone(&active);
-                worker = Some(
-                    thread::Builder::new()
-                        .name("herdr-micro-hid-client".into())
-                        .spawn(move || {
-                            let _guard = LeaseGuard(lease);
-                            let _ = serve_client(&mut stream);
-                        })?,
-                );
+                let reader = match authenticate_client(&mut stream) {
+                    Ok(reader) => reader,
+                    Err(error) => {
+                        eprintln!("herdr-micro-hid client: {error:#}");
+                        continue;
+                    }
+                };
+                return Ok(Some((stream, reader)));
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if !active.load(Ordering::Acquire) && idle_since.elapsed() >= HID_IDLE_TIMEOUT {
-                    break;
-                }
                 thread::sleep(Duration::from_millis(20));
             }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error).context("accept HID client"),
         }
     }
-    if let Some(worker) = worker {
-        let _ = worker.join();
+}
+
+fn install_signal_handler(signal: c_int, handler: libc::sighandler_t) -> Result<()> {
+    // SAFETY: zero is a valid base for sigaction, the mask is initialized below,
+    // and both pointers passed to sigaction remain valid for the call.
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = handler;
+    if unsafe { libc::sigemptyset(&mut action.sa_mask) } != 0
+        || unsafe { libc::sigaction(signal, &action, ptr::null_mut()) } != 0
+    {
+        return Err(io::Error::last_os_error().into());
     }
     Ok(())
 }
 
-struct LeaseGuard(Arc<AtomicBool>);
-
-impl Drop for LeaseGuard {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+fn unblock_helper_signals() -> Result<()> {
+    // exec preserves the signal mask, so do not rely on launchd's current mask.
+    let mut signals: libc::sigset_t = unsafe { std::mem::zeroed() };
+    // SAFETY: signals is live and initialized before it is passed to sigprocmask.
+    if unsafe { libc::sigemptyset(&mut signals) } != 0
+        || unsafe { libc::sigaddset(&mut signals, libc::SIGTERM) } != 0
+        || unsafe { libc::sigaddset(&mut signals, libc::SIGALRM) } != 0
+        || unsafe { libc::sigprocmask(libc::SIG_UNBLOCK, &signals, ptr::null_mut()) } != 0
+    {
+        return Err(io::Error::last_os_error()).context("unblock HID helper signals");
     }
+    Ok(())
 }
 
-fn serve_client(stream: &mut UnixStream) -> Result<()> {
+fn authenticate_client(stream: &mut UnixStream) -> Result<BufReader<UnixStream>> {
     stream.set_read_timeout(Some(HID_CONNECT_TIMEOUT))?;
     stream.set_write_timeout(Some(HID_CONNECT_TIMEOUT))?;
-    let hello = match read_message(stream).context("read HID client handshake") {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let hello = match read_message(&mut reader).context("read HID client handshake") {
         Ok(hello) => hello,
         Err(error) => {
-            let _ = write_error(stream, &error.to_string());
+            let _ = write_error(stream, HelperErrorCode::Helper, &error.to_string());
             return Err(error);
         }
     };
@@ -488,15 +541,22 @@ fn serve_client(stream: &mut UnixStream) -> Result<()> {
         || hello.get("type").and_then(Value::as_str) != Some("hello")
         || hello.get("helperVersion").and_then(Value::as_str) != Some(HELPER_VERSION)
     {
-        let _ = write_error(stream, "incompatible HID client protocol");
+        let _ = write_error(
+            stream,
+            HelperErrorCode::Helper,
+            "incompatible HID client protocol",
+        );
         bail!("incompatible HID client protocol")
     }
+    Ok(reader)
+}
 
+fn serve_client(stream: &mut UnixStream, reader: BufReader<UnixStream>) -> Result<()> {
     let (event_tx, event_rx) = mpsc::channel();
     let device = match MicroDevice::open_exclusive(event_tx) {
         Ok(device) => device,
         Err(error) => {
-            let _ = write_error(stream, &error.to_string());
+            let _ = write_error(stream, HelperErrorCode::Unavailable, &error.to_string());
             return Err(error);
         }
     };
@@ -511,7 +571,6 @@ fn serve_client(stream: &mut UnixStream) -> Result<()> {
     stream.set_read_timeout(None)?;
     stream.set_write_timeout(Some(DEFAULT_REQUEST_TIMEOUT))?;
 
-    let reader = stream.try_clone()?;
     let writer = Arc::new(Mutex::new(stream.try_clone()?));
     let command_writer = Arc::clone(&writer);
     let close_in_progress = Arc::new(AtomicBool::new(false));
@@ -525,6 +584,7 @@ fn serve_client(stream: &mut UnixStream) -> Result<()> {
         })?;
 
     let mut shutting_down = false;
+    let mut terminal_error = None;
     let result = loop {
         if HELPER_SHUTDOWN.load(Ordering::Acquire) {
             shutting_down = true;
@@ -539,6 +599,9 @@ fn serve_client(stream: &mut UnixStream) -> Result<()> {
         }
         match event_rx.recv_timeout(Duration::from_millis(20)) {
             Ok(event) => {
+                if let DeviceEvent::Disconnected { error } = &event {
+                    terminal_error = Some(error.clone());
+                }
                 let message = json!({
                     "v": HID_PROTOCOL_VERSION,
                     "type": "event",
@@ -554,44 +617,55 @@ fn serve_client(stream: &mut UnixStream) -> Result<()> {
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                break event_disconnect_result(&done_rx, &close_in_progress);
+                break event_disconnect_result(
+                    &done_rx,
+                    &close_in_progress,
+                    terminal_error.as_deref(),
+                );
             }
         }
     };
 
-    if let Err(error) = &result {
-        if let Ok(mut writer) = writer.lock() {
-            let _ = write_error(&mut *writer, &error.to_string());
-        }
+    if let Err(error) = &result
+        && let Ok(mut writer) = writer.lock()
+    {
+        let _ = write_error(
+            &mut *writer,
+            HelperErrorCode::Unavailable,
+            &error.to_string(),
+        );
     }
     // Wake the command reader without discarding a final device/error event.
     let _ = stream.shutdown(std::net::Shutdown::Read);
-    if shutting_down {
-        let closed = done_rx
-            .recv_timeout(HELPER_SHUTDOWN_TIMEOUT)
-            .map_err(|_| anyhow!("USB helper shutdown timed out"))?
-            .map_err(anyhow::Error::msg);
-        let joined = command_thread
-            .join()
-            .map_err(|_| anyhow!("HID command thread panicked"));
-        drop(writer);
-        return result.and(closed).and(joined);
-    }
+    let closed = if shutting_down {
+        match done_rx.recv_timeout(HELPER_SHUTDOWN_TIMEOUT) {
+            Ok(result) => result.map_err(anyhow::Error::msg),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(anyhow!("USB helper shutdown timed out")),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow!("HID command reader stopped")),
+        }
+    } else {
+        Ok(())
+    };
     let joined = command_thread
         .join()
         .map_err(|_| anyhow!("HID command thread panicked"));
     drop(writer);
-    result.and(joined)
+    combine_results([result, closed, joined])
 }
 
 fn event_disconnect_result(
     done_rx: &mpsc::Receiver<std::result::Result<(), String>>,
     close_in_progress: &AtomicBool,
+    terminal_error: Option<&str>,
 ) -> Result<()> {
     if close_in_progress.load(Ordering::Acquire) {
         wait_for_command_completion(done_rx, HELPER_SHUTDOWN_TIMEOUT)
     } else {
-        Err(anyhow!("Codex Micro disconnected"))
+        Err(anyhow!(
+            terminal_error
+                .unwrap_or("Codex Micro disconnected")
+                .to_owned()
+        ))
     }
 }
 
@@ -607,7 +681,7 @@ fn wait_for_command_completion(
 }
 
 fn serve_commands(
-    mut reader: UnixStream,
+    mut reader: BufReader<UnixStream>,
     writer: Arc<Mutex<UnixStream>>,
     mut device: MicroDevice,
     close_in_progress: Arc<AtomicBool>,
@@ -640,7 +714,7 @@ fn serve_commands(
                 }
                 Incoming::Request { id, method, params } => {
                     let result = if allowed_request(method, params.as_ref()) {
-                        device.request(method, params, DEFAULT_REQUEST_TIMEOUT)
+                        device.request(method, params)
                     } else {
                         Err(anyhow!("HID request is not allowed: {method}"))
                     };
@@ -649,7 +723,29 @@ fn serve_commands(
             }
         }
     })();
-    result.and(device.close())
+    let recovery = if result.is_err() {
+        serde_json::to_value(layer_identity(1))
+            .map_err(anyhow::Error::from)
+            .and_then(|params| device.send("host.focused_app", Some(params)))
+            .context("select native layer after HID client disconnect")
+    } else {
+        Ok(())
+    };
+    let close = device.close();
+    combine_results([result, recovery, close])
+}
+
+fn combine_results<const N: usize>(results: [Result<()>; N]) -> Result<()> {
+    let errors: Vec<_> = results
+        .into_iter()
+        .filter_map(Result::err)
+        .map(|error| format!("{error:#}"))
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        bail!(errors.join("; "))
+    }
 }
 
 fn write_reply(writer: &Mutex<UnixStream>, id: u64, result: Result<Value>) -> Result<()> {
@@ -673,12 +769,13 @@ fn write_reply(writer: &Mutex<UnixStream>, id: u64, result: Result<Value>) -> Re
     write_message(&mut *writer, &message)
 }
 
-fn write_error(stream: &mut impl Write, error: &str) -> Result<()> {
+fn write_error(stream: &mut impl Write, code: HelperErrorCode, error: &str) -> Result<()> {
     write_message(
         stream,
         &json!({
             "v": HID_PROTOCOL_VERSION,
             "type": "error",
+            "code": code.as_str(),
             "error": error,
         }),
     )
@@ -803,7 +900,8 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            assert_eq!(read_message(&mut stream).unwrap()["type"], "hello");
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            assert_eq!(read_message(&mut reader).unwrap()["type"], "hello");
             write_message(
                 &mut stream,
                 &json!({
@@ -813,13 +911,13 @@ mod tests {
                 }),
             )
             .unwrap();
-            let request = read_message(&mut stream).unwrap();
+            let request = read_message(&mut reader).unwrap();
             write_message(
                 &mut stream,
                 &json!({
                     "v": HID_PROTOCOL_VERSION,
                     "type": "event",
-                    "event": {"type": "key", "key": "F13", "action": 1},
+                    "event": {"type": "key", "key": "ACT06", "action": 1},
                 }),
             )
             .unwrap();
@@ -833,7 +931,7 @@ mod tests {
                 }),
             )
             .unwrap();
-            let close = read_message(&mut stream).unwrap();
+            let close = read_message(&mut reader).unwrap();
             assert_eq!(close["type"], "close");
             write_message(
                 &mut stream,
@@ -851,15 +949,13 @@ mod tests {
         let uid = unsafe { libc::getuid() };
         let mut client = HidClient::connect_at(&path, events, uid).unwrap();
         assert_eq!(
-            client
-                .request("device.status", None, Duration::from_secs(1))
-                .unwrap(),
+            client.request("device.status", None).unwrap(),
             json!({"device": "ok"})
         );
         assert_eq!(
             event_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
             DeviceEvent::Key {
-                key: "F13".into(),
+                key: "ACT06".into(),
                 action: 1,
             }
         );
@@ -890,7 +986,8 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let _ = read_message(&mut stream).unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let _ = read_message(&mut reader).unwrap();
             write_message(
                 &mut stream,
                 &json!({
@@ -900,7 +997,7 @@ mod tests {
                 }),
             )
             .unwrap();
-            let _ = read_message(&mut stream);
+            let _ = read_message(&mut reader);
         });
         let (events, event_rx) = mpsc::channel();
         // SAFETY: getuid has no preconditions.
@@ -926,7 +1023,8 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let hello = read_message(&mut stream).unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let hello = read_message(&mut reader).unwrap();
             assert_eq!(hello["helperVersion"], HELPER_VERSION);
             write_message(
                 &mut stream,
@@ -949,6 +1047,88 @@ mod tests {
         );
         server.join().unwrap();
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn authentication_rejects_invalid_then_claims_one_valid_client() {
+        let path = test_socket("one-shot");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        // SAFETY: getuid has no preconditions.
+        let uid = unsafe { libc::getuid() };
+        HELPER_SHUTDOWN.store(false, Ordering::Release);
+        let mut invalid = UnixStream::connect(&path).unwrap();
+        write_message(
+            &mut invalid,
+            &json!({"v": HID_PROTOCOL_VERSION, "type": "invalid"}),
+        )
+        .unwrap();
+        let mut valid = UnixStream::connect(&path).unwrap();
+        write_message(
+            &mut valid,
+            &json!({
+                "v": HID_PROTOCOL_VERSION,
+                "type": "hello",
+                "helperVersion": HELPER_VERSION,
+            }),
+        )
+        .unwrap();
+
+        assert!(
+            accept_authenticated_client(&listener, uid, Duration::from_secs(1))
+                .unwrap()
+                .is_some()
+        );
+        let error = read_message(&mut BufReader::new(invalid)).unwrap();
+        assert_eq!(error["error"], "incompatible HID client protocol");
+        HELPER_SHUTDOWN.store(false, Ordering::Release);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn one_shot_helper_stops_waiting_for_a_client() {
+        let path = test_socket("idle");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        // SAFETY: getuid has no preconditions.
+        let uid = unsafe { libc::getuid() };
+        HELPER_SHUTDOWN.store(false, Ordering::Release);
+
+        assert!(
+            accept_authenticated_client(&listener, uid, Duration::from_millis(20))
+                .unwrap()
+                .is_none()
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn helper_error_codes_drive_device_state() {
+        for (code, expected) in [
+            (HelperErrorCode::Helper, "helper-error"),
+            (HelperErrorCode::Unavailable, "unavailable"),
+        ] {
+            let error = validate_hello(&json!({
+                "v": HID_PROTOCOL_VERSION,
+                "type": "error",
+                "code": code.as_str(),
+                "error": "rejected",
+            }))
+            .unwrap_err();
+            assert_eq!(connection_error_state(&error), expected);
+        }
+    }
+
+    #[test]
+    fn cleanup_errors_preserve_every_failure() {
+        let error = combine_results([
+            Err(anyhow!("primary")),
+            Err(anyhow!("recovery")),
+            Err(anyhow!("close")),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert_eq!(error, "primary; recovery; close");
     }
 
     #[test]
@@ -982,7 +1162,7 @@ mod tests {
             done_tx.send(Ok(())).unwrap();
         });
 
-        assert!(event_disconnect_result(&done_rx, &AtomicBool::new(true)).is_ok());
+        assert!(event_disconnect_result(&done_rx, &AtomicBool::new(true), None).is_ok());
         completion.join().unwrap();
     }
 
@@ -996,7 +1176,20 @@ mod tests {
             Err(mpsc::RecvTimeoutError::Disconnected)
         );
 
-        let error = event_disconnect_result(&done_rx, &AtomicBool::new(false)).unwrap_err();
+        let error = event_disconnect_result(&done_rx, &AtomicBool::new(false), None).unwrap_err();
         assert_eq!(error.to_string(), "Codex Micro disconnected");
+    }
+
+    #[test]
+    fn event_disconnect_preserves_the_device_error() {
+        let (_done_tx, done_rx) = mpsc::sync_channel(1);
+
+        let error = event_disconnect_result(
+            &done_rx,
+            &AtomicBool::new(false),
+            Some("interrupt read failed: 0xe00002ed"),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "interrupt read failed: 0xe00002ed");
     }
 }

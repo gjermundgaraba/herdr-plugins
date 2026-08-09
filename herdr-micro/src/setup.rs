@@ -16,19 +16,16 @@ use std::{
 
 use crate::{
     actions::{HERDR_LAYER, layer_identity},
-    config::{
-        Controls, config_path, load_controls, load_effort, load_lighting,
-        provision_controls, provision_effort, provision_lighting,
-    },
+    config::{Config, Controls, config_path, load, provision},
     control::{ensure_state_dir, request_status},
     device::{
-        DEFAULT_REQUEST_TIMEOUT, DeviceEvent,
-        keymap::{read_keymap, update_keymap_with, write_keymap},
+        DeviceEvent,
+        keymap::{read_keymap, write_keymap},
     },
     hid::HidClient,
 };
 
-const PI_EXTENSION: &str = ".pi/agent/extensions/herdr-micro-effort.ts";
+pub const PI_EXTENSION: &str = ".pi/agent/extensions/herdr-micro-effort.ts";
 const REQUIRED_OAI_CODES: [&str; 16] = [
     "KV_OAI_AG00",
     "KV_OAI_AG01",
@@ -173,10 +170,10 @@ fn is_blank_layer(layer: &Value) -> bool {
 
 /// Copies the compatible Layer 1 layout into blank or previously managed Layer 2.
 pub fn configure_micro(keymap: &mut Value) -> Result<()> {
-    configure_micro_with_hid(keymap, &crate::config::default_controls())
+    configure_keymap(keymap, &Config::default().controls)
 }
 
-fn configure_micro_with_hid(keymap: &mut Value, controls: &Controls) -> Result<()> {
+fn configure_keymap(keymap: &mut Value, controls: &Controls) -> Result<()> {
     let managed_process = layer_identity(HERDR_LAYER).process;
     let mut managed_ids: Vec<Value> = keymap
         .get("linkedApps")
@@ -369,13 +366,13 @@ fn reset_hid_codes(layout: &mut Value) -> Result<()> {
 
 fn set_hid_codes(layout: &mut Value, controls: &Controls) -> Result<()> {
     let enabled = crate::config::enabled_buttons(controls);
-    for (button, pointer, _) in BUTTON_KEY_SLOTS {
+    for (button, pointer, device_key) in BUTTON_KEY_SLOTS {
         let slot = layout
             .pointer_mut(pointer)
             .ok_or_else(|| anyhow!("Layer 2 button {button} is missing"))?;
         let index = usize::from(button) - 1;
         *slot = Value::String(if enabled[index] {
-            format!("KC_{}", crate::device::ACTION_KEYS[index].1)
+            device_key.into()
         } else {
             "KC_NONE".into()
         });
@@ -384,15 +381,12 @@ fn set_hid_codes(layout: &mut Value, controls: &Controls) -> Result<()> {
 }
 
 fn active_owner() -> Result<Option<String>> {
-    let output = Command::new("/bin/ps").args(["-axo", "comm="]).output()?;
-    if !output.status.success() {
-        bail!("could not inspect device owners");
-    }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .find(|command| command.ends_with("/input") || command.ends_with("/ChatGPT"))
-        .map(str::to_owned))
+    let frontmost = crate::macos::frontmost()?;
+    Ok(crate::protocol::device_owner(
+        crate::macos::bundle_is_running(crate::protocol::INPUT_BUNDLE_ID),
+        Some(&frontmost.process),
+    )
+    .map(str::to_owned))
 }
 
 fn backup_keymap(bytes: &[u8]) -> Result<PathBuf> {
@@ -414,26 +408,58 @@ fn backup_keymap(bytes: &[u8]) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn provision_and_validate_configs() -> Result<(PathBuf, PathBuf, PathBuf, Controls)> {
-    let controls = config_path("controls.json");
-    let effort = config_path("effort.json");
-    let lighting = config_path("lighting.json");
-    provision_controls(&controls).map_err(|error| anyhow!(error))?;
-    provision_effort(&effort).map_err(|error| anyhow!(error))?;
-    provision_lighting(&lighting).map_err(|error| anyhow!(error))?;
-    let parsed_controls = load_controls(&controls).map_err(|error| anyhow!(error))?;
-    load_effort(&effort).map_err(|error| anyhow!(error))?;
-    load_lighting(&lighting).map_err(|error| anyhow!(error))?;
-    Ok((controls, effort, lighting, parsed_controls))
+fn update_keymap_with<B, R, W>(
+    before: &[u8],
+    after: &[u8],
+    backup: B,
+    mut read: R,
+    mut write: W,
+) -> Result<Option<PathBuf>>
+where
+    B: FnOnce(&[u8]) -> Result<PathBuf>,
+    R: FnMut() -> Result<Vec<u8>>,
+    W: FnMut(&[u8]) -> Result<()>,
+{
+    if before == after {
+        return Ok(None);
+    }
+    let backup = backup(before)?;
+    let updated = write(after).and_then(|()| {
+        if read()? == after {
+            Ok(())
+        } else {
+            bail!("keymap read-back failed")
+        }
+    });
+    if let Err(error) = updated {
+        let restored = write(before).and_then(|()| {
+            if read()? == before {
+                Ok(())
+            } else {
+                bail!("restored keymap read-back failed")
+            }
+        });
+        return match restored {
+            Ok(()) => Err(error).with_context(|| {
+                format!(
+                    "keymap update failed; original keymap was restored; backup: {}",
+                    backup.display()
+                )
+            }),
+            Err(recovery) => Err(anyhow!(
+                "keymap update failed: {error}; automatic restore failed: {recovery}; recover from backup: {}",
+                backup.display()
+            )),
+        };
+    }
+    Ok(Some(backup))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetupReport {
     pub firmware: String,
     pub backup: Option<PathBuf>,
-    pub controls: PathBuf,
-    pub effort: PathBuf,
-    pub lighting: PathBuf,
+    pub config: PathBuf,
 }
 
 fn update_micro_keymap(
@@ -452,14 +478,15 @@ fn update_micro_keymap(
     let (event_tx, _events) = mpsc::channel::<DeviceEvent>();
     let mut device = HidClient::connect(event_tx)?;
     let result = (|| {
-        let status = device.request("device.status", None, DEFAULT_REQUEST_TIMEOUT)?;
+        let status = device.request("device.status", None)?;
         let firmware = status
             .get("version")
             .and_then(Value::as_str)
             .filter(|version| !version.is_empty())
             .ok_or_else(|| anyhow!("device did not report a firmware version"))?
             .to_owned();
-        let before = read_keymap(&device)?;
+        let request = |method: &str, params: Option<Value>| device.request(method, params);
+        let before = read_keymap(request)?;
         let mut keymap: Value = serde_json::from_slice(&before).context("invalid keymap JSON")?;
         let canonical_before = serde_json::to_vec(&keymap)?;
         configure(&mut keymap)?;
@@ -471,8 +498,8 @@ fn update_micro_keymap(
                 &before,
                 &after,
                 backup_keymap,
-                || read_keymap(&device),
-                |bytes| write_keymap(&device, bytes),
+                || read_keymap(request),
+                |bytes| write_keymap(request, bytes),
             )?
         };
         Ok((firmware, backup))
@@ -492,23 +519,22 @@ fn update_micro_keymap(
 }
 
 pub fn setup_micro() -> Result<SetupReport> {
-    let (controls, effort, lighting, parsed_controls) = provision_and_validate_configs()?;
-    let (firmware, backup) = update_micro_keymap(|keymap| {
-        configure_micro_with_hid(keymap, &parsed_controls)
-    })?;
+    let config = config_path();
+    provision(&config).map_err(|error| anyhow!(error))?;
+    let parsed = load(&config).map_err(|error| anyhow!(error))?;
+    let (firmware, backup) =
+        update_micro_keymap(|keymap| configure_keymap(keymap, &parsed.controls))?;
     Ok(SetupReport {
         firmware,
         backup,
-        controls,
-        effort,
-        lighting,
+        config,
     })
 }
 
-pub fn configure_controls() -> Result<PathBuf> {
-    let path = config_path("controls.json");
-    provision_controls(&path).map_err(|error| anyhow!(error))?;
-    load_controls(&path).map_err(|error| anyhow!(error))?;
+pub fn configure() -> Result<PathBuf> {
+    let path = config_path();
+    provision(&path).map_err(|error| anyhow!(error))?;
+    load(&path).map_err(|error| anyhow!(error))?;
     let status = Command::new("/usr/bin/open")
         .args(["-t", path.to_string_lossy().as_ref()])
         .status()
@@ -614,19 +640,6 @@ pub fn setup_pi_effort() -> Result<PiInstall> {
     install_pi_effort(&source, &target, timestamp)
 }
 
-/// Forward Herdr's status output without adding a Rust-specific wrapper.
-/// The action entrypoint should exit with the returned status.
-pub fn forward_herdr_status() -> Result<i32> {
-    let bin = env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".into());
-    let output = Command::new(&bin)
-        .arg("status")
-        .output()
-        .with_context(|| format!("run {bin} status"))?;
-    std::io::stdout().write_all(&output.stdout)?;
-    std::io::stderr().write_all(&output.stderr)?;
-    Ok(output.status.code().unwrap_or(1))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -693,6 +706,49 @@ mod tests {
     }
 
     #[test]
+    fn keymap_update_failure_restores_original_and_names_backup() {
+        let backup = PathBuf::from("/tmp/keymap-backup.json");
+        let mut writes = Vec::new();
+        let mut reads = [b"wrong".to_vec(), b"before".to_vec()].into_iter();
+        let error = update_keymap_with(
+            b"before",
+            b"after",
+            |_| Ok(backup.clone()),
+            || Ok(reads.next().unwrap()),
+            |bytes| {
+                writes.push(bytes.to_vec());
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(writes, vec![b"after".to_vec(), b"before".to_vec()]);
+        assert!(error.to_string().contains("/tmp/keymap-backup.json"));
+        assert!(error.to_string().contains("restored"));
+    }
+
+    #[test]
+    fn failed_keymap_restore_still_names_backup() {
+        let backup = PathBuf::from("/tmp/keymap-backup.json");
+        let mut writes = 0;
+        let error = update_keymap_with(
+            b"before",
+            b"after",
+            |_| Ok(backup.clone()),
+            || Ok(b"wrong".to_vec()),
+            |_| {
+                writes += 1;
+                if writes == 2 {
+                    bail!("device disappeared")
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("automatic restore failed"));
+        assert!(error.to_string().contains("/tmp/keymap-backup.json"));
+    }
+
+    #[test]
     fn configures_hid_keys_on_a_blank_layer_two() {
         let source = oai_layout();
         let mut keymap = json!({
@@ -717,11 +773,11 @@ mod tests {
         );
         assert_eq!(
             keymap.pointer("/profiles/0/layers/1/layout/keymap/2/2"),
-            Some(&json!("KC_F23"))
+            Some(&json!("KV_OAI_ACT08"))
         );
         assert_eq!(
             keymap.pointer("/profiles/0/layers/1/layout/keymap/3/2"),
-            Some(&json!("KC_STOP"))
+            Some(&json!("KV_OAI_ACT12"))
         );
         assert_eq!(
             keymap.pointer("/profiles/0/layers/1/layout/keymap/2/0"),
@@ -749,8 +805,8 @@ mod tests {
     fn prefers_the_existing_managed_profile_and_activates_it() {
         let source = oai_layout();
         let blank = blank_layer();
-        // A managed layer restored from an old backup: legacy button codes must
-        // reset cleanly, never brick setup.
+        // A managed layer may contain the previous configured button codes;
+        // setup must replace them without overwriting unrelated layouts.
         let mut restored = oai_layout();
         *restored.pointer_mut("/keymap/3/0").unwrap() = json!("KC_F19");
         let mut keymap = json!({
@@ -786,7 +842,7 @@ mod tests {
         );
         assert_eq!(
             keymap.pointer("/profiles/0/layers/1/layout/keymap/2/2"),
-            Some(&json!("KC_F23"))
+            Some(&json!("KV_OAI_ACT08"))
         );
         assert_eq!(
             keymap.pointer("/profiles/1/layers/1/linkedAppId"),

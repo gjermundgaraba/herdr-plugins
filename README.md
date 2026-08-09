@@ -22,6 +22,9 @@ herdr plugin install gjermundgaraba/herdr-plugins/popup-terminal
 
 For local development:
 
+Build each plugin using its README before linking it. `herdr plugin link` only
+registers the working tree; it does not run manifest `[[build]]` commands.
+
 ```sh
 herdr plugin link "$PWD/command-palette"
 herdr plugin link "$PWD/equalize-splits"

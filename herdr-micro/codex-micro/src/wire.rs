@@ -41,22 +41,19 @@ pub struct Reassembler {
 
 impl Reassembler {
     pub fn push(&mut self, report: &[u8]) -> Vec<Result<Value, serde_json::Error>> {
-        let offset = if report.get(0..2) == Some(&[REPORT_ID, CHANNEL_RPC]) {
-            1
-        } else if report.first() == Some(&CHANNEL_RPC) {
-            0
-        } else {
-            return vec![];
-        };
-        if report.len() < offset + 2 {
+        if report.get(0..2) != Some(&[REPORT_ID, CHANNEL_RPC]) {
             return vec![];
         }
-        let length = report[offset + 1] as usize;
-        if length > MAX_PAYLOAD || length + offset + 2 > report.len() {
+        if report.len() < 3 {
+            self.buffer.clear();
             return vec![];
         }
-        self.buffer
-            .extend_from_slice(&report[offset + 2..offset + 2 + length]);
+        let length = report[2] as usize;
+        if length > MAX_PAYLOAD || length + 3 > report.len() {
+            self.buffer.clear();
+            return vec![];
+        }
+        self.buffer.extend_from_slice(&report[3..3 + length]);
         let mut messages = Vec::new();
         while let Some(newline) = self.buffer.iter().position(|b| *b == b'\n') {
             let line: Vec<_> = self.buffer.drain(..=newline).collect();
@@ -74,7 +71,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accepts_report_id_variants_and_rejects_bad_reports() {
+    fn accepts_reports_and_rejects_bad_reports() {
         let params = serde_json::json!({"ok":true});
         let reports = encode_message("event", Some(&params), Some(1)).unwrap();
         let mut reassembler = Reassembler::default();
@@ -82,18 +79,34 @@ mod tests {
             reassembler.push(&reports[0])[0].as_ref().unwrap()["method"],
             "event"
         );
-        assert_eq!(Reassembler::default().push(&reports[0][1..]).len(), 1);
         assert!(
             Reassembler::default()
                 .push(&[REPORT_ID, CHANNEL_RPC, 62])
                 .is_empty()
         );
         let mut over = Reassembler::default();
-        let mut fragment = vec![CHANNEL_RPC, 61];
+        let mut fragment = vec![REPORT_ID, CHANNEL_RPC, 61];
         fragment.extend(std::iter::repeat_n(b'x', 61));
         for _ in 0..1100 {
             over.push(&fragment);
         }
         assert!(over.buffer.len() < MAX_REASSEMBLED);
+    }
+
+    #[test]
+    fn malformed_rpc_report_discards_partial_frame() {
+        let mut reassembler = Reassembler::default();
+        assert!(
+            reassembler
+                .push(&[REPORT_ID, CHANNEL_RPC, 1, b'{'])
+                .is_empty()
+        );
+        assert!(reassembler.push(&[REPORT_ID, CHANNEL_RPC, 62]).is_empty());
+
+        let report = encode_message("event", None, None).unwrap().remove(0);
+        assert_eq!(
+            reassembler.push(&report)[0].as_ref().unwrap()["method"],
+            "event"
+        );
     }
 }

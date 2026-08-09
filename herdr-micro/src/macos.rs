@@ -1,27 +1,27 @@
 //! Small AppKit/CoreGraphics helpers used by the daemon and doctor.
 //!
-//! AppKit identifies the foreground application; Core Graphics supplies that
-//! application's visible normal window and posts explicitly configured input.
+//! AppKit identifies the foreground application; Core Graphics supplies its
+//! visible normal-window title and posts explicitly configured key input.
 
-use std::{ptr::NonNull, thread, time::Duration};
+use std::ptr::NonNull;
 
 use anyhow::{Result, anyhow, bail};
 use objc2::rc::Retained;
 use objc2_app_kit::{NSRunningApplication, NSWorkspace};
 use objc2_core_foundation::{
-    CFDictionary, CFNumber, CFRunLoop, CFString, CFType, CGPoint, kCFRunLoopDefaultMode,
+    CFDictionary, CFNumber, CFRunLoop, CFString, CFType, CGRect, kCFRunLoopDefaultMode,
 };
 use objc2_core_graphics::{
-    CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton,
-    CGPreflightPostEventAccess, CGScrollEventUnit, CGWarpMouseCursorPosition,
-    CGWindowListCopyWindowInfo, CGWindowListOption, kCGNullWindowID, kCGWindowBounds,
-    kCGWindowLayer, kCGWindowName, kCGWindowOwnerPID,
+    CGDirectDisplayID, CGDisplayBounds, CGDisplayCopyDisplayMode, CGDisplayMode, CGEvent,
+    CGEventFlags, CGEventTapLocation, CGGetDisplaysWithRect, CGPreflightPostEventAccess,
+    CGRectIntersection, CGRectMakeWithDictionaryRepresentation, CGWindowListCopyWindowInfo,
+    CGWindowListOption, kCGNullWindowID, kCGWindowBounds, kCGWindowLayer, kCGWindowName,
+    kCGWindowOwnerPID,
 };
+use objc2_foundation::NSString;
 use serde::Serialize;
 
 use crate::config::Modifier;
-
-const SCROLL_TARGET_UNAVAILABLE: &str = "frontmost scroll target unavailable";
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct Frontmost {
@@ -29,14 +29,6 @@ pub struct Frontmost {
     pub process: String,
     pub pid: i32,
     pub title: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Bounds {
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
 }
 
 pub fn post_event_access() -> Result<()> {
@@ -93,88 +85,64 @@ pub fn frontmost() -> Result<Frontmost> {
     })
 }
 
+pub fn frontmost_pid() -> Result<i32> {
+    frontmost_application()
+        .map(|app| app.processIdentifier())
+        .ok_or_else(|| anyhow!("frontmost application unavailable"))
+}
+
 pub fn frontmost_bundle_is(expected: &str) -> bool {
     frontmost_application()
         .and_then(|app| app.bundleIdentifier())
         .is_some_and(|bundle| bundle.to_string() == expected)
 }
 
-pub fn running_bundle_ids() -> Vec<String> {
-    let applications = NSWorkspace::sharedWorkspace().runningApplications();
-    applications
-        .to_vec()
-        .into_iter()
-        .filter_map(|app| app.bundleIdentifier().map(|bundle| bundle.to_string()))
-        .collect()
-}
-
-/// Routes line scroll events through the visible normal-layer window after
-/// confirming that the expected bundle still owns the foreground.
-pub fn scroll(notches: i32, x: f64, y: f64, expected_bundle: &str) -> Result<()> {
-    post_event_access()?;
-    let (_, window) = frontmost_window().ok_or_else(|| anyhow!(SCROLL_TARGET_UNAVAILABLE))?;
-    if !frontmost_bundle_is(expected_bundle) {
-        bail!(SCROLL_TARGET_UNAVAILABLE)
-    }
-    let bounds = window_bounds(&window).ok_or_else(|| anyhow!(SCROLL_TARGET_UNAVAILABLE))?;
-    let location = point_in_bounds(bounds, x, y);
-    let original = CGEvent::new(None).map(|event| CGEvent::location(Some(&event)));
-    if !frontmost_bundle_is(expected_bundle) {
-        bail!(SCROLL_TARGET_UNAVAILABLE)
-    }
-    let _ = CGWarpMouseCursorPosition(location);
-    if let Some(event) =
-        CGEvent::new_mouse_event(None, CGEventType::MouseMoved, location, CGMouseButton::Left)
-    {
-        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
-    }
-    let _restore = CursorRestore { original };
-    thread::sleep(Duration::from_millis(50));
-    for _ in 0..notches.unsigned_abs() {
-        if !frontmost_bundle_is(expected_bundle) {
-            bail!(SCROLL_TARGET_UNAVAILABLE)
-        }
-        let event = CGEvent::new_scroll_wheel_event2(
-            None,
-            CGScrollEventUnit::Line,
-            1,
-            if notches > 0 { 1 } else { -1 },
-            0,
-            0,
+pub fn frontmost_window_scale() -> Result<f64> {
+    let app =
+        frontmost_application().ok_or_else(|| anyhow!("frontmost application unavailable"))?;
+    let window = normal_window_for(&app).ok_or_else(|| anyhow!("frontmost window unavailable"))?;
+    let bounds =
+        window_bounds(&window).ok_or_else(|| anyhow!("frontmost window bounds unavailable"))?;
+    let mut displays = [0 as CGDirectDisplayID; 8];
+    let mut count = 0;
+    // SAFETY: Both output pointers reference the stack storage declared above.
+    let error = unsafe {
+        CGGetDisplaysWithRect(
+            bounds,
+            displays.len() as u32,
+            displays.as_mut_ptr(),
+            &mut count,
         )
-        .ok_or_else(|| anyhow!("could not create scroll event"))?;
-        CGEvent::set_location(Some(&event), location);
-        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+    };
+    if error.0 != 0 || count == 0 {
+        bail!("frontmost window display unavailable")
     }
-    thread::sleep(Duration::from_millis(50));
-    Ok(())
-}
-
-struct CursorRestore {
-    original: Option<CGPoint>,
-}
-
-impl Drop for CursorRestore {
-    fn drop(&mut self) {
-        let Some(location) = self.original else {
-            return;
-        };
-        let _ = CGWarpMouseCursorPosition(location);
-        if let Some(event) =
-            CGEvent::new_mouse_event(None, CGEventType::MouseMoved, location, CGMouseButton::Left)
-        {
-            CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
-        }
+    let display = displays[..count as usize]
+        .iter()
+        .copied()
+        .max_by(|left, right| {
+            let left = CGRectIntersection(bounds, CGDisplayBounds(*left));
+            let right = CGRectIntersection(bounds, CGDisplayBounds(*right));
+            (left.size.width * left.size.height).total_cmp(&(right.size.width * right.size.height))
+        })
+        .ok_or_else(|| anyhow!("frontmost window display unavailable"))?;
+    let mode = CGDisplayCopyDisplayMode(display)
+        .ok_or_else(|| anyhow!("frontmost window display mode unavailable"))?;
+    let width = CGDisplayMode::width(Some(&mode));
+    let pixel_width = CGDisplayMode::pixel_width(Some(&mode));
+    if width == 0 || pixel_width == 0 {
+        bail!("frontmost window display scale unavailable")
     }
+    Ok(pixel_width as f64 / width as f64)
 }
 
-fn frontmost_window() -> Option<(
-    Retained<NSRunningApplication>,
-    objc2_core_foundation::CFRetained<CFDictionary>,
-)> {
-    let app = frontmost_application()?;
-    let window = normal_window_for(&app)?;
-    Some((app, window))
+pub fn bundle_is_running(bundle_id: &str) -> bool {
+    objc2::rc::autoreleasepool(|_| {
+        !NSRunningApplication::runningApplicationsWithBundleIdentifier(&NSString::from_str(
+            bundle_id,
+        ))
+        .is_empty()
+    })
 }
 
 fn normal_window_for(
@@ -213,10 +181,12 @@ fn normal_window_for(
 }
 
 fn frontmost_application() -> Option<Retained<NSRunningApplication>> {
-    if let Some(mode) = unsafe { kCFRunLoopDefaultMode } {
-        let _ = CFRunLoop::run_in_mode(Some(mode), 0.0, true);
-    }
-    NSWorkspace::sharedWorkspace().frontmostApplication()
+    objc2::rc::autoreleasepool(|_| {
+        if let Some(mode) = unsafe { kCFRunLoopDefaultMode } {
+            let _ = CFRunLoop::run_in_mode(Some(mode), 0.0, true);
+        }
+        NSWorkspace::sharedWorkspace().frontmostApplication()
+    })
 }
 
 fn usable_window_for(pid: i32, layer: Option<f64>, owner_pid: Option<f64>) -> bool {
@@ -231,51 +201,23 @@ fn window_title(window: &CFDictionary) -> Option<String> {
     value.downcast_ref::<CFString>().map(ToString::to_string)
 }
 
-fn window_bounds(window: &CFDictionary) -> Option<Bounds> {
-    // SAFETY: Core Graphics window dictionaries use CFString keys and values
-    // of documented CoreFoundation types.
+fn window_bounds(window: &CFDictionary) -> Option<CGRect> {
     let window = unsafe { window.cast_unchecked::<CFString, CFType>() };
-    let bounds = window.get(unsafe { kCGWindowBounds })?;
-    let bounds = bounds.downcast_ref::<CFDictionary>()?;
-    // SAFETY: CGRect dictionaries are CFString-to-CFNumber mappings.
-    let bounds = unsafe { bounds.cast_unchecked::<CFString, CFType>() };
-    Some(Bounds {
-        x: number(bounds, &CFString::from_str("X"))?,
-        y: number(bounds, &CFString::from_str("Y"))?,
-        width: number(bounds, &CFString::from_str("Width"))?,
-        height: number(bounds, &CFString::from_str("Height"))?,
-    })
+    let value = window.get(unsafe { kCGWindowBounds })?;
+    let dictionary = value.downcast_ref::<CFDictionary>()?;
+    let mut bounds = CGRect::default();
+    // SAFETY: Core Graphics supplied the bounds dictionary and `bounds` is writable.
+    unsafe { CGRectMakeWithDictionaryRepresentation(Some(dictionary), &mut bounds) }
+        .then_some(bounds)
 }
 
 fn number(dictionary: &CFDictionary<CFString, CFType>, key: &CFString) -> Option<f64> {
     dictionary.get(key)?.downcast_ref::<CFNumber>()?.as_f64()
 }
 
-fn point_in_bounds(bounds: Bounds, x: f64, y: f64) -> CGPoint {
-    CGPoint {
-        x: bounds.x + bounds.width * x,
-        y: bounds.y + bounds.height * y,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn relative_target_uses_window_bounds() {
-        let point = point_in_bounds(
-            Bounds {
-                x: 10.0,
-                y: 20.0,
-                width: 100.0,
-                height: 200.0,
-            },
-            0.5,
-            0.25,
-        );
-        assert_eq!(point, CGPoint { x: 60.0, y: 70.0 });
-    }
 
     #[test]
     fn only_a_normal_window_owned_by_the_active_pid_is_usable() {

@@ -25,4 +25,4 @@ Methods added after this crate's tested Herdr version remain usable:
 let value = client.call_value("some.future.method", &serde_json::json!({}))?;
 ```
 
-Validated against Herdr 0.7.5, socket protocol 17.
+Validated against Herdr 0.8.0, socket protocol 19.

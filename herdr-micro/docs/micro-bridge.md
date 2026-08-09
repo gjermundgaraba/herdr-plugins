@@ -11,8 +11,11 @@ accepts only the six device methods the bridge and guarded setup require.
 
 A separate Unix socket in `HERDR_PLUGIN_STATE_DIR` provides user-daemon status
 and stop control; `micro.log` is stored beside it. The helper restores the
-normal macOS HID driver when its authenticated client disconnects and exits
-after five idle seconds. launchd starts it again on the next connection.
+normal macOS HID driver when its authenticated client disconnects, then exits.
+launchd starts a fresh helper for the next authenticated device lease. A native
+open, teardown, or final restoration that exceeds the single hard deadline
+terminates the disposable helper so a stuck IOKit client cannot poison a later
+lease.
 
 ```text
 Codex Micro over USB
@@ -25,11 +28,21 @@ Codex Micro over USB
   → exact pane/agent action
 ```
 
-The daemon discovers Herdr sessions once per second. It briefly gives each
-session a unique terminal title, reads Ghostty's stable terminal UUID through
-its AppleScript API, restores the title, and keeps the mapping only in memory.
-Every Herdr CLI call then uses the selected session's `HERDR_SESSION` value.
-Agents and actions are never mixed across sessions.
+The daemon uses Herdr's CLI only to discover running session names and their
+socket paths at startup or when discovery becomes stale. Each session then has
+a direct socket subscription and snapshot cache; status changes drive lighting
+without polling or subprocesses. Actions are direct socket requests.
+
+Ghostty inspection uses a cached native ScriptingBridge client from Rust. The
+focused terminal UUID is queried while Ghostty is active and immediately before
+session-targeted actions. The daemon refreshes the full mapping when the focused
+terminal changes and every five seconds while Ghostty remains active. It briefly
+gives each Herdr session a unique title to associate it with a Ghostty UUID,
+restores the title, and keeps the mapping only in memory.
+
+Routing supports one active Ghostty attachment per Herdr session. If another
+Ghostty attachment to the same session becomes foreground, routing pauses while
+the session is remapped; simultaneous attachment mappings are not represented.
 
 The helper uses the Micro's JSON-RPC HID reports over its raw USB interface and
 requires a successful `device.status` round trip before reporting a
@@ -45,22 +58,23 @@ Layer routing is fixed:
 | Unrelated application | Preserve the last applicable layer; dispatch nothing |
 
 Layer 2 retains `KV_OAI_AG00` through `KV_OAI_AG05`; those private codes are
-required for six-way status lighting. Each bound action switch uses a fixed
-internal code from F21–F24/EXECUTE/SELECT/STOP (HID usages macOS maps to no
-virtual keycode, so an uncaptured Micro cannot type anything); unbound switches
-are disabled. The double-width action key spans two switches, so one half is
+required for six-way status lighting. Bound action switches use the Micro's
+native `KV_OAI_ACT06` through `KV_OAI_ACT12` events; the privileged helper's
+exclusive USB capture prevents ChatGPT from receiving them. Only configured
+macOS key bindings are synthesized back into the system. Unbound switches are
+disabled. The double-width action key spans two switches, so one half is
 unbound by default. `micro-setup` applies and verifies the managed keymap.
-Agent presses focus their slot directly through Herdr; action switches
-dispatch bindings internally.
+Agent presses focus their slot directly through Herdr; action switches dispatch
+bindings internally.
 
 ## Compatibility
 
 | Component | Current boundary |
 |---|---|
 | Platform | macOS only |
-| Herdr | 0.7.5 or newer |
+| Herdr | 0.8.0 or newer; experimental Kitty graphics enabled for scroll metrics |
 | Ghostty | 1.3 or newer; Automation permission required |
-| Build toolchain | Rust 1.85 or newer |
+| Build toolchain | Rust 1.89 or newer |
 | Codex Micro firmware 0.4.1 | USB physically verified |
 | Codex Micro firmware 0.6.1 | USB physically verified |
 | Effort control | Codex CLI, Claude Code, and Pi with the bundled extension |
@@ -78,15 +92,15 @@ dispatch bindings internally.
 - The daemon never writes firmware or keymaps. Only the explicit `micro-setup`
   action changes the keymap; it requires a blank or previously managed Layer 2,
   creates a backup, and verifies the full read-back.
-- Controls target the captured Herdr session and pane. `scroll` additionally
-  rechecks the focused Ghostty UUID before posting wheel events. `key`
+- Controls target the captured Herdr session and pane. `scroll` gets Herdr's
+  live host-cell size, rechecks the focused Ghostty UUID, then sends native
+  mouse-position and scroll commands to that exact Ghostty terminal. `key`
   bindings are the deliberate exception: they tap system-wide from any
   frontmost application while the bridge owns the device.
-- CoreGraphics output requires Accessibility permission and is used only for
-  `scroll`, which posts targeted wheel events and restores the cursor, and for
-  explicitly configured `key` bindings, which tap their configured keycode.
-  No other keyboard events are synthesized; all switch HID codes remain
-  internal to the bridge.
+- CoreGraphics output requires Accessibility permission only for explicitly
+  configured `key` bindings, which tap their configured keycode. Scrolling does
+  not move the system cursor. No other keyboard events are synthesized; all
+  switch HID codes remain internal to the bridge.
 - A selected-session failure does not fall back to another session. Controlled
   shutdown and 60 seconds without any Herdr session blank the LEDs.
 
@@ -110,8 +124,7 @@ dispatch bindings internally.
 
 The [research record](research/README.md) preserves tested versions, results,
 hardware evidence, caveats, and source links.
-[Future investigations](future-investigations.md) tracks deferred hardware and
-protocol work.
+[Future work](future-work.md) records the evidence-gated changes and spikes.
 
 ## Lifecycle
 
