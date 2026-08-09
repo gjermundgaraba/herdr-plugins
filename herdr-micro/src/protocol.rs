@@ -1,6 +1,6 @@
 use crate::{
     actions::CHATGPT_BUNDLE_IDS,
-    config::{AgentStatus, Light, LightingConfig},
+    config::{AgentStatus, Direction, Light, LightingConfig},
 };
 use herdr_client::AgentInfo;
 use std::collections::{HashMap, HashSet};
@@ -11,7 +11,7 @@ pub const INPUT_BUNDLE_ID: &str = "it.focusense.input-app";
 #[derive(Clone, Debug, PartialEq)]
 pub struct JoystickEvent {
     pub sector: Option<u8>,
-    pub direction: Option<&'static str>,
+    pub direction: Option<Direction>,
 }
 
 pub fn device_owner(input_running: bool, frontmost_bundle: Option<&str>) -> Option<&'static str> {
@@ -175,7 +175,14 @@ pub fn joystick_event(
         direction: if Some(sector) == last_sector {
             None
         } else {
-            Some(["right", "down", "left", "up"][sector as usize])
+            Some(
+                [
+                    Direction::Right,
+                    Direction::Down,
+                    Direction::Left,
+                    Direction::Up,
+                ][sector as usize],
+            )
         },
     }
 }
@@ -184,30 +191,41 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use serde_json::json;
-    fn agent(id: &str, status: &str) -> AgentInfo {
+    fn agent(id: &str, status: &str, focused: bool) -> AgentInfo {
         serde_json::from_value(json!({
             "terminal_id":id, "agent_status":status, "workspace_id":"w1",
-            "tab_id":"w1:t1", "pane_id":"w1:p1", "focused":false, "revision":1
+            "tab_id":"w1:t1", "pane_id":"w1:p1", "focused":focused, "revision":1
         }))
         .unwrap()
     }
     #[test]
     fn sticky_slots_lighting_and_joystick() {
-        let slots = assign_slots(&[], &[agent("idle", "idle"), agent("working", "working")]);
+        let agents = [
+            agent("idle", "idle", true),
+            agent("working", "working", false),
+        ];
+        let slots = assign_slots(&[], &agents);
         assert_eq!(slots[..2], [Some("working".into()), Some("idle".into())]);
         assert_eq!(
             joystick_event(0.25, 0.9, Some(0), 0.75, 0.3).direction,
-            Some("down")
+            Some(Direction::Down)
         );
         assert_eq!(joystick_event(0.0, 0.1, Some(0), 0.75, 0.3).sector, None);
+        let config = Config::default().lighting;
+        let mut focused_idle = config.light(AgentStatus::Idle);
+        focused_idle.b = focused_idle.b.max(config.focused_brightness);
+        let empty = Light {
+            c: 0,
+            b: 0.0,
+            e: 0,
+            s: 0.0,
+        };
         assert_eq!(
-            slot_lighting(
-                &slots,
-                &[agent("idle", "idle"), agent("working", "working")],
-                &Config::default().lighting
-            )
-            .len(),
-            SLOT_COUNT
+            slot_lighting(&slots, &agents, &config),
+            [config.light(AgentStatus::Working), focused_idle]
+                .into_iter()
+                .chain(std::iter::repeat_n(empty, SLOT_COUNT - 2))
+                .collect::<Vec<_>>()
         );
     }
     #[test]
@@ -228,10 +246,10 @@ mod tests {
     #[test]
     fn joystick_changes_direction_at_an_angular_boundary() {
         let first = joystick_event(0.124, 0.9, None, 0.75, 0.3);
-        assert_eq!(first.direction, Some("right"));
+        assert_eq!(first.direction, Some(Direction::Right));
         let across = joystick_event(0.126, 0.9, first.sector, 0.75, 0.3);
-        assert_eq!(across.direction, Some("down"));
+        assert_eq!(across.direction, Some(Direction::Down));
         let back = joystick_event(0.124, 0.9, across.sector, 0.75, 0.3);
-        assert_eq!(back.direction, Some("right"));
+        assert_eq!(back.direction, Some(Direction::Right));
     }
 }

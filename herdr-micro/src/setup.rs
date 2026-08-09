@@ -25,25 +25,8 @@ use crate::{
     hid::HidClient,
 };
 
-pub const PI_EXTENSION: &str = ".pi/agent/extensions/herdr-micro-effort.ts";
-const REQUIRED_OAI_CODES: [&str; 16] = [
-    "KV_OAI_AG00",
-    "KV_OAI_AG01",
-    "KV_OAI_AG02",
-    "KV_OAI_AG03",
-    "KV_OAI_AG04",
-    "KV_OAI_AG05",
-    "KV_OAI_ACT06",
-    "KV_OAI_ACT07",
-    "KV_OAI_ACT08",
-    "KV_OAI_ACT09",
-    "KV_OAI_ACT10",
-    "KV_OAI_ACT11",
-    "KV_OAI_ACT12",
-    "KV_OAI_ENC_CC",
-    "KV_OAI_ENC_CW",
-    "KV_OAI_ENC_CLK",
-];
+pub(crate) const PI_EXTENSION: &str = ".pi/agent/extensions/herdr-micro-effort.ts";
+const REQUIRED_ENCODER_CODES: [&str; 3] = ["KV_OAI_ENC_CC", "KV_OAI_ENC_CW", "KV_OAI_ENC_CLK"];
 const BUTTON_KEY_SLOTS: [(u8, &str, &str); 7] = [
     (1, "/keymap/2/0", "KV_OAI_ACT06"),
     (2, "/keymap/2/1", "KV_OAI_ACT07"),
@@ -208,7 +191,7 @@ fn configure_keymap(keymap: &mut Value, controls: &Controls) -> Result<()> {
             .cloned()
             .unwrap_or(Value::Object(Default::default()));
         let source_codes = layout_codes(&source_layout);
-        if !REQUIRED_OAI_CODES
+        if !REQUIRED_ENCODER_CODES
             .iter()
             .all(|key| source_codes.iter().any(|code| code.as_str() == Some(key)))
         {
@@ -885,22 +868,26 @@ mod tests {
         ] {
             let mut keymap = json!({
                 "profiles": [{ "id": 0, "layers": [
-                    { "layout": { "keymap": [REQUIRED_OAI_CODES] } },
+                    { "layout": oai_layout() },
                     layer
                 ] }]
             });
-            assert!(configure_micro(&mut keymap).is_err());
+            assert_eq!(
+                configure_micro(&mut keymap).unwrap_err().to_string(),
+                "Layer 2 is not blank or managed; refusing to overwrite it"
+            );
         }
     }
 
     #[test]
     fn rejects_metadata_and_partial_layout_code_matches() {
-        let mut required = REQUIRED_OAI_CODES;
-        required[5] = "KV_OAI_AG05-extra";
+        let mut source = oai_layout();
+        *source.pointer_mut("/keymap/1/3").unwrap() = json!("KV_OAI_AG05-extra");
+        source["metadata"] = json!("KV_OAI_AG05");
         let mut keymap = json!({
             "profiles": [{ "id": 0, "layers": [
                 {
-                    "layout": { "keymap": [required], "metadata": "KV_OAI_AG05" },
+                    "layout": source,
                     "description": "KV_OAI_AG05"
                 },
                 { "layout": { "keymap": [["KC_NONE"]] } }

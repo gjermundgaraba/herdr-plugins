@@ -207,10 +207,6 @@ struct InputState {
     last_joystick_sector: Option<u8>,
 }
 
-enum InputNotice {
-    Disconnected(String),
-}
-
 #[derive(Clone)]
 enum Work {
     Binding {
@@ -734,14 +730,14 @@ fn handle_device_event(
     context: &InputContext,
     routing_generation: &AtomicU64,
     worker: &SyncSender<Work>,
-    notices: &Sender<InputNotice>,
+    notices: &Sender<String>,
 ) {
     let controls = &context.controls;
     match event {
         DeviceEvent::Disconnected { error } => {
             state.gestures.clear();
             state.last_joystick_sector = None;
-            let _ = notices.send(InputNotice::Disconnected(error));
+            let _ = notices.send(error);
         }
         DeviceEvent::Joystick { angle, distance } => {
             let next = joystick_event(
@@ -752,18 +748,18 @@ fn handle_device_event(
                 controls.joystick.release_distance,
             );
             state.last_joystick_sector = next.sector;
-            let action = match next.direction {
-                Some("up") => controls.joystick.up.clone(),
-                Some("down") => controls.joystick.down.clone(),
-                Some("left") => controls.joystick.left.clone(),
-                Some("right") => controls.joystick.right.clone(),
-                _ => None,
+            let (action, direction) = match next.direction {
+                Some(Direction::Up) => (&controls.joystick.up, "up"),
+                Some(Direction::Down) => (&controls.joystick.down, "down"),
+                Some(Direction::Left) => (&controls.joystick.left, "left"),
+                Some(Direction::Right) => (&controls.joystick.right, "right"),
+                None => return,
             };
-            if let Some(action) = action {
+            if let Some(action) = action.clone() {
                 queue_binding(
                     worker,
                     Binding::Action(action),
-                    format!("joystick {}", next.direction.unwrap()),
+                    format!("joystick {direction}"),
                     context.selected(routing_generation),
                     &context.effort,
                     context.target.clone(),
@@ -867,7 +863,7 @@ fn input_worker(
     shared: Arc<Mutex<Arc<InputContext>>>,
     routing_generation: Arc<AtomicU64>,
     work: SyncSender<Work>,
-    notices: Sender<InputNotice>,
+    notices: Sender<String>,
     stopping: Arc<AtomicBool>,
 ) {
     let mut state = InputState::default();
@@ -938,19 +934,14 @@ fn send_lighting(device: &HidClient, state: &mut State) -> Result<()> {
             )
         })
         .collect();
-    let lighting = json!({"slots": slots_value, "aggregate": aggregate_value});
-    let signature = lighting.to_string();
+    let signature = json!({"slots": &slots_value, "aggregate": &aggregate_value}).to_string();
     if signature == state.last_lighting {
         return Ok(());
     }
-    let aggregate = lighting
-        .get("aggregate")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    if aggregate.as_object().is_some_and(|zones| !zones.is_empty()) {
-        device.send("v.oai.rgbcfg", Some(aggregate))?;
+    if !aggregate_value.is_empty() {
+        device.send("v.oai.rgbcfg", Some(Value::Object(aggregate_value)))?;
     }
-    device.send("v.oai.thstatus", lighting.get("slots").cloned())?;
+    device.send("v.oai.thstatus", Some(Value::Array(slots_value)))?;
     state.managed_aggregate_zones = next_zones;
     state.last_lighting = signature;
     Ok(())
@@ -1480,15 +1471,14 @@ fn update_input_context(context: &Mutex<Arc<InputContext>>, state: &State) {
     });
 }
 
-fn handle_input_notice(
+fn handle_input_disconnect(
     state: &mut State,
     device: &mut Option<HidClient>,
-    notice: InputNotice,
+    error: String,
 ) -> bool {
     if device.is_none() {
         return false;
     }
-    let InputNotice::Disconnected(error) = notice;
     device_disconnected(state, error);
     state.revoke_routing();
     close_device(device, state, false);
@@ -1593,8 +1583,8 @@ pub fn run_daemon() -> Result<()> {
     log("bridge started");
     while !stopping.load(Ordering::Acquire) {
         let mut changed = false;
-        while let Ok(notice) = input_notice_rx.try_recv() {
-            changed |= handle_input_notice(&mut state, &mut device, notice);
+        while let Ok(error) = input_notice_rx.try_recv() {
+            changed |= handle_input_disconnect(&mut state, &mut device, error);
         }
         while let Ok(update) = session_update_rx.try_recv() {
             match apply_session_update(&mut state, update, &session_workers, device.as_ref()) {
@@ -1724,8 +1714,8 @@ pub fn run_daemon() -> Result<()> {
             .min(sessions_due)
             .min(state.next_mapping_probe.unwrap_or(sessions_due));
         match input_notice_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok(notice) => {
-                if handle_input_notice(&mut state, &mut device, notice) {
+            Ok(error) => {
+                if handle_input_disconnect(&mut state, &mut device, error) {
                     update_input_context(&input_context, &state);
                     publish(&status, &state);
                 }

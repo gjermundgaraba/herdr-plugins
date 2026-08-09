@@ -1150,13 +1150,7 @@ mod tests {
 
     #[test]
     fn event_disconnect_waits_for_a_close_completion() {
-        let (event_tx, event_rx) = mpsc::channel::<DeviceEvent>();
         let (done_tx, done_rx) = mpsc::sync_channel(1);
-        drop(event_tx);
-        assert_eq!(
-            event_rx.recv_timeout(Duration::from_millis(1)),
-            Err(mpsc::RecvTimeoutError::Disconnected)
-        );
         let completion = thread::spawn(move || {
             thread::sleep(Duration::from_millis(10));
             done_tx.send(Ok(())).unwrap();
@@ -1168,13 +1162,7 @@ mod tests {
 
     #[test]
     fn event_disconnect_without_a_close_is_reported_immediately() {
-        let (event_tx, event_rx) = mpsc::channel::<DeviceEvent>();
         let (_done_tx, done_rx) = mpsc::sync_channel(1);
-        drop(event_tx);
-        assert_eq!(
-            event_rx.recv_timeout(Duration::from_millis(1)),
-            Err(mpsc::RecvTimeoutError::Disconnected)
-        );
 
         let error = event_disconnect_result(&done_rx, &AtomicBool::new(false), None).unwrap_err();
         assert_eq!(error.to_string(), "Codex Micro disconnected");

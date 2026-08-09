@@ -26,24 +26,11 @@ struct State {
     hold_due: Option<Instant>,
     pending: Option<Pending>,
 }
+#[derive(Default)]
 pub struct GestureDispatcher {
     states: HashMap<String, State>,
-    hold_default: Duration,
-    double_tap_default: Duration,
-}
-impl Default for GestureDispatcher {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 impl GestureDispatcher {
-    pub fn new() -> Self {
-        Self {
-            states: HashMap::new(),
-            hold_default: Duration::from_millis(500),
-            double_tap_default: Duration::from_millis(250),
-        }
-    }
     pub fn handle(
         &mut self,
         key: impl Into<String>,
@@ -148,13 +135,10 @@ impl GestureDispatcher {
             state.double_tap = pending.binding.double_tap;
             state.context = pending.context;
         }
-        state.hold_due = binding.hold.as_ref().map(|_| {
-            now + Duration::from_millis(
-                binding
-                    .hold_ms
-                    .unwrap_or(self.hold_default.as_millis() as u64),
-            )
-        });
+        state.hold_due = binding
+            .hold
+            .as_ref()
+            .map(|_| now + Duration::from_millis(binding.hold_ms.unwrap_or(500)));
         vec![]
     }
     fn release(&mut self, key: &str, now: Instant) -> Vec<Fired> {
@@ -184,13 +168,7 @@ impl GestureDispatcher {
             });
             self.states.remove(key);
         } else if state.binding.double_tap.is_some() {
-            let due = now
-                + Duration::from_millis(
-                    state
-                        .binding
-                        .double_tap_ms
-                        .unwrap_or(self.double_tap_default.as_millis() as u64),
-                );
+            let due = now + Duration::from_millis(state.binding.double_tap_ms.unwrap_or(250));
             state.pending = Some(Pending {
                 binding: state.binding.clone(),
                 context: state.context.clone(),
@@ -216,7 +194,7 @@ mod tests {
     use crate::config::Action;
     #[test]
     fn captures_first_session_for_double_tap() {
-        let mut dispatcher = GestureDispatcher::new();
+        let mut dispatcher = GestureDispatcher::default();
         let binding = Binding::Gesture(GestureBinding {
             tap: Some(Action::Submit),
             double_tap: Some(Action::Diff),

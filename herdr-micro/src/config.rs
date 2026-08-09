@@ -494,9 +494,6 @@ pub struct LightingConfig {
 }
 fn parse_lighting(value: Value) -> Result<LightingConfig, String> {
     let config: LightingConfig = serde_json::from_value(value).map_err(|e| e.to_string())?;
-    if config.states.len() != 5 {
-        return Err("unknown lighting state".into());
-    }
     for status in [
         AgentStatus::Blocked,
         AgentStatus::Done,

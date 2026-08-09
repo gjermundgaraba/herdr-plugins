@@ -324,9 +324,8 @@ fn agents(snapshot: &SessionSnapshot) -> Vec<Item> {
                 .map(|base_title| format!("{workspace}: {base_title}"))
                 .unwrap_or_else(|| workspace.into());
             let cwd = nonempty(agent.foreground_cwd.as_deref())
-                .or_else(|| nonempty(agent.cwd.as_deref()))
-                .unwrap_or("");
-            let subtitle = match (nonempty(Some(cwd)), nonempty(agent.agent.as_deref())) {
+                .or_else(|| nonempty(agent.cwd.as_deref()));
+            let subtitle = match (cwd, nonempty(agent.agent.as_deref())) {
                 (Some(path), Some(kind)) => format!("{path} · {kind}"),
                 (Some(path), None) => path.into(),
                 (None, Some(kind)) => kind.into(),
@@ -344,7 +343,7 @@ fn agents(snapshot: &SessionSnapshot) -> Vec<Item> {
                     tab,
                     agent.title.as_deref().unwrap_or(""),
                     stripped_terminal_title.or(terminal_title).unwrap_or(""),
-                    cwd,
+                    cwd.unwrap_or(""),
                     agent.agent_status.as_str(),
                     agent.terminal_id.as_str(),
                 ]
