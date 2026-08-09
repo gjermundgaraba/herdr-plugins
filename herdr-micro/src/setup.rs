@@ -17,7 +17,7 @@ use std::{
 use crate::{
     actions::{HERDR_LAYER, layer_identity},
     config::{Config, Controls, config_path, load, provision},
-    control::{ensure_state_dir, request_status},
+    control::{backup_dir, request_status},
     device::{
         DeviceEvent,
         keymap::{read_keymap, write_keymap},
@@ -373,7 +373,7 @@ fn active_owner() -> Result<Option<String>> {
 }
 
 fn backup_keymap(bytes: &[u8]) -> Result<PathBuf> {
-    let dir = ensure_state_dir()?;
+    let dir = backup_dir()?;
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
     let path = dir.join(format!("keymap-before-setup-{stamp}.json"));
     let mut file = OpenOptions::new()
@@ -502,7 +502,7 @@ fn update_micro_keymap(
 }
 
 pub fn setup_micro() -> Result<SetupReport> {
-    let config = config_path();
+    let config = config_path().map_err(|error| anyhow!(error))?;
     provision(&config).map_err(|error| anyhow!(error))?;
     let parsed = load(&config).map_err(|error| anyhow!(error))?;
     let (firmware, backup) =
@@ -515,7 +515,7 @@ pub fn setup_micro() -> Result<SetupReport> {
 }
 
 pub fn configure() -> Result<PathBuf> {
-    let path = config_path();
+    let path = config_path().map_err(|error| anyhow!(error))?;
     provision(&path).map_err(|error| anyhow!(error))?;
     load(&path).map_err(|error| anyhow!(error))?;
     let status = Command::new("/usr/bin/open")

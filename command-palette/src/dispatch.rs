@@ -1,10 +1,9 @@
 use std::{
-    fs::OpenOptions,
     io::Write,
     process::{Command, ExitCode, Stdio},
 };
 
-use herdr_client::{Client, Error};
+use herdr_client::{Client, Environment, Error, open_rotating_log};
 use serde_json::{Value, json};
 
 use crate::model::Dispatch;
@@ -82,11 +81,11 @@ pub fn schedule(dispatch: &Dispatch) -> Result<(), String> {
 }
 
 fn log_error(message: &str) {
-    let Some(state_dir) = std::env::var_os("HERDR_PLUGIN_STATE_DIR") else {
-        return;
-    };
-    let path = std::path::PathBuf::from(state_dir).join("command-palette.log");
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+    let path = Environment::load()
+        .ok()
+        .and_then(|environment| environment.require_plugin().ok())
+        .map(|plugin| plugin.logs_dir().join("command-palette.log"));
+    if let Some(Ok(mut file)) = path.map(|path| open_rotating_log(&path, 10 << 20, 3)) {
         let _ = writeln!(file, "{message}");
     }
 }

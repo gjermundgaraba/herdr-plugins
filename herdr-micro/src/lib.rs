@@ -15,3 +15,7 @@ pub mod setup;
 pub use codex_micro as device;
 
 pub const PLUGIN_ID: &str = "gjermundgaraba.herdr-micro";
+
+pub fn plugin_paths() -> anyhow::Result<herdr_client::PluginPaths> {
+    Ok(herdr_client::Environment::load()?.require_plugin()?)
+}

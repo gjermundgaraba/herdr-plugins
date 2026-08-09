@@ -1,4 +1,4 @@
-use herdr_client::{Environment, PluginInvocationContext, herdr_config_path};
+use herdr_client::{Environment, PluginInvocationContext, host_config_path};
 use serde::Deserialize;
 use std::{
     env, fs,
@@ -45,7 +45,7 @@ fn start_shell() -> Result<(), String> {
         .context
         .ok_or_else(|| "HERDR_PLUGIN_CONTEXT_JSON is missing".to_string())?;
     let cwd = invocation_cwd(context)?;
-    let (shell, mode) = load_shell_settings(&herdr_config_path());
+    let (shell, mode) = load_shell_settings(&host_config_path())?;
     env::set_current_dir(&cwd).map_err(|error| format!("change directory to {cwd:?}: {error}"))?;
 
     let shell_path = find_shell(&shell)?;
@@ -74,23 +74,25 @@ fn invocation_cwd(context: PluginInvocationContext) -> Result<String, String> {
         .ok_or_else(|| "no focused pane or workspace working directory".into())
 }
 
-fn load_shell_settings(path: &Path) -> (String, ShellMode) {
-    let config: HerdrConfig = fs::read_to_string(path)
-        .ok()
-        .and_then(|contents| toml::from_str(&contents).ok())
-        .unwrap_or_default();
+fn load_shell_settings(path: &Path) -> Result<(String, ShellMode), String> {
+    let config: HerdrConfig = match fs::read_to_string(path) {
+        Ok(contents) => toml::from_str(&contents)
+            .map_err(|error| format!("parse {}: {error}", path.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => HerdrConfig::default(),
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
+    };
     let shell = match config.terminal.default_shell.trim() {
         "" => env::var("SHELL").unwrap_or_default().trim().to_owned(),
         shell => shell.to_owned(),
     };
-    (
+    Ok((
         if shell.is_empty() {
             "/bin/sh".into()
         } else {
             shell
         },
         config.terminal.shell_mode,
-    )
+    ))
 }
 
 fn find_shell(shell: &str) -> Result<PathBuf, String> {
@@ -150,10 +152,10 @@ mod tests {
             "[terminal]\ndefault_shell = 'fish'\nshell_mode = 'non_login'\n",
         )
         .unwrap();
-        let settings = load_shell_settings(&path);
+        let settings = load_shell_settings(&path).unwrap();
         assert_eq!(settings, ("fish".into(), ShellMode::NonLogin));
         fs::write(&path, "[terminal]\nshell_mode = 'invalid'\n").unwrap();
-        assert_eq!(load_shell_settings(&path).1, ShellMode::Auto);
+        assert!(load_shell_settings(&path).is_err());
         fs::remove_file(path).unwrap();
         assert!(uses_login_shell(ShellMode::Auto, "macos"));
         assert!(!uses_login_shell(ShellMode::Auto, "linux"));

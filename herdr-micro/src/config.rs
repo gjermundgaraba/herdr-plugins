@@ -1,15 +1,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    env, fs, io,
+    fs, io,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
 
 #[cfg(test)]
-use std::os::unix::fs::PermissionsExt;
-
-use crate::PLUGIN_ID;
+use std::{env, os::unix::fs::PermissionsExt};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "kebab-case", deny_unknown_fields)]
@@ -537,17 +535,10 @@ fn is_hex(v: &str) -> bool {
     v.len() == 7 && v.starts_with('#') && v[1..].bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-pub fn config_path() -> PathBuf {
-    env::var_os("HERDR_PLUGIN_CONFIG_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".config/herdr/plugins/config")
-                .join(PLUGIN_ID)
-        })
-        .join("config.json")
+pub fn config_path() -> Result<PathBuf, String> {
+    Ok(crate::plugin_paths()
+        .map_err(|error| error.to_string())?
+        .config_file("config.json"))
 }
 fn ensure_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
     if let Some(parent) = path.parent() {

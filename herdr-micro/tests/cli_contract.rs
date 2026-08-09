@@ -31,6 +31,17 @@ fn output(args: &[&str]) -> Output {
     command(args).output().unwrap()
 }
 
+fn plugin_command(args: &[&str], dir: &Path, state: &Path) -> Command {
+    let mut command = command(args);
+    command
+        .env("HERDR_ENV", "1")
+        .env("HERDR_PLUGIN_ID", "example.micro")
+        .env("HERDR_PLUGIN_ROOT", dir.join("plugin"))
+        .env("HERDR_PLUGIN_CONFIG_DIR", dir.join("config"))
+        .env("HERDR_PLUGIN_STATE_DIR", state);
+    command
+}
+
 fn read_request(stream: &mut UnixStream) -> String {
     let mut request = String::new();
     BufReader::new(stream.try_clone().unwrap())
@@ -52,8 +63,9 @@ fn missing_and_invalid_cli_are_useful_errors() {
 fn status_stop_and_start_use_the_newline_json_socket_without_spawning() {
     let dir = temp_dir("socket");
     let state = dir.join("state");
-    fs::create_dir(&state).unwrap();
-    let socket = state.join("micro.sock");
+    let run = state.join("run");
+    fs::create_dir_all(&run).unwrap();
+    let socket = run.join("micro.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let server = thread::spawn(move || {
         for (expected, response) in [
@@ -86,10 +98,7 @@ fn status_stop_and_start_use_the_newline_json_socket_without_spawning() {
             ),
         ),
     ] {
-        let result = command(&args)
-            .env("HERDR_PLUGIN_STATE_DIR", &state)
-            .output()
-            .unwrap();
+        let result = plugin_command(&args, &dir, &state).output().unwrap();
         assert!(
             result.status.success(),
             "{}",

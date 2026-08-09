@@ -1,9 +1,14 @@
 use std::fmt;
-use std::path::PathBuf;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use crate::{EventEnvelope, PluginInvocationContext};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Environment {
     pub is_herdr: bool,
     pub socket_path: Option<PathBuf>,
@@ -46,17 +51,85 @@ impl Environment {
             link_handler_id: string_var("HERDR_PLUGIN_LINK_HANDLER_ID"),
         })
     }
+
+    pub fn require_plugin(&self) -> Result<PluginPaths, PluginEnvironmentError> {
+        if !self.is_herdr {
+            return Err(PluginEnvironmentError::NotInHerdr);
+        }
+        Ok(PluginPaths {
+            plugin_id: required(&self.plugin_id, "HERDR_PLUGIN_ID")?.clone(),
+            root_dir: required(&self.plugin_root, "HERDR_PLUGIN_ROOT")?.clone(),
+            config_dir: required(&self.plugin_config_dir, "HERDR_PLUGIN_CONFIG_DIR")?.clone(),
+            state_dir: required(&self.plugin_state_dir, "HERDR_PLUGIN_STATE_DIR")?.clone(),
+        })
+    }
 }
 
-pub fn herdr_config_path() -> PathBuf {
-    resolve_config_path(
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginPaths {
+    pub plugin_id: String,
+    pub root_dir: PathBuf,
+    pub config_dir: PathBuf,
+    pub state_dir: PathBuf,
+}
+
+impl PluginPaths {
+    pub fn config_file(&self, name: impl AsRef<Path>) -> PathBuf {
+        self.config_dir.join(name)
+    }
+
+    pub fn data_dir(&self) -> PathBuf {
+        self.state_dir.join("data")
+    }
+
+    pub fn cache_dir(&self) -> PathBuf {
+        self.state_dir.join("cache")
+    }
+
+    pub fn run_dir(&self) -> PathBuf {
+        self.state_dir.join("run")
+    }
+
+    pub fn logs_dir(&self) -> PathBuf {
+        self.state_dir.join("logs")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginEnvironmentError {
+    NotInHerdr,
+    Missing(&'static str),
+}
+
+impl fmt::Display for PluginEnvironmentError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotInHerdr => f.write_str("plugin must run under Herdr (HERDR_ENV=1)"),
+            Self::Missing(variable) => write!(f, "{variable} is not set"),
+        }
+    }
+}
+
+impl std::error::Error for PluginEnvironmentError {}
+
+fn required<'a, T>(
+    value: &'a Option<T>,
+    variable: &'static str,
+) -> Result<&'a T, PluginEnvironmentError> {
+    value
+        .as_ref()
+        .ok_or(PluginEnvironmentError::Missing(variable))
+}
+
+pub fn host_config_path() -> PathBuf {
+    resolve_host_config_path(
         std::env::var("HERDR_CONFIG_PATH").ok(),
         std::env::var("XDG_CONFIG_HOME").ok(),
         platform_config_dir(),
     )
 }
 
-fn resolve_config_path(
+fn resolve_host_config_path(
     explicit: Option<String>,
     xdg_config_home: Option<String>,
     platform_dir: PathBuf,
@@ -92,6 +165,95 @@ fn platform_config_dir() -> PathBuf {
         .map(PathBuf::from)
         .map(|home| home.join(".config"))
         .unwrap_or_else(|_| std::env::temp_dir())
+}
+
+/// Open an append-only private log, rotating it when it reaches `max_bytes`.
+/// `retained_files` includes the active file.
+pub fn open_rotating_log(path: &Path, max_bytes: u64, retained_files: usize) -> io::Result<File> {
+    if max_bytes == 0 || retained_files == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "log limits must be nonzero",
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if fs::metadata(path).is_ok_and(|metadata| metadata.len() >= max_bytes) {
+        for index in (1..retained_files).rev() {
+            let source = if index == 1 {
+                path.to_path_buf()
+            } else {
+                numbered_log(path, index - 1)?
+            };
+            let target = numbered_log(path, index)?;
+            match fs::remove_file(&target) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            match fs::rename(&source, &target) {
+                Ok(()) => {
+                    retain_log_tail(&target, max_bytes)?;
+                    make_private(&target)?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if retained_files == 1 {
+            fs::remove_file(path)?;
+        }
+    }
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options.open(path)?;
+    make_private(path)?;
+    Ok(file)
+}
+
+fn numbered_log(path: &Path, index: usize) -> io::Result<PathBuf> {
+    let mut name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "log path has no file name"))?
+        .to_os_string();
+    name.push(format!(".{index}"));
+    Ok(path.with_file_name(name))
+}
+
+fn retain_log_tail(path: &Path, max_bytes: u64) -> io::Result<()> {
+    let length = fs::metadata(path)?.len();
+    if length <= max_bytes {
+        return Ok(());
+    }
+    let mut source = File::open(path)?;
+    source.seek(SeekFrom::Start(length - max_bytes))?;
+    let mut name = path.file_name().unwrap().to_os_string();
+    name.push(format!(".trim-{}.tmp", std::process::id()));
+    let temporary = path.with_file_name(name);
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut target = options.open(&temporary)?;
+    io::copy(&mut source.take(max_bytes), &mut target)?;
+    target.flush()?;
+    drop(target);
+    fs::remove_file(path)?;
+    fs::rename(&temporary, path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn make_private(path: &Path) -> io::Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn make_private(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -145,7 +307,7 @@ mod tests {
     fn resolves_config_path_precedence() {
         let platform = PathBuf::from("/platform");
         assert_eq!(
-            resolve_config_path(
+            resolve_host_config_path(
                 Some("/explicit".into()),
                 Some("/xdg".into()),
                 platform.clone()
@@ -153,12 +315,59 @@ mod tests {
             PathBuf::from("/explicit")
         );
         assert_eq!(
-            resolve_config_path(None, Some("/xdg".into()), platform.clone()),
+            resolve_host_config_path(None, Some("/xdg".into()), platform.clone()),
             PathBuf::from("/xdg/herdr/config.toml")
         );
         assert_eq!(
-            resolve_config_path(None, None, platform),
+            resolve_host_config_path(None, None, platform),
             PathBuf::from("/platform/herdr/config.toml")
         );
+    }
+
+    #[test]
+    fn requires_complete_plugin_environment() {
+        let mut environment = Environment::default();
+        assert_eq!(
+            environment.require_plugin(),
+            Err(PluginEnvironmentError::NotInHerdr)
+        );
+        environment.is_herdr = true;
+        assert_eq!(
+            environment.require_plugin(),
+            Err(PluginEnvironmentError::Missing("HERDR_PLUGIN_ID"))
+        );
+        environment.plugin_id = Some("example.plugin".into());
+        environment.plugin_root = Some("/plugin".into());
+        environment.plugin_config_dir = Some("/config".into());
+        environment.plugin_state_dir = Some("/state".into());
+        let paths = environment.require_plugin().unwrap();
+        assert_eq!(
+            paths.config_file("config.toml"),
+            PathBuf::from("/config/config.toml")
+        );
+        assert_eq!(paths.data_dir(), PathBuf::from("/state/data"));
+        assert_eq!(paths.cache_dir(), PathBuf::from("/state/cache"));
+        assert_eq!(paths.run_dir(), PathBuf::from("/state/run"));
+        assert_eq!(paths.logs_dir(), PathBuf::from("/state/logs"));
+    }
+
+    #[test]
+    fn rotates_and_caps_private_logs() {
+        let dir = std::env::temp_dir().join(format!("herdr-client-log-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("plugin.log");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, b"abcdef").unwrap();
+        let mut file = open_rotating_log(&path, 4, 3).unwrap();
+        file.write_all(b"new").unwrap();
+        drop(file);
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        assert_eq!(fs::read(dir.join("plugin.log.1")).unwrap(), b"cdef");
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 }

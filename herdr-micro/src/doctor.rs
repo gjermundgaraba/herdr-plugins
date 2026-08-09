@@ -85,15 +85,18 @@ pub fn doctor() -> Report {
         helper_install::verify_installed()?;
         Ok(format!("version {HELPER_VERSION}"))
     });
-    let config_path = config_path();
-    let config = match load(&config_path) {
-        Ok(config) => {
-            report.push(
-                Level::Ok,
-                format!("configuration: {}", config_path.display()),
-            );
-            Some(config)
-        }
+    let resolved_config_path = config_path();
+    let config = match &resolved_config_path {
+        Ok(path) => match load(path) {
+            Ok(config) => {
+                report.push(Level::Ok, format!("configuration: {}", path.display()));
+                Some(config)
+            }
+            Err(error) => {
+                report.push(Level::Fail, format!("configuration: {error}"));
+                None
+            }
+        },
         Err(error) => {
             report.push(Level::Fail, format!("configuration: {error}"));
             None
@@ -155,13 +158,11 @@ pub fn doctor() -> Report {
     }
     if config.as_ref().is_some_and(|config| {
         config.effort.codex.raise.is_none() || config.effort.codex.lower.is_none()
-    }) {
+    }) && let Ok(path) = &resolved_config_path
+    {
         report.push(
             Level::Warn,
-            format!(
-                "Codex effort shortcuts are unset in {}",
-                config_path.display()
-            ),
+            format!("Codex effort shortcuts are unset in {}", path.display()),
         );
     }
     match pi_extension() {

@@ -26,8 +26,9 @@ cargo build --release --locked
 herdr plugin link "$PWD"
 ```
 
-No keybinding or configuration is required. Requires Herdr >= 0.7.5. Installing
-from GitHub requires `cargo` to build the binary.
+No keybinding or configuration is required. Its coordination lock lives under
+`HERDR_PLUGIN_STATE_DIR/run/`. Requires Herdr >= 0.7.5. Installing from GitHub
+requires `cargo` to build the binary.
 
 ## Development
 

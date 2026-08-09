@@ -1522,7 +1522,7 @@ fn apply_config_load(
 /// Run the bridge in the foreground.  `main`/the start action owns process
 /// detachment; this function deliberately owns only the live daemon.
 pub fn run_daemon() -> Result<()> {
-    let config_path = config_path();
+    let config_path = config_path().map_err(|error| anyhow!(error))?;
     provision(&config_path).map_err(|error| anyhow!(error))?;
     let config = load(&config_path).map_err(|error| anyhow!(error))?;
     let startup_enabled_buttons = enabled_buttons(&config.controls);

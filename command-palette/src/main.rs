@@ -6,7 +6,6 @@ mod ui;
 use std::{
     collections::HashMap,
     fs, io,
-    path::Path,
     process::ExitCode,
     sync::mpsc::{Receiver, TryRecvError},
     time::{Duration, Instant},
@@ -16,6 +15,7 @@ use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
     MouseButton, MouseEventKind,
 };
+use herdr_client::{Environment, PluginPaths};
 use model::{Filter, Picker};
 use serde::Deserialize;
 
@@ -28,8 +28,6 @@ enum Mode {
 
 const SPINNER_TICK: Duration = Duration::from_millis(100);
 const SOURCE_POLL: Duration = Duration::from_millis(15);
-const PLUGIN_ID: &str = "gjermundgaraba.herdr-command-palette";
-
 fn main() -> ExitCode {
     if let Some(code) = dispatch::maybe_run_worker() {
         return code;
@@ -37,15 +35,19 @@ fn main() -> ExitCode {
     if let Some(code) = maybe_open_action() {
         return code;
     }
-    if std::env::var("HERDR_ENV").ok().as_deref() != Some("1") {
-        return fail_visibly("command-palette must run inside Herdr");
-    }
-
+    let environment = match Environment::load() {
+        Ok(environment) => environment,
+        Err(error) => return fail_visibly(&error.to_string()),
+    };
+    let plugin = match environment.require_plugin() {
+        Ok(plugin) => plugin,
+        Err(error) => return fail_visibly(&error.to_string()),
+    };
     let client = match herdr_client::Client::from_env() {
         Ok(client) => client,
         Err(error) => return fail_visibly(&error.to_string()),
     };
-    let sources = sources::spawn(client);
+    let sources = sources::spawn(client, plugin.plugin_id);
     let filter = match initial_filter() {
         Ok(filter) => filter,
         Err(error) => return fail_visibly(&error),
@@ -97,20 +99,29 @@ fn maybe_open_action() -> Option<ExitCode> {
         "workspaces" => Some("workspaces"),
         _ => return Some(fail_visibly(&format!("unknown action: {action_id}"))),
     };
-    let mode = match action_mode(&action_id) {
+    let environment = match Environment::load() {
+        Ok(environment) => environment,
+        Err(error) => return Some(fail_visibly(&error.to_string())),
+    };
+    let plugin = match environment.require_plugin() {
+        Ok(plugin) => plugin,
+        Err(error) => return Some(fail_visibly(&error.to_string())),
+    };
+    let mode = match action_mode(&plugin, &action_id) {
         Ok(mode) => mode,
         Err(error) => return Some(fail_visibly(&error)),
     };
 
+    let params = open_params(&plugin.plugin_id, filter, mode);
     let result = herdr_client::Client::from_env()
-        .and_then(|client| client.call_value("plugin.pane.open", &open_params(filter, mode)));
+        .and_then(|client| client.call_value("plugin.pane.open", &params));
     Some(match result {
         Ok(_) => ExitCode::SUCCESS,
         Err(error) => fail_visibly(&format!("failed to open palette: {error}")),
     })
 }
 
-fn open_params(filter: Option<&str>, mode: Mode) -> serde_json::Value {
+fn open_params(plugin_id: &str, filter: Option<&str>, mode: Mode) -> serde_json::Value {
     let mut env = serde_json::Map::new();
     if let Some(filter) = filter {
         env.insert("HERDR_COMMAND_PALETTE_FILTER".into(), filter.into());
@@ -123,17 +134,14 @@ fn open_params(filter: Option<&str>, mode: Mode) -> serde_json::Value {
         },
     );
     serde_json::json!({
-        "plugin_id": PLUGIN_ID,
+        "plugin_id": plugin_id,
         "entrypoint": "palette",
         "env": env,
     })
 }
 
-fn action_mode(action_id: &str) -> Result<Mode, String> {
-    let Some(config_dir) = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR") else {
-        return Ok(Mode::Direct);
-    };
-    let path = Path::new(&config_dir).join("config.toml");
+fn action_mode(plugin: &PluginPaths, action_id: &str) -> Result<Mode, String> {
+    let path = plugin.config_file("config.toml");
     match fs::read_to_string(&path) {
         Ok(config) => mode_from_config(&config, action_id)
             .map_err(|error| format!("invalid {}: {error}", path.display())),
@@ -470,9 +478,9 @@ mod tests {
     #[test]
     fn open_params_pass_filter_and_mode_through_env() {
         assert_eq!(
-            open_params(Some("agents"), Mode::VimNormal),
+            open_params("example.plugin", Some("agents"), Mode::VimNormal),
             json!({
-                "plugin_id": PLUGIN_ID,
+                "plugin_id": "example.plugin",
                 "entrypoint": "palette",
                 "env": {
                     "HERDR_COMMAND_PALETTE_FILTER": "agents",
@@ -481,7 +489,7 @@ mod tests {
             })
         );
         assert_eq!(
-            open_params(None, Mode::Direct)["env"],
+            open_params("example.plugin", None, Mode::Direct)["env"],
             json!({ "HERDR_COMMAND_PALETTE_MODE": "direct" })
         );
     }

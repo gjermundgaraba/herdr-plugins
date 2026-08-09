@@ -9,8 +9,8 @@ configuration, Ghostty inspection, gestures, and macOS event output. They use a
 versioned local socket whose peers are checked by effective UID. The helper
 accepts only the six device methods the bridge and guarded setup require.
 
-A separate Unix socket in `HERDR_PLUGIN_STATE_DIR` provides user-daemon status
-and stop control; `micro.log` is stored beside it. The helper restores the
+A Unix socket at `HERDR_PLUGIN_STATE_DIR/run/micro.sock` provides user-daemon
+status and stop control; bounded logs live under `logs/`. The helper restores the
 normal macOS HID driver when its authenticated client disconnects, then exits.
 launchd starts a fresh helper for the next authenticated device lease. A native
 open, teardown, or final restoration that exceeds the single hard deadline

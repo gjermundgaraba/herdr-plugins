@@ -1,14 +1,14 @@
 use anyhow::{Context, Result, bail};
+use herdr_client::open_rotating_log;
 use herdr_micro::{
-    control::{ensure_state_dir, log_file, request_status, request_stop, start_daemon_versioned},
+    control::{log_file, request_status, request_stop, start_daemon_versioned},
     daemon, doctor, helper_install, setup,
 };
 use std::{
     env,
     ffi::OsString,
-    fs::OpenOptions,
     io,
-    os::unix::{fs::OpenOptionsExt, process::CommandExt},
+    os::unix::process::CommandExt,
     process::{Command, ExitCode, Stdio},
     time::Duration,
 };
@@ -69,13 +69,8 @@ fn start() -> Result<i32> {
         daemon::DAEMON_PROTOCOL_VERSION,
         || {
             helper_install::verify_installed()?;
-            ensure_state_dir()?;
-            let log = OpenOptions::new()
-                .append(true)
-                .create(true)
-                .mode(0o600)
-                .open(log_file())
-                .context("open Micro bridge log")?;
+            let log =
+                open_rotating_log(&log_file()?, 10 << 20, 3).context("open Micro bridge log")?;
             let stderr = log.try_clone()?;
             let mut command = Command::new(&executable);
             command

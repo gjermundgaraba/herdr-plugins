@@ -74,7 +74,10 @@ herdr plugin link . --enabled
    herdr plugin config-dir gjermundgaraba.herdr-micro
    ```
 
-   `config.json` contains controls, effort shortcuts, and lighting.
+   `config.json` contains controls, effort shortcuts, and lighting. Runtime files
+use the plugin state directory: `run/micro.sock`, `logs/micro.log`, and
+`data/backups/` for verified keymap backups. The daemon keeps three 10 MiB log
+files.
 
 Run **Configure Herdr Micro** in Herdr to open `config.json`. Binding
 changes are validated and reloaded while the bridge runs. `buttons` maps the

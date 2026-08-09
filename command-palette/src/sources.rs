@@ -7,14 +7,13 @@ use std::{
 };
 
 use herdr_client::{
-    AgentStatus, Client, PluginInvocationContext, SessionSnapshot, herdr_config_path,
+    AgentStatus, Client, PluginInvocationContext, SessionSnapshot, host_config_path,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::model::{Dispatch, Item, Kind};
 
-const PLUGIN_ID: &str = "gjermundgaraba.herdr-command-palette";
 const SAFE_API_ACTIONS: [&str; 4] = [
     "swap_pane_left",
     "swap_pane_down",
@@ -49,13 +48,13 @@ pub const SLOTS: usize = 3;
 
 pub type SourceUpdate = (usize, Result<Vec<Item>, String>);
 
-pub fn spawn(client: Client) -> Receiver<SourceUpdate> {
+pub fn spawn(client: Client, plugin_id: String) -> Receiver<SourceUpdate> {
     let (tx, rx) = channel();
-    thread::spawn(move || collect_into(client, &tx));
+    thread::spawn(move || collect_into(client, &plugin_id, &tx));
     rx
 }
 
-fn collect_into(client: Client, tx: &Sender<SourceUpdate>) {
+fn collect_into(client: Client, plugin_id: &str, tx: &Sender<SourceUpdate>) {
     let context = invocation_context();
     let keys_table = thread::spawn(host_keys_table);
     let default_bindings = thread::spawn(load_default_bindings);
@@ -96,7 +95,7 @@ fn collect_into(client: Client, tx: &Sender<SourceUpdate>) {
     let plugin_keys = load_plugin_keybindings(keys_table.as_ref());
     let _ = tx.send((
         2,
-        plugin_list.map(|list| plugin_actions(list, context.as_ref(), &plugin_keys)),
+        plugin_list.map(|list| plugin_actions(list, plugin_id, context.as_ref(), &plugin_keys)),
     ));
 }
 
@@ -133,13 +132,14 @@ fn native_actions(
 
 fn plugin_actions(
     result: PluginActionList,
+    own_plugin_id: &str,
     context: Option<&PluginInvocationContext>,
     keybindings: &HashMap<String, Vec<String>>,
 ) -> Vec<Item> {
     result
         .actions
         .into_iter()
-        .filter(|action| action.plugin_id != PLUGIN_ID)
+        .filter(|action| action.plugin_id != own_plugin_id)
         .map(|action| {
             let qualified = format!("{}.{}", action.plugin_id, action.action_id);
             Item {
@@ -614,7 +614,7 @@ fn load_plugin_keybindings(
 }
 
 fn host_keys_table() -> Option<Map<String, Value>> {
-    let raw = std::fs::read_to_string(herdr_config_path()).ok()?;
+    let raw = std::fs::read_to_string(host_config_path()).ok()?;
     let value: Value = toml::from_str(&raw).ok()?;
     value.get("keys")?.as_object().cloned()
 }

@@ -35,6 +35,22 @@ herdr plugin link "$PWD/popup-terminal"
 
 Each plugin directory above is independent and has its own `herdr-plugin.toml`.
 
-## Plugin clients
+## Plugin SDK and files
 
-A reusable typed socket client lives under [`sdk/rust`](sdk/rust).
+The reusable client under [`sdk/rust`](sdk/rust) also validates Herdr's plugin
+environment and supplies the repository file layout:
+
+```text
+HERDR_PLUGIN_CONFIG_DIR/   user-edited configuration
+HERDR_PLUGIN_STATE_DIR/
+  data/                    durable state and backups
+  cache/                   disposable data
+  run/                     sockets and locks
+  logs/                    bounded detached-process logs
+```
+
+Plugins must use the injected directories rather than derive them from `HOME`.
+They create only the state subdirectories they need. Config serialization stays
+schema-specific and each plugin README names its file. Managed actions and
+events log to stdout/stderr for `herdr plugin log list`; only detached workers
+and daemons write under `logs/`.

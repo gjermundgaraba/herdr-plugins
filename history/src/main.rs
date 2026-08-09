@@ -1,5 +1,7 @@
 use std::{
     fs,
+    io::Write,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::Path,
     process::ExitCode,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -112,26 +114,26 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    let Environment {
-        socket_path: Some(socket_path),
-        plugin_state_dir: Some(state_dir),
-        action_id,
-        event_name,
-        event,
-        ..
-    } = Environment::load().map_err(|error| error.to_string())?
-    else {
-        return Err("herdr-history must run under Herdr (missing HERDR_* env)".into());
-    };
-    let mode = match (event_name.as_deref(), action_id.as_deref()) {
+    let environment = Environment::load().map_err(|error| error.to_string())?;
+    let plugin = environment
+        .require_plugin()
+        .map_err(|error| error.to_string())?;
+    let socket_path = environment
+        .socket_path
+        .ok_or("HERDR_SOCKET_PATH is not set")?;
+    let mode = match (
+        environment.event_name.as_deref(),
+        environment.action_id.as_deref(),
+    ) {
         (Some("pane.focused"), _) => Mode::Record,
         (_, Some("back")) => Mode::Jump(-1),
         (_, Some("forward")) => Mode::Jump(1),
         invocation => return Err(format!("unknown Herdr invocation: {invocation:?}")),
     };
-    let event_pane_id =
-        event.and_then(|event| event.data.get("pane_id")?.as_str().map(ToOwned::to_owned));
-    let session_dir = session_state_dir(&state_dir, &socket_path);
+    let event_pane_id = environment
+        .event
+        .and_then(|event| event.data.get("pane_id")?.as_str().map(ToOwned::to_owned));
+    let session_dir = session_state_dir(&plugin.data_dir().join("sessions"), &socket_path);
     fs::create_dir_all(&session_dir)
         .map_err(|error| format!("cannot create {}: {error}", session_dir.display()))?;
     let state_file = session_dir.join("history.json");
@@ -141,8 +143,11 @@ fn run() -> Result<(), String> {
         .write(true)
         .create(true)
         .truncate(false)
+        .mode(0o600)
         .open(&lock_path)
         .map_err(|error| format!("cannot open {}: {error}", lock_path.display()))?;
+    fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("cannot chmod {}: {error}", lock_path.display()))?;
     lock.lock()
         .map_err(|error| format!("cannot lock {}: {error}", lock_path.display()))?;
 
@@ -197,7 +202,7 @@ fn jump(
 }
 
 #[cfg(unix)]
-fn session_state_dir(state_dir: &Path, socket_path: &Path) -> std::path::PathBuf {
+fn session_state_dir(sessions_dir: &Path, socket_path: &Path) -> std::path::PathBuf {
     use std::{fmt::Write as _, os::unix::ffi::OsStrExt};
 
     let bytes = socket_path.as_os_str().as_bytes();
@@ -205,7 +210,7 @@ fn session_state_dir(state_dir: &Path, socket_path: &Path) -> std::path::PathBuf
     for byte in bytes {
         write!(&mut key, "{byte:02x}").unwrap();
     }
-    state_dir.join("sessions").join(key)
+    sessions_dir.join(key)
 }
 
 #[cfg(unix)]
@@ -245,9 +250,17 @@ fn now_ms() -> u64 {
 fn save(path: &Path, state: &State) -> Result<(), String> {
     let tmp = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec(state).map_err(|error| error.to_string())?;
-    fs::write(&tmp, bytes)
-        .and_then(|()| fs::rename(&tmp, path))
-        .map_err(|error| format!("cannot save {}: {error}", path.display()))
+    let mut file = fs::File::options()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)
+        .map_err(|error| format!("cannot save {}: {error}", path.display()))?;
+    file.write_all(&bytes)
+        .map_err(|error| format!("cannot save {}: {error}", path.display()))?;
+    drop(file);
+    fs::rename(&tmp, path).map_err(|error| format!("cannot save {}: {error}", path.display()))
 }
 
 #[cfg(test)]

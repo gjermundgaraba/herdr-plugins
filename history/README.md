@@ -63,4 +63,4 @@ herdr plugin log list --plugin gjermundgaraba.herdr-history  # per-invocation lo
 ```
 
 By default, state lives under
-`~/.local/state/herdr/plugins/gjermundgaraba.herdr-history/sessions/`.
+`~/.local/state/herdr/plugins/gjermundgaraba.herdr-history/data/sessions/`.

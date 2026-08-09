@@ -2,7 +2,6 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
-use std::env;
 use std::fs::{self, Permissions};
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -16,35 +15,20 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::PLUGIN_ID;
-
 const SOCKET_NAME: &str = "micro.sock";
 const LOG_NAME: &str = "micro.log";
 const MAX_LINE_BYTES: usize = 64 * 1024;
 
-/// The plugin's persistent state directory.
-pub fn state_dir() -> PathBuf {
-    env::var_os("HERDR_PLUGIN_STATE_DIR").map_or_else(
-        || {
-            let home = env::var_os("HOME").unwrap_or_default();
-            PathBuf::from(home)
-                .join(".local/state/herdr/plugins")
-                .join(PLUGIN_ID)
-        },
-        PathBuf::from,
-    )
+pub fn control_socket() -> Result<PathBuf> {
+    Ok(crate::plugin_paths()?.run_dir().join(SOCKET_NAME))
 }
 
-pub fn control_socket() -> PathBuf {
-    state_dir().join(SOCKET_NAME)
+pub fn log_file() -> Result<PathBuf> {
+    Ok(crate::plugin_paths()?.logs_dir().join(LOG_NAME))
 }
 
-pub fn log_file() -> PathBuf {
-    state_dir().join(LOG_NAME)
-}
-
-pub fn ensure_state_dir() -> Result<PathBuf> {
-    let dir = state_dir();
+pub fn backup_dir() -> Result<PathBuf> {
+    let dir = crate::plugin_paths()?.data_dir().join("backups");
     fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     Ok(dir)
 }
@@ -65,11 +49,11 @@ impl Command {
 }
 
 pub fn request_status(timeout: Duration) -> Result<Value> {
-    request_at(&control_socket(), Command::Status, timeout)
+    request_at(&control_socket()?, Command::Status, timeout)
 }
 
 pub fn request_stop(timeout: Duration) -> Result<Value> {
-    request_at(&control_socket(), Command::Stop, timeout)
+    request_at(&control_socket()?, Command::Stop, timeout)
 }
 
 /// Send exactly one newline-delimited JSON request and read exactly one response.
@@ -93,8 +77,8 @@ pub fn request_at(path: &Path, command: Command, timeout: Duration) -> Result<Va
     serde_json::from_slice(&line).context("parse Micro bridge response")
 }
 
-/// Return a compatible daemon when one is live; otherwise stop the old one
-/// before starting this executable.
+/// Return a compatible daemon when one is live; otherwise stop it before
+/// starting this executable.
 pub fn start_daemon_versioned<F>(
     version: &str,
     protocol: u32,
@@ -104,11 +88,14 @@ pub fn start_daemon_versioned<F>(
 where
     F: FnOnce() -> Result<()>,
 {
-    start_daemon_versioned_at(&control_socket(), version, protocol, launch, ready_timeout)
+    let path = control_socket()?;
+    let log = log_file()?;
+    start_daemon_versioned_at(&path, &log, version, protocol, launch, ready_timeout)
 }
 
 fn start_daemon_versioned_at<F>(
     path: &Path,
+    log: &Path,
     version: &str,
     protocol: u32,
     launch: F,
@@ -133,10 +120,7 @@ where
         let deadline = Instant::now() + ready_timeout;
         while identity(path)? == old_socket {
             if Instant::now() >= deadline {
-                bail!(
-                    "previous Micro bridge did not stop; see {}",
-                    log_file().display()
-                );
+                bail!("previous Micro bridge did not stop; see {}", log.display());
             }
             thread::sleep(Duration::from_millis(50));
         }
@@ -151,7 +135,7 @@ where
             return Ok(status);
         }
         if Instant::now() >= deadline {
-            bail!("Micro bridge did not start; see {}", log_file().display());
+            bail!("Micro bridge did not start; see {}", log.display());
         }
         thread::sleep(Duration::from_millis(50));
     }
@@ -253,7 +237,7 @@ pub fn listen_for_control<F>(get_status: F, stopping: Arc<AtomicBool>) -> Result
 where
     F: Fn() -> Value + Send + Sync + 'static,
 {
-    listen_for_control_at(control_socket(), get_status, stopping)
+    listen_for_control_at(control_socket()?, get_status, stopping)
 }
 
 pub fn listen_for_control_at<F>(
@@ -358,8 +342,11 @@ fn read_line(stream: &mut UnixStream) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
+    use std::{
+        env,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     fn temp_dir(name: &str) -> PathBuf {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -588,6 +575,7 @@ mod tests {
         let launch_path = path.clone();
         let status = start_daemon_versioned_at(
             &path,
+            &dir.join("micro.log"),
             "0.9.0",
             1,
             move || {
@@ -637,6 +625,7 @@ mod tests {
         let launched_by_start = Arc::clone(&launched);
         let status = start_daemon_versioned_at(
             &path,
+            &dir.join("micro.log"),
             "0.9.0",
             1,
             move || {

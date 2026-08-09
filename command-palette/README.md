@@ -110,7 +110,9 @@ In Vim mode, use `j` / `k` to move and `/` to start searching. `Esc` leaves
 search first, then closes the palette.
 
 The plugin uses `nucleo-matcher` for fuzzy scoring and this repository's
-`sdk/rust` client for Herdr socket calls.
+`sdk/rust` client for Herdr socket calls. Errors from the detached dispatch
+worker use the bounded `HERDR_PLUGIN_STATE_DIR/logs/command-palette.log`; normal
+invocation output remains available through `herdr plugin log list`.
 
 ## License
 

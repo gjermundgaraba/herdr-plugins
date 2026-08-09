@@ -1,4 +1,5 @@
-use std::fs::File;
+use std::fs::{self, File};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::time::Duration;
 
 use herdr_client::{
@@ -25,6 +26,9 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let environment = Environment::load().map_err(|error| error.to_string())?;
+    let plugin = environment
+        .require_plugin()
+        .map_err(|error| error.to_string())?;
     let Some(event) = environment.event else {
         return Ok(());
     };
@@ -40,17 +44,21 @@ fn run() -> Result<(), String> {
         _ => return Ok(()),
     };
 
-    let state_dir = environment
-        .plugin_state_dir
-        .as_ref()
-        .ok_or("HERDR_PLUGIN_STATE_DIR is not set")?;
+    let run_dir = plugin.run_dir();
+    fs::create_dir_all(&run_dir).map_err(|error| format!("create run directory: {error}"))?;
     let lock = File::options()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(state_dir.join("equalize.lock"))
+        .mode(0o600)
+        .open(run_dir.join("equalize.lock"))
         .map_err(|error| format!("open lock: {error}"))?;
+    fs::set_permissions(
+        run_dir.join("equalize.lock"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .map_err(|error| format!("chmod lock: {error}"))?;
     lock.lock()
         .map_err(|error| format!("acquire lock: {error}"))?;
 
