@@ -10,7 +10,7 @@ jobs:
     name: macOS workspace
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.89.0
         with:
           components: clippy, rustfmt
@@ -22,7 +22,7 @@ jobs:
     name: Linux plugins
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.89.0
         with:
           components: clippy
@@ -48,7 +48,7 @@ jobs:
     name: Windows client
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.89.0
         with:
           components: clippy
