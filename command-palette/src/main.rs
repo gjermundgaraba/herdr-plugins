@@ -15,7 +15,7 @@ use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
     MouseButton, MouseEventKind,
 };
-use herdr_client::{Environment, PluginPaths};
+use herdr_client::{Environment, PluginInvocation, PluginPaths};
 use model::{Filter, Picker};
 use serde::Deserialize;
 
@@ -86,28 +86,24 @@ struct ActionConfig {
 }
 
 fn maybe_open_action() -> Option<ExitCode> {
-    let action_id = match std::env::var("HERDR_PLUGIN_ACTION_ID") {
-        Ok(action_id) => action_id,
-        Err(std::env::VarError::NotPresent) => return None,
-        Err(std::env::VarError::NotUnicode(_)) => {
-            return Some(fail_visibly("HERDR_PLUGIN_ACTION_ID is not valid UTF-8"));
-        }
+    let environment = match Environment::load() {
+        Ok(environment) => environment,
+        Err(error) => return Some(fail_visibly(&error.to_string())),
     };
-    let filter = match action_id.as_str() {
+    let Some(PluginInvocation::Action(action_id)) = environment.invocation() else {
+        return None;
+    };
+    let filter = match action_id {
         "open" => None,
         "agents" => Some("agents"),
         "workspaces" => Some("workspaces"),
         _ => return Some(fail_visibly(&format!("unknown action: {action_id}"))),
     };
-    let environment = match Environment::load() {
-        Ok(environment) => environment,
-        Err(error) => return Some(fail_visibly(&error.to_string())),
-    };
     let plugin = match environment.require_plugin() {
         Ok(plugin) => plugin,
         Err(error) => return Some(fail_visibly(&error.to_string())),
     };
-    let mode = match action_mode(&plugin, &action_id) {
+    let mode = match action_mode(&plugin, action_id) {
         Ok(mode) => mode,
         Err(error) => return Some(fail_visibly(&error)),
     };

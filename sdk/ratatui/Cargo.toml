@@ -1,0 +1,10 @@
+[package]
+name = "herdr-ratatui"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Shared Ratatui chrome for Herdr popup plugins"
+
+[dependencies]
+ratatui.workspace = true

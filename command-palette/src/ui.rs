@@ -1,3 +1,4 @@
+use herdr_ratatui::{SearchLine, Separator, key_hints, theme};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -61,42 +62,43 @@ pub fn render(
     picker.ensure_selection_visible();
 
     render_header(picker, mode, loading, frame, rects.header);
-    render_separator(frame, Rect::new(area.x, area.y + 1, area.width, 1));
+    frame.render_widget(Separator, Rect::new(area.x, area.y + 1, area.width, 1));
     render_rows(picker, spinner_frame, loading, frame, rects.body);
-    render_separator(frame, rects.detail);
+    frame.render_widget(Separator, rects.detail);
     render_detail(picker, frame, rects.detail);
     render_footer(mode, frame, rects.footer);
 }
 
 fn render_header(picker: &Picker, mode: Mode, loading: bool, frame: &mut Frame, area: Rect) {
-    let query = match (mode, picker.query.is_empty()) {
-        (Mode::Direct, true) => "/ type to search".into(),
-        (Mode::VimNormal, true) => "/ to search".into(),
-        (Mode::VimNormal, false) => format!("/ {}", picker.query),
-        _ => format!("/ {}▏", picker.query),
+    let search = SearchLine {
+        query: &picker.query,
+        placeholder: match mode {
+            Mode::Direct => "type to search",
+            Mode::VimNormal => "to search",
+            Mode::VimSearch => "",
+        },
+        focused: mode != Mode::VimNormal,
     };
-    let left = format!(" {query}  [{}]", picker.filter.label());
+    let filter = format!("[{}]", picker.filter.label());
     let count = if loading {
         format!("loading · {} results ", picker.len())
     } else {
         format!("{} results ", picker.len())
     };
     let gap = (area.width as usize)
-        .saturating_sub(width(&left))
+        .saturating_sub(search.line().width() + 2 + width(&filter))
         .saturating_sub(width(&count));
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                left,
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" ".repeat(gap)),
-            Span::styled(count, Style::default().fg(Color::DarkGray)),
-        ])),
-        area,
-    );
+    let mut spans = search.line().spans;
+    spans.extend([
+        Span::raw("  "),
+        Span::styled(filter, theme::accent()),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(count, theme::muted()),
+    ]);
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    if let Some(position) = search.cursor_position(area) {
+        frame.set_cursor_position(position);
+    }
 }
 
 fn render_rows(
@@ -112,10 +114,7 @@ fn render_rows(
         } else {
             " No matches"
         };
-        frame.render_widget(
-            Paragraph::new(message).style(Style::default().fg(Color::DarkGray)),
-            area,
-        );
+        frame.render_widget(Paragraph::new(message).style(theme::muted()), area);
         return;
     }
     let start = picker.scroll.min(picker.len());
@@ -149,7 +148,7 @@ fn render_row(
     area: Rect,
 ) {
     let style = if selected {
-        Style::default().bg(Color::Blue).fg(Color::White)
+        theme::selection()
     } else {
         Style::default()
     };
@@ -223,11 +222,7 @@ fn render_row(
                 area.width.saturating_sub(prefix_width as u16) as usize
             )
         ))
-        .style(if selected {
-            style
-        } else {
-            Style::default().fg(Color::DarkGray)
-        }),
+        .style(if selected { style } else { theme::muted() }),
         Rect::new(area.x, area.y + 1, area.width, 1),
     );
 }
@@ -255,7 +250,7 @@ fn render_detail(picker: &Picker, frame: &mut Frame, area: Rect) {
             " {}",
             truncate_end(detail, area.width.saturating_sub(2) as usize)
         ))
-        .style(Style::default().fg(Color::DarkGray)),
+        .style(theme::muted()),
         area,
     );
 }
@@ -267,48 +262,20 @@ fn render_footer(mode: Mode, frame: &mut Frame, area: Rect) {
         "↑↓"
     };
     let escape = if mode == Mode::VimSearch {
-        " normal"
+        "normal"
     } else {
-        " close"
+        "close"
     };
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            key(" enter"),
-            label(" open  "),
-            key(if mode == Mode::VimNormal { "/" } else { "type" }),
-            label(" search  "),
-            key("^A/^W/^T/⌥P/^G"),
-            label(" filter  "),
-            key(movement),
-            label(" move  "),
-            key("esc"),
-            label(escape),
+        Paragraph::new(key_hints(&[
+            ("enter", "open"),
+            (if mode == Mode::VimNormal { "/" } else { "type" }, "search"),
+            ("^A/^W/^T/⌥P/^G", "filter"),
+            (movement, "move"),
+            ("esc", escape),
         ])),
         area,
     );
-}
-
-fn render_separator(frame: &mut Frame, area: Rect) {
-    if area.height == 0 {
-        return;
-    }
-    frame.render_widget(
-        Paragraph::new("─".repeat(area.width as usize)).style(Style::default().fg(Color::DarkGray)),
-        area,
-    );
-}
-
-fn key(value: &'static str) -> Span<'static> {
-    Span::styled(
-        value,
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )
-}
-
-fn label(value: &'static str) -> Span<'static> {
-    Span::styled(value, Style::default().fg(Color::DarkGray))
 }
 
 fn width(value: &str) -> usize {

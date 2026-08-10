@@ -29,6 +29,17 @@ pub struct Environment {
     pub link_handler_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PluginInvocation<'a> {
+    Action(&'a str),
+    Event {
+        name: &'a str,
+        event: &'a EventEnvelope,
+    },
+    Pane(&'a str),
+    Startup,
+}
+
 impl Environment {
     pub fn load() -> Result<Self, EnvironmentError> {
         Ok(Self {
@@ -50,6 +61,19 @@ impl Environment {
             clicked_url: string_var("HERDR_PLUGIN_CLICKED_URL"),
             link_handler_id: string_var("HERDR_PLUGIN_LINK_HANDLER_ID"),
         })
+    }
+
+    pub fn invocation(&self) -> Option<PluginInvocation<'_>> {
+        if let Some(action) = self.action_id.as_deref() {
+            Some(PluginInvocation::Action(action))
+        } else if self.event_name.as_deref() == Some("startup") {
+            Some(PluginInvocation::Startup)
+        } else if let (Some(name), Some(event)) = (self.event_name.as_deref(), self.event.as_ref())
+        {
+            Some(PluginInvocation::Event { name, event })
+        } else {
+            self.entrypoint_id.as_deref().map(PluginInvocation::Pane)
+        }
     }
 
     pub fn require_plugin(&self) -> Result<PluginPaths, PluginEnvironmentError> {
@@ -321,6 +345,41 @@ mod tests {
         assert_eq!(
             resolve_host_config_path(None, None, platform),
             PathBuf::from("/platform/herdr/config.toml")
+        );
+    }
+
+    #[test]
+    fn classifies_plugin_invocations() {
+        let event = EventEnvelope {
+            event: "pane_focused".into(),
+            data: serde_json::json!({ "pane_id": "w1:p1" }),
+        };
+        let mut environment = Environment {
+            event_name: Some("pane.focused".into()),
+            event: Some(event.clone()),
+            ..Default::default()
+        };
+        assert_eq!(
+            environment.invocation(),
+            Some(PluginInvocation::Event {
+                name: "pane.focused",
+                event: &event,
+            })
+        );
+        environment.event_name = Some("startup".into());
+        environment.event = None;
+        assert_eq!(environment.invocation(), Some(PluginInvocation::Startup));
+        environment.event_name = None;
+        environment.action_id = Some("open".into());
+        assert_eq!(
+            environment.invocation(),
+            Some(PluginInvocation::Action("open"))
+        );
+        environment.action_id = None;
+        environment.entrypoint_id = Some("palette".into());
+        assert_eq!(
+            environment.invocation(),
+            Some(PluginInvocation::Pane("palette"))
         );
     }
 

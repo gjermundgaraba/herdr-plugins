@@ -3,7 +3,8 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::time::Duration;
 
 use herdr_client::{
-    Client, Environment, LayoutExportParams, LayoutNode, LayoutSetSplitRatioParams, SplitDirection,
+    Client, Environment, LayoutExportParams, LayoutNode, LayoutSetSplitRatioParams,
+    PluginInvocation, SplitDirection,
 };
 
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(1);
@@ -29,18 +30,18 @@ fn run() -> Result<(), String> {
     let plugin = environment
         .require_plugin()
         .map_err(|error| error.to_string())?;
-    let Some(event) = environment.event else {
-        return Ok(());
-    };
-
-    // Dispatch on HERDR_PLUGIN_EVENT: the envelope's own `event` field uses
-    // underscore names (`pane_created`), not the manifest's dotted names.
-    let created_pane_id = match environment.event_name.as_deref() {
-        Some("pane.created") => match event.data["pane"]["pane_id"].as_str() {
+    let created_pane_id = match environment.invocation() {
+        Some(PluginInvocation::Event {
+            name: "pane.created",
+            event,
+        }) => match event.data["pane"]["pane_id"].as_str() {
             Some(pane_id) if !pane_id.is_empty() => Some(pane_id.to_owned()),
             _ => return Ok(()),
         },
-        Some("pane.closed") | Some("pane.exited") => None,
+        Some(PluginInvocation::Event {
+            name: "pane.closed" | "pane.exited",
+            ..
+        }) => None,
         _ => return Ok(()),
     };
 

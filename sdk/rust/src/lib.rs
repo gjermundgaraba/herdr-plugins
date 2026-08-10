@@ -10,8 +10,8 @@ mod types;
 
 pub use client::{ApiError, Client, Error, Subscription};
 pub use env::{
-    Environment, EnvironmentError, PluginEnvironmentError, PluginPaths, host_config_path,
-    open_rotating_log,
+    Environment, EnvironmentError, PluginEnvironmentError, PluginInvocation, PluginPaths,
+    host_config_path, open_rotating_log,
 };
 pub use types::*;
 

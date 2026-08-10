@@ -54,3 +54,6 @@ They create only the state subdirectories they need. Config serialization stays
 schema-specific and each plugin README names its file. Managed actions and
 events log to stdout/stderr for `herdr plugin log list`; only detached workers
 and daemons write under `logs/`.
+
+Rust popup plugins share search chrome, key hints, separators, and colors through
+[`herdr-ratatui`](sdk/ratatui) without sharing application state or event loops.

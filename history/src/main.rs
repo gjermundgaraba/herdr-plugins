@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use herdr_client::{Client, Environment, Error as ClientError};
+use herdr_client::{Client, Environment, Error as ClientError, PluginInvocation};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -118,21 +118,25 @@ fn run() -> Result<(), String> {
     let plugin = environment
         .require_plugin()
         .map_err(|error| error.to_string())?;
+    let (mode, event_pane_id) = match environment.invocation() {
+        Some(PluginInvocation::Event {
+            name: "pane.focused",
+            event,
+        }) => (
+            Mode::Record,
+            event
+                .data
+                .get("pane_id")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+        ),
+        Some(PluginInvocation::Action("back")) => (Mode::Jump(-1), None),
+        Some(PluginInvocation::Action("forward")) => (Mode::Jump(1), None),
+        invocation => return Err(format!("unknown Herdr invocation: {invocation:?}")),
+    };
     let socket_path = environment
         .socket_path
         .ok_or("HERDR_SOCKET_PATH is not set")?;
-    let mode = match (
-        environment.event_name.as_deref(),
-        environment.action_id.as_deref(),
-    ) {
-        (Some("pane.focused"), _) => Mode::Record,
-        (_, Some("back")) => Mode::Jump(-1),
-        (_, Some("forward")) => Mode::Jump(1),
-        invocation => return Err(format!("unknown Herdr invocation: {invocation:?}")),
-    };
-    let event_pane_id = environment
-        .event
-        .and_then(|event| event.data.get("pane_id")?.as_str().map(ToOwned::to_owned));
     let session_dir = session_state_dir(&plugin.data_dir().join("sessions"), &socket_path);
     fs::create_dir_all(&session_dir)
         .map_err(|error| format!("cannot create {}: {error}", session_dir.display()))?;

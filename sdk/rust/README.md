@@ -19,11 +19,27 @@ fn main() -> Result<(), herdr_client::Error> {
 }
 ```
 
+Plugin binaries can classify their Herdr launch without comparing raw environment
+variables:
+
+```rust
+use herdr_client::{Environment, PluginInvocation};
+
+match Environment::load()?.invocation() {
+    Some(PluginInvocation::Action("open")) => { /* open the plugin UI */ }
+    Some(PluginInvocation::Pane("palette")) => { /* run the UI */ }
+    _ => {}
+}
+```
+
 Methods added after this crate's tested Herdr version remain usable:
 
 ```rust
 let value = client.call_value("some.future.method", &serde_json::json!({}))?;
 ```
+
+Methods that retain the socket for a protocol-specific stream, currently
+`pane.graphics.stream`, require dedicated support rather than `call_value`.
 
 Plugin entrypoints can require Herdr's managed directories instead of deriving
 paths from `HOME` or XDG variables:
