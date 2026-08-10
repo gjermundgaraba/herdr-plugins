@@ -33,7 +33,7 @@ jobs:
           -p herdr-command-palette
           -p herdr-equalize-splits
           -p herdr-history
-          -p popup-terminal
+          -p herdr-popup-terminal
           -- -D warnings
       - run: >-
           cargo +1.89.0 test --all-features --locked
@@ -42,7 +42,7 @@ jobs:
           -p herdr-command-palette
           -p herdr-equalize-splits
           -p herdr-history
-          -p popup-terminal
+          -p herdr-popup-terminal
 
   windows:
     name: Windows client

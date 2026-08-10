@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 description = "Automatically equalize Herdr pane sizes after splits and closes"
+repository.workspace = true
 
 [dependencies]
 herdr-client.workspace = true

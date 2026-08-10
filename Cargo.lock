@@ -340,6 +340,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "herdr-popup-terminal"
+version = "0.2.0"
+dependencies = [
+ "herdr-client",
+ "serde",
+ "toml",
+]
+
+[[package]]
 name = "herdr-ratatui"
 version = "0.1.0"
 dependencies = [
@@ -647,15 +656,6 @@ dependencies = [
  "redox_syscall",
  "smallvec",
  "windows-link",
-]
-
-[[package]]
-name = "popup-terminal"
-version = "0.2.0"
-dependencies = [
- "herdr-client",
- "serde",
- "toml",
 ]
 
 [[package]]

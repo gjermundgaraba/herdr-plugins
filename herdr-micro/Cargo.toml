@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 description = "Control Herdr from a Work Louder Codex Micro"
-repository = "https://github.com/gjermundgaraba/herdr-plugins"
+repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true

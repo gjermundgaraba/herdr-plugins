@@ -4,9 +4,9 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Device library for the Work Louder Codex Micro"
-repository = "https://github.com/gjermundgaraba/herdr-plugins"
 publish = false
+description = "Device library for the Work Louder Codex Micro"
+repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true

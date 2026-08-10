@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 description = "Typed, synchronous client for the Herdr plugin socket API"
+repository.workspace = true
 
 [dependencies]
 interprocess = "2.4.3"

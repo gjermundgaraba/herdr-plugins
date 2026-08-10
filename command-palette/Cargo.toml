@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 description = "Fuzzy command and navigation palette for Herdr"
+repository.workspace = true
 
 [dependencies]
 crossterm = "0.29.0"

@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 description = "Vim-style pane focus history for Herdr"
+repository.workspace = true
 
 [dependencies]
 herdr-client.workspace = true
