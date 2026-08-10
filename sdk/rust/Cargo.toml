@@ -7,6 +7,6 @@ license.workspace = true
 description = "Typed, synchronous client for the Herdr plugin socket API"
 
 [dependencies]
-interprocess = "2.4.2"
+interprocess = "2.4.3"
 serde.workspace = true
 serde_json.workspace = true

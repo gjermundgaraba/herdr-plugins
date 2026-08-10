@@ -116,4 +116,4 @@ invocation output remains available through `herdr plugin log list`.
 
 ## License
 
-Apache-2.0. See `LICENSE`.
+MIT. See [`../LICENSE`](../LICENSE).

@@ -4,6 +4,8 @@ use serde_json::{Value, json};
 
 const READ_CHUNK: usize = 512;
 const WRITE_CHUNK: usize = 384;
+// ponytail: Codex keymaps are much smaller; raise this only if firmware grows past it.
+const MAX_KEYMAP_SIZE: usize = 8 * 1024 * 1024;
 
 fn keymap_chunk(value: Value) -> Result<(Vec<u8>, usize)> {
     let data = value
@@ -24,9 +26,22 @@ where
     F: FnMut(usize) -> Result<Value>,
 {
     let mut offset = 0;
+    let mut expected_total = None;
     let mut body = Vec::new();
     loop {
         let (chunk, total) = keymap_chunk(read(offset)?)?;
+        if total > MAX_KEYMAP_SIZE {
+            bail!("keymap exceeds {MAX_KEYMAP_SIZE} bytes");
+        }
+        match expected_total {
+            None => {
+                body.try_reserve_exact(total)
+                    .context("cannot allocate keymap buffer")?;
+                expected_total = Some(total);
+            }
+            Some(expected) if expected != total => bail!("keymap size changed while reading"),
+            Some(_) => {}
+        }
         if chunk.is_empty() {
             bail!("empty keymap chunk");
         }
@@ -89,6 +104,27 @@ pub fn write_keymap(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_oversized_or_changing_keymaps() {
+        let oversized = read_keymap_with(|_| {
+            Ok(json!({
+                "data": STANDARD.encode(b"a"),
+                "total_size": MAX_KEYMAP_SIZE + 1
+            }))
+        })
+        .unwrap_err();
+        assert!(oversized.to_string().contains("exceeds"));
+
+        let changing = read_keymap_with(|offset| {
+            Ok(json!({
+                "data": STANDARD.encode(b"a"),
+                "total_size": if offset == 0 { 2 } else { 3 }
+            }))
+        })
+        .unwrap_err();
+        assert!(changing.to_string().contains("size changed"));
+    }
 
     #[test]
     fn reads_and_writes_exact_chunks() {

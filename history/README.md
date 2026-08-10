@@ -41,7 +41,7 @@ command = "gjermundgaraba.herdr-history.forward"
 description = "History forward"
 ```
 
-Reload with `herdr server reload-config`. Requires Herdr >= 0.7.5 and Rust >= 1.89
+Reload with `herdr server reload-config`. Requires Herdr >= 0.8.0 and Rust >= 1.89
 to install. The installed plugin has no runtime language dependency.
 
 ## How it works

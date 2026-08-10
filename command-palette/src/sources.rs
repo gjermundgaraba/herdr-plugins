@@ -34,6 +34,7 @@ struct PluginAction {
     title: String,
     #[serde(default)]
     description: Option<String>,
+    platforms: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -139,7 +140,14 @@ fn plugin_actions(
     result
         .actions
         .into_iter()
-        .filter(|action| action.plugin_id != own_plugin_id)
+        .filter(|action| {
+            action.plugin_id != own_plugin_id
+                && action.platforms.as_ref().is_none_or(|platforms| {
+                    platforms
+                        .iter()
+                        .any(|platform| platform == std::env::consts::OS)
+                })
+        })
         .map(|action| {
             let qualified = format!("{}.{}", action.plugin_id, action.action_id);
             Item {
@@ -675,7 +683,7 @@ mod tests {
 
     fn snapshot(agents: Vec<AgentInfo>) -> SessionSnapshot {
         SessionSnapshot {
-            version: "0.7.5".into(),
+            version: "0.8.0".into(),
             protocol: 17,
             focused_workspace_id: None,
             focused_tab_id: None,
@@ -755,7 +763,7 @@ mod tests {
     #[test]
     fn safe_api_actions_dispatch_without_destructive_closes() {
         let snapshot = SessionSnapshot {
-            version: "0.7.5".into(),
+            version: "0.8.0".into(),
             protocol: 17,
             focused_workspace_id: None,
             focused_tab_id: None,
@@ -774,6 +782,29 @@ mod tests {
             json!({ "pane_id": "pane-1", "direction": "left" })
         );
         assert!(native_dispatch("close_pane", &snapshot, None).is_none());
+    }
+
+    #[test]
+    fn plugin_actions_include_host_and_unrestricted_platforms() {
+        let unsupported = if std::env::consts::OS == "linux" {
+            "macos"
+        } else {
+            "linux"
+        };
+        let actions: PluginActionList = serde_json::from_value(json!({
+            "actions": [
+                { "plugin_id": "supported", "action_id": "open", "title": "Supported", "platforms": [std::env::consts::OS] },
+                { "plugin_id": "unsupported", "action_id": "open", "title": "Unsupported", "platforms": [unsupported] },
+                { "plugin_id": "unrestricted", "action_id": "open", "title": "Unrestricted" },
+            ]
+        }))
+        .unwrap();
+
+        let details = plugin_actions(actions, "palette", None, &HashMap::new())
+            .into_iter()
+            .map(|item| item.detail)
+            .collect::<Vec<_>>();
+        assert_eq!(details, ["supported.open", "unrestricted.open"]);
     }
 
     #[test]

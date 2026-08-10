@@ -10,7 +10,7 @@ publish = false
 
 [dependencies]
 anyhow.workspace = true
-base64 = "0.23.0"
+base64 = "0.23.1"
 libc.workspace = true
 objc2-core-foundation = { workspace = true, features = ["CFDate", "CFDictionary", "CFNumber", "CFRunLoop", "CFString"] }
 objc2-io-kit = { version = "0.3.2", default-features = false, features = ["AppleUSBDefinitions", "IOUSBHostFamilyDefinitions", "IOUSBLib", "USB", "USBSpec", "libc", "objc2", "std", "usb"] }

@@ -8,6 +8,4 @@ description = "Automatically equalize Herdr pane sizes after splits and closes"
 
 [dependencies]
 herdr-client.workspace = true
-
-[dev-dependencies]
 serde_json.workspace = true

@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::Path;
 use std::time::Duration;
 
 use herdr_client::{
@@ -18,6 +20,13 @@ struct RatioUpdate {
     ratio: f64,
 }
 
+enum Trigger {
+    Startup,
+    Refresh,
+    Created(String),
+    Removed(String),
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("equalize-splits: {error}");
@@ -30,63 +39,85 @@ fn run() -> Result<(), String> {
     let plugin = environment
         .require_plugin()
         .map_err(|error| error.to_string())?;
-    let created_pane_id = match environment.invocation() {
+    let trigger = match environment.invocation() {
+        Some(PluginInvocation::Startup) => Trigger::Startup,
         Some(PluginInvocation::Event {
             name: "pane.created",
             event,
         }) => match event.data["pane"]["pane_id"].as_str() {
-            Some(pane_id) if !pane_id.is_empty() => Some(pane_id.to_owned()),
+            Some(pane_id) if !pane_id.is_empty() => Trigger::Created(pane_id.to_owned()),
             _ => return Ok(()),
         },
         Some(PluginInvocation::Event {
             name: "pane.closed" | "pane.exited",
-            ..
-        }) => None,
+            event,
+        }) => match event.data["pane_id"].as_str() {
+            Some(pane_id) if !pane_id.is_empty() => Trigger::Removed(pane_id.to_owned()),
+            _ => return Ok(()),
+        },
+        Some(PluginInvocation::Event {
+            name: "pane.moved", ..
+        }) => Trigger::Refresh,
         _ => return Ok(()),
     };
 
     let run_dir = plugin.run_dir();
     fs::create_dir_all(&run_dir).map_err(|error| format!("create run directory: {error}"))?;
+    let lock_path = run_dir.join("equalize.lock");
     let lock = File::options()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .mode(0o600)
-        .open(run_dir.join("equalize.lock"))
+        .open(&lock_path)
         .map_err(|error| format!("open lock: {error}"))?;
-    fs::set_permissions(
-        run_dir.join("equalize.lock"),
-        fs::Permissions::from_mode(0o600),
-    )
-    .map_err(|error| format!("chmod lock: {error}"))?;
+    fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("chmod lock: {error}"))?;
     lock.lock()
         .map_err(|error| format!("acquire lock: {error}"))?;
 
     let client = Client::from_env()
         .map_err(|error| error.to_string())?
         .with_timeout(SOCKET_TIMEOUT);
+    let cache_dir = plugin.cache_dir();
+    fs::create_dir_all(&cache_dir).map_err(|error| format!("create cache directory: {error}"))?;
+    let pane_tabs_path = cache_dir.join("pane-tabs.json");
+    let mut pane_tabs = match trigger {
+        Trigger::Startup => HashMap::new(),
+        _ => load_pane_tabs(&pane_tabs_path)?,
+    };
+    let snapshot = client
+        .snapshot()
+        .map_err(|error| format!("snapshot session: {error}"))?;
+    let removed_tab_id = refresh_pane_tabs(
+        &mut pane_tabs,
+        snapshot
+            .panes
+            .iter()
+            .map(|pane| (pane.pane_id.as_str(), pane.tab_id.as_str())),
+        match &trigger {
+            Trigger::Removed(pane_id) => Some(pane_id.as_str()),
+            _ => None,
+        },
+    );
+    save_pane_tabs(&pane_tabs_path, &pane_tabs)?;
 
-    let params = match &created_pane_id {
+    let created_pane_id = match &trigger {
+        Trigger::Startup | Trigger::Refresh => return Ok(()),
+        Trigger::Created(pane_id) => Some(pane_id),
+        Trigger::Removed(_) => None,
+    };
+    let params = match created_pane_id {
         Some(pane_id) => LayoutExportParams {
             pane_id: Some(pane_id.clone()),
             tab_id: None,
         },
         None => {
-            // ponytail: pane lifecycle events lack a tab id; UI closes target the
-            // workspace's active tab. Cache layouts if background API closes need support.
-            let workspaces = client
-                .workspaces()
-                .map_err(|error| format!("list workspaces: {error}"))?;
-            let Some(tab_id) = workspaces
-                .into_iter()
-                .find(|workspace| {
-                    Some(&workspace.workspace_id) == environment.workspace_id.as_ref()
-                })
-                .map(|workspace| workspace.active_tab_id)
-                .filter(|tab_id| !tab_id.is_empty())
+            let Some(tab_id) = removed_tab_id
+                .filter(|tab_id| snapshot.tabs.iter().any(|tab| tab.tab_id == *tab_id))
             else {
-                return Ok(()); // Closing the last pane may also close its workspace.
+                return Ok(()); // The tab may have closed with its last pane.
             };
             LayoutExportParams {
                 tab_id: Some(tab_id),
@@ -99,7 +130,7 @@ fn run() -> Result<(), String> {
         .map_err(|error| format!("export layout: {error}"))?;
 
     for _ in 0..MAX_RATIO_UPDATES {
-        let plan = match &created_pane_id {
+        let plan = match created_pane_id {
             Some(pane_id) => equalization_plan(&layout.root, pane_id),
             None => full_equalization_plan(&layout.root),
         };
@@ -116,6 +147,39 @@ fn run() -> Result<(), String> {
             .map_err(|error| format!("set split ratio: {error}"))?;
     }
     Err("layout kept changing while equalizing".into())
+}
+
+fn refresh_pane_tabs<'a>(
+    pane_tabs: &mut HashMap<String, String>,
+    panes: impl IntoIterator<Item = (&'a str, &'a str)>,
+    removed_pane_id: Option<&str>,
+) -> Option<String> {
+    let removed_tab_id = removed_pane_id.and_then(|pane_id| pane_tabs.remove(pane_id));
+    pane_tabs.extend(
+        panes
+            .into_iter()
+            .map(|(pane_id, tab_id)| (pane_id.to_owned(), tab_id.to_owned())),
+    );
+    removed_tab_id
+}
+
+fn load_pane_tabs(path: &Path) -> Result<HashMap<String, String>, String> {
+    match fs::read(path) {
+        Ok(contents) => serde_json::from_slice(&contents)
+            .map_err(|error| format!("read pane-to-tab cache: {error}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+        Err(error) => Err(format!("read pane-to-tab cache: {error}")),
+    }
+}
+
+fn save_pane_tabs(path: &Path, pane_tabs: &HashMap<String, String>) -> Result<(), String> {
+    let temporary = path.with_extension("json.tmp");
+    let contents = serde_json::to_vec(pane_tabs)
+        .map_err(|error| format!("serialize pane-to-tab cache: {error}"))?;
+    fs::write(&temporary, contents).map_err(|error| format!("write pane-to-tab cache: {error}"))?;
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("chmod pane-to-tab cache: {error}"))?;
+    fs::rename(&temporary, path).map_err(|error| format!("save pane-to-tab cache: {error}"))
 }
 
 /// Equalize the connected same-direction region around a freshly created pane.
@@ -324,6 +388,25 @@ mod tests {
         );
 
         assert_eq!(equalization_plan(&root, "b"), vec![]);
+    }
+
+    #[test]
+    fn removed_panes_keep_other_pending_mappings() {
+        let mut pane_tabs = HashMap::from([
+            ("pane-a".into(), "tab-a".into()),
+            ("pane-b".into(), "tab-b".into()),
+        ]);
+
+        assert_eq!(
+            refresh_pane_tabs(&mut pane_tabs, [], Some("pane-a")),
+            Some("tab-a".into())
+        );
+        assert_eq!(pane_tabs.get("pane-b").map(String::as_str), Some("tab-b"));
+        refresh_pane_tabs(&mut pane_tabs, [("pane-b", "tab-c")], None);
+        assert_eq!(
+            refresh_pane_tabs(&mut pane_tabs, [], Some("pane-b")),
+            Some("tab-c".into())
+        );
     }
 
     #[test]

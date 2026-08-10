@@ -7,14 +7,14 @@ license.workspace = true
 description = "Fuzzy command and navigation palette for Herdr"
 
 [dependencies]
-crossterm = "0.29"
+crossterm = "0.29.0"
 herdr-client.workspace = true
 herdr-ratatui.workspace = true
 libc.workspace = true
-nucleo-matcher = "0.3"
+nucleo-matcher = "0.3.1"
 ratatui = { workspace = true, features = ["crossterm_0_29"] }
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
-unicode-truncate = "2"
-unicode-width = "0.2"
+unicode-truncate = "2.0.1"
+unicode-width = "0.2.2"
