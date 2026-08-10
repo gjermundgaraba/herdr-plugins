@@ -174,4 +174,5 @@ is indexed in [the research record](docs/research/README.md).
 
 ## License
 
-MIT. See [third-party notices](THIRD_PARTY_NOTICES.md).
+Apache-2.0. See [`../LICENSE`](../LICENSE) and
+[third-party notices](THIRD_PARTY_NOTICES.md).

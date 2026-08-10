@@ -57,3 +57,7 @@ and daemons write under `logs/`.
 
 Rust popup plugins share search chrome, key hints, separators, and colors through
 [`herdr-ratatui`](sdk/ratatui) without sharing application state or event loops.
+
+## License
+
+Apache-2.0. See [`LICENSE`](LICENSE).

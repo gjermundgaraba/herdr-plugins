@@ -116,4 +116,6 @@ invocation output remains available through `herdr plugin log list`.
 
 ## License
 
-MIT. See [`../LICENSE`](../LICENSE).
+Apache-2.0. Portions originated in
+[Herdr](https://github.com/herdrdev/herdr)'s Apache-2.0-licensed picker code.
+See [`../LICENSE`](../LICENSE).
