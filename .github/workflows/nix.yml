@@ -25,7 +25,7 @@ jobs:
           - name: Linux
             runner: ubuntu-latest
           - name: macOS
-            runner: macos-14
+            runner: macos-15
 
     steps:
       - uses: actions/checkout@v5
