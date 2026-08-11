@@ -109,6 +109,7 @@
             "herdr-micro"
             "herdr-micro-hid"
           ];
+          runtimeFiles = [ "integrations/pi/herdr-effort.js" ];
           platforms = [ "darwin" ];
           binLayout = true;
         };
@@ -178,6 +179,9 @@
                 else
                   ''install -Dm755 "${cargoReleaseDir}/${binary}" "$out/target/release/${binary}"''
               ) definition.binaries;
+              installRuntimeFiles = lib.concatMapStringsSep "\n" (
+                file: ''install -Dm444 "${name}/${file}" "$out/${name}/${file}"''
+              ) (definition.runtimeFiles or [ ]);
             in
             rustPlatform.buildRustPackage {
               pname = "herdr-plugin-${name}";
@@ -203,6 +207,7 @@
                 mkdir -p "$out/${name}"
                 install -Dm444 "${name}/herdr-plugin.toml" "$out/${name}/herdr-plugin.toml"
                 ${installBinaries}
+                ${installRuntimeFiles}
 
                 runHook postInstall
               '';
