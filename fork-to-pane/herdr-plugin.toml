@@ -1,0 +1,16 @@
+id = "gjermundgaraba.herdr-fork-to-pane"
+name = "Fork to Pane"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Fork the focused Pi, Codex, or Claude Code session into a new pane"
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["cargo", "build", "--release", "--locked"]
+
+[[actions]]
+id = "fork"
+title = "Fork agent into right pane"
+description = "Fork the focused Pi, Codex, or Claude Code session"
+contexts = ["pane"]
+command = ["../target/release/herdr-fork-to-pane"]

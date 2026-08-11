@@ -11,8 +11,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    AgentInfo, EventEnvelope, EventSubscription, LayoutDescription, LayoutExportParams,
-    LayoutSetSplitRatioParams, PaneInfo, PingResult, SessionSnapshot, TabInfo, WorkspaceInfo,
+    AgentInfo, AgentStartParams, EventEnvelope, EventSubscription, LayoutDescription,
+    LayoutExportParams, LayoutSetSplitRatioParams, PaneInfo, PaneSplitParams, PingResult,
+    SessionSnapshot, TabInfo, WorkspaceInfo,
 };
 
 type LocalStream = interprocess::local_socket::Stream;
@@ -120,6 +121,21 @@ impl Client {
         Ok(result.pane)
     }
 
+    pub fn split_pane(&self, params: &PaneSplitParams) -> Result<PaneInfo, Error> {
+        let result: PaneResult = self.call("pane.split", params)?;
+        Ok(result.pane)
+    }
+
+    pub fn close_pane(&self, pane_id: &str) -> Result<(), Error> {
+        self.call_value("pane.close", &json!({ "pane_id": pane_id }))
+            .map(|_| ())
+    }
+
+    pub fn focus_pane(&self, pane_id: &str) -> Result<PaneInfo, Error> {
+        let result: PaneResult = self.call("pane.focus", &json!({ "pane_id": pane_id }))?;
+        Ok(result.pane)
+    }
+
     pub fn export_layout(&self, params: &LayoutExportParams) -> Result<LayoutDescription, Error> {
         let result: LayoutResult = self.call("layout.export", params)?;
         Ok(result.layout)
@@ -136,6 +152,11 @@ impl Client {
     pub fn agents(&self) -> Result<Vec<AgentInfo>, Error> {
         let result: AgentListResult = self.call("agent.list", &json!({}))?;
         Ok(result.agents)
+    }
+
+    pub fn start_agent(&self, params: &AgentStartParams) -> Result<AgentInfo, Error> {
+        let result: AgentStartedResult = self.call("agent.start", params)?;
+        Ok(result.agent)
     }
 
     /// Start a long-lived event subscription on a dedicated connection.
@@ -347,6 +368,11 @@ struct AgentListResult {
     #[serde(rename = "type")]
     _kind: String,
     agents: Vec<AgentInfo>,
+}
+
+#[derive(Deserialize)]
+struct AgentStartedResult {
+    agent: AgentInfo,
 }
 
 #[derive(Deserialize)]

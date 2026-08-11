@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "command-palette",
     "equalize-splits",
+    "fork-to-pane",
     "herdr-micro",
     "herdr-micro/codex-micro",
     "history",

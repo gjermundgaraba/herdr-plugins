@@ -313,6 +313,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "herdr-fork-to-pane"
+version = "0.1.0"
+dependencies = [
+ "herdr-client",
+ "serde_json",
+]
+
+[[package]]
 name = "herdr-history"
 version = "0.1.0"
 dependencies = [
