@@ -29,14 +29,15 @@ five of the right switch, then five of both. It received five `ACT10` and
 seven `ACT11` press/release pairs with no disconnect. The first two complete
 pairs were `ACT11` alone; later reports contained both codes, including one
 `ACT10` press 832 ms before the corresponding `ACT11` press. This proves that
-`ACT11` can occur independently.
+both physical switches are independently usable.
 
 A slower capture of three installed-cap presses at each of its left, center,
 and right positions received exactly nine `ACT10` press/release pairs and
 eleven `ACT11` pairs. BLE buffered some edges, but there was no disconnect.
-For the tested stock cap and firmware, `ACT10` is therefore the stable logical
-button signal; `ACT11` is the secondary switch and can chatter, so it must not
-dispatch a second action.
+The stock double-width keycap can actuate either or both switches depending on
+press position. Dual events are therefore expected mechanical behavior, not
+evidence that `ACT11` is unusable; bind the two switches independently only
+when that is the intended interaction.
 
 ### Native Layer 2 action trace (2026-08-08)
 

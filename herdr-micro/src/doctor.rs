@@ -4,12 +4,13 @@ use anyhow::Result;
 use std::{env, fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Command, time::Duration};
 
 use crate::{
+    actions::GHOSTTY_PROCESS,
     config::{config_path, load, requires_accessibility},
     control::request_status,
     ghostty::inspect_ghostty,
     helper_install,
     hid::HELPER_VERSION,
-    macos::{frontmost, post_event_access},
+    macos::{bundle_is_running, frontmost, post_event_access},
     setup::{PI_EXTENSION, plugin_root},
 };
 
@@ -124,15 +125,22 @@ pub fn doctor() -> Report {
             format!("Frontmost application could not be inspected: {error}"),
         ),
     }
-    match inspect_ghostty() {
-        Ok(terminals) => report.push(
-            Level::Ok,
-            format!(
-                "Ghostty native bridge: {} terminal(s) visible",
-                terminals.len()
+    if bundle_is_running(GHOSTTY_PROCESS) {
+        match inspect_ghostty() {
+            Ok(terminals) => report.push(
+                Level::Ok,
+                format!(
+                    "Ghostty native bridge: {} terminal(s) visible",
+                    terminals.len()
+                ),
             ),
-        ),
-        Err(error) => report.push(Level::Fail, format!("Ghostty native bridge: {error}")),
+            Err(error) => report.push(Level::Fail, format!("Ghostty native bridge: {error}")),
+        }
+    } else {
+        report.push(
+            Level::Warn,
+            "Ghostty native bridge was not checked because Ghostty is not running",
+        );
     }
     match request_status(Duration::from_millis(750)) {
         Ok(status) => {
@@ -166,10 +174,31 @@ pub fn doctor() -> Report {
         );
     }
     match pi_extension() {
-        Some(path) if path.exists() => report.push(
-            Level::Ok,
-            format!("Pi effort extension: {}", path.display()),
-        ),
+        Some(path) if path.exists() => {
+            let bundled = plugin_root()
+                .and_then(|root| {
+                    fs::read(root.join("integrations/pi/herdr-effort.js")).map_err(Into::into)
+                })
+                .ok();
+            match (fs::read(&path), bundled) {
+                (Ok(installed), Some(bundled)) if installed == bundled => report.push(
+                    Level::Ok,
+                    format!("Pi effort extension: {}", path.display()),
+                ),
+                (Ok(_), Some(_)) => report.push(
+                    Level::Warn,
+                    format!(
+                        "Pi effort extension differs from bundled version: {}",
+                        path.display()
+                    ),
+                ),
+                (Err(error), _) => report.push(
+                    Level::Warn,
+                    format!("Pi effort extension could not be read: {error}"),
+                ),
+                (_, None) => report.push(Level::Warn, "Bundled Pi effort extension is unavailable"),
+            }
+        }
         _ => report.push(
             Level::Warn,
             "Pi effort extension is not installed (optional)",

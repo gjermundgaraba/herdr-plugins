@@ -7,7 +7,7 @@ dial, and joystick to the focused Codex, Claude Code, or Pi agent.
 ## Requirements
 
 - macOS and a Codex Micro
-- [Herdr](https://herdr.dev/docs/install/) 0.8.0 or newer
+- [Herdr](https://herdr.dev/docs/install/) socket protocol 20
 - Herdr `[experimental].kitty_graphics = true` for exact pane scrolling
 - Ghostty 1.3 or newer
 - Rust 1.89 or newer when building from source
@@ -96,8 +96,8 @@ Names cover F13–F20; `keycode` accepts any macOS virtual keycode (0–127)
 instead of `key`, and optional `modifiers` adds any of `cmd`, `shift`, `alt`,
 `ctrl`, and `fn`.
 The stock wide keycap spans switches 5 and 6, so `controls.buttons["6"]`
-stays `null` by default. All four top-level fields—`version`, `controls`,
-`effort`, and `lighting`—are required.
+stays `null` by default. The three top-level fields—`controls`, `effort`, and
+`lighting`—are required.
 
 The privileged helper captures the USB-connected Micro so ChatGPT cannot also
 receive Layer 2 events. Binding a previously unbound switch (or the reverse)
@@ -130,7 +130,7 @@ Codex's `-` syntax:
 {"effort":{"codex":{"raise":"ctrl+shift+t","lower":"ctrl+t"}}}
 ```
 
-Claude Code uses its native `/effort` picker. See [effort control](docs/effort-control.md)
+Claude Code uses its native `/effort` picker. See [effort control](docs/micro-bridge.md#thinking-effort-control)
 for operational boundaries.
 
 ## Routing and operation

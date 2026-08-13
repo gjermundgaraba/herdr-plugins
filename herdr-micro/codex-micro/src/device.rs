@@ -4,13 +4,13 @@
 //! commands and waits for replies, so callbacks never outlive their storage.
 
 use std::{
-    collections::HashMap,
+    cell::Cell,
     ffi::{CStr, c_void},
     pin::Pin,
     ptr::{self, NonNull},
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender, SyncSender, TryRecvError},
     },
     thread::{self, JoinHandle},
@@ -38,6 +38,7 @@ use crate::wire::{REPORT_ID, REPORT_SIZE, Reassembler, encode_message};
 const MICRO_VENDOR_ID: i32 = 0x303A;
 const MICRO_PRODUCT_ID: i32 = 0x8360;
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+const RESPONSE_SLACK: Duration = Duration::from_millis(100);
 const DEVICE_OPEN_TIMEOUT: Duration = Duration::from_secs(7);
 const INTERFACE_NUMBER: i64 = 0;
 const INTERRUPT_ENDPOINT: u8 = 0x81;
@@ -68,6 +69,7 @@ enum Command {
     Send {
         method: String,
         params: Option<Value>,
+        deadline: Instant,
         reply: SyncSender<std::result::Result<(), String>>,
     },
     Request {
@@ -81,13 +83,14 @@ enum Command {
 }
 
 struct Pending {
+    id: u64,
     deadline: Instant,
     reply: SyncSender<std::result::Result<Value, String>>,
 }
 
 pub struct MicroDevice {
     command_tx: Sender<Command>,
-    next_request_id: AtomicU64,
+    next_request_id: Cell<u64>,
     closed: Arc<AtomicBool>,
     terminal_error: Arc<OnceLock<String>>,
     owner: Option<JoinHandle<Result<()>>>,
@@ -142,7 +145,7 @@ impl MicroDevice {
         match ready_rx.recv_timeout(DEVICE_OPEN_TIMEOUT) {
             Ok(Ok(())) => Ok(Self {
                 command_tx,
-                next_request_id: AtomicU64::new(1),
+                next_request_id: Cell::new(1),
                 closed,
                 terminal_error,
                 owner: Some(owner),
@@ -161,32 +164,40 @@ impl MicroDevice {
 
     pub fn send(&self, method: impl Into<String>, params: Option<Value>) -> Result<()> {
         self.ensure_open()?;
+        let deadline = Instant::now() + DEFAULT_REQUEST_TIMEOUT;
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.command_tx
             .send(Command::Send {
                 method: method.into(),
                 params,
+                deadline,
                 reply: reply_tx,
             })
             .map_err(|_| self.disconnected_error())?;
-        await_send_reply(reply_rx, DEFAULT_REQUEST_TIMEOUT, &self.terminal_error)
+        await_send_reply(
+            reply_rx,
+            DEFAULT_REQUEST_TIMEOUT + RESPONSE_SLACK,
+            &self.terminal_error,
+        )
     }
 
     pub fn request(&self, method: impl Into<String>, params: Option<Value>) -> Result<Value> {
         self.ensure_open()?;
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let id = self.next_request_id.get();
+        self.next_request_id.set(id + 1);
+        let deadline = Instant::now() + DEFAULT_REQUEST_TIMEOUT;
         self.command_tx
             .send(Command::Request {
                 id,
                 method: method.into(),
                 params,
-                deadline: Instant::now() + DEFAULT_REQUEST_TIMEOUT,
+                deadline,
                 reply: reply_tx,
             })
             .map_err(|_| self.disconnected_error())?;
         reply_rx
-            .recv_timeout(DEFAULT_REQUEST_TIMEOUT + Duration::from_millis(100))
+            .recv_timeout(DEFAULT_REQUEST_TIMEOUT + RESPONSE_SLACK)
             .map_err(|_| {
                 self.terminal_error
                     .get()
@@ -285,7 +296,7 @@ struct Owner {
     command_rx: Receiver<Command>,
     event_tx: Sender<DeviceEvent>,
     reassembler: Reassembler,
-    pending: HashMap<u64, Pending>,
+    pending: Option<Pending>,
     closed: Arc<AtomicBool>,
     read_pending: bool,
     torn_down: bool,
@@ -356,7 +367,7 @@ impl Owner {
             command_rx,
             event_tx,
             reassembler: Reassembler::default(),
-            pending: HashMap::new(),
+            pending: None,
             closed,
             read_pending: false,
             torn_down: false,
@@ -406,12 +417,15 @@ impl Owner {
                 Ok(Command::Send {
                     method,
                     params,
+                    deadline,
                     reply,
                 }) => {
-                    let _ = reply.send(
-                        self.write(method, params, None)
-                            .map_err(|error| error.to_string()),
-                    );
+                    let result = if Instant::now() >= deadline {
+                        Err(anyhow!("device write timed out"))
+                    } else {
+                        self.write(method, params, None, deadline)
+                    };
+                    let _ = reply.send(result.map_err(|error| error.to_string()));
                 }
                 Ok(Command::Request {
                     id,
@@ -451,13 +465,12 @@ impl Owner {
                 self.disconnect(error.to_string());
             }
         }
-        let now = Instant::now();
-        let expired: Vec<_> = self
+        if let Some(id) = self
             .pending
-            .iter()
-            .filter_map(|(&id, pending)| (pending.deadline <= now).then_some(id))
-            .collect();
-        for id in expired {
+            .as_ref()
+            .filter(|pending| pending.deadline <= Instant::now())
+            .map(|pending| pending.id)
+        {
             self.fail_pending(id, format!("request {id} timed out"));
         }
     }
@@ -483,21 +496,51 @@ impl Owner {
         deadline: Instant,
         reply: SyncSender<std::result::Result<Value, String>>,
     ) -> Result<()> {
-        self.pending.insert(id, Pending { deadline, reply });
-        if let Err(error) = self.write(method, params, Some(id)) {
+        assert!(
+            self.pending.is_none(),
+            "device owner started a second pending request"
+        );
+        self.pending = Some(Pending {
+            id,
+            deadline,
+            reply,
+        });
+        if Instant::now() >= deadline {
+            self.fail_pending(id, format!("request {id} timed out"));
+            return Ok(());
+        }
+        if let Err(error) = self.write(method, params, Some(id), deadline) {
             self.fail_pending(id, error.to_string());
             return Err(error);
         }
         Ok(())
     }
 
-    fn write(&mut self, method: String, params: Option<Value>, id: Option<u64>) -> Result<()> {
+    fn write(
+        &mut self,
+        method: String,
+        params: Option<Value>,
+        id: Option<u64>,
+        deadline: Instant,
+    ) -> Result<()> {
+        let mut wrote_report = false;
         for mut report in encode_message(&method, params.as_ref(), id)? {
+            let remaining = deadline.checked_duration_since(Instant::now());
+            let Some(remaining) =
+                remaining.filter(|remaining| *remaining >= Duration::from_millis(1))
+            else {
+                let error = "request timed out";
+                if wrote_report {
+                    self.disconnect(error.into());
+                }
+                return Err(anyhow!(error));
+            };
             let payload = output_wire(&mut report)?;
-            if let Err(error) = self.device.set_output_report(payload) {
+            if let Err(error) = self.device.set_output_report(payload, remaining) {
                 self.disconnect(error.to_string());
                 return Err(error);
             }
+            wrote_report = true;
         }
         Ok(())
     }
@@ -508,7 +551,12 @@ impl Owner {
             if let Some(id) = envelope.get("id").and_then(Value::as_u64)
                 && (envelope.get("result").is_some() || envelope.get("error").is_some())
             {
-                if let Some(pending) = self.pending.remove(&id) {
+                if self
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.id == id)
+                    && let Some(pending) = self.pending.take()
+                {
                     let result = envelope
                         .get("error")
                         .map(error_message)
@@ -534,13 +582,18 @@ impl Owner {
     }
 
     fn fail_pending(&mut self, id: u64, error: String) {
-        if let Some(pending) = self.pending.remove(&id) {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.id == id)
+            && let Some(pending) = self.pending.take()
+        {
             let _ = pending.reply.send(Err(error));
         }
     }
 
     fn fail_all(&mut self, error: &str) {
-        for (_, pending) in self.pending.drain() {
+        if let Some(pending) = self.pending.take() {
             let _ = pending.reply.send(Err(error.into()));
         }
     }
@@ -843,7 +896,8 @@ impl UsbDevice {
         Ok(())
     }
 
-    fn set_output_report(&self, payload: &mut [u8]) -> Result<()> {
+    fn set_output_report(&self, payload: &mut [u8], timeout: Duration) -> Result<()> {
+        let timeout_ms = control_timeout_ms(timeout)?;
         let request = self
             .table()
             .DeviceRequestTO
@@ -856,8 +910,8 @@ impl UsbDevice {
             wLength: payload.len() as u16,
             pData: payload.as_mut_ptr().cast(),
             wLenDone: 0,
-            noDataTimeout: CONTROL_TIMEOUT_MS,
-            completionTimeout: CONTROL_TIMEOUT_MS,
+            noDataTimeout: timeout_ms,
+            completionTimeout: timeout_ms,
         };
         // SAFETY: payload remains live for this bounded synchronous endpoint-zero request.
         let status = unsafe { request(self.this(), &mut request_data) };
@@ -903,6 +957,16 @@ impl UsbDevice {
         }
         self.released = true;
     }
+}
+
+fn control_timeout_ms(timeout: Duration) -> Result<u32> {
+    let timeout_ms = u32::try_from(timeout.as_millis())
+        .unwrap_or(CONTROL_TIMEOUT_MS)
+        .min(CONTROL_TIMEOUT_MS);
+    if timeout_ms == 0 {
+        bail!("HID SET_REPORT deadline expired")
+    }
+    Ok(timeout_ms)
 }
 
 impl Drop for UsbDevice {
@@ -1324,6 +1388,16 @@ mod tests {
     }
 
     #[test]
+    fn usb_control_timeout_never_rounds_an_expired_deadline_up() {
+        assert!(control_timeout_ms(Duration::from_micros(999)).is_err());
+        assert_eq!(control_timeout_ms(Duration::from_millis(1)).unwrap(), 1);
+        assert_eq!(
+            control_timeout_ms(Duration::from_secs(3)).unwrap(),
+            CONTROL_TIMEOUT_MS
+        );
+    }
+
+    #[test]
     fn endpoint_address_identifies_interrupt_in_endpoint() {
         assert_eq!(endpoint_address(kUSBIn as u8, 1), INTERRUPT_ENDPOINT);
         assert_ne!(endpoint_address(kUSBOut as u8, 1), INTERRUPT_ENDPOINT);
@@ -1353,7 +1427,7 @@ mod tests {
         let owner_joined = Arc::clone(&joined);
         let mut device = MicroDevice {
             command_tx,
-            next_request_id: AtomicU64::new(1),
+            next_request_id: Cell::new(1),
             closed: Arc::new(AtomicBool::new(true)),
             terminal_error: Arc::new(OnceLock::new()),
             owner: Some(thread::spawn(move || {
@@ -1389,6 +1463,7 @@ mod tests {
             .send(Command::Send {
                 method: "first".into(),
                 params: None,
+                deadline: Instant::now(),
                 reply: send_tx,
             })
             .unwrap();

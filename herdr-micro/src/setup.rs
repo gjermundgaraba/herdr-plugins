@@ -26,7 +26,11 @@ use crate::{
 };
 
 pub(crate) const PI_EXTENSION: &str = ".pi/agent/extensions/herdr-micro-effort.ts";
-const REQUIRED_ENCODER_CODES: [&str; 3] = ["KV_OAI_ENC_CC", "KV_OAI_ENC_CW", "KV_OAI_ENC_CLK"];
+const ENCODER_SLOTS: [(&str, &str); 3] = [
+    ("/encoders/0/0", "KV_OAI_ENC_CC"),
+    ("/encoders/0/1", "KV_OAI_ENC_CW"),
+    ("/encoders/0/2", "KV_OAI_ENC_CLK"),
+];
 const BUTTON_KEY_SLOTS: [(u8, &str, &str); 7] = [
     (1, "/keymap/2/0", "KV_OAI_ACT06"),
     (2, "/keymap/2/1", "KV_OAI_ACT07"),
@@ -75,9 +79,9 @@ fn oai_profile_index(keymap: &Value, managed_link_id: Option<&Value>) -> Result<
         .enumerate()
         .filter(|(_, profile)| {
             profile.pointer("/layers/0/layout").is_some_and(|layout| {
-                layout_codes(layout)
-                    .iter()
-                    .any(|code| code.as_str() == Some("KV_OAI_AG05"))
+                AGENT_KEY_SLOTS.iter().any(|(_, pointer, stock)| {
+                    layout.pointer(pointer).and_then(Value::as_str) == Some(*stock)
+                })
             })
         })
         .map(|(index, _)| index)
@@ -102,33 +106,6 @@ fn oai_profile_index(keymap: &Value, managed_link_id: Option<&Value>) -> Result<
         matches.len(),
         managed.len()
     )
-}
-
-fn layout_codes(layout: &Value) -> Vec<&Value> {
-    fn collect<'a>(value: &'a Value, codes: &mut Vec<&'a Value>) {
-        match value {
-            Value::Array(values) => values.iter().for_each(|value| collect(value, codes)),
-            value => codes.push(value),
-        }
-    }
-
-    let mut codes = Vec::new();
-    if let Some(keymap) = layout.get("keymap") {
-        collect(keymap, &mut codes);
-    }
-    if let Some(encoders) = layout.get("encoders") {
-        collect(encoders, &mut codes);
-    }
-    if let Some(sectors) = layout
-        .pointer("/joystick/sectors")
-        .and_then(Value::as_array)
-    {
-        sectors
-            .iter()
-            .filter_map(|sector| sector.get("k"))
-            .for_each(|code| collect(code, &mut codes));
-    }
-    codes
 }
 
 fn is_blank_layer(layer: &Value) -> bool {
@@ -190,15 +167,7 @@ fn configure_keymap(keymap: &mut Value, controls: &Controls) -> Result<()> {
             .get("layout")
             .cloned()
             .unwrap_or(Value::Object(Default::default()));
-        let source_codes = layout_codes(&source_layout);
-        if !REQUIRED_ENCODER_CODES
-            .iter()
-            .all(|key| source_codes.iter().any(|code| code.as_str() == Some(key)))
-        {
-            bail!("Layer 1 is not a compatible Codex Micro OAI layout");
-        }
-        validate_agent_slots(&source_layout)?;
-        validate_button_slots(&source_layout)?;
+        validate_oai_layout(&source_layout)?;
         let target_is_managed = managed_link_id
             .as_ref()
             .is_some_and(|id| layers[HERDR_LAYER - 1].get("linkedAppId") == Some(id));
@@ -318,6 +287,17 @@ fn validate_button_slots(layout: &Value) -> Result<()> {
     for (button, pointer, stock) in BUTTON_KEY_SLOTS {
         if layout.pointer(pointer).and_then(Value::as_str) != Some(stock) {
             bail!("Layer 1 button {button} must use {stock}");
+        }
+    }
+    Ok(())
+}
+
+fn validate_oai_layout(layout: &Value) -> Result<()> {
+    validate_agent_slots(layout)?;
+    validate_button_slots(layout)?;
+    for (pointer, stock) in ENCODER_SLOTS {
+        if layout.pointer(pointer).and_then(Value::as_str) != Some(stock) {
+            bail!("Layer 1 encoder slot {pointer} must use {stock}");
         }
     }
     Ok(())
@@ -895,7 +875,24 @@ mod tests {
         });
         assert_eq!(
             configure_micro(&mut keymap).unwrap_err().to_string(),
-            "expected one OAI or managed profile, found 0 OAI and 0 managed"
+            "Layer 1 Agent slot 6 must use KV_OAI_AG05"
+        );
+    }
+
+    #[test]
+    fn rejects_oai_codes_in_nonstandard_slots() {
+        let mut source = oai_layout();
+        source["encoders"] = json!([["KV_OAI_ENC_CW", "KV_OAI_ENC_CC", "KV_OAI_ENC_CLK"]]);
+        let mut keymap = json!({
+            "profiles": [{ "id": 0, "layers": [
+                { "layout": source },
+                blank_layer()
+            ] }]
+        });
+
+        assert_eq!(
+            configure_micro(&mut keymap).unwrap_err().to_string(),
+            "Layer 1 encoder slot /encoders/0/0 must use KV_OAI_ENC_CC"
         );
     }
 

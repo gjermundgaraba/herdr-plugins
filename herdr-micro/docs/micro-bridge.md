@@ -29,9 +29,9 @@ Codex Micro over USB
 ```
 
 The daemon uses Herdr's CLI only to discover running session names and their
-socket paths at startup or when discovery becomes stale. Each session then has
-a direct socket subscription and snapshot cache; status changes drive lighting
-without polling or subprocesses. Actions are direct socket requests.
+socket paths at startup or when discovery becomes stale. It subscribes directly
+to the selected session; status changes drive lighting without polling or
+subprocesses. Actions are direct socket requests.
 
 Ghostty inspection uses a cached native ScriptingBridge client from Rust. The
 focused terminal UUID is queried while Ghostty is active and immediately before
@@ -122,9 +122,24 @@ bindings internally.
   `/reload` after installing the extension. Effort changes affect later model
   requests, not a request already in flight.
 
+## Thinking-effort control
+
+The bridge freezes the focused agent and pane from the selected Herdr session,
+then sends the agent-specific operation to that exact pane:
+
+| Agent | Mechanism |
+|---|---|
+| Codex | User-configured `chat.increase_reasoning_effort` / `chat.decrease_reasoning_effort` bindings |
+| Claude | Native `/effort` picker, one step left or right |
+| Pi | Bundled extension using `getThinkingLevel()` / `setThinkingLevel()` |
+
+Install the Pi extension with `bin/herdr-micro setup-pi-effort`; existing
+sessions need `/reload`. Claude persists `low` through `xhigh`, while `max` is
+session-only. The changed effort applies to later provider calls.
+
 The [research record](research/README.md) preserves tested versions, results,
-hardware evidence, caveats, and source links.
-[Future work](future-work.md) records the evidence-gated changes and spikes.
+hardware evidence, caveats, and source links, including the upstream
+[Claude model configuration](https://code.claude.com/docs/en/model-config).
 
 ## Lifecycle
 

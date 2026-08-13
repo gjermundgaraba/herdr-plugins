@@ -4,7 +4,6 @@ use anyhow::{Context, Result, bail};
 use herdr_client::{AgentInfo, Client, Error as ClientError, EventSubscription, SessionSnapshot};
 use serde::Deserialize;
 use std::{
-    collections::HashSet,
     env,
     io::Read,
     path::PathBuf,
@@ -20,7 +19,7 @@ use std::{
 
 pub const DEFAULT_HERDR_BIN: &str = "herdr";
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
-const MIN_HERDR_PROTOCOL: u32 = 19;
+const MIN_HERDR_PROTOCOL: u32 = 20;
 const SUBSCRIPTION_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +39,7 @@ pub enum SessionUpdate {
     Agents {
         session: String,
         generation: u64,
+        session_epoch: String,
         agents: Vec<AgentInfo>,
     },
     Unavailable {
@@ -120,46 +120,52 @@ fn follow_session(
     stopping: &AtomicBool,
     connected: &mut bool,
 ) -> Result<()> {
-    while active.load(Ordering::Acquire) && !stopping.load(Ordering::Acquire) {
-        let before = current_snapshot(client)?;
-        let subscribed_panes = pane_ids(&before);
-        let subscriptions = session_subscriptions(subscribed_panes.iter().map(String::as_str));
-        let mut subscription = client.subscribe(&subscriptions)?;
-        subscription.set_receive_timeout(SUBSCRIPTION_POLL_INTERVAL)?;
-        let snapshot = current_snapshot(client)?;
-        let current_panes = pane_ids(&snapshot);
-        send_agents(session, generation, updates, snapshot.agents)?;
-        *connected = true;
-        if current_panes != subscribed_panes {
-            thread::park_timeout(SUBSCRIPTION_POLL_INTERVAL);
-            continue;
-        }
-        loop {
-            match subscription.next_event() {
-                Ok(Some(_)) => {}
-                Ok(None) => return Ok(()),
-                Err(ClientError::Io(error))
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                    ) =>
-                {
-                    if !active.load(Ordering::Acquire) || stopping.load(Ordering::Acquire) {
-                        return Ok(());
-                    }
-                    continue;
-                }
-                Err(error) => return Err(error.into()),
-            };
-            let snapshot = current_snapshot(client)?;
-            let current_panes = pane_ids(&snapshot);
-            send_agents(session, generation, updates, snapshot.agents)?;
-            if current_panes != subscribed_panes {
-                break;
-            }
-        }
+    if !active.load(Ordering::Acquire) || stopping.load(Ordering::Acquire) {
+        return Ok(());
     }
-    Ok(())
+    let snapshot = current_snapshot(client)?;
+    let session_epoch = snapshot.session_epoch.clone();
+    let client = client.clone().with_session_epoch(&session_epoch);
+    let subscriptions = session_subscriptions();
+    let mut subscription = client.subscribe(&snapshot.event_cursor, &subscriptions)?;
+    subscription.set_receive_timeout(SUBSCRIPTION_POLL_INTERVAL)?;
+    send_agents(
+        session,
+        generation,
+        updates,
+        session_epoch.clone(),
+        snapshot.agents,
+    )?;
+    *connected = true;
+    loop {
+        match subscription.next_event() {
+            Ok(Some(_)) => {}
+            Ok(None) => return Ok(()),
+            Err(ClientError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                if !active.load(Ordering::Acquire) || stopping.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let snapshot = current_snapshot(&client)?;
+        if snapshot.session_epoch != session_epoch {
+            return Ok(());
+        }
+        send_agents(
+            session,
+            generation,
+            updates,
+            session_epoch.clone(),
+            snapshot.agents,
+        )?;
+    }
 }
 
 pub(crate) fn current_snapshot(client: &Client) -> Result<SessionSnapshot> {
@@ -188,16 +194,8 @@ fn validate_snapshot(snapshot: SessionSnapshot) -> Result<SessionSnapshot> {
     Ok(snapshot)
 }
 
-fn pane_ids(snapshot: &SessionSnapshot) -> HashSet<String> {
-    snapshot
-        .panes
-        .iter()
-        .map(|pane| pane.pane_id.clone())
-        .collect()
-}
-
-fn session_subscriptions<'a>(pane_ids: impl Iterator<Item = &'a str>) -> Vec<EventSubscription> {
-    let mut subscriptions: Vec<_> = [
+fn session_subscriptions() -> Vec<EventSubscription> {
+    [
         "workspace.created",
         "workspace.closed",
         "workspace.focused",
@@ -210,26 +208,25 @@ fn session_subscriptions<'a>(pane_ids: impl Iterator<Item = &'a str>) -> Vec<Eve
         "pane.moved",
         "pane.exited",
         "pane.agent_detected",
+        "pane.agent_status_changed",
     ]
     .into_iter()
     .map(EventSubscription::new)
-    .collect();
-    subscriptions.extend(pane_ids.map(|pane_id| {
-        EventSubscription::new("pane.agent_status_changed").filter("pane_id", pane_id)
-    }));
-    subscriptions
+    .collect()
 }
 
 fn send_agents(
     session: &str,
     generation: u64,
     updates: &Sender<SessionUpdate>,
+    session_epoch: String,
     agents: Vec<AgentInfo>,
 ) -> Result<()> {
     updates
         .send(SessionUpdate::Agents {
             session: session.into(),
             generation,
+            session_epoch,
             agents,
         })
         .map_err(|_| anyhow::anyhow!("Micro daemon stopped"))
@@ -367,6 +364,8 @@ mod tests {
             "snapshot": {
                 "version": "0.8.0",
                 "protocol": MIN_HERDR_PROTOCOL,
+                "session_epoch": "epoch",
+                "event_cursor": { "stream_id": "stream", "sequence": 42 },
                 "workspaces": [],
                 "tabs": [],
                 "panes": [{
@@ -406,13 +405,13 @@ mod tests {
     }
 
     #[test]
-    fn agent_status_subscriptions_are_scoped_to_panes() {
-        let subscriptions = session_subscriptions(["w1:p1"].into_iter());
+    fn agent_status_subscription_covers_the_whole_session() {
+        let subscriptions = session_subscriptions();
         let status = subscriptions
             .iter()
             .find(|subscription| subscription.kind == "pane.agent_status_changed")
             .unwrap();
-        assert_eq!(status.filters.get("pane_id"), Some(&"w1:p1".into()));
+        assert!(status.filters.is_empty());
     }
 
     #[test]
@@ -432,24 +431,17 @@ mod tests {
             let (mut subscription, _) = listener.accept().unwrap();
             let request = read_request(&subscription);
             assert_eq!(request["method"], "events.subscribe");
+            assert_eq!(request["params"]["after_event_cursor"]["sequence"], 42);
             reply(
                 &mut subscription,
                 &request,
                 serde_json::json!({ "type": "subscription_started" }),
             );
-
-            let (mut after_subscribe, _) = listener.accept().unwrap();
-            let request = read_request(&after_subscribe);
-            reply(
-                &mut after_subscribe,
-                &request,
-                snapshot(serde_json::json!([])),
-            );
             writeln!(
                 subscription,
                 "{}",
                 serde_json::json!({
-                    "event": "pane.agent_status_changed",
+                    "event": "pane_agent_status_changed",
                     "data": { "pane_id": "w1:p1" }
                 })
             )
@@ -507,6 +499,8 @@ mod tests {
             serde_json::from_value::<SessionSnapshot>(serde_json::json!({
                 "version": "0.8.0",
                 "protocol": protocol,
+                "session_epoch": "epoch",
+                "event_cursor": { "stream_id": "stream", "sequence": 42 },
                 "workspaces": [],
                 "tabs": [],
                 "panes": [{

@@ -3,7 +3,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    cell::Cell,
     ffi::{CString, c_char, c_int, c_void},
     io::{self, BufRead, BufReader, Read, Write},
     os::unix::{
@@ -14,7 +14,7 @@ use std::{
     ptr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Sender, SyncSender},
     },
     thread::{self, JoinHandle},
@@ -31,7 +31,7 @@ pub const HID_LAUNCH_SOCKET_NAME: &str = "Control";
 pub const HID_MAX_LINE_BYTES: usize = 64 * 1024;
 pub const HELPER_LABEL: &str = "dev.herdr.herdr-micro-hid";
 // Increment whenever privileged helper code changes.
-pub const HELPER_VERSION: &str = "14";
+pub const HELPER_VERSION: &str = "15";
 const HID_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const HELPER_SHUTDOWN_TIMEOUT: Duration =
     MicroDevice::NATIVE_WATCHDOG_TIMEOUT.saturating_add(Duration::from_secs(1));
@@ -51,6 +51,7 @@ pub fn current_hid_socket_path() -> PathBuf {
 }
 
 type Reply = std::result::Result<Value, String>;
+type PendingReply = Arc<Mutex<Option<(u64, SyncSender<Reply>)>>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HelperErrorCode {
@@ -103,9 +104,9 @@ pub(crate) fn connection_error_state(error: &anyhow::Error) -> &'static str {
 }
 
 pub struct HidClient {
-    writer: Arc<Mutex<UnixStream>>,
-    pending: Arc<Mutex<HashMap<u64, SyncSender<Reply>>>>,
-    next_id: AtomicU64,
+    writer: UnixStream,
+    pending: PendingReply,
+    next_id: Cell<u64>,
     closed: Arc<AtomicBool>,
     event_tx: Sender<DeviceEvent>,
     reader: Option<JoinHandle<()>>,
@@ -143,8 +144,7 @@ impl HidClient {
         stream.set_read_timeout(None)?;
         stream.set_write_timeout(Some(DEFAULT_REQUEST_TIMEOUT))?;
 
-        let writer = Arc::new(Mutex::new(stream));
-        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let pending = Arc::new(Mutex::new(None));
         let closed = Arc::new(AtomicBool::new(false));
         let reader_pending = Arc::clone(&pending);
         let reader_closed = Arc::clone(&closed);
@@ -155,9 +155,9 @@ impl HidClient {
                 move || client_reader(reader, event_tx, reader_pending, reader_closed)
             })?;
         Ok(Self {
-            writer,
+            writer: stream,
             pending,
-            next_id: AtomicU64::new(1),
+            next_id: Cell::new(1),
             closed,
             event_tx,
             reader: Some(reader),
@@ -176,14 +176,17 @@ impl HidClient {
         if self.closed.load(Ordering::Acquire) {
             bail!("device disconnected")
         }
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = self.next_id.get();
+        self.next_id.set(id + 1);
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        self.pending
+        let mut pending = self
+            .pending
             .lock()
-            .map_err(|_| anyhow!("HID reply table poisoned"))?
-            .insert(id, reply_tx);
+            .map_err(|_| anyhow!("HID reply table poisoned"))?;
+        assert!(pending.is_none(), "HID client started a second request");
+        *pending = Some((id, reply_tx));
+        drop(pending);
         let message = json!({
-            "v": HID_PROTOCOL_VERSION,
             "type": kind,
             "id": id,
             "method": method,
@@ -208,16 +211,16 @@ impl HidClient {
     }
 
     fn write(&self, message: &Value) -> Result<()> {
-        let mut writer = self
-            .writer
-            .lock()
-            .map_err(|_| anyhow!("HID socket writer poisoned"))?;
-        write_message(&mut *writer, message)
+        write_message(&mut &self.writer, message)
     }
 
     fn remove_pending(&self, id: u64) {
-        if let Ok(mut pending) = self.pending.lock() {
-            pending.remove(&id);
+        if let Ok(mut pending) = self.pending.lock()
+            && pending
+                .as_ref()
+                .is_some_and(|(pending_id, _)| *pending_id == id)
+        {
+            pending.take();
         }
     }
 
@@ -230,8 +233,7 @@ impl HidClient {
     }
 
     fn shutdown_writer(&self) {
-        let writer = self.writer.lock().unwrap();
-        let _ = writer.shutdown(std::net::Shutdown::Both);
+        let _ = self.writer.shutdown(std::net::Shutdown::Both);
     }
 
     pub fn close(&mut self) -> Result<()> {
@@ -256,14 +258,17 @@ impl HidClient {
     }
 
     fn close_remote(&self) -> Result<()> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = self.next_id.get();
+        self.next_id.set(id + 1);
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        self.pending
+        let mut pending = self
+            .pending
             .lock()
-            .map_err(|_| anyhow!("HID reply table poisoned"))?
-            .insert(id, reply_tx);
+            .map_err(|_| anyhow!("HID reply table poisoned"))?;
+        assert!(pending.is_none(), "HID client started a second request");
+        *pending = Some((id, reply_tx));
+        drop(pending);
         if let Err(error) = self.write(&json!({
-            "v": HID_PROTOCOL_VERSION,
             "type": "close",
             "id": id,
         })) {
@@ -287,13 +292,12 @@ impl Drop for HidClient {
 fn client_reader(
     mut reader: BufReader<UnixStream>,
     event_tx: Sender<DeviceEvent>,
-    pending: Arc<Mutex<HashMap<u64, SyncSender<Reply>>>>,
+    pending: PendingReply,
     closed: Arc<AtomicBool>,
 ) {
     let result = (|| -> Result<()> {
         loop {
             let message = read_message(&mut reader)?;
-            require_version(&message)?;
             match message.get("type").and_then(Value::as_str) {
                 Some("reply") => {
                     let id = message
@@ -305,7 +309,12 @@ fn client_reader(
                         Some(_) => bail!("HID reply error must be a string"),
                         None => Ok(message.get("result").cloned().unwrap_or(Value::Null)),
                     };
-                    if let Some(tx) = pending.lock().ok().and_then(|mut map| map.remove(&id)) {
+                    if let Some(tx) = pending.lock().ok().and_then(|mut pending| {
+                        pending
+                            .as_ref()
+                            .is_some_and(|(pending_id, _)| *pending_id == id)
+                            .then(|| pending.take().unwrap().1)
+                    }) {
                         let _ = tx.send(reply);
                     }
                 }
@@ -336,10 +345,10 @@ fn client_reader(
         .err()
         .map(|error| error.to_string())
         .unwrap_or_else(|| "device disconnected".into());
-    if let Ok(mut replies) = pending.lock() {
-        for (_, reply) in replies.drain() {
-            let _ = reply.send(Err(error.clone()));
-        }
+    if let Ok(mut pending) = pending.lock()
+        && let Some((_, reply)) = pending.take()
+    {
+        let _ = reply.send(Err(error.clone()));
     }
     if !intentional {
         let _ = event_tx.send(DeviceEvent::Disconnected { error });
@@ -347,10 +356,10 @@ fn client_reader(
 }
 
 fn validate_hello(message: &Value) -> Result<()> {
-    require_version(message)?;
     match message.get("type").and_then(Value::as_str) {
         Some("hello")
-            if message.get("helperVersion").and_then(Value::as_str) == Some(HELPER_VERSION) =>
+            if require_version(message).is_ok()
+                && message.get("helperVersion").and_then(Value::as_str) == Some(HELPER_VERSION) =>
         {
             Ok(())
         }
@@ -603,7 +612,6 @@ fn serve_client(stream: &mut UnixStream, reader: BufReader<UnixStream>) -> Resul
                     terminal_error = Some(error.clone());
                 }
                 let message = json!({
-                    "v": HID_PROTOCOL_VERSION,
                     "type": "event",
                     "event": event,
                 });
@@ -751,13 +759,11 @@ fn combine_results<const N: usize>(results: [Result<()>; N]) -> Result<()> {
 fn write_reply(writer: &Mutex<UnixStream>, id: u64, result: Result<Value>) -> Result<()> {
     let message = match result {
         Ok(result) => json!({
-            "v": HID_PROTOCOL_VERSION,
             "type": "reply",
             "id": id,
             "result": result,
         }),
         Err(error) => json!({
-            "v": HID_PROTOCOL_VERSION,
             "type": "reply",
             "id": id,
             "error": error.to_string(),
@@ -773,7 +779,6 @@ fn write_error(stream: &mut impl Write, code: HelperErrorCode, error: &str) -> R
     write_message(
         stream,
         &json!({
-            "v": HID_PROTOCOL_VERSION,
             "type": "error",
             "code": code.as_str(),
             "error": error,
@@ -798,7 +803,6 @@ enum Incoming<'a> {
 }
 
 fn parse_command(message: &Value) -> Result<Incoming<'_>> {
-    require_version(message)?;
     match message.get("type").and_then(Value::as_str) {
         Some("close") => Ok(Incoming::Close {
             id: message
@@ -912,10 +916,10 @@ mod tests {
             )
             .unwrap();
             let request = read_message(&mut reader).unwrap();
+            assert!(request.get("v").is_none());
             write_message(
                 &mut stream,
                 &json!({
-                    "v": HID_PROTOCOL_VERSION,
                     "type": "event",
                     "event": {"type": "key", "key": "ACT06", "action": 1},
                 }),
@@ -924,7 +928,6 @@ mod tests {
             write_message(
                 &mut stream,
                 &json!({
-                    "v": HID_PROTOCOL_VERSION,
                     "type": "reply",
                     "id": request["id"],
                     "result": {"device": "ok"},
@@ -933,10 +936,10 @@ mod tests {
             .unwrap();
             let close = read_message(&mut reader).unwrap();
             assert_eq!(close["type"], "close");
+            assert!(close.get("v").is_none());
             write_message(
                 &mut stream,
                 &json!({
-                    "v": HID_PROTOCOL_VERSION,
                     "type": "reply",
                     "id": close["id"],
                     "result": null,
