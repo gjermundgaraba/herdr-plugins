@@ -8,7 +8,6 @@ use serde_json::Value;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Filter {
     All,
-    Actions,
     Workspaces,
     Tabs,
     Panes,
@@ -16,9 +15,8 @@ pub enum Filter {
 }
 
 impl Filter {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 5] = [
         Self::All,
-        Self::Actions,
         Self::Workspaces,
         Self::Tabs,
         Self::Panes,
@@ -28,7 +26,6 @@ impl Filter {
     pub const fn label(self) -> &'static str {
         match self {
             Self::All => "all",
-            Self::Actions => "actions",
             Self::Workspaces => "workspaces",
             Self::Tabs => "tabs",
             Self::Panes => "panes",
@@ -49,20 +46,17 @@ impl std::str::FromStr for Filter {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "all" => Ok(Self::All),
-            "actions" => Ok(Self::Actions),
             "workspaces" => Ok(Self::Workspaces),
             "tabs" => Ok(Self::Tabs),
             "panes" => Ok(Self::Panes),
             "agents" => Ok(Self::Agents),
-            _ => Err("expected all, actions, workspaces, tabs, panes, or agents"),
+            _ => Err("expected all, workspaces, tabs, panes, or agents"),
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
-    NativeAction,
-    PluginAction,
     Workspace,
     Tab,
     Pane,
@@ -72,7 +66,6 @@ pub enum Kind {
 impl Kind {
     pub const fn filter(self) -> Filter {
         match self {
-            Self::NativeAction | Self::PluginAction => Filter::Actions,
             Self::Workspace => Filter::Workspaces,
             Self::Tab => Filter::Tabs,
             Self::Pane => Filter::Panes,
@@ -82,8 +75,6 @@ impl Kind {
 
     pub const fn label(self) -> &'static str {
         match self {
-            Self::NativeAction => "native",
-            Self::PluginAction => "plugin",
             Self::Workspace => "workspace",
             Self::Tab => "tab",
             Self::Pane => "pane",
@@ -96,13 +87,15 @@ impl Kind {
 pub struct Dispatch {
     pub method: String,
     pub params: Value,
+    pub session_epoch: String,
 }
 
 impl Dispatch {
-    pub fn new(method: impl Into<String>, params: Value) -> Self {
+    pub fn new(method: impl Into<String>, params: Value, session_epoch: impl Into<String>) -> Self {
         Self {
             method: method.into(),
             params,
+            session_epoch: session_epoch.into(),
         }
     }
 }
@@ -114,7 +107,6 @@ pub struct Item {
     pub title: String,
     pub subtitle: String,
     pub detail: String,
-    pub keys: Vec<String>,
     pub dispatch: Dispatch,
 }
 
@@ -252,12 +244,11 @@ impl Picker {
 
 fn haystack(item: &Item) -> Utf32String {
     format!(
-        "{} {} {} {} {}",
+        "{} {} {} {}",
         item.title,
         item.subtitle,
         item.detail,
-        item.kind.label(),
-        item.keys.join(" ")
+        item.kind.label()
     )
     .into()
 }
@@ -274,8 +265,7 @@ mod tests {
             title: title.into(),
             subtitle: String::new(),
             detail: String::new(),
-            keys: Vec::new(),
-            dispatch: Dispatch::new("test", json!({})),
+            dispatch: Dispatch::new("test", json!({}), "session"),
         }
     }
 
@@ -283,7 +273,7 @@ mod tests {
     fn fuzzy_search_and_source_filter_compose() {
         let mut picker = Picker::new(
             vec![
-                item(Kind::NativeAction, "Split pane"),
+                item(Kind::Pane, "Split logs"),
                 item(Kind::Workspace, "api"),
                 item(Kind::Agent, "Claude API fixer"),
             ],
@@ -309,10 +299,10 @@ mod tests {
 
         picker.set_items(vec![
             item(Kind::Workspace, "api"),
-            item(Kind::NativeAction, "Split pane"),
+            item(Kind::Pane, "Split logs"),
         ]);
         assert_eq!(picker.len(), 1);
-        assert_eq!(picker.row(0).unwrap().title, "Split pane");
+        assert_eq!(picker.row(0).unwrap().title, "Split logs");
     }
 
     #[test]

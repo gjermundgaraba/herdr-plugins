@@ -21,6 +21,9 @@ pub fn maybe_run_worker() -> Option<ExitCode> {
     let Some(raw_params) = args.next() else {
         return Some(ExitCode::FAILURE);
     };
+    let Some(session_epoch) = args.next() else {
+        return Some(ExitCode::FAILURE);
+    };
     let params: Value = match serde_json::from_str(&raw_params) {
         Ok(params) => params,
         Err(error) => {
@@ -29,14 +32,16 @@ pub fn maybe_run_worker() -> Option<ExitCode> {
         }
     };
 
-    let result = Client::from_env().and_then(|client| {
-        match client.call_value("popup.close", &json!({})) {
-            Ok(_) => {}
-            Err(Error::Api(error)) if error.code == "popup_not_open" => {}
-            Err(error) => return Err(error),
-        }
-        client.call_value(&method, &params)
-    });
+    let result = Client::from_env()
+        .map(|client| client.with_session_epoch(session_epoch))
+        .and_then(|client| {
+            match client.call_value("popup.close", &json!({})) {
+                Ok(_) => {}
+                Err(Error::Api(error)) if error.code == "popup_not_open" => {}
+                Err(error) => return Err(error),
+            }
+            client.call_value(&method, &params)
+        });
     match result {
         Ok(_) => Some(ExitCode::SUCCESS),
         Err(error) => {
@@ -54,6 +59,7 @@ pub fn schedule(dispatch: &Dispatch) -> Result<(), String> {
         .arg(WORKER_FLAG)
         .arg(&dispatch.method)
         .arg(dispatch.params.to_string())
+        .arg(&dispatch.session_epoch)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -84,7 +90,7 @@ fn log_error(message: &str) {
     let path = Environment::load()
         .ok()
         .and_then(|environment| environment.require_plugin().ok())
-        .map(|plugin| plugin.logs_dir().join("command-palette.log"));
+        .map(|plugin| plugin.logs_dir().join("picker.log"));
     if let Some(Ok(mut file)) = path.map(|path| open_rotating_log(&path, 10 << 20, 3)) {
         let _ = writeln!(file, "{message}");
     }
