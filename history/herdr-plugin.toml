@@ -1,6 +1,6 @@
 id = "gjermundgaraba.herdr-history"
 name = "Herdr History"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.8.0"
 description = "Vim-style back/forward focus history across panes, tabs, and workspaces"
 platforms = ["macos", "linux"]
@@ -8,8 +8,13 @@ platforms = ["macos", "linux"]
 [[build]]
 command = ["cargo", "build", "--release", "--locked"]
 
-[[events]]
-on = "pane.focused"
+[[startup]]
+command = ["../target/release/herdr-history"]
+
+[[actions]]
+id = "activate"
+title = "Start history"
+description = "Start focus history for this Herdr session"
 command = ["../target/release/herdr-history"]
 
 [[actions]]
