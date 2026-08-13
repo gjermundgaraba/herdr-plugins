@@ -2,10 +2,10 @@
 
 Small synchronous client for Herdr's public plugin socket API. It provides:
 
-- typed session, workspace, tab, pane, agent, layout, and plugin-context models
+- typed session, workspace, tab, pane, agent, and layout models
 - generic typed calls for every socket method
-- typed helpers for common read operations
-- long-lived event subscriptions
+- typed helpers for operations used by these plugins
+- cursor-bound, long-lived event subscriptions
 - Unix socket and Windows named-pipe transport
 
 ```rust
@@ -58,4 +58,9 @@ let log = plugin.logs_dir().join("plugin.log");
 `HERDR_PLUGIN_STATE_DIR`; create only the directories an entrypoint uses.
 `open_rotating_log` creates private append-only logs with bounded retention.
 
-Validated against Herdr 0.8.0, socket protocol 19.
+Read `session.snapshot`, then pass its `event_cursor` to `Client::subscribe` so
+events that occur during subscription setup are replayed without a gap. Use
+`Client::with_session_epoch(snapshot.session_epoch)` for later state-derived
+requests so a restarted session cannot receive stale pane or tab ids.
+
+Validated against Herdr 0.8.0, socket protocol 20.

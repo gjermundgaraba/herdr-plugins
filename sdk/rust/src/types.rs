@@ -33,27 +33,12 @@ impl From<&str> for AgentStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ServerCapabilities {
-    pub live_handoff: bool,
-    #[serde(default)]
-    pub detached_server_daemon: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PingResult {
-    #[serde(rename = "type")]
-    pub kind: String,
-    pub version: String,
-    pub protocol: u32,
-    #[serde(default)]
-    pub capabilities: Option<ServerCapabilities>,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionSnapshot {
     pub version: String,
     pub protocol: u32,
+    pub session_epoch: String,
+    pub event_cursor: EventCursor,
     #[serde(default)]
     pub focused_workspace_id: Option<String>,
     #[serde(default)]
@@ -65,6 +50,12 @@ pub struct SessionSnapshot {
     pub panes: Vec<PaneInfo>,
     pub layouts: Vec<PaneLayoutSnapshot>,
     pub agents: Vec<AgentInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventCursor {
+    pub stream_id: String,
+    pub sequence: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -297,9 +288,7 @@ pub struct PaneSplitParams {
 pub struct LayoutDescription {
     pub workspace_id: String,
     pub tab_id: String,
-    #[serde(default)]
     pub zoomed: bool,
-    #[serde(default)]
     pub focused_pane_id: String,
     pub root: LayoutNode,
 }
@@ -324,6 +313,10 @@ pub struct LayoutSetSplitRatioParams {
 }
 
 /// Lifecycle and filtered-subscription events share this envelope shape.
+///
+/// Subscription requests use dotted names such as `pane.focused`; lifecycle
+/// event envelopes use Herdr's snake-case wire discriminator, such as
+/// `pane_focused`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EventEnvelope {
     pub event: String,
@@ -351,38 +344,4 @@ impl EventSubscription {
         self.filters.insert(name.into(), value.into());
         self
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct PluginInvocationContext {
-    #[serde(default)]
-    pub workspace_id: Option<String>,
-    #[serde(default)]
-    pub workspace_label: Option<String>,
-    #[serde(default)]
-    pub workspace_cwd: Option<String>,
-    #[serde(default)]
-    pub worktree: Option<WorkspaceWorktreeInfo>,
-    #[serde(default)]
-    pub tab_id: Option<String>,
-    #[serde(default)]
-    pub tab_label: Option<String>,
-    #[serde(default)]
-    pub focused_pane_id: Option<String>,
-    #[serde(default)]
-    pub focused_pane_cwd: Option<String>,
-    #[serde(default)]
-    pub focused_pane_agent: Option<String>,
-    #[serde(default)]
-    pub focused_pane_status: Option<AgentStatus>,
-    #[serde(default)]
-    pub selected_text: Option<String>,
-    #[serde(default)]
-    pub invocation_source: Option<String>,
-    #[serde(default)]
-    pub correlation_id: Option<String>,
-    #[serde(default)]
-    pub clicked_url: Option<String>,
-    #[serde(default)]
-    pub link_handler_id: Option<String>,
 }

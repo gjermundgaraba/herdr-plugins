@@ -11,11 +11,11 @@ mod types;
 pub use client::{ApiError, Client, Error, Subscription};
 pub use env::{
     Environment, EnvironmentError, PluginEnvironmentError, PluginInvocation, PluginPaths,
-    host_config_path, open_rotating_log,
+    open_rotating_log, socket_scope_dir,
 };
 pub use types::*;
 
 /// Stable Herdr release used to validate the typed models.
 pub const TESTED_HERDR_VERSION: &str = "0.8.0";
 /// Socket protocol shipped by [`TESTED_HERDR_VERSION`].
-pub const TESTED_PROTOCOL: u32 = 19;
+pub const TESTED_PROTOCOL: u32 = 20;
