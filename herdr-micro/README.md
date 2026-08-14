@@ -7,7 +7,7 @@ dial, and joystick to the focused Codex, Claude Code, or Pi agent.
 ## Requirements
 
 - macOS and a Codex Micro
-- [Herdr](https://herdr.dev/docs/install/) socket protocol 20
+- [Herdr](https://herdr.dev/docs/install/) 0.8.0 or newer (socket protocol 19)
 - Herdr `[experimental].kitty_graphics = true` for exact pane scrolling
 - Ghostty 1.3 or newer
 - Rust 1.89 or newer when building from source
@@ -137,8 +137,8 @@ for operational boundaries.
 
 One bridge serves the default and named Herdr sessions. Native ScriptingBridge
 queries map each running session to its Ghostty terminal UUID. Herdr snapshots
-and subscriptions drive routing and lighting, and actions use direct socket
-requests to the focused mapped session.
+drive routing and lighting, and actions use direct socket requests to the
+focused mapped session.
 
 - Codex desktop frontmost: Layer 1 and device ownership yielded to Codex
 - Mapped Ghostty terminal frontmost: Layer 2 and the matching Herdr session

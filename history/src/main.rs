@@ -289,9 +289,10 @@ fn run_daemon() -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let _socket_cleanup = SocketCleanup(&paths.control_socket);
     let mut state = State::fresh();
-    let mut session_epoch = None;
+    let mut server_identity = None;
     let mut connection = None;
     let mut reconnect_at = Instant::now();
+    let mut reconnect_logged = false;
 
     loop {
         if !executable_is_current(&executable, &build) {
@@ -299,10 +300,19 @@ fn run_daemon() -> Result<(), String> {
         }
 
         if connection.is_none() && Instant::now() >= reconnect_at {
-            match connect_focus_stream(&socket_path, &mut state, &mut session_epoch) {
-                Ok(connected) => connection = Some(connected),
+            match connect_focus_stream(&socket_path, &mut state, &mut server_identity) {
+                Ok(connected) => {
+                    if reconnect_logged {
+                        log_error("history reconnected");
+                    }
+                    connection = Some(connected);
+                    reconnect_logged = false;
+                }
                 Err(error) => {
-                    log_error(&format!("history reconnect failed: {error}"));
+                    if !reconnect_logged {
+                        log_error(&format!("history reconnect failed: {error}"));
+                        reconnect_logged = true;
+                    }
                     reconnect_at = Instant::now() + RECONNECT_INTERVAL;
                 }
             }
@@ -312,7 +322,7 @@ fn run_daemon() -> Result<(), String> {
             .as_ref()
             .is_some_and(|connected| connected.subscription.has_buffered_event())
         {
-            match record_next_event(&mut connection.as_mut().unwrap().subscription, &mut state) {
+            match connection.as_mut().unwrap().record_next_event(&mut state) {
                 Ok(true) => {}
                 Ok(false) => {
                     connection = None;
@@ -332,8 +342,7 @@ fn run_daemon() -> Result<(), String> {
             connection.as_ref().map(|connected| &connected.subscription),
         )? {
             Ready::Event => {
-                let result =
-                    record_next_event(&mut connection.as_mut().unwrap().subscription, &mut state);
+                let result = connection.as_mut().unwrap().record_next_event(&mut state);
                 match result {
                     Ok(true) => {}
                     Ok(false) => {
@@ -347,7 +356,16 @@ fn run_daemon() -> Result<(), String> {
                     }
                 }
             }
-            Ready::Timeout => {}
+            Ready::Timeout => {
+                let result = connection
+                    .as_mut()
+                    .map(|connected| connected.finish_replay(&mut state));
+                if let Some(Err(error)) = result {
+                    log_error(&error);
+                    connection = None;
+                    reconnect_at = Instant::now();
+                }
+            }
             Ready::Control => match listener.accept() {
                 Ok((stream, _)) => {
                     stream
@@ -355,7 +373,9 @@ fn run_daemon() -> Result<(), String> {
                         .map_err(|error| format!("cannot configure history client: {error}"))?;
                     handle_control(
                         stream,
-                        connection.as_ref().map(|connected| &connected.client),
+                        connection.as_ref().and_then(|connected| {
+                            (!connected.replaying).then_some(&connected.client)
+                        }),
                         &mut state,
                     );
                 }
@@ -373,52 +393,106 @@ fn executable_is_current(path: &Path, identity: &str) -> bool {
 struct FocusConnection {
     client: Client,
     subscription: Subscription,
+    replaying: bool,
+    baseline_pane: Option<String>,
+    replayed_panes: Vec<String>,
+}
+
+impl FocusConnection {
+    fn record_next_event(&mut self, state: &mut State) -> Result<bool, String> {
+        match self.subscription.next_event() {
+            Ok(Some(event)) => {
+                if event.event == "pane_focused"
+                    && let Some(pane_id) = event
+                        .data
+                        .get("pane_id")
+                        .and_then(serde_json::Value::as_str)
+                {
+                    if self.replaying {
+                        self.replayed_panes.push(pane_id.into());
+                    } else {
+                        state.expire_echoes(now_ms());
+                        state.record(pane_id.into());
+                    }
+                }
+                Ok(true)
+            }
+            Ok(None) => Ok(false),
+            Err(ClientError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                Ok(true)
+            }
+            Err(error) => Err(format!("pane focus subscription ended: {error}")),
+        }
+    }
+
+    fn finish_replay(&mut self, state: &mut State) -> Result<(), String> {
+        if !self.replaying {
+            return Ok(());
+        }
+        let start = replay_suffix(&self.replayed_panes, self.baseline_pane.as_deref());
+        state.expire_echoes(now_ms());
+        for pane_id in self.replayed_panes.drain(start..) {
+            state.record(pane_id);
+        }
+        if let Some(pane_id) = self
+            .client
+            .snapshot()
+            .map_err(|error| format!("cannot reconcile focused pane: {error}"))?
+            .focused_pane_id
+        {
+            state.record(pane_id);
+        }
+        self.replaying = false;
+        Ok(())
+    }
+}
+
+fn replay_suffix(events: &[String], baseline: Option<&str>) -> usize {
+    baseline
+        .and_then(|pane| events.iter().rposition(|event| event == pane))
+        .map_or(events.len(), |index| index + 1)
 }
 
 fn connect_focus_stream(
     socket_path: &Path,
     state: &mut State,
-    session_epoch: &mut Option<String>,
+    server_identity: &mut Option<String>,
 ) -> Result<FocusConnection, String> {
+    let identity = file_identity(socket_path)
+        .map_err(|error| format!("cannot inspect Herdr socket: {error}"))?;
     let client = Client::new(socket_path).with_timeout(SOCKET_TIMEOUT);
     let snapshot = client
         .snapshot()
         .map_err(|error| format!("cannot snapshot focused pane: {error}"))?;
     let subscription = client
-        .subscribe(
-            &snapshot.event_cursor,
-            &[EventSubscription::new("pane.focused")],
-        )
+        .subscribe(&[EventSubscription::new("pane.focused")])
         .map_err(|error| format!("cannot subscribe to pane focus events: {error}"))?;
+    if file_identity(socket_path).ok().as_ref() != Some(&identity) {
+        return Err("Herdr server changed while history connected".into());
+    }
     subscription
         .set_receive_timeout(SOCKET_TIMEOUT)
         .map_err(|error| format!("cannot bound focus event reads: {error}"))?;
-    reconcile_snapshot(
-        state,
-        session_epoch,
-        snapshot.session_epoch.clone(),
-        snapshot.focused_pane_id,
-    );
-    Ok(FocusConnection {
-        client: client.with_session_epoch(snapshot.session_epoch),
-        subscription,
-    })
-}
-
-fn reconcile_snapshot(
-    state: &mut State,
-    session_epoch: &mut Option<String>,
-    next_epoch: String,
-    focused_pane_id: Option<String>,
-) {
-    if session_epoch.as_ref() != Some(&next_epoch) {
+    if server_identity.as_ref() != Some(&identity) {
         *state = State::fresh();
-        *session_epoch = Some(next_epoch);
+        *server_identity = Some(identity);
     }
     state.expire_echoes(now_ms());
-    if let Some(pane_id) = focused_pane_id {
+    if let Some(pane_id) = snapshot.focused_pane_id.clone() {
         state.record(pane_id);
     }
+    Ok(FocusConnection {
+        client,
+        subscription,
+        replaying: true,
+        baseline_pane: snapshot.focused_pane_id,
+        replayed_panes: Vec::new(),
+    })
 }
 
 enum Ready {
@@ -466,36 +540,6 @@ fn wait_ready(
         Ok(Ready::Event)
     } else {
         Ok(Ready::Control)
-    }
-}
-
-fn record_next_event(
-    subscription: &mut herdr_client::Subscription,
-    state: &mut State,
-) -> Result<bool, String> {
-    match subscription.next_event() {
-        Ok(Some(event)) => {
-            if event.event == "pane_focused"
-                && let Some(pane_id) = event
-                    .data
-                    .get("pane_id")
-                    .and_then(serde_json::Value::as_str)
-            {
-                state.expire_echoes(now_ms());
-                state.record(pane_id.into());
-            }
-            Ok(true)
-        }
-        Ok(None) => Ok(false),
-        Err(ClientError::Io(error))
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-            ) =>
-        {
-            Ok(true)
-        }
-        Err(error) => Err(format!("pane focus subscription ended: {error}")),
     }
 }
 
@@ -791,15 +835,10 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_preserves_a_session_and_resets_a_replacement() {
-        let mut state = visited(&["A", "B"]);
-        let mut epoch = Some("one".into());
-        reconcile_snapshot(&mut state, &mut epoch, "one".into(), Some("C".into()));
-        assert_eq!(state.entries, ["A", "B", "C"]);
-
-        reconcile_snapshot(&mut state, &mut epoch, "two".into(), Some("X".into()));
-        assert_eq!(state.entries, ["X"]);
-        assert_eq!(epoch.as_deref(), Some("two"));
+    fn retained_replay_keeps_only_events_after_the_snapshot_boundary() {
+        let events = ["B", "C", "B", "D"].map(str::to_owned);
+        assert_eq!(replay_suffix(&events, Some("B")), 3);
+        assert_eq!(replay_suffix(&events, Some("A")), events.len());
     }
 
     fn visited(panes: &[&str]) -> State {

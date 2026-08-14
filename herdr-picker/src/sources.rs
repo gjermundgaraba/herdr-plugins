@@ -1,33 +1,17 @@
-use std::{
-    cmp::Reverse,
-    collections::HashMap,
-    sync::mpsc::{Receiver, channel},
-    thread,
-};
+use std::{cmp::Reverse, collections::HashMap};
 
 use herdr_client::{AgentStatus, Client, SessionSnapshot};
 use serde_json::json;
 
 use crate::model::{Dispatch, Item, Kind};
 
-pub type SourceUpdate = Result<Vec<Item>, String>;
-
-pub fn spawn(client: Client) -> Receiver<SourceUpdate> {
-    let (tx, rx) = channel();
-    thread::spawn(move || {
-        let items = client
-            .snapshot()
-            .map(|snapshot| {
-                let mut items = workspaces(&snapshot);
-                items.extend(agents(&snapshot));
-                items.extend(tabs(&snapshot));
-                items.extend(panes(&snapshot));
-                items
-            })
-            .map_err(|error| error.to_string());
-        let _ = tx.send(items);
-    });
-    rx
+pub fn load(client: &Client) -> Result<Vec<Item>, String> {
+    let snapshot = client.snapshot().map_err(|error| error.to_string())?;
+    let mut items = workspaces(&snapshot);
+    items.extend(agents(&snapshot));
+    items.extend(tabs(&snapshot));
+    items.extend(panes(&snapshot));
+    Ok(items)
 }
 
 fn workspaces(snapshot: &SessionSnapshot) -> Vec<Item> {
@@ -47,7 +31,6 @@ fn workspaces(snapshot: &SessionSnapshot) -> Vec<Item> {
             dispatch: Dispatch::new(
                 "workspace.focus",
                 json!({ "workspace_id": workspace.workspace_id }),
-                &snapshot.session_epoch,
             ),
         })
         .collect()
@@ -86,11 +69,7 @@ fn tabs(snapshot: &SessionSnapshot) -> Vec<Item> {
                     tab.pane_count, tab.agent_status
                 ),
                 detail: tab.tab_id.clone(),
-                dispatch: Dispatch::new(
-                    "tab.focus",
-                    json!({ "tab_id": tab.tab_id }),
-                    &snapshot.session_epoch,
-                ),
+                dispatch: Dispatch::new("tab.focus", json!({ "tab_id": tab.tab_id })),
             }
         })
         .collect()
@@ -138,11 +117,7 @@ fn panes(snapshot: &SessionSnapshot) -> Vec<Item> {
                 title: title.into(),
                 subtitle: format!("{workspace} · {tab} · {}", pane.agent_status),
                 detail: format!("{} · {} · {cwd}", pane.pane_id, pane.terminal_id),
-                dispatch: Dispatch::new(
-                    "pane.focus",
-                    json!({ "pane_id": pane.pane_id }),
-                    &snapshot.session_epoch,
-                ),
+                dispatch: Dispatch::new("pane.focus", json!({ "pane_id": pane.pane_id })),
             }
         })
         .collect()
@@ -224,11 +199,7 @@ fn agents(snapshot: &SessionSnapshot) -> Vec<Item> {
                 .filter(|value| !value.is_empty())
                 .collect::<Vec<_>>()
                 .join(" · "),
-                dispatch: Dispatch::new(
-                    "agent.focus",
-                    json!({ "target": agent.pane_id }),
-                    &snapshot.session_epoch,
-                ),
+                dispatch: Dispatch::new("agent.focus", json!({ "target": agent.pane_id })),
             }
         })
         .collect()
@@ -297,12 +268,7 @@ mod tests {
     fn snapshot(agents: Vec<AgentInfo>) -> SessionSnapshot {
         SessionSnapshot {
             version: "0.8.0".into(),
-            protocol: 20,
-            session_epoch: "session".into(),
-            event_cursor: herdr_client::EventCursor {
-                stream_id: "stream".into(),
-                sequence: 42,
-            },
+            protocol: 19,
             focused_workspace_id: None,
             focused_tab_id: None,
             focused_pane_id: None,

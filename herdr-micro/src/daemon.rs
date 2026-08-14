@@ -98,7 +98,6 @@ struct State {
     config: Config,
     sessions: Vec<Session>,
     session_agents: HashMap<String, Vec<AgentInfo>>,
-    session_epochs: HashMap<String, String>,
     mappings: Vec<SessionTerminalMapping>,
     selected_session: Option<String>,
     routing_verified: bool,
@@ -191,7 +190,6 @@ struct InputContext {
     controls: Controls,
     effort: EffortConfig,
     session: Option<Session>,
-    session_epoch: Option<String>,
     terminal: Option<String>,
     target: Option<AgentInfo>,
     slots: Vec<Option<AgentInfo>>,
@@ -205,7 +203,6 @@ impl InputContext {
             controls: config.controls.clone(),
             effort: config.effort.clone(),
             session: None,
-            session_epoch: None,
             terminal: None,
             target: None,
             slots: vec![None; SLOT_COUNT],
@@ -214,15 +211,9 @@ impl InputContext {
         }
     }
 
-    fn selected(&self, routing_generation: &AtomicU64) -> Option<(Session, String, String)> {
+    fn selected(&self, routing_generation: &AtomicU64) -> Option<(Session, String)> {
         (self.routing_ready && self.generation == routing_generation.load(Ordering::Acquire))
-            .then(|| {
-                self.session
-                    .clone()
-                    .zip(self.terminal.clone())
-                    .zip(self.session_epoch.clone())
-                    .map(|((session, terminal), epoch)| (session, terminal, epoch))
-            })
+            .then(|| self.session.clone().zip(self.terminal.clone()))
             .flatten()
     }
 }
@@ -239,7 +230,6 @@ enum Work {
         binding: Box<Binding>,
         source: String,
         session: Session,
-        session_epoch: String,
         terminal: String,
         effort: EffortConfig,
         target: Option<(String, String, Option<String>)>,
@@ -247,9 +237,9 @@ enum Work {
     },
     FocusSlot {
         pane_id: String,
+        agent_terminal_id: String,
         source: String,
         session: Session,
-        session_epoch: String,
         terminal: String,
         generation: u64,
     },
@@ -268,7 +258,6 @@ impl Work {
                 Self::Binding {
                     binding: first,
                     session: first_session,
-                    session_epoch: first_epoch,
                     terminal: first_terminal,
                     effort: first_effort,
                     target: first_target,
@@ -278,7 +267,6 @@ impl Work {
                 Self::Binding {
                     binding: second,
                     session: second_session,
-                    session_epoch: second_epoch,
                     terminal: second_terminal,
                     effort: second_effort,
                     target: second_target,
@@ -296,7 +284,6 @@ impl Work {
                 ) => {
                     first_direction == second_direction
                         && first_session == second_session
-                        && first_epoch == second_epoch
                         && first_terminal == second_terminal
                         && first_effort == second_effort
                         && first_target == second_target
@@ -347,7 +334,6 @@ fn action_name(action: &Action) -> &'static str {
 
 struct DispatchLease<'a> {
     session: &'a Session,
-    session_epoch: &'a str,
     terminal: &'a str,
     generation: u64,
     routing_generation: &'a AtomicU64,
@@ -355,7 +341,7 @@ struct DispatchLease<'a> {
 
 impl DispatchLease<'_> {
     fn client(&self) -> Client {
-        self.session.client().with_session_epoch(self.session_epoch)
+        self.session.client()
     }
 
     fn ensure(&self) -> Result<String> {
@@ -568,19 +554,13 @@ fn action_worker(
             log("control ignored: stale Herdr routing");
             continue;
         }
-        let (session_info, session_epoch, terminal) = match &work {
+        let (session_info, terminal) = match &work {
             Work::Binding {
-                session,
-                session_epoch,
-                terminal,
-                ..
+                session, terminal, ..
             }
             | Work::FocusSlot {
-                session,
-                session_epoch,
-                terminal,
-                ..
-            } => (session.clone(), session_epoch.clone(), terminal.clone()),
+                session, terminal, ..
+            } => (session.clone(), terminal.clone()),
         };
         let snapshot = match current_snapshot(&session_info.client()) {
             Ok(snapshot) => snapshot,
@@ -592,17 +572,12 @@ fn action_worker(
                 continue;
             }
         };
-        if snapshot.session_epoch != session_epoch {
-            log("control ignored: Herdr session was replaced");
-            continue;
-        }
         if generation != routing_generation.load(Ordering::Acquire) {
             log("control ignored: stale Herdr routing");
             continue;
         }
         let lease = DispatchLease {
             session: &session_info,
-            session_epoch: &session_epoch,
             terminal: &terminal,
             generation,
             routing_generation: &routing_generation,
@@ -610,17 +585,21 @@ fn action_worker(
         let result = match work {
             Work::FocusSlot {
                 pane_id,
+                agent_terminal_id,
                 source,
                 session,
                 ..
             } => {
-                let result = if snapshot.agents.iter().any(|agent| agent.pane_id == pane_id) {
-                    lease
-                        .ensure()
-                        .and_then(|_| focus_agent(&lease.client(), &pane_id))
-                } else {
-                    Err(anyhow!("Agent slot pane disappeared"))
-                };
+                let result =
+                    if snapshot.agents.iter().any(|agent| {
+                        agent.pane_id == pane_id && agent.terminal_id == agent_terminal_id
+                    }) {
+                        lease
+                            .ensure()
+                            .and_then(|_| focus_agent(&lease.client(), &pane_id))
+                    } else {
+                        Err(anyhow!("Agent slot pane disappeared"))
+                    };
                 if result.is_ok() {
                     log(format!("{source}: focused {}/{pane_id}", session.name));
                 }
@@ -685,7 +664,7 @@ fn queue_binding(
     sender: &SyncSender<Work>,
     binding: Binding,
     source: String,
-    route: Option<(Session, String, String)>,
+    route: Option<(Session, String)>,
     effort: &EffortConfig,
     target: Option<AgentInfo>,
     generation: u64,
@@ -705,12 +684,11 @@ fn queue_binding(
         return;
     }
     match route {
-        Some((session, terminal, session_epoch)) => {
+        Some((session, terminal)) => {
             let work = Work::Binding {
                 binding: Box::new(binding),
                 source,
                 session,
-                session_epoch,
                 terminal,
                 effort: effort.clone(),
                 target: agent_identity(target.as_ref()),
@@ -734,14 +712,12 @@ fn handle_fired(
     fired: Vec<Fired>,
 ) {
     for fired in fired {
-        let route = context
-            .selected(routing_generation)
-            .filter(|(session, _, _)| {
-                fired
-                    .context
-                    .as_deref()
-                    .is_some_and(|name| name == session.name)
-            });
+        let route = context.selected(routing_generation).filter(|(session, _)| {
+            fired
+                .context
+                .as_deref()
+                .is_some_and(|name| name == session.name)
+        });
         queue_binding(
             sender,
             Binding::Action(fired.action),
@@ -823,12 +799,12 @@ fn handle_device_event(
                     let session = context.selected(routing_generation);
                     let agent = context.slots[index].as_ref();
                     match (session, agent) {
-                        (Some((session, terminal, session_epoch)), Some(agent)) => {
+                        (Some((session, terminal)), Some(agent)) => {
                             let work = Work::FocusSlot {
                                 pane_id: agent.pane_id.clone(),
+                                agent_terminal_id: agent.terminal_id.clone(),
                                 source: key,
                                 session,
-                                session_epoch,
                                 terminal,
                                 generation: context.generation,
                             };
@@ -848,9 +824,7 @@ fn handle_device_event(
             }
             let binding = key_binding(controls, &key, action);
             let captured = context.selected(routing_generation);
-            let gesture_context = captured
-                .as_ref()
-                .map(|(session, _, _)| session.name.clone());
+            let gesture_context = captured.as_ref().map(|(session, _)| session.name.clone());
             if matches!(key.as_str(), "ENC_CC" | "ENC_CW") {
                 if let Some(binding) = binding {
                     queue_binding(
@@ -1122,7 +1096,6 @@ fn refresh_sessions(
     if selected_changed {
         workers.clear();
         state.session_agents.clear();
-        state.session_epochs.clear();
         state.session_slots.clear();
         if previous_selected.is_some() && discovered_selected.is_some() {
             reset_selected_route(state);
@@ -1159,9 +1132,6 @@ fn sync_selected_worker(
     workers.retain(|name, _| state.selected_session.as_deref() == Some(name));
     state
         .session_agents
-        .retain(|name, _| state.selected_session.as_deref() == Some(name));
-    state
-        .session_epochs
         .retain(|name, _| state.selected_session.as_deref() == Some(name));
     state
         .session_slots
@@ -1299,7 +1269,7 @@ fn apply_selected_agents(state: &mut State, device: Option<&HidClient>) -> Resul
         None => (false, None),
     };
     if available && agents.is_none() {
-        state.routing_ready = state.session_epochs.contains_key(&session);
+        state.routing_ready = true;
         state.last_herdr_error.clear();
         return Ok(());
     }
@@ -1366,23 +1336,8 @@ fn apply_session_update(
     }
     match update {
         SessionUpdate::Agents {
-            session,
-            session_epoch,
-            agents,
-            ..
+            session, agents, ..
         } => {
-            let replaced = state
-                .session_epochs
-                .get(&session)
-                .is_some_and(|epoch| epoch != &session_epoch);
-            if replaced {
-                state.session_agents.remove(&session);
-                state.session_slots.remove(&session);
-                if state.selected_session.as_deref() == Some(&session) {
-                    reset_selected_route(state);
-                }
-            }
-            state.session_epochs.insert(session.clone(), session_epoch);
             state.session_agents.insert(session.clone(), agents);
             if session_route_is_verified(state, &session) {
                 state.last_herdr_error.clear();
@@ -1392,7 +1347,6 @@ fn apply_session_update(
         }
         SessionUpdate::Unavailable { session, error, .. } => {
             let became_unavailable = state.session_agents.remove(&session).is_some();
-            state.session_epochs.remove(&session);
             if state.selected_session.as_deref() == Some(&session) {
                 apply_selected_agents(state, device)?;
                 if state.last_herdr_error != error {
@@ -1544,11 +1498,6 @@ fn update_input_context(context: &Mutex<Arc<InputContext>>, state: &State) {
         controls: state.config.controls.clone(),
         effort: state.config.effort.clone(),
         session: session.cloned(),
-        session_epoch: state
-            .selected_session
-            .as_ref()
-            .and_then(|name| state.session_epochs.get(name))
-            .cloned(),
         terminal: state.focused_terminal.clone(),
         target: target.cloned(),
         slots: state
@@ -1949,7 +1898,6 @@ mod tests {
             controls: config.controls,
             effort: config.effort,
             session: Some(session("work")),
-            session_epoch: Some("epoch".into()),
             terminal: Some("terminal".into()),
             target: Some(target),
             slots: vec![None; SLOT_COUNT],
@@ -2064,7 +2012,6 @@ mod tests {
         let update = || SessionUpdate::Agents {
             session: "work".into(),
             generation: 7,
-            session_epoch: "epoch".into(),
             agents: vec![agent("terminal", "pane", "codex")],
         };
 

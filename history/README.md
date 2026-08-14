@@ -53,22 +53,26 @@ command = "gjermundgaraba.herdr-history.forward"
 description = "History forward"
 ```
 
-Reload with `herdr server reload-config`. Requires Herdr socket protocol 20 and
-Rust >= 1.89 to install. The installed plugin has no runtime language dependency.
+Reload with `herdr server reload-config`. Requires Herdr >= 0.8.0 (socket
+protocol 19) and Rust >= 1.89 to install. The installed plugin has no runtime
+language dependency.
 
 ## How it works
 
 A small per-session daemon is the only history writer. It seeds from a
-`session.snapshot`, then subscribes to ordered `pane.focused` events after that
-snapshot's event cursor, so focus changes during startup cannot be lost or
-reordered. Back/forward commands are serialized through the same daemon and call
-`pane.focus`, which switches workspace and tab automatically. History resets
-when the Herdr session epoch changes, because pane ids recycle across normal
-server restarts; live handoff keeps the epoch and history. A dropped event
-subscription reconnects and reconciles from a fresh snapshot without stopping
-the daemon. Concurrent Herdr sessions use separate in-memory histories and
-control sockets keyed by Herdr socket path and executable identity. Rebuilt
-daemons retire themselves instead of continuing to run stale code.
+`session.snapshot`, then consumes Herdr's ordered retained `pane.focused`
+stream. The snapshot's focused pane is used as the replay boundary when a
+dropped stream reconnects. Herdr 0.8.0 exposes no exact snapshot cursor, so
+activation on an already-running server intentionally starts at its current
+pane; activate before changing focus as described above.
+
+Back/forward commands are serialized through the same daemon and call
+`pane.focus`, which switches workspace and tab automatically. Rebinding the
+server socket resets history because pane ids may recycle; reconnect failures
+are logged once per outage. Concurrent Herdr sessions use separate
+in-memory histories and control sockets keyed by Herdr socket path and
+executable identity. Rebuilt daemons retire themselves instead of continuing
+to run stale code.
 
 ## Development
 

@@ -29,9 +29,11 @@ Codex Micro over USB
 ```
 
 The daemon uses Herdr's CLI only to discover running session names and their
-socket paths at startup or when discovery becomes stale. It subscribes directly
-to the selected session; status changes drive lighting without polling or
-subprocesses. Actions are direct socket requests.
+socket paths at startup or when discovery becomes stale. It polls the selected
+session's stable `session.snapshot` API four times per second; changed agent
+state drives routing and lighting without additional subprocesses. Actions are
+direct socket requests after a fresh snapshot confirms the captured agent
+identity.
 
 Ghostty inspection uses a cached native ScriptingBridge client from Rust. The
 focused terminal UUID is queried while Ghostty is active and immediately before

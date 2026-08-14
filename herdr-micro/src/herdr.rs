@@ -1,7 +1,7 @@
 //! Herdr session discovery and direct socket access.
 
 use anyhow::{Context, Result, bail};
-use herdr_client::{AgentInfo, Client, Error as ClientError, EventSubscription, SessionSnapshot};
+use herdr_client::{AgentInfo, Client, SessionSnapshot};
 use serde::Deserialize;
 use std::{
     env,
@@ -19,8 +19,8 @@ use std::{
 
 pub const DEFAULT_HERDR_BIN: &str = "herdr";
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
-const MIN_HERDR_PROTOCOL: u32 = 20;
-const SUBSCRIPTION_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const MIN_HERDR_PROTOCOL: u32 = 19;
+const SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
@@ -39,7 +39,6 @@ pub enum SessionUpdate {
     Agents {
         session: String,
         generation: u64,
-        session_epoch: String,
         agents: Vec<AgentInfo>,
     },
     Unavailable {
@@ -93,7 +92,7 @@ pub fn spawn_session_worker(
                 error: result
                     .err()
                     .map(|error| error.to_string())
-                    .unwrap_or_else(|| "Herdr subscription ended".into()),
+                    .unwrap_or_else(|| "Herdr snapshot polling ended".into()),
             });
             if connected {
                 retry = Duration::from_millis(250);
@@ -123,48 +122,18 @@ fn follow_session(
     if !active.load(Ordering::Acquire) || stopping.load(Ordering::Acquire) {
         return Ok(());
     }
-    let snapshot = current_snapshot(client)?;
-    let session_epoch = snapshot.session_epoch.clone();
-    let client = client.clone().with_session_epoch(&session_epoch);
-    let subscriptions = session_subscriptions();
-    let mut subscription = client.subscribe(&snapshot.event_cursor, &subscriptions)?;
-    subscription.set_receive_timeout(SUBSCRIPTION_POLL_INTERVAL)?;
-    send_agents(
-        session,
-        generation,
-        updates,
-        session_epoch.clone(),
-        snapshot.agents,
-    )?;
-    *connected = true;
+    let mut previous = None;
     loop {
-        match subscription.next_event() {
-            Ok(Some(_)) => {}
-            Ok(None) => return Ok(()),
-            Err(ClientError::Io(error))
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                ) =>
-            {
-                if !active.load(Ordering::Acquire) || stopping.load(Ordering::Acquire) {
-                    return Ok(());
-                }
-                continue;
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let snapshot = current_snapshot(&client)?;
-        if snapshot.session_epoch != session_epoch {
+        let agents = current_snapshot(client)?.agents;
+        if previous.as_ref() != Some(&agents) {
+            send_agents(session, generation, updates, agents.clone())?;
+            previous = Some(agents);
+        }
+        *connected = true;
+        thread::park_timeout(SNAPSHOT_POLL_INTERVAL);
+        if !active.load(Ordering::Acquire) || stopping.load(Ordering::Acquire) {
             return Ok(());
         }
-        send_agents(
-            session,
-            generation,
-            updates,
-            session_epoch.clone(),
-            snapshot.agents,
-        )?;
     }
 }
 
@@ -194,39 +163,16 @@ fn validate_snapshot(snapshot: SessionSnapshot) -> Result<SessionSnapshot> {
     Ok(snapshot)
 }
 
-fn session_subscriptions() -> Vec<EventSubscription> {
-    [
-        "workspace.created",
-        "workspace.closed",
-        "workspace.focused",
-        "tab.created",
-        "tab.closed",
-        "tab.focused",
-        "pane.created",
-        "pane.closed",
-        "pane.focused",
-        "pane.moved",
-        "pane.exited",
-        "pane.agent_detected",
-        "pane.agent_status_changed",
-    ]
-    .into_iter()
-    .map(EventSubscription::new)
-    .collect()
-}
-
 fn send_agents(
     session: &str,
     generation: u64,
     updates: &Sender<SessionUpdate>,
-    session_epoch: String,
     agents: Vec<AgentInfo>,
 ) -> Result<()> {
     updates
         .send(SessionUpdate::Agents {
             session: session.into(),
             generation,
-            session_epoch,
             agents,
         })
         .map_err(|_| anyhow::anyhow!("Micro daemon stopped"))
@@ -364,8 +310,6 @@ mod tests {
             "snapshot": {
                 "version": "0.8.0",
                 "protocol": MIN_HERDR_PROTOCOL,
-                "session_epoch": "epoch",
-                "event_cursor": { "stream_id": "stream", "sequence": 42 },
                 "workspaces": [],
                 "tabs": [],
                 "panes": [{
@@ -405,50 +349,24 @@ mod tests {
     }
 
     #[test]
-    fn agent_status_subscription_covers_the_whole_session() {
-        let subscriptions = session_subscriptions();
-        let status = subscriptions
-            .iter()
-            .find(|subscription| subscription.kind == "pane.agent_status_changed")
-            .unwrap();
-        assert!(status.filters.is_empty());
-    }
-
-    #[test]
-    fn subscription_bootstraps_then_refreshes_agents_after_an_event() {
+    fn polling_publishes_only_changed_agent_snapshots() {
         let path = std::env::temp_dir().join(format!(
             "herdr-micro-follow-session-{}.sock",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
+        let active = Arc::new(AtomicBool::new(true));
+        let server_active = Arc::clone(&active);
         let server = thread::spawn(move || {
             let (mut before, _) = listener.accept().unwrap();
             let request = read_request(&before);
             assert_eq!(request["method"], "session.snapshot");
             reply(&mut before, &request, snapshot(serde_json::json!([])));
 
-            let (mut subscription, _) = listener.accept().unwrap();
-            let request = read_request(&subscription);
-            assert_eq!(request["method"], "events.subscribe");
-            assert_eq!(request["params"]["after_event_cursor"]["sequence"], 42);
-            reply(
-                &mut subscription,
-                &request,
-                serde_json::json!({ "type": "subscription_started" }),
-            );
-            writeln!(
-                subscription,
-                "{}",
-                serde_json::json!({
-                    "event": "pane_agent_status_changed",
-                    "data": { "pane_id": "w1:p1" }
-                })
-            )
-            .unwrap();
-
             let (mut after_event, _) = listener.accept().unwrap();
             let request = read_request(&after_event);
+            assert_eq!(request["method"], "session.snapshot");
             reply(
                 &mut after_event,
                 &request,
@@ -463,10 +381,10 @@ mod tests {
                     "revision": 2
                 }])),
             );
+            server_active.store(false, Ordering::Release);
         });
 
         let (updates, received) = mpsc::channel();
-        let active = AtomicBool::new(true);
         let stopping = AtomicBool::new(false);
         let mut connected = false;
         follow_session(
@@ -499,8 +417,6 @@ mod tests {
             serde_json::from_value::<SessionSnapshot>(serde_json::json!({
                 "version": "0.8.0",
                 "protocol": protocol,
-                "session_epoch": "epoch",
-                "event_cursor": { "stream_id": "stream", "sequence": 42 },
                 "workspaces": [],
                 "tabs": [],
                 "panes": [{

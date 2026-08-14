@@ -18,4 +18,4 @@ pub use types::*;
 /// Stable Herdr release used to validate the typed models.
 pub const TESTED_HERDR_VERSION: &str = "0.8.0";
 /// Socket protocol shipped by [`TESTED_HERDR_VERSION`].
-pub const TESTED_PROTOCOL: u32 = 20;
+pub const TESTED_PROTOCOL: u32 = 19;

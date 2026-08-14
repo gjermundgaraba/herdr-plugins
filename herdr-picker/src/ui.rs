@@ -56,27 +56,21 @@ pub fn rects(area: Rect) -> Rects {
     }
 }
 
-pub fn render(
-    picker: &mut Picker,
-    mode: Mode,
-    spinner_frame: usize,
-    loading: bool,
-    frame: &mut Frame,
-) {
+pub fn render(picker: &mut Picker, mode: Mode, spinner_frame: usize, frame: &mut Frame) {
     let area = frame.area();
     let rects = rects(area);
     picker.visible_rows = (rects.body.height / ROW_HEIGHT) as usize;
     picker.ensure_selection_visible();
 
-    render_header(picker, mode, loading, frame, rects.header);
+    render_header(picker, mode, frame, rects.header);
     frame.render_widget(Separator, Rect::new(area.x, area.y + 1, area.width, 1));
-    render_rows(picker, spinner_frame, loading, frame, rects.body);
+    render_rows(picker, spinner_frame, frame, rects.body);
     frame.render_widget(Separator, rects.detail_separator);
     render_detail(picker, frame, rects.detail);
     render_footer(mode, frame, rects.footer);
 }
 
-fn render_header(picker: &Picker, mode: Mode, loading: bool, frame: &mut Frame, area: Rect) {
+fn render_header(picker: &Picker, mode: Mode, frame: &mut Frame, area: Rect) {
     let search = SearchLine {
         query: &picker.query,
         placeholder: match mode {
@@ -87,11 +81,7 @@ fn render_header(picker: &Picker, mode: Mode, loading: bool, frame: &mut Frame, 
         focused: mode != Mode::VimNormal,
     };
     let filter = format!("[{}]", picker.filter.label());
-    let count = if loading {
-        format!("loading · {} results ", picker.len())
-    } else {
-        format!("{} results ", picker.len())
-    };
+    let count = format!("{} results ", picker.len());
     let gap = (area.width as usize)
         .saturating_sub(search.line().width() + 2 + width(&filter))
         .saturating_sub(width(&count));
@@ -108,20 +98,9 @@ fn render_header(picker: &Picker, mode: Mode, loading: bool, frame: &mut Frame, 
     }
 }
 
-fn render_rows(
-    picker: &Picker,
-    spinner_frame: usize,
-    loading: bool,
-    frame: &mut Frame,
-    area: Rect,
-) {
+fn render_rows(picker: &Picker, spinner_frame: usize, frame: &mut Frame, area: Rect) {
     if picker.is_empty() {
-        let message = if loading {
-            " Loading…"
-        } else {
-            " No matches"
-        };
-        frame.render_widget(Paragraph::new(message).style(theme::muted()), area);
+        frame.render_widget(Paragraph::new(" No matches").style(theme::muted()), area);
         return;
     }
     let start = picker.scroll.min(picker.len());
@@ -335,7 +314,7 @@ mod tests {
             title: "title".into(),
             subtitle: "subtitle".into(),
             detail: String::new(),
-            dispatch: Dispatch::new("test", json!({}), "session"),
+            dispatch: Dispatch::new("test", json!({})),
         };
         let mut terminal = Terminal::new(TestBackend::new(20, ROW_HEIGHT)).unwrap();
         terminal

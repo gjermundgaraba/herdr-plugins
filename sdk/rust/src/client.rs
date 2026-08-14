@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    AgentInfo, AgentStartParams, EventCursor, EventEnvelope, EventSubscription, LayoutDescription,
+    AgentInfo, AgentStartParams, EventEnvelope, EventSubscription, LayoutDescription,
     LayoutExportParams, LayoutSetSplitRatioParams, PaneInfo, PaneSplitParams, SessionSnapshot,
 };
 
@@ -24,7 +24,6 @@ const MAX_NDJSON_FRAME_BYTES: usize = 1 << 20;
 pub struct Client {
     socket_path: PathBuf,
     timeout: Option<Duration>,
-    expected_session_epoch: Option<String>,
     next_id: Arc<AtomicU64>,
 }
 
@@ -33,7 +32,6 @@ impl Client {
         Self {
             socket_path: socket_path.into(),
             timeout: None,
-            expected_session_epoch: None,
             next_id: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -51,11 +49,6 @@ impl Client {
         self
     }
 
-    pub fn with_session_epoch(mut self, session_epoch: impl Into<String>) -> Self {
-        self.expected_session_epoch = Some(session_epoch.into());
-        self
-    }
-
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
     }
@@ -69,13 +62,7 @@ impl Client {
         let id = self.request_id();
         let mut stream = self.connect()?;
         self.set_timeouts(&stream)?;
-        write_request(
-            &mut stream,
-            &id,
-            method,
-            params,
-            self.expected_session_epoch.as_deref(),
-        )?;
+        write_request(&mut stream, &id, method, params)?;
         read_response(&mut BufReader::new(stream), &id)
     }
 
@@ -136,11 +123,7 @@ impl Client {
     }
 
     /// Start a long-lived event subscription on a dedicated connection.
-    pub fn subscribe(
-        &self,
-        after_event_cursor: &EventCursor,
-        subscriptions: &[EventSubscription],
-    ) -> Result<Subscription, Error> {
+    pub fn subscribe(&self, subscriptions: &[EventSubscription]) -> Result<Subscription, Error> {
         let id = self.request_id();
         let mut stream = self.connect()?;
         self.set_timeouts(&stream)?;
@@ -148,11 +131,7 @@ impl Client {
             &mut stream,
             &id,
             "events.subscribe",
-            &json!({
-                "after_event_cursor": after_event_cursor,
-                "subscriptions": subscriptions,
-            }),
-            self.expected_session_epoch.as_deref(),
+            &json!({ "subscriptions": subscriptions }),
         )?;
 
         let mut reader = BufReader::new(stream);
@@ -339,8 +318,6 @@ struct Request<'a, P: ?Sized> {
     id: &'a str,
     method: &'a str,
     params: &'a P,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    expected_session_epoch: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
@@ -385,18 +362,8 @@ fn write_request<P: Serialize + ?Sized>(
     id: &str,
     method: &str,
     params: &P,
-    expected_session_epoch: Option<&str>,
 ) -> Result<(), Error> {
-    serde_json::to_writer(
-        &mut *stream,
-        &Request {
-            id,
-            method,
-            params,
-            expected_session_epoch,
-        },
-    )
-    .map_err(Error::Json)?;
+    serde_json::to_writer(&mut *stream, &Request { id, method, params }).map_err(Error::Json)?;
     stream.write_all(b"\n")?;
     stream.flush()?;
     Ok(())
@@ -492,7 +459,10 @@ mod tests {
                 .expect("read request");
             let request: Value = serde_json::from_str(&request).expect("parse request");
             assert_eq!(request["method"], "events.subscribe");
-            assert_eq!(request["params"]["after_event_cursor"]["sequence"], 42);
+            assert_eq!(
+                request["params"]["subscriptions"][0]["type"],
+                "pane.focused"
+            );
             writeln!(
                 stream,
                 "{}",
@@ -543,35 +513,6 @@ mod tests {
     }
 
     #[test]
-    fn bound_calls_send_the_expected_session_epoch() {
-        let path = socket_path("session-epoch");
-        let _ = std::fs::remove_file(&path);
-        let listener = UnixListener::bind(&path).expect("bind test socket");
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept request");
-            let mut request = String::new();
-            BufReader::new(stream.try_clone().expect("clone stream"))
-                .read_line(&mut request)
-                .expect("read request");
-            let request: Value = serde_json::from_str(&request).expect("parse request");
-            assert_eq!(request["expected_session_epoch"], "session-1");
-            writeln!(
-                stream,
-                "{}",
-                json!({ "id": request["id"], "result": { "type": "ok" } })
-            )
-            .expect("write response");
-        });
-
-        Client::new(&path)
-            .with_session_epoch("session-1")
-            .call_value("ping", &json!({}))
-            .expect("bound call");
-        server.join().expect("server thread");
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
     fn api_errors_keep_the_server_code() {
         let line = br#"{"id":"x","error":{"code":"not_found","message":"pane not found"}}
 "#;
@@ -597,13 +538,7 @@ mod tests {
         });
 
         let mut subscription = Client::new(&path)
-            .subscribe(
-                &EventCursor {
-                    stream_id: "stream".into(),
-                    sequence: 42,
-                },
-                &[EventSubscription::new("pane.focused")],
-            )
+            .subscribe(&[EventSubscription::new("pane.focused")])
             .expect("subscribe");
         let event = subscription
             .next_event()
@@ -627,13 +562,7 @@ mod tests {
         });
 
         let mut subscription = Client::new(&path)
-            .subscribe(
-                &EventCursor {
-                    stream_id: "stream".into(),
-                    sequence: 42,
-                },
-                &[EventSubscription::new("pane.focused")],
-            )
+            .subscribe(&[EventSubscription::new("pane.focused")])
             .expect("subscribe");
         subscription
             .set_receive_timeout(Duration::from_millis(20))
@@ -672,13 +601,7 @@ mod tests {
         });
 
         let mut subscription = Client::new(&path)
-            .subscribe(
-                &EventCursor {
-                    stream_id: "stream".into(),
-                    sequence: 42,
-                },
-                &[EventSubscription::new("pane.focused")],
-            )
+            .subscribe(&[EventSubscription::new("pane.focused")])
             .expect("subscribe");
         assert!(matches!(subscription.next_event(), Err(Error::Json(_))));
         assert_eq!(
@@ -702,13 +625,7 @@ mod tests {
         });
 
         let mut subscription = Client::new(&path)
-            .subscribe(
-                &EventCursor {
-                    stream_id: "stream".into(),
-                    sequence: 42,
-                },
-                &[EventSubscription::new("pane.focused")],
-            )
+            .subscribe(&[EventSubscription::new("pane.focused")])
             .expect("subscribe");
         assert!(matches!(
             subscription.next_event(),
@@ -728,13 +645,7 @@ mod tests {
         });
 
         let mut subscription = Client::new(&path)
-            .subscribe(
-                &EventCursor {
-                    stream_id: "stream".into(),
-                    sequence: 42,
-                },
-                &[EventSubscription::new("pane.focused")],
-            )
+            .subscribe(&[EventSubscription::new("pane.focused")])
             .expect("subscribe");
         assert!(matches!(
             subscription.next_event(),

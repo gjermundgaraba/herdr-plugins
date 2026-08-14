@@ -88,7 +88,7 @@ polling cadence, not a performance guarantee.
 | Codex Micro firmware 0.6.1 | USB passed; BLE passed after pairing a fresh host slot |
 | Work Louder Input 0.17.2 | OAI-enabled Layer 2 clone and read-back passed |
 | Work Louder Input 0.18.0 | Firmware 0.6.1 update and retained keymap passed |
-| Herdr 0.8.0 | Direct snapshots, subscriptions, targeting, and effort actions passed |
+| Herdr 0.8.0 | Direct snapshots, targeting, and effort actions passed |
 | Codex CLI 0.145.0 | `high → xhigh → high` passed |
 | Claude Code 2.1.220 | `xhigh → high → xhigh` passed |
 | Pi 0.82.1 | `medium → high → medium` passed with the bundled extension |

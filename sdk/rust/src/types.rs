@@ -37,8 +37,6 @@ impl From<&str> for AgentStatus {
 pub struct SessionSnapshot {
     pub version: String,
     pub protocol: u32,
-    pub session_epoch: String,
-    pub event_cursor: EventCursor,
     #[serde(default)]
     pub focused_workspace_id: Option<String>,
     #[serde(default)]
@@ -50,12 +48,6 @@ pub struct SessionSnapshot {
     pub panes: Vec<PaneInfo>,
     pub layouts: Vec<PaneLayoutSnapshot>,
     pub agents: Vec<AgentInfo>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EventCursor {
-    pub stream_id: String,
-    pub sequence: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -7,7 +7,6 @@ use std::{
     collections::HashMap,
     fs, io,
     process::ExitCode,
-    sync::mpsc::{Receiver, TryRecvError},
     time::{Duration, Instant},
 };
 
@@ -27,7 +26,6 @@ enum Mode {
 }
 
 const SPINNER_TICK: Duration = Duration::from_millis(100);
-const SOURCE_POLL: Duration = Duration::from_millis(15);
 fn main() -> ExitCode {
     if let Some(code) = dispatch::maybe_run_worker() {
         return code;
@@ -39,12 +37,15 @@ fn main() -> ExitCode {
         Ok(client) => client,
         Err(error) => return fail_visibly(&error.to_string()),
     };
-    let sources = sources::spawn(client);
+    let items = match sources::load(&client) {
+        Ok(items) => items,
+        Err(error) => return fail_visibly(&error),
+    };
     let filter = match initial_filter() {
         Ok(filter) => filter,
         Err(error) => return fail_visibly(&error),
     };
-    let mut picker = Picker::new(Vec::new(), filter);
+    let mut picker = Picker::new(items, filter);
     let mut mode = match initial_mode() {
         Ok(mode) => mode,
         Err(error) => return fail_visibly(&error),
@@ -52,7 +53,7 @@ fn main() -> ExitCode {
 
     let mut terminal = ratatui::init();
     let _ = crossterm::execute!(io::stdout(), EnableMouseCapture);
-    let selection = run(&mut terminal, &mut picker, &mut mode, &sources);
+    let selection = run(&mut terminal, &mut picker, &mut mode);
     let _ = crossterm::execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
 
@@ -176,46 +177,20 @@ fn run(
     terminal: &mut ratatui::DefaultTerminal,
     picker: &mut Picker,
     mode: &mut Mode,
-    sources: &Receiver<sources::SourceUpdate>,
 ) -> io::Result<Option<model::Dispatch>> {
-    let mut loading = true;
     let mut spinner_frame = 0;
     let mut next_spinner_frame = Instant::now() + SPINNER_TICK;
     let mut dirty = true;
     loop {
-        loop {
-            match sources.try_recv() {
-                Ok(Ok(items)) => {
-                    picker.set_items(items);
-                    loading = false;
-                    dirty = true;
-                }
-                Ok(Err(error)) => return Err(io::Error::other(error)),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    loading = false;
-                    break;
-                }
-            }
-        }
         if dirty {
-            terminal.draw(|frame| ui::render(picker, *mode, spinner_frame, loading, frame))?;
+            terminal.draw(|frame| ui::render(picker, *mode, spinner_frame, frame))?;
             dirty = false;
         }
 
         let spinner_active = picker.needs_spinner();
-        let timeout = if loading {
-            SOURCE_POLL
-        } else if spinner_active {
-            next_spinner_frame.saturating_duration_since(Instant::now())
-        } else {
-            // Nothing time-based remains once sources are done and no spinner
-            // is visible; effectively block until input. Duration::MAX is out:
-            // mio clamps it to tv_sec = i64::MAX, which macOS kevent rejects
-            // with EINVAL.
-            Duration::from_secs(3600)
-        };
-        if event::poll(timeout)? {
+        if !spinner_active
+            || event::poll(next_spinner_frame.saturating_duration_since(Instant::now()))?
+        {
             // Drain every queued event before redrawing so fast typing and
             // held-key repeat cost one refilter each but only one draw.
             loop {
@@ -391,7 +366,7 @@ mod tests {
                     title: title.into(),
                     subtitle: String::new(),
                     detail: String::new(),
-                    dispatch: Dispatch::new("test", json!({}), "session"),
+                    dispatch: Dispatch::new("test", json!({})),
                 })
                 .collect(),
             Filter::All,

@@ -87,15 +87,13 @@ impl Kind {
 pub struct Dispatch {
     pub method: String,
     pub params: Value,
-    pub session_epoch: String,
 }
 
 impl Dispatch {
-    pub fn new(method: impl Into<String>, params: Value, session_epoch: impl Into<String>) -> Self {
+    pub fn new(method: impl Into<String>, params: Value) -> Self {
         Self {
             method: method.into(),
             params,
-            session_epoch: session_epoch.into(),
         }
     }
 }
@@ -124,25 +122,20 @@ pub struct Picker {
 
 impl Picker {
     pub fn new(items: Vec<Item>, filter: Filter) -> Self {
+        let haystacks = items.iter().map(haystack).collect();
         let mut picker = Self {
-            items: Vec::new(),
+            items,
             query: String::new(),
             filter,
             selected: 0,
             scroll: 0,
             visible_rows: 0,
             filtered: Vec::new(),
-            haystacks: Vec::new(),
+            haystacks,
             matcher: Matcher::new(Config::DEFAULT),
         };
-        picker.set_items(items);
+        picker.refilter();
         picker
-    }
-
-    pub fn set_items(&mut self, items: Vec<Item>) {
-        self.haystacks = items.iter().map(haystack).collect();
-        self.items = items;
-        self.refilter();
     }
 
     pub fn len(&self) -> usize {
@@ -265,7 +258,7 @@ mod tests {
             title: title.into(),
             subtitle: String::new(),
             detail: String::new(),
-            dispatch: Dispatch::new("test", json!({}), "session"),
+            dispatch: Dispatch::new("test", json!({})),
         }
     }
 
@@ -288,21 +281,6 @@ mod tests {
         picker.query = "api".into();
         picker.refilter();
         assert_eq!(picker.row(0).unwrap().title, "api");
-    }
-
-    #[test]
-    fn arriving_items_keep_the_active_query() {
-        let mut picker = Picker::new(vec![item(Kind::Workspace, "api")], Filter::All);
-        picker.query = "split".into();
-        picker.refilter();
-        assert!(picker.is_empty());
-
-        picker.set_items(vec![
-            item(Kind::Workspace, "api"),
-            item(Kind::Pane, "Split logs"),
-        ]);
-        assert_eq!(picker.len(), 1);
-        assert_eq!(picker.row(0).unwrap().title, "Split logs");
     }
 
     #[test]

@@ -28,10 +28,9 @@ herdr plugin link "$PWD"
 
 No keybinding or configuration is required. Its startup hook seeds a pane-to-tab
 cache so background pane exits equalize the affected tab. Cache and locking are
-isolated by Herdr socket, and the cache records the Herdr session epoch so
-concurrent or restarted servers cannot share session-local pane IDs. Runtime state lives under
-`HERDR_PLUGIN_STATE_DIR`. Requires Herdr >= 0.8.0. Installing from GitHub requires
-`cargo` to build the binary.
+isolated by Herdr socket, and each server startup replaces the session-local
+pane map. Runtime state lives under `HERDR_PLUGIN_STATE_DIR`. Requires Herdr >=
+0.8.0. Installing from GitHub requires `cargo` to build the binary.
 
 ## Development
 
