@@ -41,14 +41,14 @@ The flake builds each plugin independently with the Rust version in
 `rust-toolchain.toml` and the committed `Cargo.lock`:
 
 ```sh
-nix build .#command-palette
-herdr plugin link "$(nix path-info .#command-palette)/command-palette"
+nix build .#herdr-picker
+herdr plugin link "$(nix path-info .#herdr-picker)/herdr-picker"
 ```
 
-The other package names are `equalize-splits`, `history`, `popup-terminal`, and
+The other package names are `equalize-splits`, `fork-to-pane`, `history`, and
 `herdr-micro`. The last package is exposed only on macOS, matching its plugin
-manifest; the others support Linux and macOS. Every package contains a complete,
-prebuilt plugin root, so linking it never invokes Cargo.
+manifest; the others support Linux and macOS. Every package contains a
+complete, prebuilt plugin root, so linking it never invokes Cargo.
 
 For Home Manager, keep the package in the profile so its Nix store path remains
 live, then register that immutable plugin root after the profile is written:
@@ -63,15 +63,15 @@ Then pass the flake inputs to this Home Manager module:
 { config, inputs, lib, pkgs, ... }:
 let
   plugin =
-    inputs.herdr-plugins.packages.${pkgs.stdenv.hostPlatform.system}.command-palette;
+    inputs.herdr-plugins.packages.${pkgs.stdenv.hostPlatform.system}.herdr-picker;
 in
 {
   home.packages = [ plugin ];
 
-  home.activation.linkHerdrCommandPalette =
+  home.activation.linkHerdrPicker =
     lib.hm.dag.entryAfter [ "writeBoundary" ] ''
       run ${config.home.profileDirectory}/bin/herdr plugin link \
-        ${plugin}/command-palette
+        ${plugin}/herdr-picker
     '';
 }
 ```
@@ -82,7 +82,7 @@ path. Nix reuses an unchanged package from the local store on later activations,
 so there is no activation-time Rust compilation and no binary cache is required.
 
 Each package's filtered source contains its full local path-dependency closure:
-the plugin crate and `sdk/rust`, plus `sdk/ratatui` for `command-palette` and the
+the plugin crate and `sdk/rust`, plus `sdk/ratatui` for `herdr-picker` and the
 entire `herdr-micro` tree (including `codex-micro`) for `herdr-micro`. Consequently,
 editing one plugin does not invalidate unrelated plugin outputs, while edits to a
 shared SDK invalidate packages that include it.
