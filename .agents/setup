@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+run_step() {
+  local label="$1"
+  shift
+  printf '==> %s\n' "$label"
+  time "$@"
+}
+
+required_packages=(build-essential ca-certificates curl pkg-config)
+missing_packages=()
+for package in "${required_packages[@]}"; do
+  if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -Fqx 'install ok installed'; then
+    missing_packages+=("$package")
+  fi
+done
+
+if ((${#missing_packages[@]})); then
+  run_step "Updating apt package metadata" sudo apt-get update
+  run_step "Installing system packages: ${missing_packages[*]}" \
+    sudo apt-get install -y "${missing_packages[@]}"
+else
+  printf '==> Required system packages are already installed\n'
+fi
+
+herdr_profile_marker='# herdr-plugins Herdr CLI'
+if ! grep -Fqx "$herdr_profile_marker" "$HOME/.bash_profile" 2>/dev/null; then
+  cat >> "$HOME/.bash_profile" <<'EOF'
+
+# herdr-plugins Herdr CLI
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) ;;
+  *) export PATH="$HOME/.local/bin:$PATH" ;;
+esac
+EOF
+fi
+export PATH="$HOME/.local/bin:$PATH"
+
+if [[ ! -x "$HOME/.local/bin/herdr" ]]; then
+  printf '==> Installing Herdr\n'
+  curl -fsSL https://herdr.dev/install.sh | sh
+else
+  printf '==> Herdr is already installed: %s\n' "$(herdr --version)"
+fi
+
+if [[ ! -x "$HOME/.cargo/bin/rustup" ]]; then
+  printf '==> Installing rustup\n'
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --default-toolchain none
+else
+  printf '==> rustup is already installed\n'
+fi
+
+# rustup cannot update the environment of this running script.
+# shellcheck disable=SC1091
+source "$HOME/.cargo/env"
+
+profile_marker='# herdr-plugins Rust toolchain'
+if ! grep -Fqx "$profile_marker" "$HOME/.bash_profile" 2>/dev/null; then
+  cat >> "$HOME/.bash_profile" <<'EOF'
+
+# herdr-plugins Rust toolchain
+if [[ -f "$HOME/.cargo/env" ]]; then
+  . "$HOME/.cargo/env"
+fi
+EOF
+fi
+
+toolchain="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"
+if [[ -z "$toolchain" ]]; then
+  printf 'Unable to read the pinned Rust channel from rust-toolchain.toml\n' >&2
+  exit 1
+fi
+
+run_step "Installing Rust $toolchain with repository components" \
+  rustup toolchain install "$toolchain" --profile minimal --component clippy,rustfmt
+run_step "Fetching locked Cargo dependencies" cargo fetch --locked
+
+printf '==> Orb setup complete\n'
