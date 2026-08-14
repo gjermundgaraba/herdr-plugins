@@ -374,7 +374,7 @@ fn run_daemon() -> Result<(), String> {
                     handle_control(
                         stream,
                         connection.as_ref().and_then(|connected| {
-                            (!connected.replaying).then_some(&connected.client)
+                            (connected.replay == ReplayPhase::Live).then_some(&connected.client)
                         }),
                         &mut state,
                     );
@@ -393,9 +393,16 @@ fn executable_is_current(path: &Path, identity: &str) -> bool {
 struct FocusConnection {
     client: Client,
     subscription: Subscription,
-    replaying: bool,
+    replay: ReplayPhase,
     baseline_pane: Option<String>,
     replayed_panes: Vec<String>,
+}
+
+#[derive(PartialEq, Eq)]
+enum ReplayPhase {
+    Retained,
+    Snapshot,
+    Live,
 }
 
 impl FocusConnection {
@@ -408,7 +415,7 @@ impl FocusConnection {
                         .get("pane_id")
                         .and_then(serde_json::Value::as_str)
                 {
-                    if self.replaying {
+                    if self.replay != ReplayPhase::Live {
                         self.replayed_panes.push(pane_id.into());
                     } else {
                         state.expire_echoes(now_ms());
@@ -431,24 +438,46 @@ impl FocusConnection {
     }
 
     fn finish_replay(&mut self, state: &mut State) -> Result<(), String> {
-        if !self.replaying {
-            return Ok(());
-        }
-        let start = replay_suffix(&self.replayed_panes, self.baseline_pane.as_deref());
         state.expire_echoes(now_ms());
-        for pane_id in self.replayed_panes.drain(start..) {
-            state.record(pane_id);
+        match self.replay {
+            ReplayPhase::Live => {}
+            ReplayPhase::Retained => {
+                let start = replay_suffix(&self.replayed_panes, self.baseline_pane.as_deref());
+                for pane_id in self.replayed_panes.drain(start..) {
+                    state.record(pane_id);
+                }
+                self.replayed_panes.clear();
+                self.baseline_pane = self
+                    .client
+                    .snapshot()
+                    .map_err(|error| format!("cannot reconcile focused pane: {error}"))?
+                    .focused_pane_id;
+                self.replay = ReplayPhase::Snapshot;
+            }
+            ReplayPhase::Snapshot => {
+                record_snapshot_events(
+                    state,
+                    self.baseline_pane.take(),
+                    std::mem::take(&mut self.replayed_panes),
+                );
+                self.replay = ReplayPhase::Live;
+            }
         }
-        if let Some(pane_id) = self
-            .client
-            .snapshot()
-            .map_err(|error| format!("cannot reconcile focused pane: {error}"))?
-            .focused_pane_id
-        {
-            state.record(pane_id);
-        }
-        self.replaying = false;
         Ok(())
+    }
+}
+
+fn record_snapshot_events(state: &mut State, snapshot_pane: Option<String>, events: Vec<String>) {
+    // Events collected while the snapshot was in flight are ordered; the
+    // snapshot is only a fallback when no event crossed that boundary.
+    if events.is_empty() {
+        if let Some(pane_id) = snapshot_pane {
+            state.record(pane_id);
+        }
+    } else {
+        for pane_id in events {
+            state.record(pane_id);
+        }
     }
 }
 
@@ -489,7 +518,7 @@ fn connect_focus_stream(
     Ok(FocusConnection {
         client,
         subscription,
-        replaying: true,
+        replay: ReplayPhase::Retained,
         baseline_pane: snapshot.focused_pane_id,
         replayed_panes: Vec::new(),
     })
@@ -839,6 +868,21 @@ mod tests {
         let events = ["B", "C", "B", "D"].map(str::to_owned);
         assert_eq!(replay_suffix(&events, Some("B")), 3);
         assert_eq!(replay_suffix(&events, Some("A")), events.len());
+    }
+
+    #[test]
+    fn snapshot_reconciliation_preserves_queued_focus_order() {
+        let mut state = visited(&["C"]);
+        record_snapshot_events(
+            &mut state,
+            Some("E".into()),
+            ["D", "E"].map(str::to_owned).into(),
+        );
+        assert_eq!(state.entries, ["C", "D", "E"]);
+
+        let mut fallback = visited(&["C"]);
+        record_snapshot_events(&mut fallback, Some("E".into()), Vec::new());
+        assert_eq!(fallback.entries, ["C", "E"]);
     }
 
     fn visited(panes: &[&str]) -> State {
