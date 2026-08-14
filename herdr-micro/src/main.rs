@@ -1,7 +1,6 @@
 use anyhow::{Context, Result, bail};
-use herdr_client::open_rotating_log;
 use herdr_micro::{
-    control::{log_file, request_status, request_stop, start_daemon_versioned},
+    control::{request_status, request_stop, start_daemon_versioned},
     daemon, doctor, helper_install, setup,
 };
 use std::{
@@ -35,7 +34,13 @@ fn run(args: Vec<OsString>) -> Result<i32> {
     match command {
         "start" if rest.is_empty() => start(),
         "daemon" if rest.is_empty() => {
-            daemon::run_daemon()?;
+            std::panic::set_hook(Box::new(|panic| {
+                daemon::log(format!("bridge panicked: {panic}"));
+            }));
+            if let Err(error) = daemon::run_daemon() {
+                daemon::log(format!("bridge failed: {error:#}"));
+                return Err(error);
+            }
             Ok(0)
         }
         "doctor" if rest.is_empty() => Ok(doctor::run_doctor()),
@@ -69,17 +74,14 @@ fn start() -> Result<i32> {
         daemon::DAEMON_PROTOCOL_VERSION,
         || {
             helper_install::verify_installed()?;
-            let log =
-                open_rotating_log(&log_file()?, 10 << 20, 3).context("open Micro bridge log")?;
-            let stderr = log.try_clone()?;
             let mut command = Command::new(&executable);
             command
                 .arg("daemon")
                 .current_dir(&root)
                 .env("HERDR_PLUGIN_ROOT", &root)
                 .stdin(Stdio::null())
-                .stdout(Stdio::from(log))
-                .stderr(Stdio::from(stderr));
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
             unsafe {
                 command.pre_exec(|| {
                     if libc::setsid() == -1 {

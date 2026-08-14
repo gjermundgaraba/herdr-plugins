@@ -1,13 +1,12 @@
 [workspace]
 resolver = "3"
 members = [
-    "command-palette",
+    "herdr-picker",
     "equalize-splits",
     "fork-to-pane",
     "herdr-micro",
     "herdr-micro/codex-micro",
     "history",
-    "popup-terminal",
     "sdk/ratatui",
     "sdk/rust",
 ]

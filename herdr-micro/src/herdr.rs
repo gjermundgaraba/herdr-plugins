@@ -1,10 +1,9 @@
 //! Herdr session discovery and direct socket access.
 
 use anyhow::{Context, Result, bail};
-use herdr_client::{AgentInfo, Client, Error as ClientError, EventSubscription, SessionSnapshot};
+use herdr_client::{AgentInfo, Client, SessionSnapshot};
 use serde::Deserialize;
 use std::{
-    collections::HashSet,
     env,
     io::Read,
     path::PathBuf,
@@ -21,7 +20,7 @@ use std::{
 pub const DEFAULT_HERDR_BIN: &str = "herdr";
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const MIN_HERDR_PROTOCOL: u32 = 19;
-const SUBSCRIPTION_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
@@ -93,7 +92,7 @@ pub fn spawn_session_worker(
                 error: result
                     .err()
                     .map(|error| error.to_string())
-                    .unwrap_or_else(|| "Herdr subscription ended".into()),
+                    .unwrap_or_else(|| "Herdr snapshot polling ended".into()),
             });
             if connected {
                 retry = Duration::from_millis(250);
@@ -120,46 +119,22 @@ fn follow_session(
     stopping: &AtomicBool,
     connected: &mut bool,
 ) -> Result<()> {
-    while active.load(Ordering::Acquire) && !stopping.load(Ordering::Acquire) {
-        let before = current_snapshot(client)?;
-        let subscribed_panes = pane_ids(&before);
-        let subscriptions = session_subscriptions(subscribed_panes.iter().map(String::as_str));
-        let mut subscription = client.subscribe(&subscriptions)?;
-        subscription.set_receive_timeout(SUBSCRIPTION_POLL_INTERVAL)?;
-        let snapshot = current_snapshot(client)?;
-        let current_panes = pane_ids(&snapshot);
-        send_agents(session, generation, updates, snapshot.agents)?;
-        *connected = true;
-        if current_panes != subscribed_panes {
-            thread::park_timeout(SUBSCRIPTION_POLL_INTERVAL);
-            continue;
+    if !active.load(Ordering::Acquire) || stopping.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let mut previous = None;
+    loop {
+        let agents = current_snapshot(client)?.agents;
+        if previous.as_ref() != Some(&agents) {
+            send_agents(session, generation, updates, agents.clone())?;
+            previous = Some(agents);
         }
-        loop {
-            match subscription.next_event() {
-                Ok(Some(_)) => {}
-                Ok(None) => return Ok(()),
-                Err(ClientError::Io(error))
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                    ) =>
-                {
-                    if !active.load(Ordering::Acquire) || stopping.load(Ordering::Acquire) {
-                        return Ok(());
-                    }
-                    continue;
-                }
-                Err(error) => return Err(error.into()),
-            };
-            let snapshot = current_snapshot(client)?;
-            let current_panes = pane_ids(&snapshot);
-            send_agents(session, generation, updates, snapshot.agents)?;
-            if current_panes != subscribed_panes {
-                break;
-            }
+        *connected = true;
+        thread::park_timeout(SNAPSHOT_POLL_INTERVAL);
+        if !active.load(Ordering::Acquire) || stopping.load(Ordering::Acquire) {
+            return Ok(());
         }
     }
-    Ok(())
 }
 
 pub(crate) fn current_snapshot(client: &Client) -> Result<SessionSnapshot> {
@@ -186,38 +161,6 @@ fn validate_snapshot(snapshot: SessionSnapshot) -> Result<SessionSnapshot> {
         bail!("Herdr returned empty pane or terminal identity");
     }
     Ok(snapshot)
-}
-
-fn pane_ids(snapshot: &SessionSnapshot) -> HashSet<String> {
-    snapshot
-        .panes
-        .iter()
-        .map(|pane| pane.pane_id.clone())
-        .collect()
-}
-
-fn session_subscriptions<'a>(pane_ids: impl Iterator<Item = &'a str>) -> Vec<EventSubscription> {
-    let mut subscriptions: Vec<_> = [
-        "workspace.created",
-        "workspace.closed",
-        "workspace.focused",
-        "tab.created",
-        "tab.closed",
-        "tab.focused",
-        "pane.created",
-        "pane.closed",
-        "pane.focused",
-        "pane.moved",
-        "pane.exited",
-        "pane.agent_detected",
-    ]
-    .into_iter()
-    .map(EventSubscription::new)
-    .collect();
-    subscriptions.extend(pane_ids.map(|pane_id| {
-        EventSubscription::new("pane.agent_status_changed").filter("pane_id", pane_id)
-    }));
-    subscriptions
 }
 
 fn send_agents(
@@ -406,57 +349,24 @@ mod tests {
     }
 
     #[test]
-    fn agent_status_subscriptions_are_scoped_to_panes() {
-        let subscriptions = session_subscriptions(["w1:p1"].into_iter());
-        let status = subscriptions
-            .iter()
-            .find(|subscription| subscription.kind == "pane.agent_status_changed")
-            .unwrap();
-        assert_eq!(status.filters.get("pane_id"), Some(&"w1:p1".into()));
-    }
-
-    #[test]
-    fn subscription_bootstraps_then_refreshes_agents_after_an_event() {
+    fn polling_publishes_only_changed_agent_snapshots() {
         let path = std::env::temp_dir().join(format!(
             "herdr-micro-follow-session-{}.sock",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
+        let active = Arc::new(AtomicBool::new(true));
+        let server_active = Arc::clone(&active);
         let server = thread::spawn(move || {
             let (mut before, _) = listener.accept().unwrap();
             let request = read_request(&before);
             assert_eq!(request["method"], "session.snapshot");
             reply(&mut before, &request, snapshot(serde_json::json!([])));
 
-            let (mut subscription, _) = listener.accept().unwrap();
-            let request = read_request(&subscription);
-            assert_eq!(request["method"], "events.subscribe");
-            reply(
-                &mut subscription,
-                &request,
-                serde_json::json!({ "type": "subscription_started" }),
-            );
-
-            let (mut after_subscribe, _) = listener.accept().unwrap();
-            let request = read_request(&after_subscribe);
-            reply(
-                &mut after_subscribe,
-                &request,
-                snapshot(serde_json::json!([])),
-            );
-            writeln!(
-                subscription,
-                "{}",
-                serde_json::json!({
-                    "event": "pane.agent_status_changed",
-                    "data": { "pane_id": "w1:p1" }
-                })
-            )
-            .unwrap();
-
             let (mut after_event, _) = listener.accept().unwrap();
             let request = read_request(&after_event);
+            assert_eq!(request["method"], "session.snapshot");
             reply(
                 &mut after_event,
                 &request,
@@ -471,10 +381,10 @@ mod tests {
                     "revision": 2
                 }])),
             );
+            server_active.store(false, Ordering::Release);
         });
 
         let (updates, received) = mpsc::channel();
-        let active = AtomicBool::new(true);
         let stopping = AtomicBool::new(false);
         let mut connected = false;
         follow_session(

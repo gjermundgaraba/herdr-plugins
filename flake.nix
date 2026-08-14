@@ -27,27 +27,17 @@
 
       forAllSystems = nixpkgs.lib.genAttrs systems;
 
-      allWorkspaceMembers = [
-        "command-palette"
-        "equalize-splits"
-        "herdr-micro"
-        "herdr-micro/codex-micro"
-        "history"
-        "popup-terminal"
-        "sdk/ratatui"
-        "sdk/rust"
-      ];
+      allWorkspaceMembers =
+        (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.members;
 
       pluginDefinitions = {
-        command-palette = {
-          crateName = "herdr-command-palette";
-          version = "0.2.0";
+        herdr-picker = {
           sourceRoots = [
-            "command-palette"
+            "herdr-picker"
             "sdk/ratatui"
             "sdk/rust"
           ];
-          binaries = [ "herdr-command-palette" ];
+          binaries = [ "herdr-picker" ];
           platforms = [
             "darwin"
             "linux"
@@ -55,8 +45,6 @@
         };
 
         equalize-splits = {
-          crateName = "herdr-equalize-splits";
-          version = "0.3.0";
           sourceRoots = [
             "equalize-splits"
             "sdk/rust"
@@ -68,9 +56,19 @@
           ];
         };
 
+        fork-to-pane = {
+          sourceRoots = [
+            "fork-to-pane"
+            "sdk/rust"
+          ];
+          binaries = [ "herdr-fork-to-pane" ];
+          platforms = [
+            "darwin"
+            "linux"
+          ];
+        };
+
         history = {
-          crateName = "herdr-history";
-          version = "0.1.0";
           sourceRoots = [
             "history"
             "sdk/rust"
@@ -82,23 +80,7 @@
           ];
         };
 
-        popup-terminal = {
-          crateName = "herdr-popup-terminal";
-          version = "0.2.0";
-          sourceRoots = [
-            "popup-terminal"
-            "sdk/rust"
-          ];
-          binaries = [ "herdr-popup-terminal" ];
-          platforms = [
-            "darwin"
-            "linux"
-          ];
-        };
-
         herdr-micro = {
-          crateName = "herdr-micro";
-          version = "0.1.0";
           # This includes codex-micro, the plugin's local path dependency.
           sourceRoots = [
             "herdr-micro"
@@ -167,6 +149,9 @@
           buildPlugin =
             name: definition:
             let
+              crate =
+                builtins.fromTOML
+                  (builtins.readFile (./. + "/${name}/Cargo.toml"));
               pluginSource = sourceFor name definition;
               selectedWorkspaceMembers = definition.sourceRoots;
               selectedWorkspaceMembersText = workspaceMembersText selectedWorkspaceMembers;
@@ -185,13 +170,13 @@
             in
             rustPlatform.buildRustPackage {
               pname = "herdr-plugin-${name}";
-              inherit (definition) version;
+              inherit (crate.package) version;
               src = pluginSource;
 
               cargoLock.lockFile = ./Cargo.lock;
               cargoBuildFlags = [
                 "--package"
-                definition.crateName
+                crate.package.name
               ];
               doCheck = true;
 

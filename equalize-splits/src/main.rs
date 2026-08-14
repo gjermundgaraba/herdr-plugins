@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use herdr_client::{
     Client, Environment, LayoutExportParams, LayoutNode, LayoutSetSplitRatioParams,
-    PluginInvocation, SplitDirection,
+    PluginInvocation, SplitDirection, socket_scope_dir,
 };
 
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(1);
@@ -22,7 +22,7 @@ struct RatioUpdate {
 
 enum Trigger {
     Startup,
-    Refresh,
+    Moved(String),
     Created(String),
     Removed(String),
 }
@@ -39,6 +39,10 @@ fn run() -> Result<(), String> {
     let plugin = environment
         .require_plugin()
         .map_err(|error| error.to_string())?;
+    let socket_path = environment
+        .socket_path
+        .as_deref()
+        .ok_or("HERDR_SOCKET_PATH is not set")?;
     let trigger = match environment.invocation() {
         Some(PluginInvocation::Startup) => Trigger::Startup,
         Some(PluginInvocation::Event {
@@ -56,12 +60,16 @@ fn run() -> Result<(), String> {
             _ => return Ok(()),
         },
         Some(PluginInvocation::Event {
-            name: "pane.moved", ..
-        }) => Trigger::Refresh,
+            name: "pane.moved",
+            event,
+        }) => match event.data["previous_pane_id"].as_str() {
+            Some(pane_id) if !pane_id.is_empty() => Trigger::Moved(pane_id.to_owned()),
+            _ => return Ok(()),
+        },
         _ => return Ok(()),
     };
 
-    let run_dir = plugin.run_dir();
+    let run_dir = socket_scope_dir(&plugin.run_dir().join("sessions"), socket_path);
     fs::create_dir_all(&run_dir).map_err(|error| format!("create run directory: {error}"))?;
     let lock_path = run_dir.join("equalize.lock");
     let lock = File::options()
@@ -76,20 +84,17 @@ fn run() -> Result<(), String> {
         .map_err(|error| format!("chmod lock: {error}"))?;
     lock.lock()
         .map_err(|error| format!("acquire lock: {error}"))?;
-
-    let client = Client::from_env()
-        .map_err(|error| error.to_string())?
-        .with_timeout(SOCKET_TIMEOUT);
-    let cache_dir = plugin.cache_dir();
+    let client = Client::new(socket_path).with_timeout(SOCKET_TIMEOUT);
+    let snapshot = client
+        .snapshot()
+        .map_err(|error| format!("snapshot session: {error}"))?;
+    let cache_dir = socket_scope_dir(&plugin.cache_dir().join("sessions"), socket_path);
     fs::create_dir_all(&cache_dir).map_err(|error| format!("create cache directory: {error}"))?;
     let pane_tabs_path = cache_dir.join("pane-tabs.json");
     let mut pane_tabs = match trigger {
         Trigger::Startup => HashMap::new(),
         _ => load_pane_tabs(&pane_tabs_path)?,
     };
-    let snapshot = client
-        .snapshot()
-        .map_err(|error| format!("snapshot session: {error}"))?;
     let removed_tab_id = refresh_pane_tabs(
         &mut pane_tabs,
         snapshot
@@ -97,14 +102,14 @@ fn run() -> Result<(), String> {
             .iter()
             .map(|pane| (pane.pane_id.as_str(), pane.tab_id.as_str())),
         match &trigger {
-            Trigger::Removed(pane_id) => Some(pane_id.as_str()),
+            Trigger::Moved(pane_id) | Trigger::Removed(pane_id) => Some(pane_id.as_str()),
             _ => None,
         },
     );
     save_pane_tabs(&pane_tabs_path, &pane_tabs)?;
 
     let created_pane_id = match &trigger {
-        Trigger::Startup | Trigger::Refresh => return Ok(()),
+        Trigger::Startup | Trigger::Moved(_) => return Ok(()),
         Trigger::Created(pane_id) => Some(pane_id),
         Trigger::Removed(_) => None,
     };
@@ -165,8 +170,7 @@ fn refresh_pane_tabs<'a>(
 
 fn load_pane_tabs(path: &Path) -> Result<HashMap<String, String>, String> {
     match fs::read(path) {
-        Ok(contents) => serde_json::from_slice(&contents)
-            .map_err(|error| format!("read pane-to-tab cache: {error}")),
+        Ok(contents) => Ok(serde_json::from_slice(&contents).unwrap_or_default()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
         Err(error) => Err(format!("read pane-to-tab cache: {error}")),
     }
@@ -410,6 +414,18 @@ mod tests {
     }
 
     #[test]
+    fn moved_pane_forgets_its_previous_id() {
+        let mut pane_tabs = HashMap::from([("old-id".into(), "tab-a".into())]);
+
+        refresh_pane_tabs(&mut pane_tabs, [("new-id", "tab-b")], Some("old-id"));
+
+        assert_eq!(
+            pane_tabs,
+            HashMap::from([("new-id".into(), "tab-b".into())])
+        );
+    }
+
+    #[test]
     fn equalizes_after_middle_pane_closes() {
         let root = split(
             SplitDirection::Down,
@@ -428,11 +444,21 @@ mod tests {
 
     #[test]
     fn herdr_wire_fixtures() {
+        assert!(
+            serde_json::from_value::<LayoutDescription>(serde_json::json!({
+                "workspace_id": "w1",
+                "tab_id": "w1:t1",
+                "root": {"type": "pane", "pane_id": "w1:p1"}
+            }))
+            .is_err()
+        );
         let mut response: serde_json::Value = serde_json::from_str(
             r#"{
                 "layout": {
                     "workspace_id": "w1",
                     "tab_id": "w1:t1",
+                    "zoomed": false,
+                    "focused_pane_id": "w1:p3",
                     "root": {
                         "type": "split",
                         "direction": "right",

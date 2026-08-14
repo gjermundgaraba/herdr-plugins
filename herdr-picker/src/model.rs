@@ -8,7 +8,6 @@ use serde_json::Value;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Filter {
     All,
-    Actions,
     Workspaces,
     Tabs,
     Panes,
@@ -16,9 +15,8 @@ pub enum Filter {
 }
 
 impl Filter {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 5] = [
         Self::All,
-        Self::Actions,
         Self::Workspaces,
         Self::Tabs,
         Self::Panes,
@@ -28,7 +26,6 @@ impl Filter {
     pub const fn label(self) -> &'static str {
         match self {
             Self::All => "all",
-            Self::Actions => "actions",
             Self::Workspaces => "workspaces",
             Self::Tabs => "tabs",
             Self::Panes => "panes",
@@ -49,20 +46,17 @@ impl std::str::FromStr for Filter {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "all" => Ok(Self::All),
-            "actions" => Ok(Self::Actions),
             "workspaces" => Ok(Self::Workspaces),
             "tabs" => Ok(Self::Tabs),
             "panes" => Ok(Self::Panes),
             "agents" => Ok(Self::Agents),
-            _ => Err("expected all, actions, workspaces, tabs, panes, or agents"),
+            _ => Err("expected all, workspaces, tabs, panes, or agents"),
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
-    NativeAction,
-    PluginAction,
     Workspace,
     Tab,
     Pane,
@@ -72,7 +66,6 @@ pub enum Kind {
 impl Kind {
     pub const fn filter(self) -> Filter {
         match self {
-            Self::NativeAction | Self::PluginAction => Filter::Actions,
             Self::Workspace => Filter::Workspaces,
             Self::Tab => Filter::Tabs,
             Self::Pane => Filter::Panes,
@@ -82,8 +75,6 @@ impl Kind {
 
     pub const fn label(self) -> &'static str {
         match self {
-            Self::NativeAction => "native",
-            Self::PluginAction => "plugin",
             Self::Workspace => "workspace",
             Self::Tab => "tab",
             Self::Pane => "pane",
@@ -114,7 +105,6 @@ pub struct Item {
     pub title: String,
     pub subtitle: String,
     pub detail: String,
-    pub keys: Vec<String>,
     pub dispatch: Dispatch,
 }
 
@@ -132,25 +122,20 @@ pub struct Picker {
 
 impl Picker {
     pub fn new(items: Vec<Item>, filter: Filter) -> Self {
+        let haystacks = items.iter().map(haystack).collect();
         let mut picker = Self {
-            items: Vec::new(),
+            items,
             query: String::new(),
             filter,
             selected: 0,
             scroll: 0,
             visible_rows: 0,
             filtered: Vec::new(),
-            haystacks: Vec::new(),
+            haystacks,
             matcher: Matcher::new(Config::DEFAULT),
         };
-        picker.set_items(items);
+        picker.refilter();
         picker
-    }
-
-    pub fn set_items(&mut self, items: Vec<Item>) {
-        self.haystacks = items.iter().map(haystack).collect();
-        self.items = items;
-        self.refilter();
     }
 
     pub fn len(&self) -> usize {
@@ -252,12 +237,11 @@ impl Picker {
 
 fn haystack(item: &Item) -> Utf32String {
     format!(
-        "{} {} {} {} {}",
+        "{} {} {} {}",
         item.title,
         item.subtitle,
         item.detail,
-        item.kind.label(),
-        item.keys.join(" ")
+        item.kind.label()
     )
     .into()
 }
@@ -274,7 +258,6 @@ mod tests {
             title: title.into(),
             subtitle: String::new(),
             detail: String::new(),
-            keys: Vec::new(),
             dispatch: Dispatch::new("test", json!({})),
         }
     }
@@ -283,7 +266,7 @@ mod tests {
     fn fuzzy_search_and_source_filter_compose() {
         let mut picker = Picker::new(
             vec![
-                item(Kind::NativeAction, "Split pane"),
+                item(Kind::Pane, "Split logs"),
                 item(Kind::Workspace, "api"),
                 item(Kind::Agent, "Claude API fixer"),
             ],
@@ -298,21 +281,6 @@ mod tests {
         picker.query = "api".into();
         picker.refilter();
         assert_eq!(picker.row(0).unwrap().title, "api");
-    }
-
-    #[test]
-    fn arriving_items_keep_the_active_query() {
-        let mut picker = Picker::new(vec![item(Kind::Workspace, "api")], Filter::All);
-        picker.query = "split".into();
-        picker.refilter();
-        assert!(picker.is_empty());
-
-        picker.set_items(vec![
-            item(Kind::Workspace, "api"),
-            item(Kind::NativeAction, "Split pane"),
-        ]);
-        assert_eq!(picker.len(), 1);
-        assert_eq!(picker.row(0).unwrap().title, "Split pane");
     }
 
     #[test]

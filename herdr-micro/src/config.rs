@@ -355,8 +355,8 @@ fn parse_action_or_null(value: &Value, label: &str) -> Result<Option<Action>, St
     if value.is_null() {
         Ok(None)
     } else {
-        let action: Action = serde_json::from_value(value.clone())
-            .map_err(|_| format!("{label}.action is invalid"))?;
+        let action: Action =
+            serde_json::from_value(value.clone()).map_err(|error| format!("{label}: {error}"))?;
         validate_action(&action, label)?;
         Ok(Some(action))
     }
@@ -568,14 +568,7 @@ impl Default for Config {
 
 fn parse_config(value: &Value) -> Result<Config, String> {
     let root = object(value, "configuration")?;
-    fields(
-        root,
-        &["version", "controls", "effort", "lighting"],
-        "configuration",
-    )?;
-    if root.get("version") != Some(&Value::from(1)) {
-        return Err("version must be 1".into());
-    }
+    fields(root, &["controls", "effort", "lighting"], "configuration")?;
     Ok(Config {
         controls: parse_controls(req(root, "controls")?)?,
         effort: parse_effort(req(root, "effort")?.clone())?,
@@ -585,7 +578,6 @@ fn parse_config(value: &Value) -> Result<Config, String> {
 
 fn config_json() -> Value {
     serde_json::json!({
-        "version": 1,
         "controls": {
             "buttons": {"1":null,"2":null,"3":{"byAgent":{"codex":{"action":"fast"},"pi":{"action":"fast"},"default":null}},"4":{"action":"prompt","prompt":"/copy","submit":true},"5":null,"6":null,"7":{"action":"submit"}},
             "dial":{"clockwise":{"action":"effort","direction":"raise"},"counterclockwise":{"action":"effort","direction":"lower"},"press":{"action":"prompt","prompt":"/model","submit":true}},
@@ -643,9 +635,6 @@ mod tests {
         let mut rebound = controls.clone();
         rebound.buttons.insert(5, controls.buttons[&7].clone());
         assert_ne!(enabled_buttons(&rebound), enabled_buttons(&controls));
-        let mut wrong_version = config_json();
-        wrong_version["version"] = serde_json::json!(2);
-        assert!(parse_config(&wrong_version).is_err());
         let mut stale = config_json();
         stale["controls"]["actionDeviceKeys"] = serde_json::json!({});
         assert!(parse_config(&stale).is_err());

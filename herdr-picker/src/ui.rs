@@ -21,6 +21,7 @@ pub const ROW_HEIGHT: u16 = 2;
 pub struct Rects {
     pub header: Rect,
     pub body: Rect,
+    pub detail_separator: Rect,
     pub detail: Rect,
     pub footer: Rect,
 }
@@ -33,6 +34,12 @@ pub fn rects(area: Rect) -> Rects {
             area.y.saturating_add(2),
             area.width,
             area.height.saturating_sub(5),
+        ),
+        detail_separator: Rect::new(
+            area.x,
+            area.y.saturating_add(area.height.saturating_sub(3)),
+            area.width,
+            area.height.min(1),
         ),
         detail: Rect::new(
             area.x,
@@ -49,27 +56,21 @@ pub fn rects(area: Rect) -> Rects {
     }
 }
 
-pub fn render(
-    picker: &mut Picker,
-    mode: Mode,
-    spinner_frame: usize,
-    loading: bool,
-    frame: &mut Frame,
-) {
+pub fn render(picker: &mut Picker, mode: Mode, spinner_frame: usize, frame: &mut Frame) {
     let area = frame.area();
     let rects = rects(area);
     picker.visible_rows = (rects.body.height / ROW_HEIGHT) as usize;
     picker.ensure_selection_visible();
 
-    render_header(picker, mode, loading, frame, rects.header);
+    render_header(picker, mode, frame, rects.header);
     frame.render_widget(Separator, Rect::new(area.x, area.y + 1, area.width, 1));
-    render_rows(picker, spinner_frame, loading, frame, rects.body);
-    frame.render_widget(Separator, rects.detail);
+    render_rows(picker, spinner_frame, frame, rects.body);
+    frame.render_widget(Separator, rects.detail_separator);
     render_detail(picker, frame, rects.detail);
     render_footer(mode, frame, rects.footer);
 }
 
-fn render_header(picker: &Picker, mode: Mode, loading: bool, frame: &mut Frame, area: Rect) {
+fn render_header(picker: &Picker, mode: Mode, frame: &mut Frame, area: Rect) {
     let search = SearchLine {
         query: &picker.query,
         placeholder: match mode {
@@ -80,11 +81,7 @@ fn render_header(picker: &Picker, mode: Mode, loading: bool, frame: &mut Frame, 
         focused: mode != Mode::VimNormal,
     };
     let filter = format!("[{}]", picker.filter.label());
-    let count = if loading {
-        format!("loading · {} results ", picker.len())
-    } else {
-        format!("{} results ", picker.len())
-    };
+    let count = format!("{} results ", picker.len());
     let gap = (area.width as usize)
         .saturating_sub(search.line().width() + 2 + width(&filter))
         .saturating_sub(width(&count));
@@ -101,20 +98,9 @@ fn render_header(picker: &Picker, mode: Mode, loading: bool, frame: &mut Frame, 
     }
 }
 
-fn render_rows(
-    picker: &Picker,
-    spinner_frame: usize,
-    loading: bool,
-    frame: &mut Frame,
-    area: Rect,
-) {
+fn render_rows(picker: &Picker, spinner_frame: usize, frame: &mut Frame, area: Rect) {
     if picker.is_empty() {
-        let message = if loading {
-            " Loading…"
-        } else {
-            " No matches"
-        };
-        frame.render_widget(Paragraph::new(message).style(theme::muted()), area);
+        frame.render_widget(Paragraph::new(" No matches").style(theme::muted()), area);
         return;
     }
     let start = picker.scroll.min(picker.len());
@@ -123,10 +109,9 @@ fn render_rows(
         .min(start + (area.height / ROW_HEIGHT) as usize);
     for (visible, index) in (start..end).enumerate() {
         render_row(
-            // start..end is clamped to picker.len(), so the row exists.
             picker.row(index).unwrap(),
             index == picker.selected,
-            matches!(picker.filter, Filter::All | Filter::Actions),
+            picker.filter == Filter::All,
             spinner_frame,
             frame,
             Rect::new(
@@ -161,22 +146,16 @@ fn render_row(
     let prefix_width = left_padding
         + badge.as_deref().map_or(0, width)
         + glyph.map_or(0, |(glyph, _)| width(glyph) + 1);
-    let keys = item.keys.join(", ");
-    let key_width = width(&keys).min((area.width / 3) as usize);
     let title_budget = area
         .width
         .saturating_sub(prefix_width as u16)
-        .saturating_sub(key_width as u16)
-        .saturating_sub(2) as usize;
+        .saturating_sub(1) as usize;
     let title = truncate_end(&item.title, title_budget);
     let gap = area
         .width
         .saturating_sub(prefix_width as u16)
-        .saturating_sub(width(&title) as u16)
-        .saturating_sub(key_width as u16)
-        .saturating_sub(1) as usize;
+        .saturating_sub(width(&title) as u16) as usize;
     let badge_color = match item.kind {
-        Kind::NativeAction | Kind::PluginAction => Color::Magenta,
         Kind::Workspace => Color::Cyan,
         Kind::Tab => Color::Green,
         Kind::Pane => Color::Yellow,
@@ -206,8 +185,6 @@ fn render_row(
             ),
             Span::styled(title, style.add_modifier(Modifier::BOLD)),
             Span::styled(" ".repeat(gap), style),
-            Span::styled(truncate_start(&keys, key_width), style),
-            Span::styled(" ", style),
         ]))
         .style(style),
         Rect::new(area.x, area.y, area.width, 1),
@@ -270,7 +247,7 @@ fn render_footer(mode: Mode, frame: &mut Frame, area: Rect) {
         Paragraph::new(key_hints(&[
             ("enter", "open"),
             (if mode == Mode::VimNormal { "/" } else { "type" }, "search"),
-            ("^A/^W/^T/⌥P/^G", "filter"),
+            ("^W/^T/⌥P/^G", "filter"),
             (movement, "move"),
             ("esc", escape),
         ])),
@@ -292,16 +269,6 @@ fn truncate_end(value: &str, max: usize) -> String {
     format!("{}…", value.unicode_truncate(max).0)
 }
 
-fn truncate_start(value: &str, max: usize) -> String {
-    if width(value) <= max {
-        return value.into();
-    }
-    let Some(max) = max.checked_sub(1) else {
-        return String::new();
-    };
-    format!("…{}", value.unicode_truncate_start(max).0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,36 +279,31 @@ mod tests {
     #[test]
     fn truncation_preserves_graphemes_and_width_budget() {
         assert_eq!(truncate_end("👩‍💻abc", 3), "👩‍💻…");
-        assert_eq!(truncate_start("abc👩‍💻", 3), "…👩‍💻");
         assert_eq!(truncate_end("anything", 0), "");
     }
 
     #[test]
+    fn detail_separator_has_its_own_row() {
+        let rects = rects(Rect::new(0, 0, 80, 20));
+        assert_eq!(rects.detail_separator.y + 1, rects.detail.y);
+    }
+
+    #[test]
     fn agent_status_glyphs_cover_known_and_future_statuses() {
-        assert_eq!(
-            agent_status_glyph(Some(&"blocked".into()), 1),
-            ("◉", Color::Red)
-        );
-        assert_eq!(
-            agent_status_glyph(Some(&"done".into()), 1),
-            ("●", Color::Cyan)
-        );
-        assert_eq!(
-            agent_status_glyph(Some(&"working".into()), 0),
-            ("⠼", Color::Yellow)
-        );
-        assert_eq!(
-            agent_status_glyph(Some(&"working".into()), 1),
-            ("⠴", Color::Yellow)
-        );
-        assert_eq!(
-            agent_status_glyph(Some(&"idle".into()), 1),
-            ("✓", Color::Green)
-        );
-        assert_eq!(
-            agent_status_glyph(Some(&"future".into()), 1),
-            ("○", Color::DarkGray)
-        );
+        for (status, frame, expected) in [
+            ("blocked", 1, ("◉", Color::Red)),
+            ("done", 1, ("●", Color::Cyan)),
+            ("working", 0, ("⠼", Color::Yellow)),
+            ("working", 1, ("⠴", Color::Yellow)),
+            ("idle", 1, ("✓", Color::Green)),
+            ("future", 1, ("○", Color::DarkGray)),
+        ] {
+            assert_eq!(
+                agent_status_glyph(Some(&status.into()), frame),
+                expected,
+                "{status} frame {frame}"
+            );
+        }
     }
 
     #[test]
@@ -352,7 +314,6 @@ mod tests {
             title: "title".into(),
             subtitle: "subtitle".into(),
             detail: String::new(),
-            keys: Vec::new(),
             dispatch: Dispatch::new("test", json!({})),
         };
         let mut terminal = Terminal::new(TestBackend::new(20, ROW_HEIGHT)).unwrap();

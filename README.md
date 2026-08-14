@@ -4,22 +4,20 @@ Independent plugins for [Herdr](https://herdr.dev/).
 
 | Plugin | Description |
 | --- | --- |
-| [command-palette](command-palette) | Fuzzy actions, keybindings, workspaces, tabs, panes, and agents, plus an attention-ranked Agents view |
+| [herdr-picker](herdr-picker) | Fuzzy workspaces, tabs, panes, and agents, plus an attention-ranked Agents view |
 | [equalize-splits](equalize-splits) | Automatically equalize pane sizes after splitting |
 | [fork-to-pane](fork-to-pane) | Fork the focused Pi, Codex, or Claude Code session into a new pane |
 | [history](history) | Vim-style back/forward focus history |
 | [herdr-micro](herdr-micro) | Control Herdr from a Work Louder Codex Micro |
-| [popup-terminal](popup-terminal) | Native popup shell in the focused pane's working directory |
 
 Install only the plugin you want:
 
 ```sh
-herdr plugin install gjermundgaraba/herdr-plugins/command-palette
+herdr plugin install gjermundgaraba/herdr-plugins/herdr-picker
 herdr plugin install gjermundgaraba/herdr-plugins/equalize-splits
 herdr plugin install gjermundgaraba/herdr-plugins/fork-to-pane
 herdr plugin install gjermundgaraba/herdr-plugins/history
 herdr plugin install gjermundgaraba/herdr-plugins/herdr-micro
-herdr plugin install gjermundgaraba/herdr-plugins/popup-terminal
 ```
 
 For local development:
@@ -28,12 +26,11 @@ Build each plugin using its README before linking it. `herdr plugin link` only
 registers the working tree; it does not run manifest `[[build]]` commands.
 
 ```sh
-herdr plugin link "$PWD/command-palette"
+herdr plugin link "$PWD/herdr-picker"
 herdr plugin link "$PWD/equalize-splits"
 herdr plugin link "$PWD/fork-to-pane"
 herdr plugin link "$PWD/history"
 herdr plugin link "$PWD/herdr-micro"
-herdr plugin link "$PWD/popup-terminal"
 ```
 
 Each plugin directory above is independent and has its own `herdr-plugin.toml`.
@@ -44,14 +41,14 @@ The flake builds each plugin independently with the Rust version in
 `rust-toolchain.toml` and the committed `Cargo.lock`:
 
 ```sh
-nix build .#command-palette
-herdr plugin link "$(nix path-info .#command-palette)/command-palette"
+nix build .#herdr-picker
+herdr plugin link "$(nix path-info .#herdr-picker)/herdr-picker"
 ```
 
-The other package names are `equalize-splits`, `history`, `popup-terminal`, and
+The other package names are `equalize-splits`, `fork-to-pane`, `history`, and
 `herdr-micro`. The last package is exposed only on macOS, matching its plugin
-manifest; the others support Linux and macOS. Every package contains a complete,
-prebuilt plugin root, so linking it never invokes Cargo.
+manifest; the others support Linux and macOS. Every package contains a
+complete, prebuilt plugin root, so linking it never invokes Cargo.
 
 For Home Manager, keep the package in the profile so its Nix store path remains
 live, then register that immutable plugin root after the profile is written:
@@ -66,15 +63,15 @@ Then pass the flake inputs to this Home Manager module:
 { config, inputs, lib, pkgs, ... }:
 let
   plugin =
-    inputs.herdr-plugins.packages.${pkgs.stdenv.hostPlatform.system}.command-palette;
+    inputs.herdr-plugins.packages.${pkgs.stdenv.hostPlatform.system}.herdr-picker;
 in
 {
   home.packages = [ plugin ];
 
-  home.activation.linkHerdrCommandPalette =
+  home.activation.linkHerdrPicker =
     lib.hm.dag.entryAfter [ "writeBoundary" ] ''
       run ${config.home.profileDirectory}/bin/herdr plugin link \
-        ${plugin}/command-palette
+        ${plugin}/herdr-picker
     '';
 }
 ```
@@ -85,7 +82,7 @@ path. Nix reuses an unchanged package from the local store on later activations,
 so there is no activation-time Rust compilation and no binary cache is required.
 
 Each package's filtered source contains its full local path-dependency closure:
-the plugin crate and `sdk/rust`, plus `sdk/ratatui` for `command-palette` and the
+the plugin crate and `sdk/rust`, plus `sdk/ratatui` for `herdr-picker` and the
 entire `herdr-micro` tree (including `codex-micro`) for `herdr-micro`. Consequently,
 editing one plugin does not invalidate unrelated plugin outputs, while edits to a
 shared SDK invalidate packages that include it.

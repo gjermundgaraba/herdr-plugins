@@ -1,11 +1,11 @@
 [package]
-name = "herdr-command-palette"
-version = "0.2.0"
+name = "herdr-picker"
+version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "Fuzzy command and navigation palette for Herdr"
+description = "Fuzzy resource picker for Herdr"
 repository.workspace = true
 
 [dependencies]

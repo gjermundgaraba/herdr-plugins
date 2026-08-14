@@ -1,0 +1,35 @@
+id = "gjermundgaraba.herdr-picker"
+name = "herdr-picker"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Fuzzy picker for Herdr workspaces, tabs, panes, and agents"
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["cargo", "build", "--release", "--locked"]
+
+[[actions]]
+id = "open"
+title = "Picker"
+description = "Search workspaces, tabs, panes, and agents"
+command = ["../target/release/herdr-picker"]
+
+[[actions]]
+id = "agents"
+title = "Agents"
+description = "Attention-ranked agent picker"
+command = ["../target/release/herdr-picker"]
+
+[[actions]]
+id = "workspaces"
+title = "Workspaces"
+description = "Workspace picker"
+command = ["../target/release/herdr-picker"]
+
+[[panes]]
+id = "picker"
+title = "herdr picker"
+placement = "popup"
+width = "88%"
+height = "80%"
+command = ["../target/release/herdr-picker"]

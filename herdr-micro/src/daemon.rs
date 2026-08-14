@@ -2,15 +2,16 @@
 //! Herdr parsing, gestures, and macOS operations live in their small modules.
 
 use anyhow::{Result, anyhow, bail};
-use herdr_client::{AgentInfo, SessionSnapshot};
+use herdr_client::{AgentInfo, Client, SessionSnapshot, open_rotating_log};
 use serde_json::{Value, json};
 use signal_hook::consts::{SIGINT, SIGTERM};
+use std::io::Write;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        Arc, Mutex,
+        Arc, LazyLock, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError},
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -54,12 +55,22 @@ const NO_SESSIONS_SHUTDOWN: Duration = Duration::from_secs(60);
 const WORK_QUEUE_CAPACITY: usize = 16;
 pub const DAEMON_PROTOCOL_VERSION: u32 = 2;
 
-fn log(message: impl AsRef<str>) {
-    eprintln!(
+static LOG_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+pub fn log(message: impl AsRef<str>) {
+    let _guard = LOG_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let line = format!(
         "{} {}",
         format_timestamp(SystemTime::now()),
         message.as_ref()
     );
+    if let Ok(path) = crate::control::log_file()
+        && let Ok(mut file) = open_rotating_log(&path, 10 << 20, 3)
+        && writeln!(file, "{line}").is_ok()
+    {
+        return;
+    }
+    eprintln!("{line}");
 }
 
 fn format_timestamp(time: SystemTime) -> String {
@@ -89,6 +100,7 @@ struct State {
     session_agents: HashMap<String, Vec<AgentInfo>>,
     mappings: Vec<SessionTerminalMapping>,
     selected_session: Option<String>,
+    routing_verified: bool,
     routing_ready: bool,
     routing_generation: Arc<AtomicU64>,
     session_slots: HashMap<String, Vec<Option<String>>>,
@@ -157,6 +169,11 @@ impl State {
     }
 
     fn revoke_routing(&mut self) {
+        self.routing_verified = false;
+        self.invalidate_routing();
+    }
+
+    fn invalidate_routing(&mut self) {
         if self.routing_ready {
             self.routing_ready = false;
             self.routing_generation.fetch_add(1, Ordering::AcqRel);
@@ -220,6 +237,7 @@ enum Work {
     },
     FocusSlot {
         pane_id: String,
+        agent_terminal_id: String,
         source: String,
         session: Session,
         terminal: String,
@@ -322,6 +340,10 @@ struct DispatchLease<'a> {
 }
 
 impl DispatchLease<'_> {
+    fn client(&self) -> Client {
+        self.session.client()
+    }
+
     fn ensure(&self) -> Result<String> {
         if self.generation != self.routing_generation.load(Ordering::Acquire) {
             bail!("stale Herdr routing")
@@ -376,7 +398,6 @@ fn execute_scroll(
         percent,
     )?;
     let cell = lease
-        .session
         .client()
         .call_value("pane.graphics.info", &json!({ "pane_id": expected_pane }))?;
     let cell_width = cell
@@ -415,7 +436,7 @@ fn execute_action(
     repeat: usize,
     lease: &DispatchLease<'_>,
 ) -> Result<bool> {
-    let client = lease.session.client();
+    let client = lease.client();
     match action {
         Action::Prompt { prompt, submit } => {
             let current = ready_agent(current)?;
@@ -516,7 +537,8 @@ fn action_worker(
             .unwrap_or_else(|| receiver.recv_timeout(Duration::from_millis(50)))
         {
             Ok(work) => work,
-            Err(_) => continue,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
         };
         let mut repeat = 1;
         while let Ok(next) = receiver.try_recv() {
@@ -563,17 +585,21 @@ fn action_worker(
         let result = match work {
             Work::FocusSlot {
                 pane_id,
+                agent_terminal_id,
                 source,
                 session,
                 ..
             } => {
-                let result = if snapshot.agents.iter().any(|agent| agent.pane_id == pane_id) {
-                    lease
-                        .ensure()
-                        .and_then(|_| focus_agent(&session_info.client(), &pane_id))
-                } else {
-                    Err(anyhow!("Agent slot pane disappeared"))
-                };
+                let result =
+                    if snapshot.agents.iter().any(|agent| {
+                        agent.pane_id == pane_id && agent.terminal_id == agent_terminal_id
+                    }) {
+                        lease
+                            .ensure()
+                            .and_then(|_| focus_agent(&lease.client(), &pane_id))
+                    } else {
+                        Err(anyhow!("Agent slot pane disappeared"))
+                    };
                 if result.is_ok() {
                     log(format!("{source}: focused {}/{pane_id}", session.name));
                 }
@@ -776,6 +802,7 @@ fn handle_device_event(
                         (Some((session, terminal)), Some(agent)) => {
                             let work = Work::FocusSlot {
                                 pane_id: agent.pane_id.clone(),
+                                agent_terminal_id: agent.terminal_id.clone(),
                                 source: key,
                                 session,
                                 terminal,
@@ -1008,12 +1035,8 @@ fn select_session(
     if state.selected_session == next {
         return Ok(());
     }
-    state.routing_ready = false;
-    state.routing_generation.fetch_add(1, Ordering::AcqRel);
+    reset_selected_route(state);
     state.selected_session = next;
-    state.agents.clear();
-    state.slots.fill(None);
-    state.last_lighting.clear();
     if let Some(device) = device {
         send_lighting(device, state)?;
     }
@@ -1023,6 +1046,13 @@ fn select_session(
         .map(|session| format!("Herdr session selected: {session}"))
         .unwrap_or_else(|| "Herdr session unselected".into()));
     Ok(())
+}
+
+fn reset_selected_route(state: &mut State) {
+    state.revoke_routing();
+    state.agents.clear();
+    state.slots.fill(None);
+    state.last_lighting.clear();
 }
 
 fn routing_failure(state: &mut State, message: impl Into<String>) {
@@ -1057,38 +1087,23 @@ fn refresh_sessions(
         state.no_sessions_at = None;
     }
     let changed = discovered != state.sessions;
-    let names: HashSet<_> = discovered
-        .iter()
-        .map(|session| session.name.as_str())
-        .collect();
-    workers.retain(|name, _| names.contains(name.as_str()));
-    for session in &discovered {
-        let replace = !workers.contains_key(&session.name)
-            || state
-                .sessions
-                .iter()
-                .find(|current| current.name == session.name)
-                != Some(session);
-        if replace {
-            state.session_agents.remove(&session.name);
-            *worker_generation += 1;
-            workers.insert(
-                session.name.clone(),
-                spawn_session_worker(
-                    session.clone(),
-                    *worker_generation,
-                    updates.clone(),
-                    Arc::clone(stopping),
-                ),
-            );
+    let selected = state.selected_session.as_deref();
+    let previous_selected =
+        selected.and_then(|name| state.sessions.iter().find(|session| session.name == name));
+    let discovered_selected =
+        selected.and_then(|name| discovered.iter().find(|session| session.name == name));
+    let selected_changed = previous_selected != discovered_selected;
+    if selected_changed {
+        workers.clear();
+        state.session_agents.clear();
+        state.session_slots.clear();
+        if previous_selected.is_some() && discovered_selected.is_some() {
+            reset_selected_route(state);
+            if let Some(device) = device {
+                send_lighting(device, state)?;
+            }
         }
     }
-    state
-        .session_agents
-        .retain(|name, _| names.contains(name.as_str()));
-    state
-        .session_slots
-        .retain(|name, _| names.contains(name.as_str()));
     state.sessions = discovered;
     if state
         .selected_session
@@ -1097,13 +1112,7 @@ fn refresh_sessions(
     {
         select_session(device, state, None)?;
     }
-    if state
-        .selected_session
-        .as_ref()
-        .is_some_and(|name| !state.session_agents.contains_key(name))
-    {
-        apply_selected_agents(state, device)?;
-    }
+    sync_selected_worker(state, workers, worker_generation, updates, stopping);
     if changed {
         state.mappings.clear();
         refresh_mappings(state);
@@ -1111,6 +1120,41 @@ fn refresh_sessions(
     Ok(state
         .no_sessions_at
         .is_some_and(|at| now.duration_since(at) >= NO_SESSIONS_SHUTDOWN))
+}
+
+fn sync_selected_worker(
+    state: &mut State,
+    workers: &mut HashMap<String, SessionWorker>,
+    worker_generation: &mut u64,
+    updates: &Sender<SessionUpdate>,
+    stopping: &Arc<AtomicBool>,
+) {
+    workers.retain(|name, _| state.selected_session.as_deref() == Some(name));
+    state
+        .session_agents
+        .retain(|name, _| state.selected_session.as_deref() == Some(name));
+    state
+        .session_slots
+        .retain(|name, _| state.selected_session.as_deref() == Some(name));
+    let Some(session) = state
+        .selected_session
+        .as_ref()
+        .and_then(|name| state.sessions.iter().find(|session| session.name == *name))
+    else {
+        return;
+    };
+    if !workers.contains_key(&session.name) {
+        *worker_generation += 1;
+        workers.insert(
+            session.name.clone(),
+            spawn_session_worker(
+                session.clone(),
+                *worker_generation,
+                updates.clone(),
+                Arc::clone(stopping),
+            ),
+        );
+    }
 }
 
 fn refresh_mappings(state: &mut State) {
@@ -1202,11 +1246,13 @@ fn refresh_routing(state: &mut State, device: Option<&HidClient>) -> Result<bool
                 state,
                 automatic_layer(Some(&frontmost_process), Some(&session)),
             )?;
+            state.routing_verified = true;
             state.last_routing_error.clear();
             apply_selected_agents(state, device)?;
             return Ok(terminal_changed || previous_layer != state.active_layer);
         }
         Err(error) => {
+            state.focused_terminal = None;
             routing_failure(state, error.to_string());
             state.revoke_routing();
         }
@@ -1232,7 +1278,7 @@ fn apply_selected_agents(state: &mut State, device: Option<&HidClient>) -> Resul
             if agent_identity(state.agents.iter().find(|agent| agent.focused))
                 != agent_identity(agents.iter().find(|agent| agent.focused))
             {
-                state.revoke_routing();
+                state.invalidate_routing();
             }
             let previous = state
                 .session_slots
@@ -1253,7 +1299,7 @@ fn apply_selected_agents(state: &mut State, device: Option<&HidClient>) -> Resul
             let had_state = state.routing_ready
                 || !state.agents.is_empty()
                 || state.slots.iter().any(Option::is_some);
-            state.revoke_routing();
+            state.invalidate_routing();
             state.agents.clear();
             state.slots.fill(None);
             if had_state {
@@ -1293,14 +1339,7 @@ fn apply_session_update(
             session, agents, ..
         } => {
             state.session_agents.insert(session.clone(), agents);
-            if state.routing_ready
-                && state.owner.is_none()
-                && state.selected_session.as_deref() == Some(&session)
-                && state
-                    .frontmost
-                    .as_ref()
-                    .is_some_and(|frontmost| frontmost.process == GHOSTTY_PROCESS)
-            {
+            if session_route_is_verified(state, &session) {
                 state.last_herdr_error.clear();
                 apply_selected_agents(state, device)?;
             }
@@ -1318,6 +1357,10 @@ fn apply_session_update(
             Ok(became_unavailable)
         }
     }
+}
+
+fn session_route_is_verified(state: &State, session: &str) -> bool {
+    state.routing_verified && state.selected_session.as_deref() == Some(session)
 }
 
 fn refresh_frontmost(state: &mut State) -> bool {
@@ -1570,9 +1613,11 @@ pub fn run_daemon() -> Result<()> {
         Arc::clone(&stopping),
     )?;
     let (shutdown_tx, shutdown_rx) = mpsc::channel();
+    let (control_result_tx, control_result_rx) = mpsc::sync_channel(1);
     let control_thread = thread::spawn(move || {
-        let _ = server.run_with_shutdown(&shutdown_rx);
+        let _ = control_result_tx.send(server.run_with_shutdown(&shutdown_rx));
     });
+    let mut control_error = None;
     let mut device = None;
     let mut routing_due = Instant::now();
     let mut config_due = Instant::now();
@@ -1582,6 +1627,24 @@ pub fn run_daemon() -> Result<()> {
     let mut worker_generation = 0;
     log("bridge started");
     while !stopping.load(Ordering::Acquire) {
+        match control_result_rx.try_recv() {
+            Ok(Ok(())) => {
+                control_error = Some("Micro control server stopped unexpectedly".into());
+                stopping.store(true, Ordering::Release);
+                continue;
+            }
+            Ok(Err(error)) => {
+                control_error = Some(format!("Micro control server failed: {error:#}"));
+                stopping.store(true, Ordering::Release);
+                continue;
+            }
+            Err(TryRecvError::Disconnected) => {
+                control_error = Some("Micro control server thread disconnected".into());
+                stopping.store(true, Ordering::Release);
+                continue;
+            }
+            Err(TryRecvError::Empty) => {}
+        }
         let mut changed = false;
         while let Ok(error) = input_notice_rx.try_recv() {
             changed |= handle_input_disconnect(&mut state, &mut device, error);
@@ -1667,6 +1730,13 @@ pub fn run_daemon() -> Result<()> {
                         log(format!("refresh failed: {error:#}"));
                     }
                 }
+                sync_selected_worker(
+                    &mut state,
+                    &mut session_workers,
+                    &mut worker_generation,
+                    &session_update_tx,
+                    &stopping,
+                );
                 match open_device(&mut device, &device_tx, &mut state) {
                     Ok(device_changed) => changed |= device_changed,
                     Err(error) => {
@@ -1735,7 +1805,10 @@ pub fn run_daemon() -> Result<()> {
     let _ = worker.join();
     let _ = shutdown_tx.send(());
     let _ = control_thread.join();
-    Ok(())
+    match control_error {
+        Some(error) => Err(anyhow!(error)),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -1876,6 +1949,36 @@ mod tests {
     }
 
     #[test]
+    fn resetting_selected_route_revokes_published_identities() {
+        let mut state = State::new(Config::default());
+        state.selected_session = Some("work".into());
+        state.sessions = vec![session("work")];
+        state.routing_verified = true;
+        state.routing_ready = true;
+        state.agents = vec![agent("terminal", "pane", "codex")];
+        state.slots[0] = Some("terminal".into());
+        let queued = state.routing_generation();
+        let replacement = Session {
+            name: "work".into(),
+            socket_path: "/tmp/replacement.sock".into(),
+        };
+
+        let previous = state.sessions.iter().find(|session| session.name == "work");
+        let discovered = [replacement];
+        let replacement = discovered.iter().find(|session| session.name == "work");
+        assert_ne!(previous, replacement);
+        if previous.is_some() && replacement.is_some() {
+            reset_selected_route(&mut state);
+        }
+
+        assert!(!state.routing_verified);
+        assert!(!state.routing_ready);
+        assert_ne!(queued, state.routing_generation());
+        assert!(state.agents.is_empty());
+        assert!(state.slots.iter().all(Option::is_none));
+    }
+
+    #[test]
     fn selected_session_requires_a_live_snapshot() {
         let mut state = State::new(Config::default());
         state.selected_session = Some("work".into());
@@ -1889,6 +1992,35 @@ mod tests {
         apply_selected_agents(&mut state, None).unwrap();
         assert!(!state.routing_ready);
         assert!(state.agents.is_empty());
+    }
+
+    #[test]
+    fn agent_updates_require_a_verified_terminal_route() {
+        let mut state = State::new(Config::default());
+        state.selected_session = Some("work".into());
+        state.focused_terminal = Some("terminal".into());
+        state.frontmost = Some(macos::Frontmost {
+            app_name: "Ghostty".into(),
+            process: GHOSTTY_PROCESS.into(),
+            pid: 1,
+            title: String::new(),
+        });
+        let stopping = Arc::new(AtomicBool::new(true));
+        let (updates, _) = mpsc::channel();
+        let worker = spawn_session_worker(session("work"), 7, updates, stopping);
+        let workers = HashMap::from([("work".into(), worker)]);
+        let update = || SessionUpdate::Agents {
+            session: "work".into(),
+            generation: 7,
+            agents: vec![agent("terminal", "pane", "codex")],
+        };
+
+        apply_session_update(&mut state, update(), &workers, None).unwrap();
+        assert!(!state.routing_ready);
+
+        state.routing_verified = true;
+        apply_session_update(&mut state, update(), &workers, None).unwrap();
+        assert!(state.routing_ready);
     }
 
     #[test]

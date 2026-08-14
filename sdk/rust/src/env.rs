@@ -6,27 +6,20 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-use crate::{EventEnvelope, PluginInvocationContext};
+use crate::EventEnvelope;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Environment {
     pub is_herdr: bool,
     pub socket_path: Option<PathBuf>,
-    pub bin_path: Option<PathBuf>,
     pub plugin_id: Option<String>,
-    pub plugin_root: Option<PathBuf>,
     pub plugin_config_dir: Option<PathBuf>,
     pub plugin_state_dir: Option<PathBuf>,
-    pub context: Option<PluginInvocationContext>,
-    pub workspace_id: Option<String>,
-    pub tab_id: Option<String>,
-    pub pane_id: Option<String>,
     pub action_id: Option<String>,
     pub event_name: Option<String>,
     pub event: Option<EventEnvelope>,
     pub entrypoint_id: Option<String>,
-    pub clicked_url: Option<String>,
-    pub link_handler_id: Option<String>,
+    pub pane_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -45,21 +38,14 @@ impl Environment {
         Ok(Self {
             is_herdr: string_var("HERDR_ENV").as_deref() == Some("1"),
             socket_path: path_var("HERDR_SOCKET_PATH"),
-            bin_path: path_var("HERDR_BIN_PATH"),
             plugin_id: string_var("HERDR_PLUGIN_ID"),
-            plugin_root: path_var("HERDR_PLUGIN_ROOT"),
             plugin_config_dir: path_var("HERDR_PLUGIN_CONFIG_DIR"),
             plugin_state_dir: path_var("HERDR_PLUGIN_STATE_DIR"),
-            context: json_var("HERDR_PLUGIN_CONTEXT_JSON")?,
-            workspace_id: string_var("HERDR_WORKSPACE_ID"),
-            tab_id: string_var("HERDR_TAB_ID"),
-            pane_id: string_var("HERDR_PANE_ID"),
             action_id: string_var("HERDR_PLUGIN_ACTION_ID"),
             event_name: string_var("HERDR_PLUGIN_EVENT"),
             event: json_var("HERDR_PLUGIN_EVENT_JSON")?,
             entrypoint_id: string_var("HERDR_PLUGIN_ENTRYPOINT_ID"),
-            clicked_url: string_var("HERDR_PLUGIN_CLICKED_URL"),
-            link_handler_id: string_var("HERDR_PLUGIN_LINK_HANDLER_ID"),
+            pane_id: string_var("HERDR_PANE_ID"),
         })
     }
 
@@ -82,7 +68,6 @@ impl Environment {
         }
         Ok(PluginPaths {
             plugin_id: required(&self.plugin_id, "HERDR_PLUGIN_ID")?.clone(),
-            root_dir: required(&self.plugin_root, "HERDR_PLUGIN_ROOT")?.clone(),
             config_dir: required(&self.plugin_config_dir, "HERDR_PLUGIN_CONFIG_DIR")?.clone(),
             state_dir: required(&self.plugin_state_dir, "HERDR_PLUGIN_STATE_DIR")?.clone(),
         })
@@ -92,7 +77,6 @@ impl Environment {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginPaths {
     pub plugin_id: String,
-    pub root_dir: PathBuf,
     pub config_dir: PathBuf,
     pub state_dir: PathBuf,
 }
@@ -119,6 +103,32 @@ impl PluginPaths {
     }
 }
 
+pub fn socket_scope_dir(base: &Path, socket_path: &Path) -> PathBuf {
+    let mut key = String::new();
+    for byte in socket_path_bytes(socket_path) {
+        use fmt::Write as _;
+        let _ = write!(&mut key, "{byte:02x}");
+    }
+    base.join(key)
+}
+
+#[cfg(unix)]
+fn socket_path_bytes(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(windows)]
+fn socket_path_bytes(path: &Path) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt;
+
+    path.as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PluginEnvironmentError {
     NotInHerdr,
@@ -143,52 +153,6 @@ fn required<'a, T>(
     value
         .as_ref()
         .ok_or(PluginEnvironmentError::Missing(variable))
-}
-
-pub fn host_config_path() -> PathBuf {
-    resolve_host_config_path(
-        std::env::var("HERDR_CONFIG_PATH").ok(),
-        std::env::var("XDG_CONFIG_HOME").ok(),
-        platform_config_dir(),
-    )
-}
-
-fn resolve_host_config_path(
-    explicit: Option<String>,
-    xdg_config_home: Option<String>,
-    platform_dir: PathBuf,
-) -> PathBuf {
-    explicit.map(PathBuf::from).unwrap_or_else(|| {
-        xdg_config_home
-            .map(PathBuf::from)
-            .unwrap_or(platform_dir)
-            .join("herdr/config.toml")
-    })
-}
-
-#[cfg(windows)]
-fn platform_config_dir() -> PathBuf {
-    std::env::var("APPDATA")
-        .map(PathBuf::from)
-        .or_else(|_| {
-            std::env::var("USERPROFILE")
-                .map(PathBuf::from)
-                .map(|profile| profile.join("AppData/Roaming"))
-        })
-        .or_else(|_| {
-            std::env::var("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join(".config"))
-        })
-        .unwrap_or_else(|_| std::env::temp_dir())
-}
-
-#[cfg(not(windows))]
-fn platform_config_dir() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(".config"))
-        .unwrap_or_else(|_| std::env::temp_dir())
 }
 
 /// Open an append-only private log, rotating it when it reaches `max_bytes`.
@@ -307,7 +271,9 @@ fn string_var(name: &str) -> Option<String> {
 }
 
 fn path_var(name: &str) -> Option<PathBuf> {
-    string_var(name).map(PathBuf::from)
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 fn json_var<T: serde::de::DeserializeOwned>(
@@ -326,27 +292,6 @@ fn json_var<T: serde::de::DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn resolves_config_path_precedence() {
-        let platform = PathBuf::from("/platform");
-        assert_eq!(
-            resolve_host_config_path(
-                Some("/explicit".into()),
-                Some("/xdg".into()),
-                platform.clone()
-            ),
-            PathBuf::from("/explicit")
-        );
-        assert_eq!(
-            resolve_host_config_path(None, Some("/xdg".into()), platform.clone()),
-            PathBuf::from("/xdg/herdr/config.toml")
-        );
-        assert_eq!(
-            resolve_host_config_path(None, None, platform),
-            PathBuf::from("/platform/herdr/config.toml")
-        );
-    }
 
     #[test]
     fn classifies_plugin_invocations() {
@@ -396,7 +341,6 @@ mod tests {
             Err(PluginEnvironmentError::Missing("HERDR_PLUGIN_ID"))
         );
         environment.plugin_id = Some("example.plugin".into());
-        environment.plugin_root = Some("/plugin".into());
         environment.plugin_config_dir = Some("/config".into());
         environment.plugin_state_dir = Some("/state".into());
         let paths = environment.require_plugin().unwrap();
@@ -408,6 +352,20 @@ mod tests {
         assert_eq!(paths.cache_dir(), PathBuf::from("/state/cache"));
         assert_eq!(paths.run_dir(), PathBuf::from("/state/run"));
         assert_eq!(paths.logs_dir(), PathBuf::from("/state/logs"));
+    }
+
+    #[test]
+    fn socket_scopes_are_stable_and_isolated() {
+        let first = socket_scope_dir(Path::new("/state"), Path::new("/sessions/one.sock"));
+        assert_eq!(
+            first,
+            socket_scope_dir(Path::new("/state"), Path::new("/sessions/one.sock"))
+        );
+        assert_ne!(
+            first,
+            socket_scope_dir(Path::new("/state"), Path::new("/sessions/two.sock"))
+        );
+        assert_eq!(first.parent(), Some(Path::new("/state")));
     }
 
     #[test]

@@ -21,11 +21,23 @@ cargo build --release --locked
 herdr plugin link /path/to/herdr-plugins/history
 ```
 
+Startup is automatic with a new Herdr server. When installing, linking, or
+enabling the plugin on a server that is already running, start history before
+changing focus:
+
+```sh
+herdr plugin action invoke gjermundgaraba.herdr-history.activate
+```
+
+Run that once in each active Herdr session. Back/forward deliberately refuse to
+create a late, incomplete history.
+
 Then bind keys in `~/.config/herdr/config.toml` (there is no plugin key registration
 in Herdr's plugin API v1). `prefix+o` is Herdr's default `open_notification_target`,
 so free it first — a conflicting `[[keys.command]]` is silently disabled otherwise:
 
 ```toml
+[keys]
 open_notification_target = ""
 
 [[keys.command]]
@@ -41,26 +53,32 @@ command = "gjermundgaraba.herdr-history.forward"
 description = "History forward"
 ```
 
-Reload with `herdr server reload-config`. Requires Herdr >= 0.8.0 and Rust >= 1.89
-to install. The installed plugin has no runtime language dependency.
+Reload with `herdr server reload-config`. Requires Herdr >= 0.8.0 (socket
+protocol 19) and Rust >= 1.89 to install. The installed plugin has no runtime
+language dependency.
 
 ## How it works
 
-A `pane.focused` event hook records pane ids into a locked JSON file under
-`HERDR_PLUGIN_STATE_DIR`; back/forward call the socket method `pane.focus`, which
-switches workspace and tab automatically. Focus events caused by the plugin's own
-jumps carry no origin marker, so each jump pre-registers its target as an expected
-"echo" that the next record consumes instead of recording. History resets when the
-server socket identity changes, because pane ids recycle across server restarts.
-Concurrent Herdr sessions use separate state files and locks keyed by socket path.
+A small per-session daemon is the only history writer. It seeds from a
+`session.snapshot`, then consumes Herdr's ordered retained `pane.focused`
+stream. The snapshot's focused pane is used as the replay boundary when a
+dropped stream reconnects. Herdr 0.8.0 exposes no exact snapshot cursor, so
+activation on an already-running server intentionally starts at its current
+pane; activate before changing focus as described above.
+
+Back/forward commands are serialized through the same daemon and call
+`pane.focus`, which switches workspace and tab automatically. Rebinding the
+server socket resets history because pane ids may recycle; reconnect failures
+are logged once per outage. Concurrent Herdr sessions use separate
+in-memory histories and control sockets keyed by Herdr socket path and
+executable identity. Rebuilt daemons retire themselves instead of continuing
+to run stale code.
 
 ## Development
 
 ```sh
 cargo test                                                 # pure history logic
 cargo build --release --locked                             # linked executable
+herdr plugin action invoke gjermundgaraba.herdr-history.activate
 herdr plugin log list --plugin gjermundgaraba.herdr-history  # per-invocation logs
 ```
-
-By default, state lives under
-`~/.local/state/herdr/plugins/gjermundgaraba.herdr-history/data/sessions/`.

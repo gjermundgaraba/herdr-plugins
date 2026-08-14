@@ -7,7 +7,6 @@ use std::{
     collections::HashMap,
     fs, io,
     process::ExitCode,
-    sync::mpsc::{Receiver, TryRecvError},
     time::{Duration, Instant},
 };
 
@@ -27,7 +26,6 @@ enum Mode {
 }
 
 const SPINNER_TICK: Duration = Duration::from_millis(100);
-const SOURCE_POLL: Duration = Duration::from_millis(15);
 fn main() -> ExitCode {
     if let Some(code) = dispatch::maybe_run_worker() {
         return code;
@@ -35,24 +33,19 @@ fn main() -> ExitCode {
     if let Some(code) = maybe_open_action() {
         return code;
     }
-    let environment = match Environment::load() {
-        Ok(environment) => environment,
-        Err(error) => return fail_visibly(&error.to_string()),
-    };
-    let plugin = match environment.require_plugin() {
-        Ok(plugin) => plugin,
-        Err(error) => return fail_visibly(&error.to_string()),
-    };
     let client = match herdr_client::Client::from_env() {
         Ok(client) => client,
         Err(error) => return fail_visibly(&error.to_string()),
     };
-    let sources = sources::spawn(client, plugin.plugin_id);
+    let items = match sources::load(&client) {
+        Ok(items) => items,
+        Err(error) => return fail_visibly(&error),
+    };
     let filter = match initial_filter() {
         Ok(filter) => filter,
         Err(error) => return fail_visibly(&error),
     };
-    let mut picker = Picker::new(Vec::new(), filter);
+    let mut picker = Picker::new(items, filter);
     let mut mode = match initial_mode() {
         Ok(mode) => mode,
         Err(error) => return fail_visibly(&error),
@@ -60,7 +53,7 @@ fn main() -> ExitCode {
 
     let mut terminal = ratatui::init();
     let _ = crossterm::execute!(io::stdout(), EnableMouseCapture);
-    let selection = run(&mut terminal, &mut picker, &mut mode, &sources);
+    let selection = run(&mut terminal, &mut picker, &mut mode);
     let _ = crossterm::execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
 
@@ -113,17 +106,17 @@ fn maybe_open_action() -> Option<ExitCode> {
         .and_then(|client| client.call_value("plugin.pane.open", &params));
     Some(match result {
         Ok(_) => ExitCode::SUCCESS,
-        Err(error) => fail_visibly(&format!("failed to open palette: {error}")),
+        Err(error) => fail_visibly(&format!("failed to open picker: {error}")),
     })
 }
 
 fn open_params(plugin_id: &str, filter: Option<&str>, mode: Mode) -> serde_json::Value {
     let mut env = serde_json::Map::new();
     if let Some(filter) = filter {
-        env.insert("HERDR_COMMAND_PALETTE_FILTER".into(), filter.into());
+        env.insert("HERDR_PICKER_FILTER".into(), filter.into());
     }
     env.insert(
-        "HERDR_COMMAND_PALETTE_MODE".into(),
+        "HERDR_PICKER_MODE".into(),
         match mode {
             Mode::Direct => "direct".into(),
             Mode::VimNormal | Mode::VimSearch => "vim".into(),
@@ -131,7 +124,7 @@ fn open_params(plugin_id: &str, filter: Option<&str>, mode: Mode) -> serde_json:
     );
     serde_json::json!({
         "plugin_id": plugin_id,
-        "entrypoint": "palette",
+        "entrypoint": "picker",
         "env": env,
     })
 }
@@ -160,23 +153,23 @@ fn mode_from_config(config: &str, action_id: &str) -> Result<Mode, String> {
 }
 
 fn initial_filter() -> Result<Filter, String> {
-    match std::env::var("HERDR_COMMAND_PALETTE_FILTER") {
+    match std::env::var("HERDR_PICKER_FILTER") {
         Ok(value) => value
             .parse()
-            .map_err(|error| format!("invalid HERDR_COMMAND_PALETTE_FILTER: {error}")),
+            .map_err(|error| format!("invalid HERDR_PICKER_FILTER: {error}")),
         Err(std::env::VarError::NotPresent) => Ok(Filter::All),
         Err(std::env::VarError::NotUnicode(_)) => {
-            Err("HERDR_COMMAND_PALETTE_FILTER is not valid UTF-8".into())
+            Err("HERDR_PICKER_FILTER is not valid UTF-8".into())
         }
     }
 }
 
 fn initial_mode() -> Result<Mode, String> {
-    match std::env::var("HERDR_COMMAND_PALETTE_MODE") {
+    match std::env::var("HERDR_PICKER_MODE") {
         Ok(value) if value == "vim" => Ok(Mode::VimNormal),
         Ok(value) if value == "direct" => Ok(Mode::Direct),
         Err(std::env::VarError::NotPresent) => Ok(Mode::Direct),
-        _ => Err("invalid HERDR_COMMAND_PALETTE_MODE: expected direct or vim".into()),
+        _ => Err("invalid HERDR_PICKER_MODE: expected direct or vim".into()),
     }
 }
 
@@ -184,53 +177,20 @@ fn run(
     terminal: &mut ratatui::DefaultTerminal,
     picker: &mut Picker,
     mode: &mut Mode,
-    sources: &Receiver<sources::SourceUpdate>,
 ) -> io::Result<Option<model::Dispatch>> {
-    let mut slots: [Option<Vec<model::Item>>; sources::SLOTS] = Default::default();
-    let mut loading = true;
     let mut spinner_frame = 0;
     let mut next_spinner_frame = Instant::now() + SPINNER_TICK;
     let mut dirty = true;
     loop {
-        let mut items_changed = false;
-        loop {
-            match sources.try_recv() {
-                Ok((slot, Ok(items))) => {
-                    slots[slot] = Some(items);
-                    items_changed = true;
-                }
-                Ok((_, Err(error))) => return Err(io::Error::other(error)),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    loading = false;
-                    break;
-                }
-            }
-        }
-        if items_changed {
-            loading = slots.iter().any(Option::is_none);
-            picker.set_items(slots.iter().flatten().flatten().cloned().collect());
-            dirty = true;
-        }
-
         if dirty {
-            terminal.draw(|frame| ui::render(picker, *mode, spinner_frame, loading, frame))?;
+            terminal.draw(|frame| ui::render(picker, *mode, spinner_frame, frame))?;
             dirty = false;
         }
 
         let spinner_active = picker.needs_spinner();
-        let timeout = if loading {
-            SOURCE_POLL
-        } else if spinner_active {
-            next_spinner_frame.saturating_duration_since(Instant::now())
-        } else {
-            // Nothing time-based remains once sources are done and no spinner
-            // is visible; effectively block until input. Duration::MAX is out:
-            // mio clamps it to tv_sec = i64::MAX, which macOS kevent rejects
-            // with EINVAL.
-            Duration::from_secs(3600)
-        };
-        if event::poll(timeout)? {
+        if !spinner_active
+            || event::poll(next_spinner_frame.saturating_duration_since(Instant::now()))?
+        {
             // Drain every queued event before redrawing so fast typing and
             // held-key repeat cost one refilter each but only one draw.
             loop {
@@ -343,7 +303,6 @@ fn handle_key(
         }
         (KeyCode::Tab, KeyModifiers::SHIFT) | (KeyCode::BackTab, _) => picker.cycle_filter(-1),
         (KeyCode::Tab, _) => picker.cycle_filter(1),
-        (KeyCode::Char('a'), KeyModifiers::CONTROL) => picker.set_filter(Filter::Actions),
         (KeyCode::Char('w'), KeyModifiers::CONTROL) => picker.set_filter(Filter::Workspaces),
         (KeyCode::Char('t'), KeyModifiers::CONTROL) => picker.set_filter(Filter::Tabs),
         (KeyCode::Char('p'), modifiers) if modifiers.contains(KeyModifiers::ALT) => {
@@ -375,6 +334,7 @@ fn row_at(picker: &Picker, body: ratatui::layout::Rect, column: u16, row: u16) -
         || column >= body.x + body.width
         || row < body.y
         || row >= body.y + body.height
+        || row - body.y >= body.height / ui::ROW_HEIGHT * ui::ROW_HEIGHT
     {
         return None;
     }
@@ -383,7 +343,7 @@ fn row_at(picker: &Picker, body: ratatui::layout::Rect, column: u16, row: u16) -
 }
 
 fn fail_visibly(message: &str) -> ExitCode {
-    eprintln!("herdr-command-palette: {message}");
+    eprintln!("herdr-picker: {message}");
     eprintln!("Press Enter to close.");
     let mut line = String::new();
     let _ = io::stdin().read_line(&mut line);
@@ -406,7 +366,6 @@ mod tests {
                     title: title.into(),
                     subtitle: String::new(),
                     detail: String::new(),
-                    keys: Vec::new(),
                     dispatch: Dispatch::new("test", json!({})),
                 })
                 .collect(),
@@ -472,21 +431,30 @@ mod tests {
     }
 
     #[test]
+    fn mouse_ignores_an_unpainted_partial_row() {
+        let picker = picker();
+        let body = ratatui::layout::Rect::new(0, 0, 20, 3);
+
+        assert_eq!(row_at(&picker, body, 0, 1), Some(0));
+        assert_eq!(row_at(&picker, body, 0, 2), None);
+    }
+
+    #[test]
     fn open_params_pass_filter_and_mode_through_env() {
         assert_eq!(
             open_params("example.plugin", Some("agents"), Mode::VimNormal),
             json!({
                 "plugin_id": "example.plugin",
-                "entrypoint": "palette",
+                "entrypoint": "picker",
                 "env": {
-                    "HERDR_COMMAND_PALETTE_FILTER": "agents",
-                    "HERDR_COMMAND_PALETTE_MODE": "vim",
+                    "HERDR_PICKER_FILTER": "agents",
+                    "HERDR_PICKER_MODE": "vim",
                 },
             })
         );
         assert_eq!(
             open_params("example.plugin", None, Mode::Direct)["env"],
-            json!({ "HERDR_COMMAND_PALETTE_MODE": "direct" })
+            json!({ "HERDR_PICKER_MODE": "direct" })
         );
     }
 

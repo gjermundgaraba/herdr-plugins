@@ -84,7 +84,7 @@ fn log_error(message: &str) {
     let path = Environment::load()
         .ok()
         .and_then(|environment| environment.require_plugin().ok())
-        .map(|plugin| plugin.logs_dir().join("command-palette.log"));
+        .map(|plugin| plugin.logs_dir().join("picker.log"));
     if let Some(Ok(mut file)) = path.map(|path| open_rotating_log(&path, 10 << 20, 3)) {
         let _ = writeln!(file, "{message}");
     }
