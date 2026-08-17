@@ -35,16 +35,12 @@ state drives routing and lighting without additional discovery subprocesses.
 Built-in actions are direct socket requests after a fresh snapshot confirms
 the captured agent identity. Configured script actions run synchronously from
 the plugin root after the same validation. They receive `HERDR_SOCKET_PATH`,
-`HERDR_SESSION`, `HERDR_PANE_ID`, and `HERDR_MICRO_REPEAT`, and inherit
-`HERDR_BIN_PATH`. Child output is bounded; failures report stderr and their
-binding. A process group that exceeds the five-second deadline is terminated
-and reaped.
+`HERDR_SESSION`, and `HERDR_PANE_ID`, and inherit `HERDR_BIN_PATH`. Child output
+is bounded; failures report stderr and their binding. A process group that
+exceeds the five-second deadline is terminated and reaped.
 
-An optional script `queue` groups consecutive pending actions with the same
-queue name and frozen route. The single action worker preserves their FIFO
-order and may coalesce exact adjacent script actions by increasing
-`HERDR_MICRO_REPEAT`; queues do not run in parallel. The bounded worker accepts
-16 pending actions and logs inputs rejected while full.
+The single action worker runs each accepted script once in FIFO order. Its
+bounded queue accepts 16 pending actions and logs inputs rejected while full.
 
 Ghostty inspection uses a cached native ScriptingBridge client from Rust. The
 focused terminal UUID is queried while Ghostty is active and immediately before
@@ -109,9 +105,8 @@ bindings internally.
   live host-cell size, rechecks the focused Ghostty UUID, then sends native
   mouse-position and scroll commands to that exact Ghostty terminal. `key`
   bindings are the deliberate exception: they tap system-wide from any
-  frontmost application while the bridge owns the device. Script batching
-  requires the same frozen session, terminal, pane, agent, and routing
-  generation; different targets are never combined.
+  frontmost application while the bridge owns the device. Scripts recheck the
+  frozen session, terminal, pane, agent, and routing generation before running.
 - CoreGraphics output requires Accessibility permission only for explicitly
   configured `key` bindings, which tap their configured keycode. Scrolling does
   not move the system cursor. No other keyboard events are synthesized; all
@@ -136,10 +131,6 @@ bindings internally.
 - Claude effort changes require an empty prompt. Existing Pi sessions need
   `/reload` after installing the extension. Effort changes affect later model
   requests, not a request already in flight.
-- Script grouping is opportunistic: only already-pending consecutive actions
-  can share a batch. FIFO applies to accepted actions; a full 16-item worker
-  queue rejects and logs new input.
-
 ## Thinking-effort control
 
 The bridge freezes the focused agent and pane from the selected Herdr session,

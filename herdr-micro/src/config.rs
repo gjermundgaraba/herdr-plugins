@@ -24,8 +24,6 @@ pub enum Action {
         command: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         args: Vec<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        queue: Option<String>,
     },
     FocusPane {
         direction: Direction,
@@ -390,9 +388,6 @@ fn validate_action(action: &Action, label: &str) -> Result<(), String> {
         Action::Script { command, .. } if command.trim().is_empty() => {
             Err(format!("{label}.command must be a non-empty string"))
         }
-        Action::Script {
-            queue: Some(queue), ..
-        } if queue.trim().is_empty() => Err(format!("{label}.queue must be a non-empty string")),
         Action::Key { key, keycode, .. } => key_action_code(key.as_deref(), *keycode)
             .map(|_| ())
             .map_err(|error| format!("{label}: {error}")),
@@ -571,15 +566,15 @@ fn config_json() -> Value {
             "buttons": {"1":null,"2":null,"3":{"byAgent":{"codex":{"action":"fast"},"pi":{"action":"fast"},"default":null}},"4":{"action":"prompt","prompt":"/copy","submit":true},"5":null,"6":null,"7":{"action":"submit"}},
             "dial":{
                 "clockwise":{"byAgent":{
-                    "codex":{"action":"script","command":"/bin/sh","args":["./integrations/thinking-effort.sh","alt+."],"queue":"thinking-effort"},
-                    "claude":{"action":"script","command":"/bin/sh","args":["./integrations/thinking-effort.sh","claude","raise"],"queue":"thinking-effort"},
-                    "pi":{"action":"script","command":"/bin/sh","args":["./integrations/thinking-effort.sh","ctrl+shift+right"],"queue":"thinking-effort"},
+                    "codex":{"action":"script","command":"/bin/sh","args":["./integrations/thinking-effort.sh","alt+."]},
+                    "claude":{"action":"script","command":"/bin/sh","args":["./integrations/thinking-effort.sh","claude","raise"]},
+                    "pi":{"action":"script","command":"/bin/sh","args":["./integrations/thinking-effort.sh","ctrl+shift+right"]},
                     "default":null
                 }},
                 "counterclockwise":{"byAgent":{
-                    "codex":{"action":"script","command":"/bin/sh","args":["./integrations/thinking-effort.sh","alt+,"],"queue":"thinking-effort"},
-                    "claude":{"action":"script","command":"/bin/sh","args":["./integrations/thinking-effort.sh","claude","lower"],"queue":"thinking-effort"},
-                    "pi":{"action":"script","command":"/bin/sh","args":["./integrations/thinking-effort.sh","ctrl+shift+left"],"queue":"thinking-effort"},
+                    "codex":{"action":"script","command":"/bin/sh","args":["./integrations/thinking-effort.sh","alt+,"]},
+                    "claude":{"action":"script","command":"/bin/sh","args":["./integrations/thinking-effort.sh","claude","lower"]},
+                    "pi":{"action":"script","command":"/bin/sh","args":["./integrations/thinking-effort.sh","ctrl+shift+left"]},
                     "default":null
                 }},
                 "press":{"action":"prompt","prompt":"/model","submit":true}
@@ -625,9 +620,8 @@ mod tests {
                 .resolve(agent)
                 .unwrap()
             {
-                Action::Script { args, queue, .. } => {
+                Action::Script { args, .. } => {
                     assert_eq!(args[1], expected);
-                    assert_eq!(queue.as_deref(), Some("thinking-effort"));
                 }
                 action => panic!("unexpected {agent} dial action: {action:?}"),
             }
@@ -638,12 +632,11 @@ mod tests {
                 .resolve("claude")
                 .unwrap()
             {
-                Action::Script { args, queue, .. } => {
+                Action::Script { args, .. } => {
                     assert_eq!(
                         args,
                         ["./integrations/thinking-effort.sh", "claude", direction]
                     );
-                    assert_eq!(queue.as_deref(), Some("thinking-effort"));
                 }
                 action => panic!("unexpected Claude dial action: {action:?}"),
             }
@@ -714,14 +707,10 @@ mod tests {
 
     #[test]
     fn validates_scripts_and_lighting() {
-        for invalid in [
-            serde_json::json!({"action":"script","command":" "}),
-            serde_json::json!({"action":"script","command":"ok","queue":" "}),
-        ] {
-            let mut config = config_json();
-            config["controls"]["dial"]["clockwise"] = invalid;
-            assert!(parse_config(&config).is_err());
-        }
+        let mut config = config_json();
+        config["controls"]["dial"]["clockwise"] =
+            serde_json::json!({"action":"script","command":" "});
+        assert!(parse_config(&config).is_err());
         let mut lighting = config_json();
         lighting["lighting"] =
             serde_json::json!({"states":{},"focusedBrightness":1,"ambient":"status","keys":null});

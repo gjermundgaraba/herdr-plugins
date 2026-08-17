@@ -224,7 +224,6 @@ struct InputState {
     last_joystick_sector: Option<u8>,
 }
 
-#[derive(Clone)]
 enum Work {
     Binding {
         binding: Box<Binding>,
@@ -242,85 +241,6 @@ enum Work {
         terminal: String,
         generation: u64,
     },
-}
-
-impl Work {
-    fn generation(&self) -> u64 {
-        match self {
-            Self::Binding { generation, .. } | Self::FocusSlot { generation, .. } => *generation,
-        }
-    }
-
-    fn resolved_action(&self) -> Option<Action> {
-        match self {
-            Self::Binding {
-                binding, target, ..
-            } => binding.resolve(
-                target
-                    .as_ref()
-                    .and_then(|(_, _, agent)| agent.as_deref())
-                    .unwrap_or(""),
-            ),
-            Self::FocusSlot { .. } => None,
-        }
-    }
-
-    fn same_route(&self, other: &Self) -> bool {
-        match (self, other) {
-            (
-                Self::Binding {
-                    session: first_session,
-                    terminal: first_terminal,
-                    target: first_target,
-                    generation: first_generation,
-                    ..
-                },
-                Self::Binding {
-                    session: second_session,
-                    terminal: second_terminal,
-                    target: second_target,
-                    generation: second_generation,
-                    ..
-                },
-            ) => {
-                first_session == second_session
-                    && first_terminal == second_terminal
-                    && first_target == second_target
-                    && first_generation == second_generation
-            }
-            _ => false,
-        }
-    }
-
-    fn script_queue(&self) -> Option<String> {
-        match self.resolved_action() {
-            Some(Action::Script {
-                queue: Some(queue), ..
-            }) => Some(queue),
-            _ => None,
-        }
-    }
-
-    fn same_script_queue(&self, other: &Self) -> bool {
-        self.same_route(other)
-            && self
-                .script_queue()
-                .zip(other.script_queue())
-                .is_some_and(|(first, second)| first == second)
-    }
-
-    fn same_coalescible_action(&self, other: &Self) -> bool {
-        if !self.same_route(other) {
-            return false;
-        }
-        match (self.resolved_action(), other.resolved_action()) {
-            (
-                Some(first @ Action::Script { queue: Some(_), .. }),
-                Some(second @ Action::Script { queue: Some(_), .. }),
-            ) => first == second,
-            _ => false,
-        }
-    }
 }
 
 fn require_agent(agent: Option<&AgentInfo>) -> Result<&AgentInfo> {
@@ -461,7 +381,6 @@ fn script_command(
     root: &Path,
     session: &Session,
     pane: &str,
-    repeat: usize,
 ) -> Command {
     let mut child = Command::new(command);
     child
@@ -478,8 +397,7 @@ fn script_command(
         .env("HERDR_ENV", "1")
         .env("HERDR_SOCKET_PATH", &session.socket_path)
         .env("HERDR_SESSION", &session.name)
-        .env("HERDR_PANE_ID", pane)
-        .env("HERDR_MICRO_REPEAT", repeat.to_string());
+        .env("HERDR_PANE_ID", pane);
     child
 }
 
@@ -487,7 +405,6 @@ fn execute_script(
     command: &str,
     args: &[String],
     current: Option<&AgentInfo>,
-    repeat: usize,
     lease: &DispatchLease<'_>,
 ) -> Result<()> {
     let current = require_agent(current)?;
@@ -501,7 +418,6 @@ fn execute_script(
         &plugin_root()?,
         lease.session,
         &current.pane_id,
-        repeat,
     );
     run_command_with_timeout(&mut child, COMMAND_TIMEOUT)?;
     Ok(())
@@ -511,7 +427,6 @@ fn execute_action(
     action: &Action,
     current: Option<&AgentInfo>,
     snapshot: &SessionSnapshot,
-    repeat: usize,
     lease: &DispatchLease<'_>,
 ) -> Result<bool> {
     let client = lease.client();
@@ -550,11 +465,7 @@ fn execute_action(
             lease.ensure()?;
             submit(&client, current)?;
         }
-        Action::Script {
-            command,
-            args,
-            queue: _,
-        } => execute_script(command, args, current, repeat, lease)?,
+        Action::Script { command, args } => execute_script(command, args, current, lease)?,
         Action::FocusPane { direction } => {
             let direction = match direction {
                 Direction::Up => "up",
@@ -586,8 +497,10 @@ fn execute_action(
     Ok(true)
 }
 
-fn execute_work(work: Work, repeat: usize, routing_generation: &AtomicU64) -> Result<()> {
-    let generation = work.generation();
+fn execute_work(work: Work, routing_generation: &AtomicU64) -> Result<()> {
+    let generation = match &work {
+        Work::Binding { generation, .. } | Work::FocusSlot { generation, .. } => *generation,
+    };
     if generation != routing_generation.load(Ordering::Acquire) {
         log("control ignored: stale Herdr routing");
         return Ok(());
@@ -658,17 +571,12 @@ fn execute_work(work: Work, repeat: usize, routing_generation: &AtomicU64) -> Re
             ) else {
                 return Ok(());
             };
-            let executed = execute_action(&action, current, &snapshot, repeat, &lease)
+            let executed = execute_action(&action, current, &snapshot, &lease)
                 .with_context(|| format!("{source}: {}", action_name(&action)))?;
             if executed {
                 log(format!(
-                    "{source}: {}{} in {}{}",
+                    "{source}: {} in {}{}",
                     action_name(&action),
-                    if repeat > 1 {
-                        format!(" x{repeat}")
-                    } else {
-                        String::new()
-                    },
                     session.name,
                     current
                         .map(|agent| format!(
@@ -684,67 +592,22 @@ fn execute_work(work: Work, repeat: usize, routing_generation: &AtomicU64) -> Re
     Ok(())
 }
 
-fn coalesce_batch(batch: Vec<Work>) -> Vec<(Work, usize)> {
-    let mut batch = batch.into_iter().peekable();
-    let mut runs = Vec::new();
-    while let Some(work) = batch.next() {
-        let mut repeat = 1;
-        while batch
-            .peek()
-            .is_some_and(|next| work.same_coalescible_action(next))
-        {
-            batch.next();
-            repeat += 1;
-        }
-        runs.push((work, repeat));
-    }
-    runs
-}
-
 fn action_worker(
     receiver: Receiver<Work>,
     routing_generation: Arc<AtomicU64>,
     stopping: Arc<AtomicBool>,
 ) {
-    let mut deferred = None;
     while !stopping.load(Ordering::Acquire) {
-        let work = match deferred
-            .take()
-            .map(Ok)
-            .unwrap_or_else(|| receiver.recv_timeout(Duration::from_millis(50)))
-        {
+        let work = match receiver.recv_timeout(Duration::from_millis(50)) {
             Ok(work) => work,
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
         };
-        let mut batch = vec![work];
-        if batch[0].script_queue().is_some() {
-            while let Ok(next) = receiver.try_recv() {
-                if batch[0].same_script_queue(&next) {
-                    batch.push(next);
-                } else {
-                    deferred = Some(next);
-                    break;
-                }
-            }
-        } else {
-            while let Ok(next) = receiver.try_recv() {
-                if batch[0].same_coalescible_action(&next) {
-                    batch.push(next);
-                } else {
-                    deferred = Some(next);
-                    break;
-                }
-            }
+        if stopping.load(Ordering::Acquire) {
+            break;
         }
-
-        for (work, repeat) in coalesce_batch(batch) {
-            if stopping.load(Ordering::Acquire) {
-                break;
-            }
-            if let Err(error) = execute_work(work, repeat, &routing_generation) {
-                log(format!("control failed: {error:#}"));
-            }
+        if let Err(error) = execute_work(work, &routing_generation) {
+            log(format!("control failed: {error:#}"));
         }
     }
 }
@@ -1938,29 +1801,6 @@ mod tests {
         }
     }
 
-    fn script_work(
-        session: Session,
-        terminal: &str,
-        pane: &str,
-        agent: &str,
-        key: &str,
-        queue: Option<&str>,
-        generation: u64,
-    ) -> Work {
-        Work::Binding {
-            binding: Box::new(Binding::Action(Action::Script {
-                command: "/bin/sh".into(),
-                args: vec!["adapter".into(), key.into()],
-                queue: queue.map(str::to_owned),
-            })),
-            source: "dial".into(),
-            session,
-            terminal: terminal.into(),
-            target: Some((terminal.into(), pane.into(), Some(agent.into()))),
-            generation,
-        }
-    }
-
     #[test]
     fn timestamps_are_utc_iso_8601() {
         assert_eq!(format_timestamp(UNIX_EPOCH), "1970-01-01T00:00:00.000Z");
@@ -2013,143 +1853,6 @@ mod tests {
     }
 
     #[test]
-    fn script_queues_preserve_action_and_frozen_route_identity() {
-        let raise = script_work(
-            session("work"),
-            "terminal",
-            "pane",
-            "codex",
-            "raise",
-            Some("effort"),
-            7,
-        );
-        let same = script_work(
-            session("work"),
-            "terminal",
-            "pane",
-            "codex",
-            "raise",
-            Some("effort"),
-            7,
-        );
-        let lower = script_work(
-            session("work"),
-            "terminal",
-            "pane",
-            "codex",
-            "lower",
-            Some("effort"),
-            7,
-        );
-        assert!(raise.same_script_queue(&lower));
-        assert!(raise.same_coalescible_action(&same));
-        assert!(!raise.same_coalescible_action(&lower));
-
-        for different_target in [
-            script_work(
-                session("other"),
-                "terminal",
-                "pane",
-                "codex",
-                "raise",
-                Some("effort"),
-                7,
-            ),
-            script_work(
-                Session {
-                    name: "work".into(),
-                    socket_path: "/tmp/replacement.sock".into(),
-                },
-                "terminal",
-                "pane",
-                "codex",
-                "raise",
-                Some("effort"),
-                7,
-            ),
-            script_work(
-                session("work"),
-                "other-terminal",
-                "pane",
-                "codex",
-                "raise",
-                Some("effort"),
-                7,
-            ),
-            script_work(
-                session("work"),
-                "terminal",
-                "other-pane",
-                "codex",
-                "raise",
-                Some("effort"),
-                7,
-            ),
-            script_work(
-                session("work"),
-                "terminal",
-                "pane",
-                "pi",
-                "raise",
-                Some("effort"),
-                7,
-            ),
-            script_work(
-                session("work"),
-                "terminal",
-                "pane",
-                "codex",
-                "raise",
-                Some("effort"),
-                8,
-            ),
-        ] {
-            assert!(!raise.same_script_queue(&different_target));
-            assert!(!raise.same_coalescible_action(&different_target));
-        }
-
-        let unqueued = script_work(
-            session("work"),
-            "terminal",
-            "pane",
-            "codex",
-            "raise",
-            None,
-            7,
-        );
-        assert!(!unqueued.same_script_queue(&unqueued));
-        assert!(!unqueued.same_coalescible_action(&unqueued));
-    }
-
-    #[test]
-    fn queued_scripts_preserve_order_and_total_repeats() {
-        let batch = ["raise", "raise", "lower", "raise"]
-            .map(|key| {
-                script_work(
-                    session("work"),
-                    "terminal",
-                    "pane",
-                    "codex",
-                    key,
-                    Some("effort"),
-                    7,
-                )
-            })
-            .into();
-        let effects: Vec<_> = coalesce_batch(batch)
-            .into_iter()
-            .flat_map(|(work, repeat)| {
-                let key = match work.resolved_action().unwrap() {
-                    Action::Script { args, .. } => args[1].clone(),
-                    _ => unreachable!(),
-                };
-                std::iter::repeat_n(key, repeat)
-            })
-            .collect();
-        assert_eq!(effects, ["raise", "raise", "lower", "raise"]);
-    }
-
-    #[test]
     fn script_context_drives_the_bundled_adapter() {
         let dir = temp_dir("script-context");
         let fake_herdr = dir.join("herdr");
@@ -2159,7 +1862,7 @@ mod tests {
             &fake_herdr,
             r#"#!/bin/sh
 if [ ! -e "$HERDR_TEST_ENV" ]; then
-    printf '%s\n' "$HERDR_SESSION" "$HERDR_SOCKET_PATH" "$HERDR_PANE_ID" "$HERDR_MICRO_REPEAT" "$PWD" > "$HERDR_TEST_ENV"
+    printf '%s\n' "$HERDR_SESSION" "$HERDR_SOCKET_PATH" "$HERDR_PANE_ID" "$PWD" > "$HERDR_TEST_ENV"
 fi
 printf '%s\n' --call "$@" >> "$HERDR_TEST_LOG"
 "#,
@@ -2170,14 +1873,14 @@ printf '%s\n' --call "$@" >> "$HERDR_TEST_LOG"
         let config = Config::default();
         let target_session = session("work");
 
-        let Action::Script { command, args, .. } = key_binding(&config.controls, "ENC_CC", 1)
+        let Action::Script { command, args } = key_binding(&config.controls, "ENC_CC", 1)
             .unwrap()
             .resolve("codex")
             .unwrap()
         else {
             panic!("expected Codex script action");
         };
-        let mut child = script_command(&command, &args, root, &target_session, "w9:p4", 3);
+        let mut child = script_command(&command, &args, root, &target_session, "w9:p4");
         child
             .env("HERDR_BIN_PATH", &fake_herdr)
             .env("HERDR_TEST_LOG", &calls)
@@ -2185,22 +1888,22 @@ printf '%s\n' --call "$@" >> "$HERDR_TEST_LOG"
         run_command_with_timeout(&mut child, COMMAND_TIMEOUT).unwrap();
         assert_eq!(
             fs::read_to_string(&environment).unwrap(),
-            format!("work\n/tmp/work.sock\nw9:p4\n3\n{}\n", root.display())
+            format!("work\n/tmp/work.sock\nw9:p4\n{}\n", root.display())
         );
         assert_eq!(
             fs::read_to_string(&calls).unwrap(),
-            "--call\npane\nsend-keys\nw9:p4\nalt+.\nalt+.\nalt+.\n"
+            "--call\npane\nsend-keys\nw9:p4\nalt+.\n"
         );
 
         fs::remove_file(&calls).unwrap();
-        let Action::Script { command, args, .. } = key_binding(&config.controls, "ENC_CW", 1)
+        let Action::Script { command, args } = key_binding(&config.controls, "ENC_CW", 1)
             .unwrap()
             .resolve("claude")
             .unwrap()
         else {
             panic!("expected Claude script action");
         };
-        let mut child = script_command(&command, &args, root, &target_session, "w9:p4", 3);
+        let mut child = script_command(&command, &args, root, &target_session, "w9:p4");
         child
             .env("HERDR_BIN_PATH", &fake_herdr)
             .env("HERDR_TEST_LOG", &calls)
@@ -2208,7 +1911,7 @@ printf '%s\n' --call "$@" >> "$HERDR_TEST_LOG"
         run_command_with_timeout(&mut child, COMMAND_TIMEOUT).unwrap();
         assert_eq!(
             fs::read_to_string(&calls).unwrap(),
-            "--call\npane\nsend-text\nw9:p4\n/effort\n--call\npane\nsend-keys\nw9:p4\nenter\n--call\npane\nsend-keys\nw9:p4\nleft\nleft\nleft\n--call\npane\nsend-keys\nw9:p4\nenter\n"
+            "--call\npane\nsend-text\nw9:p4\n/effort\n--call\npane\nsend-keys\nw9:p4\nenter\n--call\npane\nsend-keys\nw9:p4\nleft\n--call\npane\nsend-keys\nw9:p4\nenter\n"
         );
         fs::remove_dir_all(dir).unwrap();
     }
@@ -2223,7 +1926,7 @@ printf '%s\n' --call "$@" >> "$HERDR_TEST_LOG"
             generation: 3,
             routing_generation: &routing_generation,
         };
-        let error = execute_script("/usr/bin/true", &[], None, 1, &lease).unwrap_err();
+        let error = execute_script("/usr/bin/true", &[], None, &lease).unwrap_err();
         assert_eq!(error.to_string(), "no focused Herdr agent");
     }
 

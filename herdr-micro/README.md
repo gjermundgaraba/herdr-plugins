@@ -131,23 +131,17 @@ A binding can run a command synchronously from the plugin root:
 {
   "action": "script",
   "command": "/bin/sh",
-  "args": ["./integrations/thinking-effort.sh", "alt+."],
-  "queue": "thinking-effort"
+  "args": ["./integrations/thinking-effort.sh", "alt+."]
 }
 ```
 
 Scripts inherit `HERDR_BIN_PATH` and receive the frozen target as
 `HERDR_SOCKET_PATH`, `HERDR_SESSION`, and `HERDR_PANE_ID`.
-`HERDR_MICRO_REPEAT` contains the number of coalesced identical actions.
 Stale inherited Herdr target selectors are removed. Each script has a
-five-second timeout. Output is bounded, and failures report the binding,
-exit status, and stderr.
-
-The optional `queue` keeps consecutive scripts with the same queue name and
-frozen route together in FIFO order. Exact adjacent script actions within that
-batch may be combined through `HERDR_MICRO_REPEAT`. All scripts still use the
-single serial action worker; queues do not add parallel workers. The worker
-accepts up to 16 pending actions and logs inputs rejected while full.
+five-second timeout. Output is bounded, and failures report the binding, exit
+status, and stderr. Scripts run once per input through the single serial FIFO
+worker, which accepts up to 16 pending actions and logs inputs rejected while
+full.
 
 ## Routing and operation
 
