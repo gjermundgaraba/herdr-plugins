@@ -49,7 +49,7 @@ impl GestureDispatcher {
                 source: key,
                 context,
             }],
-            Some(Binding::Gesture(binding)) => self.press(key, binding.clone(), context, now),
+            Some(Binding::Gesture(binding)) => self.press(key, *binding.clone(), context, now),
             _ => vec![],
         }
     }
@@ -195,11 +195,11 @@ mod tests {
     #[test]
     fn captures_first_session_for_double_tap() {
         let mut dispatcher = GestureDispatcher::default();
-        let binding = Binding::Gesture(GestureBinding {
+        let binding = Binding::Gesture(Box::new(GestureBinding {
             tap: Some(Action::Submit),
             double_tap: Some(Action::Diff),
             ..Default::default()
-        });
+        }));
         let now = Instant::now();
         assert!(
             dispatcher

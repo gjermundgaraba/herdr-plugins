@@ -74,10 +74,9 @@ herdr plugin link . --enabled
    herdr plugin config-dir gjermundgaraba.herdr-micro
    ```
 
-   `config.json` contains controls, effort shortcuts, and lighting. Runtime files
-use the plugin state directory: `run/micro.sock`, `logs/micro.log`, and
-`data/backups/` for verified keymap backups. The daemon keeps three 10 MiB log
-files.
+   `config.json` contains controls and lighting. Runtime files use the plugin
+state directory: `run/micro.sock`, `logs/micro.log`, and `data/backups/` for
+verified keymap backups. The daemon keeps three 10 MiB log files.
 
 Run **Configure Herdr Micro** in Herdr to open `config.json`. Binding
 changes are validated and reloaded while the bridge runs. `buttons` maps the
@@ -96,8 +95,9 @@ Names cover F13–F20; `keycode` accepts any macOS virtual keycode (0–127)
 instead of `key`, and optional `modifiers` adds any of `cmd`, `shift`, `alt`,
 `ctrl`, and `fn`.
 The stock wide keycap spans switches 5 and 6, so `controls.buttons["6"]`
-stays `null` by default. The three top-level fields—`controls`, `effort`, and
-`lighting`—are required.
+stays `null` by default. The two top-level fields—`controls` and `lighting`—are
+required. Existing configurations must remove the old top-level `effort`
+object and use the dial's script bindings from the generated default.
 
 The privileged helper captures the USB-connected Micro so ChatGPT cannot also
 receive Layer 2 events. Binding a previously unbound switch (or the reverse)
@@ -115,30 +115,47 @@ herdr plugin action invoke setup-pi-effort \
   --plugin gjermundgaraba.herdr-micro
 ```
 
-For Codex, add shortcuts to `~/.codex/config.toml`:
+Codex CLI reads TUI shortcuts from `~/.codex/config.toml`; Codex Desktop's
+`~/.codex/keybindings.json` is unrelated. The default Micro configuration
+runs the bundled adapter with Codex's native `alt+.` and `alt+,` defaults, so
+no Codex configuration is required. If those TUI bindings are overridden,
+update the adapter arguments in `config.json`. Claude Code uses the same
+adapter with its `/effort` picker. See [effort
+control](docs/micro-bridge.md#thinking-effort-control) for operational
+boundaries.
 
-```toml
-[tui.keymap.chat]
-increase_reasoning_effort = "ctrl-shift-t"
-decrease_reasoning_effort = "ctrl-t"
-```
+## Script actions
 
-Match those shortcuts in `config.json` under `effort`; it uses `+`, not
-Codex's `-` syntax:
+A binding can run a command synchronously from the plugin root:
 
 ```json
-{"effort":{"codex":{"raise":"ctrl+shift+t","lower":"ctrl+t"}}}
+{
+  "action": "script",
+  "command": "/bin/sh",
+  "args": ["./integrations/thinking-effort.sh", "alt+."],
+  "queue": "thinking-effort"
+}
 ```
 
-Claude Code uses its native `/effort` picker. See [effort control](docs/micro-bridge.md#thinking-effort-control)
-for operational boundaries.
+Scripts inherit `HERDR_BIN_PATH` and receive the frozen target as
+`HERDR_SOCKET_PATH`, `HERDR_SESSION`, and `HERDR_PANE_ID`.
+`HERDR_MICRO_REPEAT` contains the number of coalesced identical actions.
+Stale inherited Herdr target selectors are removed. Each script has a
+five-second timeout; stdout and stderr are captured for failures.
+
+The optional `queue` keeps consecutive scripts with the same queue name and
+frozen route together in FIFO order. Exact adjacent script actions within that
+batch may be combined through `HERDR_MICRO_REPEAT`. All scripts still use the
+single serial action worker; queues do not add parallel workers. The worker
+accepts up to 16 pending actions and logs inputs rejected while full.
 
 ## Routing and operation
 
 One bridge serves the default and named Herdr sessions. Native ScriptingBridge
 queries map each running session to its Ghostty terminal UUID. Herdr snapshots
-drive routing and lighting, and actions use direct socket requests to the
-focused mapped session.
+drive routing and lighting. Built-in actions use direct socket requests;
+configured scripts run only after the same frozen session, pane, agent, and
+routing identity have been revalidated.
 
 - Codex desktop frontmost: Layer 1 and device ownership yielded to Codex
 - Mapped Ghostty terminal frontmost: Layer 2 and the matching Herdr session

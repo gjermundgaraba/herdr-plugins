@@ -6,6 +6,7 @@ use serde::Deserialize;
 use std::{
     env,
     io::Read,
+    os::unix::process::CommandExt,
     path::PathBuf,
     process::{Command, Stdio},
     sync::{
@@ -19,6 +20,7 @@ use std::{
 
 pub const DEFAULT_HERDR_BIN: &str = "herdr";
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const COMMAND_OUTPUT_LIMIT: usize = 64 * 1024;
 const MIN_HERDR_PROTOCOL: u32 = 19;
 const SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -231,50 +233,90 @@ fn parse_sessions(output: &str) -> Result<Vec<Session>> {
     Ok(sessions)
 }
 
-fn run_command_with_timeout(command: &mut Command, timeout: Duration) -> Result<String> {
+#[derive(Default)]
+struct CapturedOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn drain_output(mut reader: impl Read) -> CapturedOutput {
+    let mut output = CapturedOutput::default();
+    let mut buffer = [0; 8192];
+    while let Ok(count) = reader.read(&mut buffer) {
+        if count == 0 {
+            break;
+        }
+        let kept = count.min(COMMAND_OUTPUT_LIMIT.saturating_sub(output.bytes.len()));
+        output.bytes.extend_from_slice(&buffer[..kept]);
+        output.truncated |= kept < count;
+    }
+    output
+}
+
+fn terminate_process_group(process_group: i32) -> std::io::Result<()> {
+    if unsafe { libc::kill(-process_group, libc::SIGKILL) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+pub(crate) fn run_command_with_timeout(command: &mut Command, timeout: Duration) -> Result<String> {
     let program = command.get_program().to_string_lossy().into_owned();
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to run {program}"))?;
+    let process_group = i32::try_from(child.id()).context("child process ID is too large")?;
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
-    let out_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = std::io::BufReader::new(stdout).read_to_end(&mut bytes);
-        bytes
-    });
-    let err_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = std::io::BufReader::new(stderr).read_to_end(&mut bytes);
-        bytes
-    });
+    let out_reader = thread::spawn(move || drain_output(stdout));
+    let err_reader = thread::spawn(move || drain_output(stderr));
     let started = Instant::now();
     let (status, timed_out) = loop {
-        if let Some(status) = child.try_wait().context("wait for Herdr session list")? {
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("wait for {program}"))?
+        {
             break (status, false);
         }
         if started.elapsed() >= timeout {
-            let _ = child.kill();
-            break (
-                child.wait().context("reap timed out Herdr session list")?,
-                true,
-            );
+            if let Err(error) = terminate_process_group(process_group) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error).context(format!("terminate timed out {program}"));
+            }
+            let status = child
+                .wait()
+                .with_context(|| format!("reap timed out {program}"))?;
+            break (status, true);
         }
         thread::sleep(Duration::from_millis(10));
     };
+    terminate_process_group(process_group)
+        .with_context(|| format!("terminate descendants of {program}"))?;
     let stdout = out_reader.join().unwrap_or_default();
     let stderr = err_reader.join().unwrap_or_default();
-    let detail = String::from_utf8_lossy(&stderr).trim().to_owned();
+    let detail = String::from_utf8_lossy(&stderr.bytes).trim().to_owned();
+    let truncated = if stderr.truncated {
+        " (stderr truncated)"
+    } else {
+        ""
+    };
     if timed_out {
-        bail!(
-            "Herdr session discovery timed out after {}s",
-            timeout.as_secs_f64()
-        );
+        bail!("{program} timed out after {}s", timeout.as_secs_f64());
     }
     if !status.success() {
-        bail!("Herdr session discovery failed: {detail}");
+        bail!("{program} failed with {status}: {detail}{truncated}");
     }
-    Ok(String::from_utf8_lossy(&stdout).into_owned())
+    Ok(String::from_utf8_lossy(&stdout.bytes).into_owned())
 }
 
 #[cfg(test)]
@@ -346,6 +388,44 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn command_runner_reports_stderr_and_reaps_timeouts() {
+        let error = run_command_with_timeout(
+            Command::new("/bin/sh").args(["-c", "printf failure >&2; exit 7"]),
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("failure"));
+
+        let started = Instant::now();
+        let error = run_command_with_timeout(
+            Command::new("/bin/sh").args(["-c", "exec /bin/sleep 5"]),
+            Duration::from_millis(20),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        let started = Instant::now();
+        run_command_with_timeout(
+            Command::new("/bin/sh").args(["-c", "/bin/sleep 5 &"]),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        let noisy = format!(
+            "/usr/bin/yes x | /usr/bin/head -c {}",
+            COMMAND_OUTPUT_LIMIT * 2
+        );
+        let output = run_command_with_timeout(
+            Command::new("/bin/sh").args(["-c", &noisy]),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(output.len(), COMMAND_OUTPUT_LIMIT);
     }
 
     #[test]

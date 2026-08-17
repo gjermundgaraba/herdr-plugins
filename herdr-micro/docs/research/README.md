@@ -95,7 +95,10 @@ polling cadence, not a performance guarantee.
 
 The effort-control rows were exercised through Herdr on 2026-07-26. The
 action runner targeted pane IDs directly rather than the frontmost macOS
-window; the final Layer 2 test confirmed the physical dial integration.
+window; the final Layer 2 test confirmed the physical dial integration. Those
+results predate the configurable script adapter. Its explicit pane, operation,
+repeat, and `HERDR_BIN_PATH` contract has automated coverage, but this
+worktree's adapter and named-queue path have not yet been physically exercised.
 
 After the 0.6.1 firmware update, an existing BLE host pairing retained stale
 GATT metadata and rejected output reports. Pairing an unused BLE slot restored
@@ -120,6 +123,7 @@ change can break this integration without notice.
 - [Herdr plugin guide](https://herdr.dev/docs/plugins/)
 - [Herdr CLI reference](https://herdr.dev/docs/cli-reference/)
 - [Herdr agents and states](https://herdr.dev/docs/agents/)
+- [Codex CLI 0.145.0 TUI keymap source](https://github.com/openai/codex/blob/rust-v0.145.0/codex-rs/tui/src/keymap.rs)
 - [Work Louder Codex Micro product page](https://worklouder.cc/codex-micro)
 - [Work Louder Codex Micro setup and BLE pairing](https://worklouder.cc/openai-micro-setup)
 - [Work Louder firmware 0.6.1 release](https://github.com/worklouder/cm-v2-fw-releases/releases/tag/v0.6.1)

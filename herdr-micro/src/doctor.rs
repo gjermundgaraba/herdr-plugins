@@ -164,15 +164,6 @@ pub fn doctor() -> Report {
         // not an installation failure.
         Err(error) => report.push(Level::Warn, format!("Micro bridge is not running: {error}")),
     }
-    if config.as_ref().is_some_and(|config| {
-        config.effort.codex.raise.is_none() || config.effort.codex.lower.is_none()
-    }) && let Ok(path) = &resolved_config_path
-    {
-        report.push(
-            Level::Warn,
-            format!("Codex effort shortcuts are unset in {}", path.display()),
-        );
-    }
     match pi_extension() {
         Some(path) if path.exists() => {
             let bundled = plugin_root()

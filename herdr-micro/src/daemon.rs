@@ -1,13 +1,14 @@
 //! The long-lived Codex Micro bridge.  Keep the policy here; HID framing,
 //! Herdr parsing, gestures, and macOS operations live in their small modules.
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use herdr_client::{AgentInfo, Client, SessionSnapshot, open_rotating_log};
 use serde_json::{Value, json};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use std::io::Write;
 use std::{
     collections::{HashMap, HashSet},
+    process::Command,
     sync::{
         Arc, LazyLock, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -20,12 +21,11 @@ use std::{
 use crate::{
     actions::{
         GHOSTTY_PROCESS, automatic_layer, focus_agent, focus_pane, layer_identity, open_diff,
-        plan_effort_change, prompt as send_prompt, scroll_plan, submit,
+        prompt as send_prompt, scroll_plan, submit,
     },
     config::{
-        Action, Binding, Config, Controls, Direction, EffortConfig, EffortDirection, Modifier,
-        VerticalDirection, config_path, enabled_buttons, key_action_code, key_binding, load,
-        provision,
+        Action, Binding, Config, Controls, Direction, Modifier, VerticalDirection, config_path,
+        enabled_buttons, key_action_code, key_binding, load, provision,
     },
     control::listen_for_control,
     device::DeviceEvent,
@@ -34,8 +34,8 @@ use crate::{
         SessionTerminalMapping, focused_terminal_id, probe_session_terminals, scroll_terminal,
     },
     herdr::{
-        Session, SessionUpdate, SessionWorker, current_snapshot, discover_sessions,
-        spawn_session_worker,
+        COMMAND_TIMEOUT, Session, SessionUpdate, SessionWorker, current_snapshot,
+        discover_sessions, run_command_with_timeout, spawn_session_worker,
     },
     hid::{HidClient, connection_error_state},
     macos,
@@ -43,6 +43,7 @@ use crate::{
         INPUT_BUNDLE_ID, SLOT_COUNT, aggregate_lighting, assign_slots, device_owner,
         joystick_event, slot_lighting,
     },
+    setup::plugin_root,
 };
 
 const CONFIG_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -188,7 +189,6 @@ impl State {
 #[derive(Clone)]
 struct InputContext {
     controls: Controls,
-    effort: EffortConfig,
     session: Option<Session>,
     terminal: Option<String>,
     target: Option<AgentInfo>,
@@ -201,7 +201,6 @@ impl InputContext {
     fn new(config: &Config) -> Self {
         Self {
             controls: config.controls.clone(),
-            effort: config.effort.clone(),
             session: None,
             terminal: None,
             target: None,
@@ -231,7 +230,6 @@ enum Work {
         source: String,
         session: Session,
         terminal: String,
-        effort: EffortConfig,
         target: Option<(String, String, Option<String>)>,
         generation: u64,
     },
@@ -252,45 +250,73 @@ impl Work {
         }
     }
 
-    fn same_effort(&self, other: &Self) -> bool {
+    fn resolved_action(&self) -> Option<Action> {
+        match self {
+            Self::Binding {
+                binding, target, ..
+            } => binding.resolve(
+                target
+                    .as_ref()
+                    .and_then(|(_, _, agent)| agent.as_deref())
+                    .unwrap_or(""),
+            ),
+            Self::FocusSlot { .. } => None,
+        }
+    }
+
+    fn same_route(&self, other: &Self) -> bool {
         match (self, other) {
             (
                 Self::Binding {
-                    binding: first,
                     session: first_session,
                     terminal: first_terminal,
-                    effort: first_effort,
                     target: first_target,
                     generation: first_generation,
                     ..
                 },
                 Self::Binding {
-                    binding: second,
                     session: second_session,
                     terminal: second_terminal,
-                    effort: second_effort,
                     target: second_target,
                     generation: second_generation,
                     ..
                 },
-            ) => match (first.as_ref(), second.as_ref()) {
-                (
-                    Binding::Action(Action::Effort {
-                        direction: first_direction,
-                    }),
-                    Binding::Action(Action::Effort {
-                        direction: second_direction,
-                    }),
-                ) => {
-                    first_direction == second_direction
-                        && first_session == second_session
-                        && first_terminal == second_terminal
-                        && first_effort == second_effort
-                        && first_target == second_target
-                        && first_generation == second_generation
-                }
-                _ => false,
-            },
+            ) => {
+                first_session == second_session
+                    && first_terminal == second_terminal
+                    && first_target == second_target
+                    && first_generation == second_generation
+            }
+            _ => false,
+        }
+    }
+
+    fn script_queue(&self) -> Option<String> {
+        match self.resolved_action() {
+            Some(Action::Script {
+                queue: Some(queue), ..
+            }) => Some(queue),
+            _ => None,
+        }
+    }
+
+    fn same_script_queue(&self, other: &Self) -> bool {
+        self.same_route(other)
+            && self
+                .script_queue()
+                .zip(other.script_queue())
+                .is_some_and(|(first, second)| first == second)
+    }
+
+    fn same_coalescible_action(&self, other: &Self) -> bool {
+        if !self.same_route(other) {
+            return false;
+        }
+        match (self.resolved_action(), other.resolved_action()) {
+            (
+                Some(first @ Action::Script { queue: Some(_), .. }),
+                Some(second @ Action::Script { queue: Some(_), .. }),
+            ) => first == second,
             _ => false,
         }
     }
@@ -325,7 +351,7 @@ fn action_name(action: &Action) -> &'static str {
         Action::Diff => "diff",
         Action::Fast => "fast",
         Action::Submit => "submit",
-        Action::Effort { .. } => "effort",
+        Action::Script { .. } => "script",
         Action::FocusPane { .. } => "focus-pane",
         Action::Scroll { .. } => "scroll",
         Action::Key { .. } => "key",
@@ -428,11 +454,44 @@ fn execute_scroll(
     Ok(true)
 }
 
+fn execute_script(
+    command: &str,
+    args: &[String],
+    current: Option<&AgentInfo>,
+    repeat: usize,
+    lease: &DispatchLease<'_>,
+) -> Result<()> {
+    let current = require_agent(current)?;
+    if current.agent.as_deref().is_none_or(str::is_empty) {
+        bail!("focused Herdr agent has no kind");
+    }
+    lease.ensure()?;
+    let mut child = Command::new(command);
+    child
+        .args(args)
+        .current_dir(plugin_root()?)
+        .env_remove("HERDR_ACTIVE_PANE_CWD")
+        .env_remove("HERDR_ACTIVE_PANE_ID")
+        .env_remove("HERDR_ACTIVE_TAB_ID")
+        .env_remove("HERDR_ACTIVE_WORKSPACE_ID")
+        .env_remove("HERDR_CLIENT_SOCKET_PATH")
+        .env_remove("HERDR_PLUGIN_CONTEXT_JSON")
+        .env_remove("HERDR_TAB_ID")
+        .env_remove("HERDR_WORKSPACE_ID")
+        .env("HERDR_ENV", "1")
+        .env("HERDR_SOCKET_PATH", &lease.session.socket_path)
+        .env("HERDR_SESSION", &lease.session.name)
+        .env("HERDR_PANE_ID", &current.pane_id)
+        .env("HERDR_MICRO_REPEAT", repeat.to_string());
+    run_command_with_timeout(&mut child, COMMAND_TIMEOUT)
+        .with_context(|| format!("script {command}"))?;
+    Ok(())
+}
+
 fn execute_action(
     action: &Action,
     current: Option<&AgentInfo>,
     snapshot: &SessionSnapshot,
-    effort: &EffortConfig,
     repeat: usize,
     lease: &DispatchLease<'_>,
 ) -> Result<bool> {
@@ -472,27 +531,11 @@ fn execute_action(
             lease.ensure()?;
             submit(&client, current)?;
         }
-        Action::Effort { direction } => {
-            let current = require_agent(current)?;
-            let direction = match direction {
-                EffortDirection::Raise => "raise",
-                EffortDirection::Lower => "lower",
-            };
-            let plan = plan_effort_change(
-                current.agent.as_deref().unwrap_or_default(),
-                direction,
-                &current.pane_id,
-                effort,
-                repeat,
-            )?;
-            for step in plan {
-                lease.ensure()?;
-                client.call_value(step.method, &step.params)?;
-                if let Some(ms) = step.wait_after_ms {
-                    thread::sleep(Duration::from_millis(ms));
-                }
-            }
-        }
+        Action::Script {
+            command,
+            args,
+            queue: _,
+        } => execute_script(command, args, current, repeat, lease)?,
         Action::FocusPane { direction } => {
             let direction = match direction {
                 Direction::Up => "up",
@@ -524,6 +567,120 @@ fn execute_action(
     Ok(true)
 }
 
+fn execute_work(work: Work, repeat: usize, routing_generation: &AtomicU64) -> Result<()> {
+    let generation = work.generation();
+    if generation != routing_generation.load(Ordering::Acquire) {
+        log("control ignored: stale Herdr routing");
+        return Ok(());
+    }
+    let (session_info, terminal) = match &work {
+        Work::Binding {
+            session, terminal, ..
+        }
+        | Work::FocusSlot {
+            session, terminal, ..
+        } => (session.clone(), terminal.clone()),
+    };
+    let snapshot = match current_snapshot(&session_info.client()) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            log(format!(
+                "control failed: refresh {}: {error:#}",
+                session_info.name
+            ));
+            return Ok(());
+        }
+    };
+    if generation != routing_generation.load(Ordering::Acquire) {
+        log("control ignored: stale Herdr routing");
+        return Ok(());
+    }
+    let lease = DispatchLease {
+        session: &session_info,
+        terminal: &terminal,
+        generation,
+        routing_generation,
+    };
+    match work {
+        Work::FocusSlot {
+            pane_id,
+            agent_terminal_id,
+            source,
+            session,
+            ..
+        } => {
+            if !snapshot
+                .agents
+                .iter()
+                .any(|agent| agent.pane_id == pane_id && agent.terminal_id == agent_terminal_id)
+            {
+                bail!("Agent slot pane disappeared");
+            }
+            lease.ensure()?;
+            focus_agent(&lease.client(), &pane_id)?;
+            log(format!("{source}: focused {}/{pane_id}", session.name));
+        }
+        Work::Binding {
+            binding,
+            source,
+            session,
+            target,
+            ..
+        } => {
+            let current = snapshot.agents.iter().find(|agent| agent.focused);
+            if agent_identity(current) != target {
+                log(format!("{source} ignored: focused pane changed"));
+                return Ok(());
+            }
+            let Some(action) = binding.resolve(
+                current
+                    .and_then(|agent| agent.agent.as_deref())
+                    .unwrap_or(""),
+            ) else {
+                return Ok(());
+            };
+            let executed = execute_action(&action, current, &snapshot, repeat, &lease)?;
+            if executed {
+                log(format!(
+                    "{source}: {}{} in {}{}",
+                    action_name(&action),
+                    if repeat > 1 {
+                        format!(" x{repeat}")
+                    } else {
+                        String::new()
+                    },
+                    session.name,
+                    current
+                        .map(|agent| format!(
+                            " for {} in {}",
+                            agent.agent.as_deref().unwrap_or("unknown"),
+                            agent.pane_id
+                        ))
+                        .unwrap_or_default()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn coalesce_batch(batch: Vec<Work>) -> Vec<(Work, usize)> {
+    let mut batch = batch.into_iter().peekable();
+    let mut runs = Vec::new();
+    while let Some(work) = batch.next() {
+        let mut repeat = 1;
+        while batch
+            .peek()
+            .is_some_and(|next| work.same_coalescible_action(next))
+        {
+            batch.next();
+            repeat += 1;
+        }
+        runs.push((work, repeat));
+    }
+    runs
+}
+
 fn action_worker(
     receiver: Receiver<Work>,
     routing_generation: Arc<AtomicU64>,
@@ -540,117 +697,34 @@ fn action_worker(
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
         };
-        let mut repeat = 1;
-        while let Ok(next) = receiver.try_recv() {
-            if work.same_effort(&next) {
-                repeat += 1;
-            } else {
-                deferred = Some(next);
+        let mut batch = vec![work];
+        if batch[0].script_queue().is_some() {
+            while let Ok(next) = receiver.try_recv() {
+                if batch[0].same_script_queue(&next) {
+                    batch.push(next);
+                } else {
+                    deferred = Some(next);
+                    break;
+                }
+            }
+        } else {
+            while let Ok(next) = receiver.try_recv() {
+                if batch[0].same_coalescible_action(&next) {
+                    batch.push(next);
+                } else {
+                    deferred = Some(next);
+                    break;
+                }
+            }
+        }
+
+        for (work, repeat) in coalesce_batch(batch) {
+            if stopping.load(Ordering::Acquire) {
                 break;
             }
-        }
-        let generation = work.generation();
-        if generation != routing_generation.load(Ordering::Acquire) {
-            log("control ignored: stale Herdr routing");
-            continue;
-        }
-        let (session_info, terminal) = match &work {
-            Work::Binding {
-                session, terminal, ..
+            if let Err(error) = execute_work(work, repeat, &routing_generation) {
+                log(format!("control failed: {error:#}"));
             }
-            | Work::FocusSlot {
-                session, terminal, ..
-            } => (session.clone(), terminal.clone()),
-        };
-        let snapshot = match current_snapshot(&session_info.client()) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                log(format!(
-                    "control failed: refresh {}: {error:#}",
-                    session_info.name
-                ));
-                continue;
-            }
-        };
-        if generation != routing_generation.load(Ordering::Acquire) {
-            log("control ignored: stale Herdr routing");
-            continue;
-        }
-        let lease = DispatchLease {
-            session: &session_info,
-            terminal: &terminal,
-            generation,
-            routing_generation: &routing_generation,
-        };
-        let result = match work {
-            Work::FocusSlot {
-                pane_id,
-                agent_terminal_id,
-                source,
-                session,
-                ..
-            } => {
-                let result =
-                    if snapshot.agents.iter().any(|agent| {
-                        agent.pane_id == pane_id && agent.terminal_id == agent_terminal_id
-                    }) {
-                        lease
-                            .ensure()
-                            .and_then(|_| focus_agent(&lease.client(), &pane_id))
-                    } else {
-                        Err(anyhow!("Agent slot pane disappeared"))
-                    };
-                if result.is_ok() {
-                    log(format!("{source}: focused {}/{pane_id}", session.name));
-                }
-                result
-            }
-            Work::Binding {
-                binding,
-                source,
-                session,
-                effort,
-                target,
-                ..
-            } => (|| {
-                let current = snapshot.agents.iter().find(|agent| agent.focused);
-                if agent_identity(current) != target {
-                    log(format!("{source} ignored: focused pane changed"));
-                    return Ok(());
-                }
-                let Some(action) = binding.resolve(
-                    current
-                        .and_then(|agent| agent.agent.as_deref())
-                        .unwrap_or(""),
-                ) else {
-                    return Ok(());
-                };
-                let executed =
-                    execute_action(&action, current, &snapshot, &effort, repeat, &lease)?;
-                if executed {
-                    log(format!(
-                        "{source}: {}{} in {}{}",
-                        action_name(&action),
-                        if repeat > 1 {
-                            format!(" x{repeat}")
-                        } else {
-                            String::new()
-                        },
-                        session.name,
-                        current
-                            .map(|agent| format!(
-                                " for {} in {}",
-                                agent.agent.as_deref().unwrap_or("unknown"),
-                                agent.pane_id
-                            ))
-                            .unwrap_or_default()
-                    ));
-                }
-                Ok(())
-            })(),
-        };
-        if let Err(error) = result {
-            log(format!("control failed: {error:#}"));
         }
     }
 }
@@ -665,7 +739,6 @@ fn queue_binding(
     binding: Binding,
     source: String,
     route: Option<(Session, String)>,
-    effort: &EffortConfig,
     target: Option<AgentInfo>,
     generation: u64,
 ) {
@@ -690,7 +763,6 @@ fn queue_binding(
                 source,
                 session,
                 terminal,
-                effort: effort.clone(),
                 target: agent_identity(target.as_ref()),
                 generation,
             };
@@ -723,7 +795,6 @@ fn handle_fired(
             Binding::Action(fired.action),
             fired.source,
             route,
-            &context.effort,
             context.target.clone(),
             context.generation,
         );
@@ -787,7 +858,6 @@ fn handle_device_event(
                     Binding::Action(action),
                     format!("joystick {direction}"),
                     context.selected(routing_generation),
-                    &context.effort,
                     context.target.clone(),
                     context.generation,
                 );
@@ -832,7 +902,6 @@ fn handle_device_event(
                         binding,
                         key,
                         captured,
-                        &context.effort,
                         context.target.clone(),
                         context.generation,
                     );
@@ -856,7 +925,6 @@ fn handle_device_event(
                         binding.unwrap(),
                         key,
                         captured,
-                        &context.effort,
                         context.target.clone(),
                         context.generation,
                     ),
@@ -1496,7 +1564,6 @@ fn update_input_context(context: &Mutex<Arc<InputContext>>, state: &State) {
         .and_then(|name| state.sessions.iter().find(|session| session.name == *name));
     *context.lock().unwrap_or_else(|error| error.into_inner()) = Arc::new(InputContext {
         controls: state.config.controls.clone(),
-        effort: state.config.effort.clone(),
         session: session.cloned(),
         terminal: state.focused_terminal.clone(),
         target: target.cloned(),
@@ -1838,6 +1905,29 @@ mod tests {
         }
     }
 
+    fn script_work(
+        session: Session,
+        terminal: &str,
+        pane: &str,
+        agent: &str,
+        key: &str,
+        queue: Option<&str>,
+        generation: u64,
+    ) -> Work {
+        Work::Binding {
+            binding: Box::new(Binding::Action(Action::Script {
+                command: "/bin/sh".into(),
+                args: vec!["adapter".into(), key.into()],
+                queue: queue.map(str::to_owned),
+            })),
+            source: "dial".into(),
+            session,
+            terminal: terminal.into(),
+            target: Some((terminal.into(), pane.into(), Some(agent.into()))),
+            generation,
+        }
+    }
+
     #[test]
     fn timestamps_are_utc_iso_8601() {
         assert_eq!(format_timestamp(UNIX_EPOCH), "1970-01-01T00:00:00.000Z");
@@ -1890,13 +1980,163 @@ mod tests {
     }
 
     #[test]
+    fn script_queues_preserve_action_and_frozen_route_identity() {
+        let raise = script_work(
+            session("work"),
+            "terminal",
+            "pane",
+            "codex",
+            "raise",
+            Some("effort"),
+            7,
+        );
+        let same = script_work(
+            session("work"),
+            "terminal",
+            "pane",
+            "codex",
+            "raise",
+            Some("effort"),
+            7,
+        );
+        let lower = script_work(
+            session("work"),
+            "terminal",
+            "pane",
+            "codex",
+            "lower",
+            Some("effort"),
+            7,
+        );
+        assert!(raise.same_script_queue(&lower));
+        assert!(raise.same_coalescible_action(&same));
+        assert!(!raise.same_coalescible_action(&lower));
+
+        for different_target in [
+            script_work(
+                session("other"),
+                "terminal",
+                "pane",
+                "codex",
+                "raise",
+                Some("effort"),
+                7,
+            ),
+            script_work(
+                Session {
+                    name: "work".into(),
+                    socket_path: "/tmp/replacement.sock".into(),
+                },
+                "terminal",
+                "pane",
+                "codex",
+                "raise",
+                Some("effort"),
+                7,
+            ),
+            script_work(
+                session("work"),
+                "other-terminal",
+                "pane",
+                "codex",
+                "raise",
+                Some("effort"),
+                7,
+            ),
+            script_work(
+                session("work"),
+                "terminal",
+                "other-pane",
+                "codex",
+                "raise",
+                Some("effort"),
+                7,
+            ),
+            script_work(
+                session("work"),
+                "terminal",
+                "pane",
+                "pi",
+                "raise",
+                Some("effort"),
+                7,
+            ),
+            script_work(
+                session("work"),
+                "terminal",
+                "pane",
+                "codex",
+                "raise",
+                Some("effort"),
+                8,
+            ),
+        ] {
+            assert!(!raise.same_script_queue(&different_target));
+            assert!(!raise.same_coalescible_action(&different_target));
+        }
+
+        let unqueued = script_work(
+            session("work"),
+            "terminal",
+            "pane",
+            "codex",
+            "raise",
+            None,
+            7,
+        );
+        assert!(!unqueued.same_script_queue(&unqueued));
+        assert!(!unqueued.same_coalescible_action(&unqueued));
+    }
+
+    #[test]
+    fn queued_scripts_preserve_order_and_total_repeats() {
+        let batch = ["raise", "raise", "lower", "raise"]
+            .map(|key| {
+                script_work(
+                    session("work"),
+                    "terminal",
+                    "pane",
+                    "codex",
+                    key,
+                    Some("effort"),
+                    7,
+                )
+            })
+            .into();
+        let effects: Vec<_> = coalesce_batch(batch)
+            .into_iter()
+            .flat_map(|(work, repeat)| {
+                let key = match work.resolved_action().unwrap() {
+                    Action::Script { args, .. } => args[1].clone(),
+                    _ => unreachable!(),
+                };
+                std::iter::repeat_n(key, repeat)
+            })
+            .collect();
+        assert_eq!(effects, ["raise", "raise", "lower", "raise"]);
+    }
+
+    #[test]
+    fn scripts_require_a_focused_agent() {
+        let routing_generation = AtomicU64::new(3);
+        let session = session("work");
+        let lease = DispatchLease {
+            session: &session,
+            terminal: "terminal",
+            generation: 3,
+            routing_generation: &routing_generation,
+        };
+        let error = execute_script("/usr/bin/true", &[], None, 1, &lease).unwrap_err();
+        assert_eq!(error.to_string(), "no focused Herdr agent");
+    }
+
+    #[test]
     fn key_events_capture_the_ready_session_without_hardware() {
         let (sender, receiver) = mpsc::sync_channel(1);
         let target = agent("terminal", "pane", "codex");
         let config = Config::default();
         let context = InputContext {
             controls: config.controls,
-            effort: config.effort,
             session: Some(session("work")),
             terminal: Some("terminal".into()),
             target: Some(target),
