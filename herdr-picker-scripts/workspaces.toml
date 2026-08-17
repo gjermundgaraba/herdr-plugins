@@ -1,0 +1,8 @@
+title = "Workspaces"
+submit = ["herdr-picker-focus-workspace.py"]
+
+[[steps]]
+id = "workspace"
+title = "Choose workspace"
+source = ["herdr-picker-workspaces.py"]
+search = "local"

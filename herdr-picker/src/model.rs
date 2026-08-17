@@ -1,138 +1,78 @@
-use herdr_client::AgentStatus;
+use std::collections::HashSet;
+
 use nucleo_matcher::{
     Config, Matcher, Utf32String,
     pattern::{CaseMatching, Normalization, Pattern},
 };
+use serde::Deserialize;
 use serde_json::Value;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Filter {
-    All,
-    Workspaces,
-    Tabs,
-    Panes,
-    Agents,
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Tone {
+    Muted,
+    Accent,
+    Success,
+    Warning,
+    Danger,
 }
 
-impl Filter {
-    pub const ALL: [Self; 5] = [
-        Self::All,
-        Self::Workspaces,
-        Self::Tabs,
-        Self::Panes,
-        Self::Agents,
-    ];
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::All => "all",
-            Self::Workspaces => "workspaces",
-            Self::Tabs => "tabs",
-            Self::Panes => "panes",
-            Self::Agents => "agents",
-        }
-    }
-
-    pub fn next(self, delta: isize) -> Self {
-        let index = Self::ALL.iter().position(|item| *item == self).unwrap_or(0);
-        let len = Self::ALL.len() as isize;
-        Self::ALL[(index as isize + delta).rem_euclid(len) as usize]
-    }
-}
-
-impl std::str::FromStr for Filter {
-    type Err = &'static str;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "all" => Ok(Self::All),
-            "workspaces" => Ok(Self::Workspaces),
-            "tabs" => Ok(Self::Tabs),
-            "panes" => Ok(Self::Panes),
-            "agents" => Ok(Self::Agents),
-            _ => Err("expected all, workspaces, tabs, panes, or agents"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
-    Workspace,
-    Tab,
-    Pane,
-    Agent,
-}
-
-impl Kind {
-    pub const fn filter(self) -> Filter {
-        match self {
-            Self::Workspace => Filter::Workspaces,
-            Self::Tab => Filter::Tabs,
-            Self::Pane => Filter::Panes,
-            Self::Agent => Filter::Agents,
-        }
-    }
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Workspace => "workspace",
-            Self::Tab => "tab",
-            Self::Pane => "pane",
-            Self::Agent => "agent",
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct Dispatch {
-    pub method: String,
-    pub params: Value,
-}
-
-impl Dispatch {
-    pub fn new(method: impl Into<String>, params: Value) -> Self {
-        Self {
-            method: method.into(),
-            params,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Item {
-    pub kind: Kind,
-    pub agent_status: Option<AgentStatus>,
+    pub id: String,
     pub title: String,
     pub subtitle: String,
     pub detail: String,
-    pub dispatch: Dispatch,
+    pub badge: String,
+    pub indicator: String,
+    pub tone: Option<Tone>,
+    pub spinning: bool,
+    pub search: String,
+    pub value: Value,
+}
+
+pub fn validate_items(items: &[Item]) -> Result<(), String> {
+    let mut ids = HashSet::new();
+    for (index, item) in items.iter().enumerate() {
+        if item.id.trim().is_empty() {
+            return Err(format!("items[{index}].id must not be empty"));
+        }
+        if item.title.trim().is_empty() {
+            return Err(format!("items[{index}].title must not be empty"));
+        }
+        if !ids.insert(&item.id) {
+            return Err(format!("duplicate item id {:?}", item.id));
+        }
+    }
+    Ok(())
 }
 
 pub struct Picker {
     pub items: Vec<Item>,
     pub query: String,
-    pub filter: Filter,
     pub selected: usize,
     pub scroll: usize,
     pub visible_rows: usize,
     filtered: Vec<usize>,
     haystacks: Vec<Utf32String>,
     matcher: Matcher,
+    local_search: bool,
 }
 
 impl Picker {
-    pub fn new(items: Vec<Item>, filter: Filter) -> Self {
+    pub fn new(items: Vec<Item>, local_search: bool) -> Self {
         let haystacks = items.iter().map(haystack).collect();
         let mut picker = Self {
             items,
             query: String::new(),
-            filter,
             selected: 0,
             scroll: 0,
             visible_rows: 0,
             filtered: Vec::new(),
             haystacks,
             matcher: Matcher::new(Config::DEFAULT),
+            local_search,
         };
         picker.refilter();
         picker
@@ -156,46 +96,18 @@ impl Picker {
 
     pub fn needs_spinner(&self) -> bool {
         let end = self.len().min(self.scroll + self.visible_rows);
-        (self.scroll..end).any(|index| {
-            self.row(index).is_some_and(|item| {
-                item.kind == Kind::Agent
-                    && item
-                        .agent_status
-                        .as_ref()
-                        .is_some_and(|status| status.as_str() == AgentStatus::WORKING)
-            })
-        })
-    }
-
-    pub fn set_filter(&mut self, filter: Filter) {
-        self.filter = filter;
-        self.refilter();
-    }
-
-    pub fn cycle_filter(&mut self, delta: isize) {
-        self.set_filter(self.filter.next(delta));
+        (self.scroll..end).any(|index| self.row(index).is_some_and(|item| item.spinning))
     }
 
     pub fn refilter(&mut self) {
         let query = self.query.trim();
         let mut matches = Vec::new();
 
-        if query.is_empty() {
-            matches.extend(
-                self.items
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, item)| {
-                        self.filter == Filter::All || item.kind.filter() == self.filter
-                    })
-                    .map(|(index, _)| (index, 0)),
-            );
+        if query.is_empty() || !self.local_search {
+            matches.extend((0..self.items.len()).map(|index| (index, 0)));
         } else {
             let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
-            for (index, item) in self.items.iter().enumerate() {
-                if self.filter != Filter::All && item.kind.filter() != self.filter {
-                    continue;
-                }
+            for index in 0..self.items.len() {
                 if let Some(score) =
                     pattern.score(self.haystacks[index].slice(..), &mut self.matcher)
                 {
@@ -216,6 +128,17 @@ impl Picker {
         self.scroll = 0;
     }
 
+    pub fn replace_items(&mut self, items: Vec<Item>) {
+        let selected_id = self.selected_item().map(|item| item.id.clone());
+        self.items = items;
+        self.rebuild(selected_id.as_deref());
+    }
+
+    pub fn clear_items(&mut self) {
+        self.items.clear();
+        self.rebuild(None);
+    }
+
     pub fn move_selection(&mut self, delta: isize) {
         if self.filtered.is_empty() {
             return;
@@ -233,15 +156,26 @@ impl Picker {
             self.scroll = self.selected + 1 - rows;
         }
     }
+
+    fn rebuild(&mut self, selected_id: Option<&str>) {
+        self.haystacks = self.items.iter().map(haystack).collect();
+        self.refilter();
+        if let Some(selected_id) = selected_id
+            && let Some(index) = self
+                .filtered
+                .iter()
+                .position(|index| self.items[*index].id == selected_id)
+        {
+            self.selected = index;
+            self.ensure_selection_visible();
+        }
+    }
 }
 
 fn haystack(item: &Item) -> Utf32String {
     format!(
-        "{} {} {} {}",
-        item.title,
-        item.subtitle,
-        item.detail,
-        item.kind.label()
+        "{} {} {} {} {} {}",
+        item.id, item.title, item.subtitle, item.detail, item.badge, item.search
     )
     .into()
 }
@@ -251,53 +185,55 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn item(kind: Kind, title: &str) -> Item {
+    fn item(id: &str, title: &str, search: &str) -> Item {
         Item {
-            kind,
-            agent_status: None,
+            id: id.into(),
             title: title.into(),
-            subtitle: String::new(),
-            detail: String::new(),
-            dispatch: Dispatch::new("test", json!({})),
+            search: search.into(),
+            value: json!({ "original": id }),
+            ..Item::default()
         }
     }
 
     #[test]
-    fn fuzzy_search_and_source_filter_compose() {
+    fn fuzzy_search_uses_display_and_explicit_search_text() {
         let mut picker = Picker::new(
             vec![
-                item(Kind::Pane, "Split logs"),
-                item(Kind::Workspace, "api"),
-                item(Kind::Agent, "Claude API fixer"),
+                item("logs", "Split logs", ""),
+                item("api", "Backend", "production service"),
+                item("agent", "Claude API fixer", ""),
             ],
-            Filter::All,
+            true,
         );
         picker.query = "api fix".into();
         picker.refilter();
-        assert_eq!(picker.row(0).unwrap().title, "Claude API fixer");
+        assert_eq!(picker.row(0).unwrap().id, "agent");
 
-        picker.set_filter(Filter::Workspaces);
-        assert!(picker.is_empty());
-        picker.query = "api".into();
+        picker.query = "production".into();
         picker.refilter();
-        assert_eq!(picker.row(0).unwrap().title, "api");
+        assert_eq!(picker.row(0).unwrap().id, "api");
     }
 
     #[test]
-    fn spinner_needed_only_when_working_agent_visible() {
-        let mut working = item(Kind::Agent, "worker");
-        working.agent_status = Some("working".into());
-        let mut picker = Picker::new(vec![item(Kind::Workspace, "api"), working], Filter::All);
-
-        picker.visible_rows = 1;
-        assert!(!picker.needs_spinner());
-        picker.visible_rows = 2;
-        assert!(picker.needs_spinner());
+    fn validates_item_identity() {
+        assert!(validate_items(&[item("one", "One", "")]).is_ok());
+        assert!(validate_items(&[]).is_ok());
+        assert!(
+            validate_items(&[item("same", "One", ""), item("same", "Two", "")])
+                .unwrap_err()
+                .contains("duplicate")
+        );
     }
 
     #[test]
-    fn parses_filter_labels() {
-        assert_eq!("workspaces".parse(), Ok(Filter::Workspaces));
-        assert!("workspace".parse::<Filter>().is_err());
+    fn provider_order_and_selection_survive_replacement() {
+        let mut picker = Picker::new(vec![item("one", "One", ""), item("two", "Two", "")], false);
+        picker.query = "not locally filtered".into();
+        picker.refilter();
+        picker.selected = 1;
+
+        picker.replace_items(vec![item("two", "Updated", ""), item("three", "Three", "")]);
+        assert_eq!(picker.len(), 2);
+        assert_eq!(picker.selected_item().unwrap().id, "two");
     }
 }

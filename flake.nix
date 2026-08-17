@@ -34,10 +34,32 @@
         herdr-picker = {
           sourceRoots = [
             "herdr-picker"
-            "sdk/ratatui"
             "sdk/rust"
           ];
           binaries = [ "herdr-picker" ];
+          binOnly = true;
+          platforms = [
+            "darwin"
+            "linux"
+          ];
+        };
+
+        herdr-picker-herdr = {
+          sourceRoots = [
+            "herdr-picker-herdr"
+            "sdk/rust"
+          ];
+          binaries = [
+            "herdr-picker-herdr-agents"
+            "herdr-picker-herdr-workspaces"
+            "herdr-picker-herdr-focus-agent"
+            "herdr-picker-herdr-focus-workspace"
+          ];
+          binOnly = true;
+          exampleFiles = [
+            "agents.toml"
+            "workspaces.toml"
+          ];
           platforms = [
             "darwin"
             "linux"
@@ -162,7 +184,9 @@
               cargoReleaseDir = "target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release";
               installBinaries = lib.concatMapStringsSep "\n" (
                 binary:
-                if definition.binLayout or false then
+                if definition.binOnly or false then
+                  ''install -Dm755 "${cargoReleaseDir}/${binary}" "$out/bin/${binary}"''
+                else if definition.binLayout or false then
                   ''install -Dm750 "${cargoReleaseDir}/${binary}" "$out/${name}/bin/${binary}"''
                 else
                   ''install -Dm755 "${cargoReleaseDir}/${binary}" "$out/target/release/${binary}"''
@@ -170,9 +194,13 @@
               installRuntimeFiles = lib.concatMapStringsSep "\n" (
                 file: ''install -Dm444 "${name}/${file}" "$out/${name}/${file}"''
               ) (definition.runtimeFiles or [ ]);
+              installExampleFiles = lib.concatMapStringsSep "\n" (
+                file:
+                ''install -Dm444 "${name}/examples/${file}" "$out/share/herdr-picker/examples/${file}"''
+              ) (definition.exampleFiles or [ ]);
             in
             rustPlatform.buildRustPackage {
-              pname = "herdr-plugin-${name}";
+              pname = if definition.binOnly or false then name else "herdr-plugin-${name}";
               inherit (crate.package) version;
               src = pluginSource;
 
@@ -192,21 +220,27 @@
               installPhase = ''
                 runHook preInstall
 
-                mkdir -p "$out/${name}"
-                install -Dm444 "${name}/herdr-plugin.toml" "$out/${name}/herdr-plugin.toml"
+                ${lib.optionalString (!(definition.binOnly or false)) ''
+                  install -Dm444 "${name}/herdr-plugin.toml" "$out/${name}/herdr-plugin.toml"
+                ''}
                 ${installBinaries}
                 ${installRuntimeFiles}
+                ${installExampleFiles}
 
                 runHook postInstall
               '';
 
               passthru = {
-                pluginRoot = linkPath;
                 localPathDependencyClosure = definition.sourceRoots;
+              } // lib.optionalAttrs (!(definition.binOnly or false)) {
+                pluginRoot = linkPath;
               };
 
               meta = {
-                description = "Prebuilt ${name} plugin for Herdr";
+                description =
+                  if definition.binOnly or false
+                  then crate.package.description
+                  else "Prebuilt ${name} plugin for Herdr";
                 homepage = "https://github.com/gjermundgaraba/herdr-plugins/tree/main/${name}";
                 license = lib.licenses.asl20;
                 platforms =

@@ -1,12 +1,14 @@
 [package]
-name = "herdr-ratatui"
+name = "herdr-picker-herdr"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "Shared Ratatui chrome for Herdr popup plugins"
+description = "Live Herdr data providers for herdr-picker"
 repository.workspace = true
 
 [dependencies]
-ratatui.workspace = true
+herdr-client.workspace = true
+serde.workspace = true
+serde_json.workspace = true

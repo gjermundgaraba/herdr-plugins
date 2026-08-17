@@ -336,7 +336,6 @@ version = "0.1.0"
 dependencies = [
  "crossterm",
  "herdr-client",
- "herdr-ratatui",
  "libc",
  "nucleo-matcher",
  "ratatui",
@@ -348,10 +347,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "herdr-ratatui"
+name = "herdr-picker-herdr"
 version = "0.1.0"
 dependencies = [
- "ratatui",
+ "herdr-client",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
