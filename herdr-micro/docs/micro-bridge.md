@@ -25,15 +25,23 @@ Codex Micro over USB
   → six sticky Herdr agent slots and configured controls
   → focused Ghostty terminal UUID
   → matching default or named Herdr session
-  → exact pane/agent action
+  → exact pane/agent built-in or script action
 ```
 
-The daemon uses Herdr's CLI only to discover running session names and their
-socket paths at startup or when discovery becomes stale. It polls the selected
-session's stable `session.snapshot` API four times per second; changed agent
-state drives routing and lighting without additional subprocesses. Actions are
-direct socket requests after a fresh snapshot confirms the captured agent
-identity.
+The daemon uses Herdr's CLI to discover running session names and their socket
+paths at startup or when discovery becomes stale; configured scripts may also
+invoke it for their action. It polls the selected session's stable
+`session.snapshot` API four times per second; changed agent state drives routing
+and lighting without additional discovery subprocesses.
+Built-in actions are direct socket requests after a fresh snapshot confirms
+the captured agent identity. Configured script actions run synchronously from
+the plugin root after the same validation. They receive `HERDR_SOCKET_PATH`,
+`HERDR_SESSION`, and `HERDR_PANE_ID`, and inherit `HERDR_BIN_PATH`. Child output
+is bounded; failures report stderr and their binding. A process group that
+exceeds the five-second deadline is terminated and reaped.
+
+The single action worker runs each accepted script once in FIFO order. Its
+bounded queue accepts 16 pending actions and logs inputs rejected while full.
 
 Ghostty inspection uses a cached native ScriptingBridge client from Rust. The
 focused terminal UUID is queried while Ghostty is active and immediately before
@@ -98,7 +106,8 @@ bindings internally.
   live host-cell size, rechecks the focused Ghostty UUID, then sends native
   mouse-position and scroll commands to that exact Ghostty terminal. `key`
   bindings are the deliberate exception: they tap system-wide from any
-  frontmost application while the bridge owns the device.
+  frontmost application while the bridge owns the device. Scripts recheck the
+  frozen session, terminal, pane, agent, and routing generation before running.
 - CoreGraphics output requires Accessibility permission only for explicitly
   configured `key` bindings, which tap their configured keycode. Scrolling does
   not move the system cursor. No other keyboard events are synthesized; all
@@ -131,13 +140,17 @@ then sends the agent-specific operation to that exact pane:
 
 | Agent | Mechanism |
 |---|---|
-| Codex | User-configured `chat.increase_reasoning_effort` / `chat.decrease_reasoning_effort` bindings |
-| Claude | Native `/effort` picker, one step left or right |
-| Pi | Bundled extension using `getThinkingLevel()` / `setThinkingLevel()` |
+| Codex | Bundled adapter sends the CLI defaults `alt+.` and `alt+,` |
+| Claude | The same adapter drives `/effort`, one step left or right |
+| Pi | The same adapter sends an extension shortcut; the bundled extension uses `getThinkingLevel()` / `setThinkingLevel()` |
 
 Install the Pi extension with `bin/herdr-micro setup-pi-effort`; existing
 sessions need `/reload`. Claude persists `low` through `xhigh`, while `max` is
-session-only. The changed effort applies to later provider calls.
+session-only. Codex CLI TUI bindings come from `~/.codex/config.toml`, not
+Codex Desktop's `~/.codex/keybindings.json`; the bridge targets the CLI
+defaults `alt+.` and `alt+,`. If those bindings are overridden, update the
+script arguments in `config.json`. The changed effort applies to later
+provider calls.
 
 The [research record](research/README.md) preserves tested versions, results,
 hardware evidence, caveats, and source links, including the upstream

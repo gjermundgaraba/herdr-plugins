@@ -91,7 +91,10 @@
             "herdr-micro"
             "herdr-micro-hid"
           ];
-          runtimeFiles = [ "integrations/pi/herdr-effort.js" ];
+          runtimeFiles = [
+            "integrations/pi/herdr-effort.js"
+            "integrations/thinking-effort.sh"
+          ];
           platforms = [ "darwin" ];
           binLayout = true;
         };

@@ -1,9 +1,9 @@
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use herdr_client::{AgentInfo, Client, PaneInfo, PaneLayoutSnapshot};
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::json;
 
-use crate::{PLUGIN_ID, config::EffortConfig};
+use crate::PLUGIN_ID;
 
 pub const CHATGPT_BUNDLE_IDS: [&str; 2] = ["com.openai.codex", "com.openai.chat"];
 pub const GHOSTTY_PROCESS: &str = "com.mitchellh.ghostty";
@@ -60,91 +60,6 @@ pub fn open_diff(client: &Client, agent: &AgentInfo) -> Result<()> {
         }),
     )?;
     Ok(())
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EffortStep {
-    pub method: &'static str,
-    pub params: Value,
-    pub wait_after_ms: Option<u64>,
-}
-
-pub fn plan_effort_change(
-    agent: &str,
-    direction: &str,
-    pane_id: &str,
-    config: &EffortConfig,
-    count: usize,
-) -> Result<Vec<EffortStep>> {
-    if !matches!(direction, "raise" | "lower") {
-        bail!("direction must be raise or lower, got {direction}");
-    }
-    if pane_id.is_empty() {
-        bail!("focused Herdr pane is required");
-    }
-    if count == 0 {
-        bail!("effort change count must be nonzero");
-    }
-    let step = |method, params, wait_after_ms| EffortStep {
-        method,
-        params,
-        wait_after_ms,
-    };
-    let repeated_keys = |key: &str| json!({ "pane_id": pane_id, "keys": std::iter::repeat_n(key, count).collect::<Vec<_>>() });
-    match agent {
-        "codex" => {
-            let key = match direction {
-                "raise" => config.codex.raise.as_deref(),
-                _ => config.codex.lower.as_deref(),
-            }
-            .filter(|key| !key.trim().is_empty())
-            .ok_or_else(|| anyhow!("Codex {direction} effort shortcut is not configured"))?;
-            Ok(vec![EffortStep {
-                method: "pane.send_keys",
-                params: repeated_keys(key),
-                wait_after_ms: None,
-            }])
-        }
-        "claude" => Ok(vec![
-            step(
-                "pane.send_text",
-                json!({ "pane_id": pane_id, "text": "/effort" }),
-                None,
-            ),
-            step(
-                "pane.send_keys",
-                json!({ "pane_id": pane_id, "keys": ["enter"] }),
-                Some(150),
-            ),
-            EffortStep {
-                method: "pane.send_keys",
-                params: repeated_keys(if direction == "raise" {
-                    "right"
-                } else {
-                    "left"
-                }),
-                wait_after_ms: Some(100),
-            },
-            step(
-                "pane.send_keys",
-                json!({ "pane_id": pane_id, "keys": ["enter"] }),
-                None,
-            ),
-        ]),
-        "pi" => Ok(vec![EffortStep {
-            method: "pane.send_keys",
-            params: repeated_keys(if direction == "raise" {
-                "ctrl+shift+right"
-            } else {
-                "ctrl+shift+left"
-            }),
-            wait_after_ms: None,
-        }]),
-        other => bail!(
-            "unsupported focused agent: {}",
-            if other.is_empty() { "none" } else { other }
-        ),
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -216,46 +131,8 @@ pub fn automatic_layer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{EffortConfig, EffortKeys};
     use serde_json::json;
 
-    #[test]
-    fn plans_effort_as_socket_calls() {
-        let effort = EffortConfig {
-            codex: EffortKeys {
-                raise: Some("ctrl+shift+right".into()),
-                lower: Some("ctrl+shift+left".into()),
-            },
-        };
-        assert_eq!(
-            plan_effort_change("claude", "lower", "p2", &effort, 3).unwrap()[2].params,
-            json!({"pane_id":"p2", "keys":["left", "left", "left"]})
-        );
-        assert_eq!(
-            plan_effort_change("pi", "raise", "p2", &effort, 2).unwrap()[0].params,
-            json!({"pane_id":"p2", "keys":["ctrl+shift+right", "ctrl+shift+right"]})
-        );
-        assert_eq!(
-            plan_effort_change("codex", "raise", "p1", &effort, 2).unwrap()[0].method,
-            "pane.send_keys"
-        );
-        assert!(
-            plan_effort_change(
-                "codex",
-                "raise",
-                "p1",
-                &EffortConfig {
-                    codex: EffortKeys {
-                        raise: None,
-                        lower: None,
-                    },
-                },
-                1,
-            )
-            .is_err()
-        );
-        assert!(plan_effort_change("codex", "raise", "p1", &effort, 0).is_err());
-    }
     #[test]
     fn known_chatgpt_bundles_select_layer_one() {
         for process in CHATGPT_BUNDLE_IDS {

@@ -9,19 +9,21 @@ use std::{
 #[cfg(test)]
 use std::{env, os::unix::fs::PermissionsExt};
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(tag = "action", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Action {
     Prompt {
         prompt: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         submit: Option<bool>,
     },
     Diff,
     Fast,
     Submit,
-    Effort {
-        direction: EffortDirection,
+    Script {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
     },
     FocusPane {
         direction: Direction,
@@ -31,16 +33,16 @@ pub enum Action {
         percent: f64,
     },
     Key {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         key: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         keycode: Option<u16>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[serde(default)]
         modifiers: Vec<Modifier>,
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Modifier {
     Cmd,
@@ -76,13 +78,7 @@ pub fn key_action_code(key: Option<&str>, keycode: Option<u16>) -> Result<u16, S
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum EffortDirection {
-    Raise,
-    Lower,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Direction {
     Up,
@@ -90,14 +86,14 @@ pub enum Direction {
     Left,
     Right,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VerticalDirection {
     Up,
     Down,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct GestureBinding {
     #[serde(default)]
@@ -118,7 +114,7 @@ pub struct GestureBinding {
 pub enum Binding {
     Action(Action),
     ByAgent(std::collections::BTreeMap<String, Option<Action>>),
-    Gesture(GestureBinding),
+    Gesture(Box<GestureBinding>),
 }
 
 impl<'de> Deserialize<'de> for Binding {
@@ -177,8 +173,8 @@ pub fn key_binding(config: &Controls, key: &str, action: i64) -> Option<Binding>
         }
     }
     match key {
-        "ENC_CC" => config.dial.clockwise.clone().map(Binding::Action),
-        "ENC_CW" => config.dial.counterclockwise.clone().map(Binding::Action),
+        "ENC_CC" => config.dial.clockwise.clone(),
+        "ENC_CW" => config.dial.counterclockwise.clone(),
         _ => None,
     }
 }
@@ -194,7 +190,6 @@ pub struct Controls {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub controls: Controls,
-    pub effort: EffortConfig,
     pub lighting: LightingConfig,
 }
 
@@ -227,9 +222,17 @@ pub fn requires_accessibility(controls: &Controls) -> bool {
             .press
             .as_ref()
             .is_some_and(binding_requires_accessibility)
+        || controls
+            .dial
+            .clockwise
+            .as_ref()
+            .is_some_and(binding_requires_accessibility)
+        || controls
+            .dial
+            .counterclockwise
+            .as_ref()
+            .is_some_and(binding_requires_accessibility)
         || [
-            controls.dial.clockwise.as_ref(),
-            controls.dial.counterclockwise.as_ref(),
             controls.joystick.up.as_ref(),
             controls.joystick.down.as_ref(),
             controls.joystick.left.as_ref(),
@@ -242,8 +245,8 @@ pub fn requires_accessibility(controls: &Controls) -> bool {
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Dial {
-    pub clockwise: Option<Action>,
-    pub counterclockwise: Option<Action>,
+    pub clockwise: Option<Binding>,
+    pub counterclockwise: Option<Binding>,
     pub press: Option<Binding>,
 }
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -271,9 +274,18 @@ fn parse_controls(value: &Value) -> Result<Controls, String> {
             "joystick distances must satisfy 0 <= releaseDistance < engageDistance <= 1".into(),
         );
     }
-    for (label, action) in [
+    for (label, binding) in [
         ("dial.clockwise", &controls.dial.clockwise),
         ("dial.counterclockwise", &controls.dial.counterclockwise),
+    ] {
+        if binding
+            .as_ref()
+            .is_some_and(|binding| matches!(binding, Binding::Gesture(_)))
+        {
+            return Err(format!("{label} does not support gesture bindings"));
+        }
+    }
+    for (label, action) in [
         ("joystick.up", &controls.joystick.up),
         ("joystick.down", &controls.joystick.down),
         ("joystick.left", &controls.joystick.left),
@@ -334,7 +346,7 @@ fn parse_binding(value: &Value, label: &str) -> Result<Option<Binding>, String> 
             return Err(format!("{label} timing must be an integer from 50 to 5000"));
         }
         validate_gesture_actions(&binding, label)?;
-        return Ok(Some(Binding::Gesture(binding)));
+        return Ok(Some(Binding::Gesture(Box::new(binding))));
     }
     Ok(parse_action_or_null(value, label)?.map(Binding::Action))
 }
@@ -373,6 +385,9 @@ fn validate_action(action: &Action, label: &str) -> Result<(), String> {
                 "{label}.percent must be greater than 0 and at most 100"
             ))
         }
+        Action::Script { command, .. } if command.trim().is_empty() => {
+            Err(format!("{label}.command must be a non-empty string"))
+        }
         Action::Key { key, keycode, .. } => key_action_code(key.as_deref(), *keycode)
             .map(|_| ())
             .map_err(|error| format!("{label}: {error}")),
@@ -401,36 +416,6 @@ fn valid_agent(agent: &str) -> bool {
         matches!(chars.next(), Some('a'..='z'))
             && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EffortConfig {
-    pub codex: EffortKeys,
-}
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EffortKeys {
-    pub raise: Option<String>,
-    pub lower: Option<String>,
-}
-fn parse_effort(value: Value) -> Result<EffortConfig, String> {
-    let codex = value
-        .get("codex")
-        .and_then(Value::as_object)
-        .ok_or_else(|| "codex effort configuration must be an object".to_owned())?;
-    for key in ["raise", "lower"] {
-        if !codex.contains_key(key) {
-            return Err(format!("codex {key} must be a key or null"));
-        }
-    }
-    let config: EffortConfig = serde_json::from_value(value).map_err(|e| e.to_string())?;
-    for key in [&config.codex.raise, &config.codex.lower] {
-        if key.as_ref().is_some_and(|key| key.trim().is_empty()) {
-            return Err("codex effort key must be a key or null".into());
-        }
-    }
-    Ok(config)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd, Serialize, Deserialize)]
@@ -568,10 +553,9 @@ impl Default for Config {
 
 fn parse_config(value: &Value) -> Result<Config, String> {
     let root = object(value, "configuration")?;
-    fields(root, &["controls", "effort", "lighting"], "configuration")?;
+    fields(root, &["controls", "lighting"], "configuration")?;
     Ok(Config {
         controls: parse_controls(req(root, "controls")?)?,
-        effort: parse_effort(req(root, "effort")?.clone())?,
         lighting: parse_lighting(req(root, "lighting")?.clone())?,
     })
 }
@@ -580,10 +564,23 @@ fn config_json() -> Value {
     serde_json::json!({
         "controls": {
             "buttons": {"1":null,"2":null,"3":{"byAgent":{"codex":{"action":"fast"},"pi":{"action":"fast"},"default":null}},"4":{"action":"prompt","prompt":"/copy","submit":true},"5":null,"6":null,"7":{"action":"submit"}},
-            "dial":{"clockwise":{"action":"effort","direction":"raise"},"counterclockwise":{"action":"effort","direction":"lower"},"press":{"action":"prompt","prompt":"/model","submit":true}},
+            "dial":{
+                "clockwise":{"byAgent":{
+                    "codex":{"action":"script","command":"/bin/sh","args":["./integrations/thinking-effort.sh","alt+."]},
+                    "claude":{"action":"script","command":"/bin/sh","args":["./integrations/thinking-effort.sh","claude","raise"]},
+                    "pi":{"action":"script","command":"/bin/sh","args":["./integrations/thinking-effort.sh","ctrl+shift+right"]},
+                    "default":null
+                }},
+                "counterclockwise":{"byAgent":{
+                    "codex":{"action":"script","command":"/bin/sh","args":["./integrations/thinking-effort.sh","alt+,"]},
+                    "claude":{"action":"script","command":"/bin/sh","args":["./integrations/thinking-effort.sh","claude","lower"]},
+                    "pi":{"action":"script","command":"/bin/sh","args":["./integrations/thinking-effort.sh","ctrl+shift+left"]},
+                    "default":null
+                }},
+                "press":{"action":"prompt","prompt":"/model","submit":true}
+            },
             "joystick":{"engageDistance":0.75,"releaseDistance":0.3,"up":{"action":"scroll","direction":"up","percent":50},"down":{"action":"scroll","direction":"down","percent":50},"left":{"action":"focus-pane","direction":"left"},"right":{"action":"focus-pane","direction":"right"}}
         },
-        "effort": {"codex":{"raise":null,"lower":null}},
         "lighting": {
             "states": {
                 "blocked":{"color":"#ffaa00","brightness":1,"effect":"solid","speed":0},
@@ -610,12 +607,39 @@ mod tests {
     fn controls_reject_unknown_fields_and_map_reversed_dial_labels() {
         let controls = Config::default().controls;
         for action in [-1, 0, 1, 2, 3] {
-            assert!(matches!(
-                key_binding(&controls, "ENC_CC", action),
-                Some(Binding::Action(Action::Effort {
-                    direction: EffortDirection::Raise
-                }))
-            ));
+            assert!(key_binding(&controls, "ENC_CC", action).is_some());
+        }
+        for (key, agent, expected) in [
+            ("ENC_CC", "codex", "alt+."),
+            ("ENC_CW", "codex", "alt+,"),
+            ("ENC_CC", "pi", "ctrl+shift+right"),
+            ("ENC_CW", "pi", "ctrl+shift+left"),
+        ] {
+            match key_binding(&controls, key, 1)
+                .unwrap()
+                .resolve(agent)
+                .unwrap()
+            {
+                Action::Script { args, .. } => {
+                    assert_eq!(args[1], expected);
+                }
+                action => panic!("unexpected {agent} dial action: {action:?}"),
+            }
+        }
+        for (key, direction) in [("ENC_CC", "raise"), ("ENC_CW", "lower")] {
+            match key_binding(&controls, key, 1)
+                .unwrap()
+                .resolve("claude")
+                .unwrap()
+            {
+                Action::Script { args, .. } => {
+                    assert_eq!(
+                        args,
+                        ["./integrations/thinking-effort.sh", "claude", direction]
+                    );
+                }
+                action => panic!("unexpected Claude dial action: {action:?}"),
+            }
         }
         assert_eq!(device_button("ACT06"), Some(1));
         assert_eq!(device_button("ACT10"), Some(5));
@@ -682,20 +706,28 @@ mod tests {
     }
 
     #[test]
-    fn validates_effort_and_lighting() {
-        let mut valid = config_json();
-        valid["effort"] = serde_json::json!({"codex":{"raise":null,"lower":"x"}});
-        assert!(parse_config(&valid).is_ok());
-        let mut blank = config_json();
-        blank["effort"] = serde_json::json!({"codex":{"raise":" ","lower":null}});
-        assert!(parse_config(&blank).is_err());
-        let mut missing = config_json();
-        missing["effort"] = serde_json::json!({"codex":{"raise":null}});
-        assert!(parse_config(&missing).is_err());
+    fn validates_scripts_and_lighting() {
+        let mut config = config_json();
+        config["controls"]["dial"]["clockwise"] =
+            serde_json::json!({"action":"script","command":" "});
+        assert!(parse_config(&config).is_err());
         let mut lighting = config_json();
         lighting["lighting"] =
             serde_json::json!({"states":{},"focusedBrightness":1,"ambient":"status","keys":null});
         assert!(parse_config(&lighting).is_err());
+    }
+
+    #[test]
+    fn dial_rotation_rejects_gesture_bindings() {
+        for direction in ["clockwise", "counterclockwise"] {
+            let mut config = config_json();
+            config["controls"]["dial"][direction] = serde_json::json!({"tap":{"action":"submit"}});
+            assert!(
+                parse_config(&config)
+                    .unwrap_err()
+                    .contains("does not support gesture bindings")
+            );
+        }
     }
 
     #[test]

@@ -82,6 +82,13 @@ pub fn doctor() -> Report {
         }
         Ok(path.display().to_string())
     });
+    check(&mut report, "Thinking-effort adapter", || {
+        let path = plugin_root()?.join("integrations/thinking-effort.sh");
+        if !fs::metadata(&path)?.is_file() {
+            anyhow::bail!("{} is not a file", path.display());
+        }
+        Ok(path.display().to_string())
+    });
     check(&mut report, "Privileged USB helper", || {
         helper_install::verify_installed()?;
         Ok(format!("version {HELPER_VERSION}"))
@@ -163,15 +170,6 @@ pub fn doctor() -> Report {
         // A stopped bridge is a normal state (micro-stop, 60s idle release),
         // not an installation failure.
         Err(error) => report.push(Level::Warn, format!("Micro bridge is not running: {error}")),
-    }
-    if config.as_ref().is_some_and(|config| {
-        config.effort.codex.raise.is_none() || config.effort.codex.lower.is_none()
-    }) && let Ok(path) = &resolved_config_path
-    {
-        report.push(
-            Level::Warn,
-            format!("Codex effort shortcuts are unset in {}", path.display()),
-        );
     }
     match pi_extension() {
         Some(path) if path.exists() => {

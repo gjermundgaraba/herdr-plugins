@@ -1,13 +1,15 @@
 //! The long-lived Codex Micro bridge.  Keep the policy here; HID framing,
 //! Herdr parsing, gestures, and macOS operations live in their small modules.
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use herdr_client::{AgentInfo, Client, SessionSnapshot, open_rotating_log};
 use serde_json::{Value, json};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use std::io::Write;
 use std::{
     collections::{HashMap, HashSet},
+    path::Path,
+    process::Command,
     sync::{
         Arc, LazyLock, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -20,12 +22,11 @@ use std::{
 use crate::{
     actions::{
         GHOSTTY_PROCESS, automatic_layer, focus_agent, focus_pane, layer_identity, open_diff,
-        plan_effort_change, prompt as send_prompt, scroll_plan, submit,
+        prompt as send_prompt, scroll_plan, submit,
     },
     config::{
-        Action, Binding, Config, Controls, Direction, EffortConfig, EffortDirection, Modifier,
-        VerticalDirection, config_path, enabled_buttons, key_action_code, key_binding, load,
-        provision,
+        Action, Binding, Config, Controls, Direction, Modifier, VerticalDirection, config_path,
+        enabled_buttons, key_action_code, key_binding, load, provision,
     },
     control::listen_for_control,
     device::DeviceEvent,
@@ -34,8 +35,8 @@ use crate::{
         SessionTerminalMapping, focused_terminal_id, probe_session_terminals, scroll_terminal,
     },
     herdr::{
-        Session, SessionUpdate, SessionWorker, current_snapshot, discover_sessions,
-        spawn_session_worker,
+        COMMAND_TIMEOUT, Session, SessionUpdate, SessionWorker, current_snapshot,
+        discover_sessions, run_command_with_timeout, spawn_session_worker,
     },
     hid::{HidClient, connection_error_state},
     macos,
@@ -43,6 +44,7 @@ use crate::{
         INPUT_BUNDLE_ID, SLOT_COUNT, aggregate_lighting, assign_slots, device_owner,
         joystick_event, slot_lighting,
     },
+    setup::plugin_root,
 };
 
 const CONFIG_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -188,7 +190,6 @@ impl State {
 #[derive(Clone)]
 struct InputContext {
     controls: Controls,
-    effort: EffortConfig,
     session: Option<Session>,
     terminal: Option<String>,
     target: Option<AgentInfo>,
@@ -201,7 +202,6 @@ impl InputContext {
     fn new(config: &Config) -> Self {
         Self {
             controls: config.controls.clone(),
-            effort: config.effort.clone(),
             session: None,
             terminal: None,
             target: None,
@@ -224,14 +224,12 @@ struct InputState {
     last_joystick_sector: Option<u8>,
 }
 
-#[derive(Clone)]
 enum Work {
     Binding {
         binding: Box<Binding>,
         source: String,
         session: Session,
         terminal: String,
-        effort: EffortConfig,
         target: Option<(String, String, Option<String>)>,
         generation: u64,
     },
@@ -243,57 +241,6 @@ enum Work {
         terminal: String,
         generation: u64,
     },
-}
-
-impl Work {
-    fn generation(&self) -> u64 {
-        match self {
-            Self::Binding { generation, .. } | Self::FocusSlot { generation, .. } => *generation,
-        }
-    }
-
-    fn same_effort(&self, other: &Self) -> bool {
-        match (self, other) {
-            (
-                Self::Binding {
-                    binding: first,
-                    session: first_session,
-                    terminal: first_terminal,
-                    effort: first_effort,
-                    target: first_target,
-                    generation: first_generation,
-                    ..
-                },
-                Self::Binding {
-                    binding: second,
-                    session: second_session,
-                    terminal: second_terminal,
-                    effort: second_effort,
-                    target: second_target,
-                    generation: second_generation,
-                    ..
-                },
-            ) => match (first.as_ref(), second.as_ref()) {
-                (
-                    Binding::Action(Action::Effort {
-                        direction: first_direction,
-                    }),
-                    Binding::Action(Action::Effort {
-                        direction: second_direction,
-                    }),
-                ) => {
-                    first_direction == second_direction
-                        && first_session == second_session
-                        && first_terminal == second_terminal
-                        && first_effort == second_effort
-                        && first_target == second_target
-                        && first_generation == second_generation
-                }
-                _ => false,
-            },
-            _ => false,
-        }
-    }
 }
 
 fn require_agent(agent: Option<&AgentInfo>) -> Result<&AgentInfo> {
@@ -325,7 +272,7 @@ fn action_name(action: &Action) -> &'static str {
         Action::Diff => "diff",
         Action::Fast => "fast",
         Action::Submit => "submit",
-        Action::Effort { .. } => "effort",
+        Action::Script { .. } => "script",
         Action::FocusPane { .. } => "focus-pane",
         Action::Scroll { .. } => "scroll",
         Action::Key { .. } => "key",
@@ -428,12 +375,55 @@ fn execute_scroll(
     Ok(true)
 }
 
+fn script_command(
+    command: &str,
+    args: &[String],
+    root: &Path,
+    session: &Session,
+    pane: &str,
+) -> Command {
+    let mut child = Command::new(command);
+    child
+        .args(args)
+        .current_dir(root)
+        .env_remove("HERDR_ACTIVE_PANE_CWD")
+        .env_remove("HERDR_ACTIVE_PANE_ID")
+        .env_remove("HERDR_ACTIVE_TAB_ID")
+        .env_remove("HERDR_ACTIVE_WORKSPACE_ID")
+        .env_remove("HERDR_CLIENT_SOCKET_PATH")
+        .env_remove("HERDR_PLUGIN_CONTEXT_JSON")
+        .env_remove("HERDR_TAB_ID")
+        .env_remove("HERDR_WORKSPACE_ID")
+        .env("HERDR_ENV", "1")
+        .env("HERDR_SOCKET_PATH", &session.socket_path)
+        .env("HERDR_SESSION", &session.name)
+        .env("HERDR_PANE_ID", pane);
+    child
+}
+
+fn execute_script(
+    command: &str,
+    args: &[String],
+    current: Option<&AgentInfo>,
+    lease: &DispatchLease<'_>,
+) -> Result<()> {
+    let current = require_agent(current)?;
+    lease.ensure()?;
+    let mut child = script_command(
+        command,
+        args,
+        &plugin_root()?,
+        lease.session,
+        &current.pane_id,
+    );
+    run_command_with_timeout(&mut child, COMMAND_TIMEOUT)?;
+    Ok(())
+}
+
 fn execute_action(
     action: &Action,
     current: Option<&AgentInfo>,
     snapshot: &SessionSnapshot,
-    effort: &EffortConfig,
-    repeat: usize,
     lease: &DispatchLease<'_>,
 ) -> Result<bool> {
     let client = lease.client();
@@ -472,27 +462,7 @@ fn execute_action(
             lease.ensure()?;
             submit(&client, current)?;
         }
-        Action::Effort { direction } => {
-            let current = require_agent(current)?;
-            let direction = match direction {
-                EffortDirection::Raise => "raise",
-                EffortDirection::Lower => "lower",
-            };
-            let plan = plan_effort_change(
-                current.agent.as_deref().unwrap_or_default(),
-                direction,
-                &current.pane_id,
-                effort,
-                repeat,
-            )?;
-            for step in plan {
-                lease.ensure()?;
-                client.call_value(step.method, &step.params)?;
-                if let Some(ms) = step.wait_after_ms {
-                    thread::sleep(Duration::from_millis(ms));
-                }
-            }
-        }
+        Action::Script { command, args } => execute_script(command, args, current, lease)?,
         Action::FocusPane { direction } => {
             let direction = match direction {
                 Direction::Up => "up",
@@ -524,132 +494,116 @@ fn execute_action(
     Ok(true)
 }
 
+fn execute_work(work: Work, routing_generation: &AtomicU64) -> Result<()> {
+    let generation = match &work {
+        Work::Binding { generation, .. } | Work::FocusSlot { generation, .. } => *generation,
+    };
+    if generation != routing_generation.load(Ordering::Acquire) {
+        log("control ignored: stale Herdr routing");
+        return Ok(());
+    }
+    let (session_info, terminal) = match &work {
+        Work::Binding {
+            session, terminal, ..
+        }
+        | Work::FocusSlot {
+            session, terminal, ..
+        } => (session.clone(), terminal.clone()),
+    };
+    let snapshot = match current_snapshot(&session_info.client()) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            log(format!(
+                "control failed: refresh {}: {error:#}",
+                session_info.name
+            ));
+            return Ok(());
+        }
+    };
+    if generation != routing_generation.load(Ordering::Acquire) {
+        log("control ignored: stale Herdr routing");
+        return Ok(());
+    }
+    let lease = DispatchLease {
+        session: &session_info,
+        terminal: &terminal,
+        generation,
+        routing_generation,
+    };
+    match work {
+        Work::FocusSlot {
+            pane_id,
+            agent_terminal_id,
+            source,
+            session,
+            ..
+        } => {
+            if !snapshot
+                .agents
+                .iter()
+                .any(|agent| agent.pane_id == pane_id && agent.terminal_id == agent_terminal_id)
+            {
+                bail!("Agent slot pane disappeared");
+            }
+            lease.ensure()?;
+            focus_agent(&lease.client(), &pane_id)?;
+            log(format!("{source}: focused {}/{pane_id}", session.name));
+        }
+        Work::Binding {
+            binding,
+            source,
+            session,
+            target,
+            ..
+        } => {
+            let current = snapshot.agents.iter().find(|agent| agent.focused);
+            if agent_identity(current) != target {
+                log(format!("{source} ignored: focused pane changed"));
+                return Ok(());
+            }
+            let Some(action) = binding.resolve(
+                current
+                    .and_then(|agent| agent.agent.as_deref())
+                    .unwrap_or(""),
+            ) else {
+                return Ok(());
+            };
+            let executed = execute_action(&action, current, &snapshot, &lease)
+                .with_context(|| format!("{source}: {}", action_name(&action)))?;
+            if executed {
+                log(format!(
+                    "{source}: {} in {}{}",
+                    action_name(&action),
+                    session.name,
+                    current
+                        .map(|agent| format!(
+                            " for {} in {}",
+                            agent.agent.as_deref().unwrap_or("unknown"),
+                            agent.pane_id
+                        ))
+                        .unwrap_or_default()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn action_worker(
     receiver: Receiver<Work>,
     routing_generation: Arc<AtomicU64>,
     stopping: Arc<AtomicBool>,
 ) {
-    let mut deferred = None;
     while !stopping.load(Ordering::Acquire) {
-        let work = match deferred
-            .take()
-            .map(Ok)
-            .unwrap_or_else(|| receiver.recv_timeout(Duration::from_millis(50)))
-        {
+        let work = match receiver.recv_timeout(Duration::from_millis(50)) {
             Ok(work) => work,
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
         };
-        let mut repeat = 1;
-        while let Ok(next) = receiver.try_recv() {
-            if work.same_effort(&next) {
-                repeat += 1;
-            } else {
-                deferred = Some(next);
-                break;
-            }
+        if stopping.load(Ordering::Acquire) {
+            break;
         }
-        let generation = work.generation();
-        if generation != routing_generation.load(Ordering::Acquire) {
-            log("control ignored: stale Herdr routing");
-            continue;
-        }
-        let (session_info, terminal) = match &work {
-            Work::Binding {
-                session, terminal, ..
-            }
-            | Work::FocusSlot {
-                session, terminal, ..
-            } => (session.clone(), terminal.clone()),
-        };
-        let snapshot = match current_snapshot(&session_info.client()) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                log(format!(
-                    "control failed: refresh {}: {error:#}",
-                    session_info.name
-                ));
-                continue;
-            }
-        };
-        if generation != routing_generation.load(Ordering::Acquire) {
-            log("control ignored: stale Herdr routing");
-            continue;
-        }
-        let lease = DispatchLease {
-            session: &session_info,
-            terminal: &terminal,
-            generation,
-            routing_generation: &routing_generation,
-        };
-        let result = match work {
-            Work::FocusSlot {
-                pane_id,
-                agent_terminal_id,
-                source,
-                session,
-                ..
-            } => {
-                let result =
-                    if snapshot.agents.iter().any(|agent| {
-                        agent.pane_id == pane_id && agent.terminal_id == agent_terminal_id
-                    }) {
-                        lease
-                            .ensure()
-                            .and_then(|_| focus_agent(&lease.client(), &pane_id))
-                    } else {
-                        Err(anyhow!("Agent slot pane disappeared"))
-                    };
-                if result.is_ok() {
-                    log(format!("{source}: focused {}/{pane_id}", session.name));
-                }
-                result
-            }
-            Work::Binding {
-                binding,
-                source,
-                session,
-                effort,
-                target,
-                ..
-            } => (|| {
-                let current = snapshot.agents.iter().find(|agent| agent.focused);
-                if agent_identity(current) != target {
-                    log(format!("{source} ignored: focused pane changed"));
-                    return Ok(());
-                }
-                let Some(action) = binding.resolve(
-                    current
-                        .and_then(|agent| agent.agent.as_deref())
-                        .unwrap_or(""),
-                ) else {
-                    return Ok(());
-                };
-                let executed =
-                    execute_action(&action, current, &snapshot, &effort, repeat, &lease)?;
-                if executed {
-                    log(format!(
-                        "{source}: {}{} in {}{}",
-                        action_name(&action),
-                        if repeat > 1 {
-                            format!(" x{repeat}")
-                        } else {
-                            String::new()
-                        },
-                        session.name,
-                        current
-                            .map(|agent| format!(
-                                " for {} in {}",
-                                agent.agent.as_deref().unwrap_or("unknown"),
-                                agent.pane_id
-                            ))
-                            .unwrap_or_default()
-                    ));
-                }
-                Ok(())
-            })(),
-        };
-        if let Err(error) = result {
+        if let Err(error) = execute_work(work, &routing_generation) {
             log(format!("control failed: {error:#}"));
         }
     }
@@ -665,7 +619,6 @@ fn queue_binding(
     binding: Binding,
     source: String,
     route: Option<(Session, String)>,
-    effort: &EffortConfig,
     target: Option<AgentInfo>,
     generation: u64,
 ) {
@@ -690,7 +643,6 @@ fn queue_binding(
                 source,
                 session,
                 terminal,
-                effort: effort.clone(),
                 target: agent_identity(target.as_ref()),
                 generation,
             };
@@ -723,7 +675,6 @@ fn handle_fired(
             Binding::Action(fired.action),
             fired.source,
             route,
-            &context.effort,
             context.target.clone(),
             context.generation,
         );
@@ -787,7 +738,6 @@ fn handle_device_event(
                     Binding::Action(action),
                     format!("joystick {direction}"),
                     context.selected(routing_generation),
-                    &context.effort,
                     context.target.clone(),
                     context.generation,
                 );
@@ -832,7 +782,6 @@ fn handle_device_event(
                         binding,
                         key,
                         captured,
-                        &context.effort,
                         context.target.clone(),
                         context.generation,
                     );
@@ -856,7 +805,6 @@ fn handle_device_event(
                         binding.unwrap(),
                         key,
                         captured,
-                        &context.effort,
                         context.target.clone(),
                         context.generation,
                     ),
@@ -1496,7 +1444,6 @@ fn update_input_context(context: &Mutex<Arc<InputContext>>, state: &State) {
         .and_then(|name| state.sessions.iter().find(|session| session.name == *name));
     *context.lock().unwrap_or_else(|error| error.into_inner()) = Arc::new(InputContext {
         controls: state.config.controls.clone(),
-        effort: state.config.effort.clone(),
         session: session.cloned(),
         terminal: state.focused_terminal.clone(),
         target: target.cloned(),
@@ -1813,7 +1760,20 @@ pub fn run_daemon() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
+
     use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "herdr-micro-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
 
     fn agent(terminal: &str, pane: &str, kind: &str) -> AgentInfo {
         serde_json::from_value(json!({
@@ -1890,13 +1850,90 @@ mod tests {
     }
 
     #[test]
+    fn script_context_drives_the_bundled_adapter() {
+        let dir = temp_dir("script-context");
+        let fake_herdr = dir.join("herdr");
+        let calls = dir.join("calls");
+        let environment = dir.join("environment");
+        fs::write(
+            &fake_herdr,
+            r#"#!/bin/sh
+if [ ! -e "$HERDR_TEST_ENV" ]; then
+    printf '%s\n' "$HERDR_SESSION" "$HERDR_SOCKET_PATH" "$HERDR_PANE_ID" "$PWD" > "$HERDR_TEST_ENV"
+fi
+printf '%s\n' --call "$@" >> "$HERDR_TEST_LOG"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&fake_herdr, fs::Permissions::from_mode(0o700)).unwrap();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let config = Config::default();
+        let target_session = session("work");
+
+        let Action::Script { command, args } = key_binding(&config.controls, "ENC_CC", 1)
+            .unwrap()
+            .resolve("codex")
+            .unwrap()
+        else {
+            panic!("expected Codex script action");
+        };
+        let mut child = script_command(&command, &args, root, &target_session, "w9:p4");
+        child
+            .env("HERDR_BIN_PATH", &fake_herdr)
+            .env("HERDR_TEST_LOG", &calls)
+            .env("HERDR_TEST_ENV", &environment);
+        run_command_with_timeout(&mut child, COMMAND_TIMEOUT).unwrap();
+        assert_eq!(
+            fs::read_to_string(&environment).unwrap(),
+            format!("work\n/tmp/work.sock\nw9:p4\n{}\n", root.display())
+        );
+        assert_eq!(
+            fs::read_to_string(&calls).unwrap(),
+            "--call\npane\nsend-keys\nw9:p4\nalt+.\n"
+        );
+
+        fs::remove_file(&calls).unwrap();
+        let Action::Script { command, args } = key_binding(&config.controls, "ENC_CW", 1)
+            .unwrap()
+            .resolve("claude")
+            .unwrap()
+        else {
+            panic!("expected Claude script action");
+        };
+        let mut child = script_command(&command, &args, root, &target_session, "w9:p4");
+        child
+            .env("HERDR_BIN_PATH", &fake_herdr)
+            .env("HERDR_TEST_LOG", &calls)
+            .env("HERDR_TEST_ENV", &environment);
+        run_command_with_timeout(&mut child, COMMAND_TIMEOUT).unwrap();
+        assert_eq!(
+            fs::read_to_string(&calls).unwrap(),
+            "--call\npane\nsend-text\nw9:p4\n/effort\n--call\npane\nsend-keys\nw9:p4\nenter\n--call\npane\nsend-keys\nw9:p4\nleft\n--call\npane\nsend-keys\nw9:p4\nenter\n"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn scripts_require_a_focused_agent() {
+        let routing_generation = AtomicU64::new(3);
+        let session = session("work");
+        let lease = DispatchLease {
+            session: &session,
+            terminal: "terminal",
+            generation: 3,
+            routing_generation: &routing_generation,
+        };
+        let error = execute_script("/usr/bin/true", &[], None, &lease).unwrap_err();
+        assert_eq!(error.to_string(), "no focused Herdr agent");
+    }
+
+    #[test]
     fn key_events_capture_the_ready_session_without_hardware() {
         let (sender, receiver) = mpsc::sync_channel(1);
         let target = agent("terminal", "pane", "codex");
         let config = Config::default();
         let context = InputContext {
             controls: config.controls,
-            effort: config.effort,
             session: Some(session("work")),
             terminal: Some("terminal".into()),
             target: Some(target),

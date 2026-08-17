@@ -497,7 +497,6 @@ pub fn setup_micro() -> Result<SetupReport> {
 pub fn configure() -> Result<PathBuf> {
     let path = config_path().map_err(|error| anyhow!(error))?;
     provision(&path).map_err(|error| anyhow!(error))?;
-    load(&path).map_err(|error| anyhow!(error))?;
     let status = Command::new("/usr/bin/open")
         .args(["-t", path.to_string_lossy().as_ref()])
         .status()
