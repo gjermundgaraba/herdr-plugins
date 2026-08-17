@@ -139,9 +139,9 @@ Scripts inherit `HERDR_BIN_PATH` and receive the frozen target as
 `HERDR_SOCKET_PATH`, `HERDR_SESSION`, and `HERDR_PANE_ID`.
 Stale inherited Herdr target selectors are removed. Each script has a
 five-second timeout. Output is bounded, and failures report the binding, exit
-status, and stderr. Scripts run once per input through the single serial FIFO
-worker, which accepts up to 16 pending actions and logs inputs rejected while
-full.
+status, and stderr. Each accepted input runs its script once; see the
+[architecture guide](docs/micro-bridge.md#current-architecture) for scheduling
+details.
 
 ## Routing and operation
 

@@ -28,10 +28,11 @@ Codex Micro over USB
   → exact pane/agent built-in or script action
 ```
 
-The daemon uses Herdr's CLI only to discover running session names and their
-socket paths at startup or when discovery becomes stale. It polls the selected
-session's stable `session.snapshot` API four times per second; changed agent
-state drives routing and lighting without additional discovery subprocesses.
+The daemon uses Herdr's CLI to discover running session names and their socket
+paths at startup or when discovery becomes stale; configured scripts may also
+invoke it for their action. It polls the selected session's stable
+`session.snapshot` API four times per second; changed agent state drives routing
+and lighting without additional discovery subprocesses.
 Built-in actions are direct socket requests after a fresh snapshot confirms
 the captured agent identity. Configured script actions run synchronously from
 the plugin root after the same validation. They receive `HERDR_SOCKET_PATH`,
@@ -131,6 +132,7 @@ bindings internally.
 - Claude effort changes require an empty prompt. Existing Pi sessions need
   `/reload` after installing the extension. Effort changes affect later model
   requests, not a request already in flight.
+
 ## Thinking-effort control
 
 The bridge freezes the focused agent and pane from the selected Herdr session,

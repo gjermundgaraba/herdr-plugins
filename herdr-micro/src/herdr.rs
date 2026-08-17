@@ -5,8 +5,8 @@ use herdr_client::{AgentInfo, Client, SessionSnapshot};
 use serde::Deserialize;
 use std::{
     env,
-    io::{self, ErrorKind, Read},
-    os::{fd::AsRawFd, unix::process::CommandExt},
+    io::{self, Read},
+    os::unix::process::CommandExt,
     path::PathBuf,
     process::{Command, Stdio},
     sync::{
@@ -195,9 +195,7 @@ pub fn discover_sessions() -> Result<Vec<Session>> {
         .env_remove("HERDR_SESSION")
         .env_remove("HERDR_PANE_ID")
         .env_remove("HERDR_TAB_ID")
-        .env_remove("HERDR_WORKSPACE_ID")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .env_remove("HERDR_WORKSPACE_ID");
     parse_sessions(&run_command_with_timeout(&mut command, COMMAND_TIMEOUT)?)
 }
 
@@ -239,33 +237,27 @@ struct CapturedOutput {
     truncated: bool,
 }
 
-fn set_nonblocking(fd: &impl AsRawFd) -> io::Result<()> {
-    let fd = fd.as_raw_fd();
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+fn capture_output(mut reader: impl Read) -> io::Result<CapturedOutput> {
+    let mut bytes = Vec::new();
+    reader
+        .by_ref()
+        .take((COMMAND_OUTPUT_LIMIT + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    let truncated = bytes.len() > COMMAND_OUTPUT_LIMIT;
+    bytes.truncate(COMMAND_OUTPUT_LIMIT);
+    io::copy(&mut reader, &mut io::sink())?;
+    Ok(CapturedOutput { bytes, truncated })
 }
 
-fn drain_output(reader: &mut impl Read, output: &mut CapturedOutput) -> io::Result<()> {
-    let mut buffer = [0; 8192];
-    loop {
-        match reader.read(&mut buffer) {
-            Ok(0) => return Ok(()),
-            Ok(count) => {
-                let kept = count.min(COMMAND_OUTPUT_LIMIT.saturating_sub(output.bytes.len()));
-                output.bytes.extend_from_slice(&buffer[..kept]);
-                output.truncated |= kept < count;
-            }
-            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-            Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(()),
-            Err(error) => return Err(error),
-        }
-    }
+fn join_output(
+    reader: thread::JoinHandle<io::Result<CapturedOutput>>,
+    stream: &str,
+    program: &str,
+) -> Result<CapturedOutput> {
+    reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("{stream} reader for {program} panicked"))?
+        .with_context(|| format!("read {stream} from {program}"))
 }
 
 fn terminate_process_group(process_group: i32) -> std::io::Result<()> {
@@ -283,6 +275,7 @@ fn terminate_process_group(process_group: i32) -> std::io::Result<()> {
 pub(crate) fn run_command_with_timeout(command: &mut Command, timeout: Duration) -> Result<String> {
     let program = command.get_program().to_string_lossy().into_owned();
     command
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
@@ -297,23 +290,13 @@ pub(crate) fn run_command_with_timeout(command: &mut Command, timeout: Duration)
             return Err(error).context("child process ID is too large");
         }
     };
-    let mut stdout = child.stdout.take().expect("piped stdout");
-    let mut stderr = child.stderr.take().expect("piped stderr");
-    if let Err(error) = set_nonblocking(&stdout).and_then(|()| set_nonblocking(&stderr)) {
-        let _ = terminate_process_group(process_group);
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error).with_context(|| format!("capture output from {program}"));
-    }
-    let mut captured_stdout = CapturedOutput::default();
-    let mut captured_stderr = CapturedOutput::default();
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let stdout_reader = thread::spawn(move || capture_output(stdout));
+    let stderr_reader = thread::spawn(move || capture_output(stderr));
     let started = Instant::now();
     let waited = (|| -> Result<_> {
         loop {
-            drain_output(&mut stdout, &mut captured_stdout)
-                .with_context(|| format!("read stdout from {program}"))?;
-            drain_output(&mut stderr, &mut captured_stderr)
-                .with_context(|| format!("read stderr from {program}"))?;
             if let Some(status) = child
                 .try_wait()
                 .with_context(|| format!("wait for {program}"))?
@@ -339,10 +322,10 @@ pub(crate) fn run_command_with_timeout(command: &mut Command, timeout: Duration)
     let (status, timed_out) = waited?;
     terminate_process_group(process_group)
         .with_context(|| format!("terminate descendants of {program}"))?;
-    drain_output(&mut stdout, &mut captured_stdout)
-        .with_context(|| format!("read stdout from {program}"))?;
-    drain_output(&mut stderr, &mut captured_stderr)
-        .with_context(|| format!("read stderr from {program}"))?;
+    let captured_stdout = join_output(stdout_reader, "stdout", &program);
+    let captured_stderr = join_output(stderr_reader, "stderr", &program);
+    let captured_stdout = captured_stdout?;
+    let captured_stderr = captured_stderr?;
     let detail = String::from_utf8_lossy(&captured_stderr.bytes)
         .trim()
         .to_owned();
@@ -356,9 +339,6 @@ pub(crate) fn run_command_with_timeout(command: &mut Command, timeout: Duration)
     }
     if !status.success() {
         bail!("{program} failed with {status}: {detail}{truncated}");
-    }
-    if captured_stdout.truncated {
-        bail!("{program} stdout exceeded {COMMAND_OUTPUT_LIMIT} bytes");
     }
     Ok(String::from_utf8_lossy(&captured_stdout.bytes).into_owned())
 }
@@ -453,23 +433,39 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
 
         let started = Instant::now();
+        let error = run_command_with_timeout(
+            Command::new("/bin/sh").args(["-c", "while :; do printf x; done"]),
+            Duration::from_millis(20),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        let marker = std::env::temp_dir().join(format!(
+            "herdr-micro-command-descendant-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&marker);
         run_command_with_timeout(
-            Command::new("/bin/sh").args(["-c", "/bin/sleep 5 &"]),
+            Command::new("/bin/sh")
+                .args(["-c", "(sleep 0.2; : > \"$HERDR_TEST_MARKER\") &"])
+                .env("HERDR_TEST_MARKER", &marker),
             Duration::from_secs(1),
         )
         .unwrap();
-        assert!(started.elapsed() < Duration::from_secs(2));
+        thread::sleep(Duration::from_millis(300));
+        assert!(!marker.exists(), "background descendant survived");
 
         let noisy = format!(
             "/usr/bin/yes x | /usr/bin/head -c {}",
             COMMAND_OUTPUT_LIMIT * 2
         );
-        let error = run_command_with_timeout(
+        let output = run_command_with_timeout(
             Command::new("/bin/sh").args(["-c", &noisy]),
             Duration::from_secs(1),
         )
-        .unwrap_err();
-        assert!(error.to_string().contains("stdout exceeded"));
+        .unwrap();
+        assert_eq!(output.len(), COMMAND_OUTPUT_LIMIT);
     }
 
     #[test]

@@ -82,6 +82,13 @@ pub fn doctor() -> Report {
         }
         Ok(path.display().to_string())
     });
+    check(&mut report, "Thinking-effort adapter", || {
+        let path = plugin_root()?.join("integrations/thinking-effort.sh");
+        if !fs::metadata(&path)?.is_file() {
+            anyhow::bail!("{} is not a file", path.display());
+        }
+        Ok(path.display().to_string())
+    });
     check(&mut report, "Privileged USB helper", || {
         helper_install::verify_installed()?;
         Ok(format!("version {HELPER_VERSION}"))

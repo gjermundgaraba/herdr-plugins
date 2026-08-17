@@ -408,9 +408,6 @@ fn execute_script(
     lease: &DispatchLease<'_>,
 ) -> Result<()> {
     let current = require_agent(current)?;
-    if current.agent.as_deref().is_none_or(str::is_empty) {
-        bail!("focused Herdr agent has no kind");
-    }
     lease.ensure()?;
     let mut child = script_command(
         command,

@@ -49,7 +49,9 @@ impl GestureDispatcher {
                 source: key,
                 context,
             }],
-            Some(Binding::Gesture(binding)) => self.press(key, *binding.clone(), context, now),
+            Some(Binding::Gesture(binding)) => {
+                self.press(key, binding.as_ref().clone(), context, now)
+            }
             _ => vec![],
         }
     }

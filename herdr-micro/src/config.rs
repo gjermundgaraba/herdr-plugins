@@ -9,12 +9,12 @@ use std::{
 #[cfg(test)]
 use std::{env, os::unix::fs::PermissionsExt};
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(tag = "action", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Action {
     Prompt {
         prompt: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         submit: Option<bool>,
     },
     Diff,
@@ -22,7 +22,7 @@ pub enum Action {
     Submit,
     Script {
         command: String,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[serde(default)]
         args: Vec<String>,
     },
     FocusPane {
@@ -33,16 +33,16 @@ pub enum Action {
         percent: f64,
     },
     Key {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         key: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         keycode: Option<u16>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[serde(default)]
         modifiers: Vec<Modifier>,
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Modifier {
     Cmd,
@@ -78,7 +78,7 @@ pub fn key_action_code(key: Option<&str>, keycode: Option<u16>) -> Result<u16, S
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Direction {
     Up,
@@ -86,14 +86,14 @@ pub enum Direction {
     Left,
     Right,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VerticalDirection {
     Up,
     Down,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct GestureBinding {
     #[serde(default)]
