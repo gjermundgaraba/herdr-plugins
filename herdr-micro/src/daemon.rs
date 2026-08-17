@@ -8,6 +8,7 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 use std::io::Write;
 use std::{
     collections::{HashMap, HashSet},
+    path::Path,
     process::Command,
     sync::{
         Arc, LazyLock, Mutex,
@@ -454,6 +455,34 @@ fn execute_scroll(
     Ok(true)
 }
 
+fn script_command(
+    command: &str,
+    args: &[String],
+    root: &Path,
+    session: &Session,
+    pane: &str,
+    repeat: usize,
+) -> Command {
+    let mut child = Command::new(command);
+    child
+        .args(args)
+        .current_dir(root)
+        .env_remove("HERDR_ACTIVE_PANE_CWD")
+        .env_remove("HERDR_ACTIVE_PANE_ID")
+        .env_remove("HERDR_ACTIVE_TAB_ID")
+        .env_remove("HERDR_ACTIVE_WORKSPACE_ID")
+        .env_remove("HERDR_CLIENT_SOCKET_PATH")
+        .env_remove("HERDR_PLUGIN_CONTEXT_JSON")
+        .env_remove("HERDR_TAB_ID")
+        .env_remove("HERDR_WORKSPACE_ID")
+        .env("HERDR_ENV", "1")
+        .env("HERDR_SOCKET_PATH", &session.socket_path)
+        .env("HERDR_SESSION", &session.name)
+        .env("HERDR_PANE_ID", pane)
+        .env("HERDR_MICRO_REPEAT", repeat.to_string());
+    child
+}
+
 fn execute_script(
     command: &str,
     args: &[String],
@@ -466,25 +495,15 @@ fn execute_script(
         bail!("focused Herdr agent has no kind");
     }
     lease.ensure()?;
-    let mut child = Command::new(command);
-    child
-        .args(args)
-        .current_dir(plugin_root()?)
-        .env_remove("HERDR_ACTIVE_PANE_CWD")
-        .env_remove("HERDR_ACTIVE_PANE_ID")
-        .env_remove("HERDR_ACTIVE_TAB_ID")
-        .env_remove("HERDR_ACTIVE_WORKSPACE_ID")
-        .env_remove("HERDR_CLIENT_SOCKET_PATH")
-        .env_remove("HERDR_PLUGIN_CONTEXT_JSON")
-        .env_remove("HERDR_TAB_ID")
-        .env_remove("HERDR_WORKSPACE_ID")
-        .env("HERDR_ENV", "1")
-        .env("HERDR_SOCKET_PATH", &lease.session.socket_path)
-        .env("HERDR_SESSION", &lease.session.name)
-        .env("HERDR_PANE_ID", &current.pane_id)
-        .env("HERDR_MICRO_REPEAT", repeat.to_string());
-    run_command_with_timeout(&mut child, COMMAND_TIMEOUT)
-        .with_context(|| format!("script {command}"))?;
+    let mut child = script_command(
+        command,
+        args,
+        &plugin_root()?,
+        lease.session,
+        &current.pane_id,
+        repeat,
+    );
+    run_command_with_timeout(&mut child, COMMAND_TIMEOUT)?;
     Ok(())
 }
 
@@ -639,7 +658,8 @@ fn execute_work(work: Work, repeat: usize, routing_generation: &AtomicU64) -> Re
             ) else {
                 return Ok(());
             };
-            let executed = execute_action(&action, current, &snapshot, repeat, &lease)?;
+            let executed = execute_action(&action, current, &snapshot, repeat, &lease)
+                .with_context(|| format!("{source}: {}", action_name(&action)))?;
             if executed {
                 log(format!(
                     "{source}: {}{} in {}{}",
@@ -1880,7 +1900,20 @@ pub fn run_daemon() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
+
     use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "herdr-micro-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
 
     fn agent(terminal: &str, pane: &str, kind: &str) -> AgentInfo {
         serde_json::from_value(json!({
@@ -2114,6 +2147,70 @@ mod tests {
             })
             .collect();
         assert_eq!(effects, ["raise", "raise", "lower", "raise"]);
+    }
+
+    #[test]
+    fn script_context_drives_the_bundled_adapter() {
+        let dir = temp_dir("script-context");
+        let fake_herdr = dir.join("herdr");
+        let calls = dir.join("calls");
+        let environment = dir.join("environment");
+        fs::write(
+            &fake_herdr,
+            r#"#!/bin/sh
+if [ ! -e "$HERDR_TEST_ENV" ]; then
+    printf '%s\n' "$HERDR_SESSION" "$HERDR_SOCKET_PATH" "$HERDR_PANE_ID" "$HERDR_MICRO_REPEAT" "$PWD" > "$HERDR_TEST_ENV"
+fi
+printf '%s\n' --call "$@" >> "$HERDR_TEST_LOG"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&fake_herdr, fs::Permissions::from_mode(0o700)).unwrap();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let config = Config::default();
+        let target_session = session("work");
+
+        let Action::Script { command, args, .. } = key_binding(&config.controls, "ENC_CC", 1)
+            .unwrap()
+            .resolve("codex")
+            .unwrap()
+        else {
+            panic!("expected Codex script action");
+        };
+        let mut child = script_command(&command, &args, root, &target_session, "w9:p4", 3);
+        child
+            .env("HERDR_BIN_PATH", &fake_herdr)
+            .env("HERDR_TEST_LOG", &calls)
+            .env("HERDR_TEST_ENV", &environment);
+        run_command_with_timeout(&mut child, COMMAND_TIMEOUT).unwrap();
+        assert_eq!(
+            fs::read_to_string(&environment).unwrap(),
+            format!("work\n/tmp/work.sock\nw9:p4\n3\n{}\n", root.display())
+        );
+        assert_eq!(
+            fs::read_to_string(&calls).unwrap(),
+            "--call\npane\nsend-keys\nw9:p4\nalt+.\nalt+.\nalt+.\n"
+        );
+
+        fs::remove_file(&calls).unwrap();
+        let Action::Script { command, args, .. } = key_binding(&config.controls, "ENC_CW", 1)
+            .unwrap()
+            .resolve("claude")
+            .unwrap()
+        else {
+            panic!("expected Claude script action");
+        };
+        let mut child = script_command(&command, &args, root, &target_session, "w9:p4", 3);
+        child
+            .env("HERDR_BIN_PATH", &fake_herdr)
+            .env("HERDR_TEST_LOG", &calls)
+            .env("HERDR_TEST_ENV", &environment);
+        run_command_with_timeout(&mut child, COMMAND_TIMEOUT).unwrap();
+        assert_eq!(
+            fs::read_to_string(&calls).unwrap(),
+            "--call\npane\nsend-text\nw9:p4\n/effort\n--call\npane\nsend-keys\nw9:p4\nenter\n--call\npane\nsend-keys\nw9:p4\nleft\nleft\nleft\n--call\npane\nsend-keys\nw9:p4\nenter\n"
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

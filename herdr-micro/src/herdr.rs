@@ -5,8 +5,8 @@ use herdr_client::{AgentInfo, Client, SessionSnapshot};
 use serde::Deserialize;
 use std::{
     env,
-    io::Read,
-    os::unix::process::CommandExt,
+    io::{self, ErrorKind, Read},
+    os::{fd::AsRawFd, unix::process::CommandExt},
     path::PathBuf,
     process::{Command, Stdio},
     sync::{
@@ -239,18 +239,33 @@ struct CapturedOutput {
     truncated: bool,
 }
 
-fn drain_output(mut reader: impl Read) -> CapturedOutput {
-    let mut output = CapturedOutput::default();
-    let mut buffer = [0; 8192];
-    while let Ok(count) = reader.read(&mut buffer) {
-        if count == 0 {
-            break;
-        }
-        let kept = count.min(COMMAND_OUTPUT_LIMIT.saturating_sub(output.bytes.len()));
-        output.bytes.extend_from_slice(&buffer[..kept]);
-        output.truncated |= kept < count;
+fn set_nonblocking(fd: &impl AsRawFd) -> io::Result<()> {
+    let fd = fd.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
     }
-    output
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn drain_output(reader: &mut impl Read, output: &mut CapturedOutput) -> io::Result<()> {
+    let mut buffer = [0; 8192];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(count) => {
+                let kept = count.min(COMMAND_OUTPUT_LIMIT.saturating_sub(output.bytes.len()));
+                output.bytes.extend_from_slice(&buffer[..kept]);
+                output.truncated |= kept < count;
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn terminate_process_group(process_group: i32) -> std::io::Result<()> {
@@ -274,38 +289,64 @@ pub(crate) fn run_command_with_timeout(command: &mut Command, timeout: Duration)
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to run {program}"))?;
-    let process_group = i32::try_from(child.id()).context("child process ID is too large")?;
-    let stdout = child.stdout.take().expect("piped stdout");
-    let stderr = child.stderr.take().expect("piped stderr");
-    let out_reader = thread::spawn(move || drain_output(stdout));
-    let err_reader = thread::spawn(move || drain_output(stderr));
-    let started = Instant::now();
-    let (status, timed_out) = loop {
-        if let Some(status) = child
-            .try_wait()
-            .with_context(|| format!("wait for {program}"))?
-        {
-            break (status, false);
+    let process_group = match i32::try_from(child.id()) {
+        Ok(process_group) => process_group,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error).context("child process ID is too large");
         }
-        if started.elapsed() >= timeout {
-            if let Err(error) = terminate_process_group(process_group) {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error).context(format!("terminate timed out {program}"));
-            }
-            let status = child
-                .wait()
-                .with_context(|| format!("reap timed out {program}"))?;
-            break (status, true);
-        }
-        thread::sleep(Duration::from_millis(10));
     };
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    if let Err(error) = set_nonblocking(&stdout).and_then(|()| set_nonblocking(&stderr)) {
+        let _ = terminate_process_group(process_group);
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error).with_context(|| format!("capture output from {program}"));
+    }
+    let mut captured_stdout = CapturedOutput::default();
+    let mut captured_stderr = CapturedOutput::default();
+    let started = Instant::now();
+    let waited = (|| -> Result<_> {
+        loop {
+            drain_output(&mut stdout, &mut captured_stdout)
+                .with_context(|| format!("read stdout from {program}"))?;
+            drain_output(&mut stderr, &mut captured_stderr)
+                .with_context(|| format!("read stderr from {program}"))?;
+            if let Some(status) = child
+                .try_wait()
+                .with_context(|| format!("wait for {program}"))?
+            {
+                break Ok((status, false));
+            }
+            if started.elapsed() >= timeout {
+                terminate_process_group(process_group)
+                    .with_context(|| format!("terminate timed out {program}"))?;
+                let status = child
+                    .wait()
+                    .with_context(|| format!("reap timed out {program}"))?;
+                break Ok((status, true));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    })();
+    if waited.is_err() {
+        let _ = terminate_process_group(process_group);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let (status, timed_out) = waited?;
     terminate_process_group(process_group)
         .with_context(|| format!("terminate descendants of {program}"))?;
-    let stdout = out_reader.join().unwrap_or_default();
-    let stderr = err_reader.join().unwrap_or_default();
-    let detail = String::from_utf8_lossy(&stderr.bytes).trim().to_owned();
-    let truncated = if stderr.truncated {
+    drain_output(&mut stdout, &mut captured_stdout)
+        .with_context(|| format!("read stdout from {program}"))?;
+    drain_output(&mut stderr, &mut captured_stderr)
+        .with_context(|| format!("read stderr from {program}"))?;
+    let detail = String::from_utf8_lossy(&captured_stderr.bytes)
+        .trim()
+        .to_owned();
+    let truncated = if captured_stderr.truncated {
         " (stderr truncated)"
     } else {
         ""
@@ -316,7 +357,10 @@ pub(crate) fn run_command_with_timeout(command: &mut Command, timeout: Duration)
     if !status.success() {
         bail!("{program} failed with {status}: {detail}{truncated}");
     }
-    Ok(String::from_utf8_lossy(&stdout.bytes).into_owned())
+    if captured_stdout.truncated {
+        bail!("{program} stdout exceeded {COMMAND_OUTPUT_LIMIT} bytes");
+    }
+    Ok(String::from_utf8_lossy(&captured_stdout.bytes).into_owned())
 }
 
 #[cfg(test)]
@@ -420,12 +464,12 @@ mod tests {
             "/usr/bin/yes x | /usr/bin/head -c {}",
             COMMAND_OUTPUT_LIMIT * 2
         );
-        let output = run_command_with_timeout(
+        let error = run_command_with_timeout(
             Command::new("/bin/sh").args(["-c", &noisy]),
             Duration::from_secs(1),
         )
-        .unwrap();
-        assert_eq!(output.len(), COMMAND_OUTPUT_LIMIT);
+        .unwrap_err();
+        assert!(error.to_string().contains("stdout exceeded"));
     }
 
     #[test]

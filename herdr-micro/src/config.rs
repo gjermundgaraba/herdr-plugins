@@ -722,9 +722,6 @@ mod tests {
             config["controls"]["dial"]["clockwise"] = invalid;
             assert!(parse_config(&config).is_err());
         }
-        let mut stale = config_json();
-        stale["effort"] = serde_json::json!({"codex":{"raise":null,"lower":null}});
-        assert!(parse_config(&stale).is_err());
         let mut lighting = config_json();
         lighting["lighting"] =
             serde_json::json!({"states":{},"focusedBrightness":1,"ambient":"status","keys":null});

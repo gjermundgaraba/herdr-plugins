@@ -36,8 +36,9 @@ Built-in actions are direct socket requests after a fresh snapshot confirms
 the captured agent identity. Configured script actions run synchronously from
 the plugin root after the same validation. They receive `HERDR_SOCKET_PATH`,
 `HERDR_SESSION`, `HERDR_PANE_ID`, and `HERDR_MICRO_REPEAT`, and inherit
-`HERDR_BIN_PATH`. Child output is bounded and captured; a process group that
-exceeds the five-second deadline is terminated and reaped.
+`HERDR_BIN_PATH`. Child output is bounded; failures report stderr and their
+binding. A process group that exceeds the five-second deadline is terminated
+and reaped.
 
 An optional script `queue` groups consecutive pending actions with the same
 queue name and frozen route. The single action worker preserves their FIFO

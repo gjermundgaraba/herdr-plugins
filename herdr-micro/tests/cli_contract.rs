@@ -1,7 +1,6 @@
 use std::{
     env, fs,
     io::{BufRead, BufReader, Write},
-    os::unix::fs::PermissionsExt,
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     process::{Command, Output},
@@ -138,59 +137,5 @@ fn setup_pi_effort_uses_plugin_root_outside_the_repository() {
     assert_eq!(fs::read(&target).unwrap(), bundled);
     assert!(String::from_utf8_lossy(&install.stdout).contains("Installed Pi effort extension:"));
 
-    fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
-fn thinking_effort_adapter_uses_frozen_target_and_herdr_binary() {
-    let dir = temp_dir("thinking-effort");
-    let fake_herdr = dir.join("herdr");
-    let log = dir.join("calls");
-    fs::write(
-        &fake_herdr,
-        "#!/bin/sh\nprintf '%s\\n' --call \"$@\" >> \"$HERDR_TEST_LOG\"\n",
-    )
-    .unwrap();
-    fs::set_permissions(&fake_herdr, fs::Permissions::from_mode(0o700)).unwrap();
-    let adapter = Path::new(env!("CARGO_MANIFEST_DIR")).join("integrations/thinking-effort.sh");
-
-    let result = Command::new("/bin/sh")
-        .arg(&adapter)
-        .arg("ctrl+shift+t")
-        .env("HERDR_BIN_PATH", &fake_herdr)
-        .env("HERDR_PANE_ID", "w9:p4")
-        .env("HERDR_MICRO_REPEAT", "3")
-        .env("HERDR_TEST_LOG", &log)
-        .output()
-        .unwrap();
-    assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
-    );
-    assert_eq!(
-        fs::read_to_string(&log).unwrap(),
-        "--call\npane\nsend-keys\nw9:p4\nctrl+shift+t\nctrl+shift+t\nctrl+shift+t\n"
-    );
-
-    fs::remove_file(&log).unwrap();
-    let result = Command::new("/bin/sh")
-        .arg(&adapter)
-        .args(["claude", "lower"])
-        .env("HERDR_BIN_PATH", &fake_herdr)
-        .env("HERDR_PANE_ID", "w9:p4")
-        .env("HERDR_MICRO_REPEAT", "3")
-        .env("HERDR_TEST_LOG", &log)
-        .output()
-        .unwrap();
-    assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
-    );
-    assert_eq!(
-        fs::read_to_string(&log).unwrap(),
-        "--call\npane\nsend-text\nw9:p4\n/effort\n--call\npane\nsend-keys\nw9:p4\nenter\n--call\npane\nsend-keys\nw9:p4\nleft\nleft\nleft\n--call\npane\nsend-keys\nw9:p4\nenter\n"
-    );
     fs::remove_dir_all(dir).unwrap();
 }

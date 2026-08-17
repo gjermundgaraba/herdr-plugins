@@ -96,8 +96,7 @@ instead of `key`, and optional `modifiers` adds any of `cmd`, `shift`, `alt`,
 `ctrl`, and `fn`.
 The stock wide keycap spans switches 5 and 6, so `controls.buttons["6"]`
 stays `null` by default. The two top-level fields—`controls` and `lighting`—are
-required. Existing configurations must remove the old top-level `effort`
-object and use the dial's script bindings from the generated default.
+required.
 
 The privileged helper captures the USB-connected Micro so ChatGPT cannot also
 receive Layer 2 events. Binding a previously unbound switch (or the reverse)
@@ -141,7 +140,8 @@ Scripts inherit `HERDR_BIN_PATH` and receive the frozen target as
 `HERDR_SOCKET_PATH`, `HERDR_SESSION`, and `HERDR_PANE_ID`.
 `HERDR_MICRO_REPEAT` contains the number of coalesced identical actions.
 Stale inherited Herdr target selectors are removed. Each script has a
-five-second timeout; stdout and stderr are captured for failures.
+five-second timeout. Output is bounded, and failures report the binding,
+exit status, and stderr.
 
 The optional `queue` keeps consecutive scripts with the same queue name and
 frozen route together in FIFO order. Exact adjacent script actions within that
