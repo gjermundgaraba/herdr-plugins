@@ -26,9 +26,8 @@ for workspace in sorted(snapshot["workspaces"], key=lambda w: w["number"]):
         {
             "id": workspace["workspace_id"],
             "title": workspace["label"],
-            "subtitle": "{} tabs · {} panes · {}".format(
-                workspace["tab_count"], workspace["pane_count"], workspace["agent_status"]
-            ),
+            "subtitle": f"{workspace['tab_count']} tabs · {workspace['pane_count']} panes"
+            f" · {workspace['agent_status']}",
             "badge": str(workspace["number"]),
             "indicator": indicator,
             "tone": tone,
