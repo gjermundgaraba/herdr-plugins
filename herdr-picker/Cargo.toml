@@ -5,12 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "Fuzzy resource picker for Herdr"
+description = "Declarative fuzzy picker for Herdr"
 repository.workspace = true
 
 [dependencies]
 crossterm = "0.29.0"
 herdr-client.workspace = true
+herdr-picker-sdk.workspace = true
 herdr-ratatui.workspace = true
 libc.workspace = true
 nucleo-matcher = "0.3.1"
