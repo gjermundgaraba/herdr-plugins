@@ -103,24 +103,18 @@ fn render_header(picker: &Picker, mode: Mode, screen: &Screen<'_>, frame: &mut F
         },
         focused: mode != Mode::VimNormal,
     };
-    let context = if screen.workflow_title == screen.step_title {
-        format!(
-            "{} · {}/{} · {} ",
-            screen.step_title,
-            screen.step_number,
-            screen.step_count,
-            picker.len(),
-        )
+    let (workflow, separator) = if screen.workflow_title == screen.step_title {
+        ("", "")
     } else {
-        format!(
-            "{} › {} · {}/{} · {} ",
-            screen.workflow_title,
-            screen.step_title,
-            screen.step_number,
-            screen.step_count,
-            picker.len(),
-        )
+        (screen.workflow_title, " › ")
     };
+    let context = format!(
+        "{workflow}{separator}{} · {}/{} · {} ",
+        screen.step_title,
+        screen.step_number,
+        screen.step_count,
+        picker.len(),
+    );
     let context = if screen.loading {
         format!("{} · loading ", context.trim_end())
     } else {

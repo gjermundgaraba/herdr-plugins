@@ -85,15 +85,16 @@ impl Picker {
     }
 
     pub fn replace_items(&mut self, items: Vec<Item>) {
-        let selected_id = self.selected_item().map(|item| item.id.clone());
-        let selected_row = self.selected.saturating_sub(self.scroll);
+        let selected = self
+            .selected_item()
+            .map(|item| (item.id.clone(), self.selected.saturating_sub(self.scroll)));
         self.items = items;
-        self.rebuild(selected_id.as_deref(), Some(selected_row));
+        self.rebuild(selected);
     }
 
     pub fn clear_items(&mut self) {
         self.items.clear();
-        self.rebuild(None, None);
+        self.rebuild(None);
     }
 
     pub fn move_selection(&mut self, delta: isize) {
@@ -114,17 +115,17 @@ impl Picker {
         }
     }
 
-    fn rebuild(&mut self, selected_id: Option<&str>, selected_row: Option<usize>) {
+    fn rebuild(&mut self, selected: Option<(String, usize)>) {
         self.haystacks = self.items.iter().map(haystack).collect();
         self.refilter();
-        if let Some(selected_id) = selected_id
+        if let Some((selected_id, selected_row)) = selected
             && let Some(index) = self
                 .filtered
                 .iter()
                 .position(|index| self.items[*index].id == selected_id)
         {
             self.selected = index;
-            self.scroll = index.saturating_sub(selected_row.unwrap_or_default());
+            self.scroll = index.saturating_sub(selected_row);
             self.ensure_selection_visible();
         }
     }

@@ -19,6 +19,7 @@ use crossterm::event::{
     MouseButton, MouseEventKind,
 };
 use model::{Item, Picker};
+use ratatui::layout::{Position, Rect};
 use serde_json::{Value, json};
 
 const USAGE: &str = "\
@@ -509,7 +510,7 @@ fn run_screen(
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
                         if ui::back_button_rect(rects.footer, step_index + 1)
-                            .contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+                            .contains(Position::new(mouse.column, mouse.row))
                         {
                             return Ok(ScreenOutcome::Back);
                         } else if let Some(index) =
@@ -619,11 +620,8 @@ fn handle_key(picker: &mut Picker, mode: &mut Mode, key: KeyEvent) -> Option<Scr
     None
 }
 
-fn row_at(picker: &Picker, body: ratatui::layout::Rect, column: u16, row: u16) -> Option<usize> {
-    if column < body.x
-        || column >= body.x + body.width
-        || row < body.y
-        || row >= body.y + body.height
+fn row_at(picker: &Picker, body: Rect, column: u16, row: u16) -> Option<usize> {
+    if !body.contains(Position::new(column, row))
         || row - body.y >= body.height / ui::ROW_HEIGHT * ui::ROW_HEIGHT
     {
         return None;
@@ -770,7 +768,7 @@ mod tests {
     #[test]
     fn mouse_ignores_an_unpainted_partial_row() {
         let picker = picker();
-        let body = ratatui::layout::Rect::new(0, 0, 20, 3);
+        let body = Rect::new(0, 0, 20, 3);
 
         assert_eq!(row_at(&picker, body, 0, 1), Some(0));
         assert_eq!(row_at(&picker, body, 0, 2), None);
