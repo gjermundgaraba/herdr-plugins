@@ -93,9 +93,8 @@ Enter the repository development shell with the same pinned Rust toolchain using
 ## Plugin SDK and files
 
 [`sdk/ratatui`](sdk/ratatui) provides shared search chrome, key hints,
-separators, and colors for Rust popup integrations, including external
-consumers such as ClankerSnip. It intentionally does not own application state
-or event loops.
+and colors for Rust popup integrations, including external consumers such as
+ClankerSnip. It intentionally does not own application state or event loops.
 
 The reusable client under [`sdk/rust`](sdk/rust) also validates Herdr's plugin
 environment and supplies the repository file layout:

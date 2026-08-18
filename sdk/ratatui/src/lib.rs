@@ -1,14 +1,13 @@
 //! Small, shared Ratatui chrome for Herdr popup plugins.
 
-use ratatui::{
-    buffer::Buffer,
+use ratatui_core::{
     layout::Rect,
+    terminal::Frame,
     text::{Line, Span},
-    widgets::{Fill, Widget},
 };
 
 pub mod theme {
-    use ratatui::style::{Color, Modifier, Style};
+    use ratatui_core::style::{Color, Modifier, Style};
 
     pub fn accent() -> Style {
         Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
@@ -23,6 +22,9 @@ pub mod theme {
     }
 }
 
+const SEARCH_PROMPT: &str = "/ ";
+const SEARCH_PROMPT_WIDTH: u16 = 2;
+
 #[derive(Debug, Clone, Copy)]
 pub struct SearchLine<'a> {
     pub query: &'a str,
@@ -31,31 +33,75 @@ pub struct SearchLine<'a> {
 }
 
 impl<'a> SearchLine<'a> {
-    pub fn line(&self) -> Line<'a> {
-        Line::from(vec![
-            Span::styled("/ ", theme::accent()),
-            if self.query.is_empty() {
-                Span::styled(self.placeholder, theme::muted())
-            } else {
-                Span::raw(self.query)
-            },
-        ])
+    pub fn desired_width(&self) -> usize {
+        let text = if self.query.is_empty() {
+            self.placeholder
+        } else {
+            self.query
+        };
+        usize::from(SEARCH_PROMPT_WIDTH)
+            .saturating_add(Line::from(text).width())
+            .saturating_add(usize::from(self.focused && !self.query.is_empty()))
     }
 
-    pub fn cursor_position(&self, area: Rect) -> Option<(u16, u16)> {
-        if !self.focused || area.width == 0 || area.height == 0 {
-            return None;
+    pub fn render(&self, frame: &mut Frame<'_>, area: Rect) {
+        let area = area.intersection(frame.area());
+        if area.is_empty() {
+            return;
         }
-        let offset = 2usize
-            .saturating_add(Line::from(self.query).width())
-            .min(usize::from(area.width.saturating_sub(1))) as u16;
-        Some((area.x.saturating_add(offset), area.y))
-    }
-}
 
-impl Widget for &SearchLine<'_> {
-    fn render(self, area: Rect, buffer: &mut Buffer) {
-        self.line().render(area, buffer);
+        let prompt_width = area.width.min(SEARCH_PROMPT_WIDTH);
+        let prompt_area = Rect::new(area.x, area.y, prompt_width, 1);
+        frame.render_widget(Line::styled(SEARCH_PROMPT, theme::accent()), prompt_area);
+
+        let input_area = Rect::new(
+            area.x.saturating_add(prompt_width),
+            area.y,
+            area.width.saturating_sub(prompt_width),
+            1,
+        );
+        if input_area.is_empty() {
+            if self.focused {
+                frame.set_cursor_position((area.right().saturating_sub(1), area.y));
+            }
+            return;
+        }
+
+        if self.query.is_empty() {
+            frame.render_widget(Line::styled(self.placeholder, theme::muted()), input_area);
+            if self.focused {
+                frame.set_cursor_position((input_area.x, input_area.y));
+            }
+            return;
+        }
+
+        let query_width = Line::from(self.query).width();
+        let query_area = Rect {
+            width: input_area.width.saturating_sub(u16::from(self.focused)),
+            ..input_area
+        };
+        if !query_area.is_empty() {
+            let query = Line::raw(self.query);
+            let query = if query_width > usize::from(query_area.width) {
+                query.right_aligned()
+            } else {
+                query
+            };
+            frame.render_widget(query, query_area);
+        }
+
+        if self.focused {
+            let cursor_x = if query_width > usize::from(query_area.width) {
+                input_area.right().saturating_sub(1)
+            } else {
+                query_area.x.saturating_add(
+                    u16::try_from(query_width)
+                        .unwrap_or(u16::MAX)
+                        .min(query_area.width),
+                )
+            };
+            frame.set_cursor_position((cursor_x, input_area.y));
+        }
     }
 }
 
@@ -73,23 +119,25 @@ pub fn key_hints<'a>(pairs: &[(&'a str, &'a str)]) -> Line<'a> {
         .collect()
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct Separator;
-
-impl Widget for Separator {
-    fn render(self, area: Rect, buffer: &mut Buffer) {
-        let area = Rect {
-            height: area.height.min(1),
-            ..area
-        };
-        Fill::new("─").style(theme::muted()).render(area, buffer);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::style::Color;
+    use ratatui_core::{backend::TestBackend, layout::Position, terminal::Terminal};
+
+    fn render_search(search: SearchLine<'_>, width: u16) -> (Vec<String>, Position) {
+        let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+        terminal
+            .draw(|frame| search.render(frame, frame.area()))
+            .unwrap();
+        let cells = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol().to_owned())
+            .collect();
+        (cells, terminal.backend().cursor_position())
+    }
 
     #[test]
     fn search_and_hints_share_popup_chrome() {
@@ -98,11 +146,10 @@ mod tests {
             placeholder: "type to search",
             focused: true,
         };
-        assert_eq!(search.line().to_string(), "/ agent");
-        assert_eq!(
-            search.cursor_position(Rect::new(4, 2, 20, 1)),
-            Some((11, 2))
-        );
+        let (cells, cursor) = render_search(search, 8);
+        assert_eq!(cells, ["/", " ", "a", "g", "e", "n", "t", " "]);
+        assert_eq!(cursor, Position::new(7, 0));
+        assert_eq!(search.desired_width(), 8);
         assert_eq!(
             key_hints(&[("enter", "open"), ("esc", "close")]).to_string(),
             "enter open  esc close"
@@ -110,16 +157,42 @@ mod tests {
     }
 
     #[test]
-    fn separator_fills_exactly_one_row() {
-        let area = Rect::new(0, 0, 3, 2);
-        let mut buffer = Buffer::empty(area);
+    fn overflowing_search_keeps_the_suffix_visible_before_the_cursor() {
+        let search = SearchLine {
+            query: "abcdefghij",
+            placeholder: "",
+            focused: true,
+        };
+        let (cells, cursor) = render_search(search, 8);
 
-        Separator.render(area, &mut buffer);
+        assert_eq!(cells, ["/", " ", "f", "g", "h", "i", "j", " "]);
+        assert_eq!(cursor, Position::new(7, 0));
+    }
 
-        for x in 0..area.width {
-            assert_eq!(buffer[(x, 0)].symbol(), "─");
-            assert_eq!(buffer[(x, 0)].fg, Color::DarkGray);
-            assert_eq!(buffer[(x, 1)].symbol(), " ");
-        }
+    #[test]
+    fn wide_search_never_places_the_cursor_on_a_continuation_cell() {
+        let search = SearchLine {
+            query: "界界",
+            placeholder: "",
+            focused: true,
+        };
+        let (cells, cursor) = render_search(search, 5);
+
+        assert_eq!(cells, ["/", " ", "界", " ", " "]);
+        assert_eq!(cursor, Position::new(4, 0));
+        assert_eq!(cells[usize::from(cursor.x)], " ");
+    }
+
+    #[test]
+    fn narrow_search_stays_in_bounds() {
+        let search = SearchLine {
+            query: "query",
+            placeholder: "",
+            focused: true,
+        };
+        let (cells, cursor) = render_search(search, 1);
+
+        assert_eq!(cells, ["/"]);
+        assert_eq!(cursor, Position::ORIGIN);
     }
 }

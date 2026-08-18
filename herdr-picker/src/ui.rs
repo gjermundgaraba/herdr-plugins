@@ -1,10 +1,11 @@
-use herdr_ratatui::{SearchLine, Separator, key_hints, theme};
+use herdr_ratatui::{SearchLine, key_hints, theme};
 use ratatui::{
     Frame,
     layout::Rect,
     style::{Color, Modifier, Style},
+    symbols,
     text::{Line, Span},
-    widgets::{Block, Paragraph, Wrap},
+    widgets::{Block, Fill, Paragraph, Wrap},
 };
 use unicode_truncate::UnicodeTruncateStr;
 use unicode_width::UnicodeWidthStr;
@@ -72,7 +73,10 @@ pub fn render(picker: &mut Picker, mode: Mode, screen: &Screen<'_>, frame: &mut 
     picker.ensure_selection_visible();
 
     render_header(picker, mode, screen, frame, rects.header);
-    frame.render_widget(Separator, Rect::new(area.x, area.y + 1, area.width, 1));
+    frame.render_widget(
+        Fill::new(symbols::line::HORIZONTAL).style(theme::muted()),
+        Rect::new(area.x, area.y + 1, area.width, 1),
+    );
     render_rows(
         picker,
         screen.loading,
@@ -81,7 +85,10 @@ pub fn render(picker: &mut Picker, mode: Mode, screen: &Screen<'_>, frame: &mut 
         frame,
         rects.body,
     );
-    frame.render_widget(Separator, rects.detail_separator);
+    frame.render_widget(
+        Fill::new(symbols::line::HORIZONTAL).style(theme::muted()),
+        rects.detail_separator,
+    );
     render_detail(picker, frame, rects.detail);
     render_footer(mode, screen, frame, rects.footer);
 }
@@ -96,8 +103,6 @@ fn render_header(picker: &Picker, mode: Mode, screen: &Screen<'_>, frame: &mut F
         },
         focused: mode != Mode::VimNormal,
     };
-    let search_line = search.line();
-    let search_width = search_line.width();
     let context = if screen.workflow_title == screen.step_title {
         format!(
             "{} · {}/{} · {} ",
@@ -121,22 +126,35 @@ fn render_header(picker: &Picker, mode: Mode, screen: &Screen<'_>, frame: &mut F
     } else {
         context
     };
+    let desired_search_width = u16::try_from(search.desired_width())
+        .unwrap_or(u16::MAX)
+        .min(area.width);
     let context_budget = area
         .width
-        .saturating_sub(search_width as u16)
+        .saturating_sub(desired_search_width)
         .saturating_sub(2) as usize;
     let context = truncate_start(&context, context_budget);
-    let gap = (area.width as usize)
-        .saturating_sub(search_width + context.width())
-        .max(2);
-    let mut spans = search_line.spans;
-    spans.extend([
-        Span::raw(" ".repeat(gap)),
-        Span::styled(context, theme::muted()),
-    ]);
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-    if let Some(position) = search.cursor_position(area) {
-        frame.set_cursor_position(position);
+    let context_width = u16::try_from(context.width())
+        .unwrap_or(u16::MAX)
+        .min(area.width);
+    let gap = if context_width == 0 { 0 } else { 2 };
+    let search_area = Rect::new(
+        area.x,
+        area.y,
+        area.width.saturating_sub(context_width).saturating_sub(gap),
+        area.height,
+    );
+    search.render(frame, search_area);
+    if context_width > 0 {
+        frame.render_widget(
+            Paragraph::new(context).style(theme::muted()),
+            Rect::new(
+                area.right().saturating_sub(context_width),
+                area.y,
+                context_width,
+                area.height,
+            ),
+        );
     }
 }
 
@@ -319,8 +337,12 @@ fn render_footer(mode: Mode, screen: &Screen<'_>, frame: &mut Frame, area: Rect)
     );
     frame.render_widget(Paragraph::new(key_hints(&hints)), hints_area);
     frame.render_widget(
-        Paragraph::new(format!(" {} ", back_button_label(screen.step_number)))
-            .style(button_style()),
+        Paragraph::new(format!(" {} ", back_button_label(screen.step_number))).style(
+            Style::new()
+                .bg(Color::Cyan)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        ),
         button,
     );
 }
@@ -347,13 +369,6 @@ fn escape_hint(mode: Mode, step_number: usize) -> &'static str {
     } else {
         "close"
     }
-}
-
-fn button_style() -> Style {
-    Style::new()
-        .bg(Color::Cyan)
-        .fg(Color::Black)
-        .add_modifier(Modifier::BOLD)
 }
 
 fn truncate_end(value: &str, max: usize) -> String {
@@ -408,6 +423,41 @@ mod tests {
         assert_eq!(empty_message(&picker, false), " No items");
         picker.query = "missing".into();
         assert_eq!(empty_message(&picker, false), " No matches");
+    }
+
+    #[test]
+    fn overflowing_search_takes_header_space_from_context() {
+        let mut picker = Picker::new(Vec::new(), true);
+        picker.query = "abcdefghij".into();
+        let screen = Screen {
+            workflow_title: "A long workflow",
+            step_title: "A long step",
+            step_number: 1,
+            step_count: 2,
+            error: None,
+            loading: false,
+            spinner_frame: 0,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(8, 1)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                render_header(&picker, Mode::Direct, &screen, frame, frame.area());
+            })
+            .unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert_eq!(rendered, "/ fghij ");
+        assert_eq!(
+            terminal.backend().cursor_position(),
+            ratatui::layout::Position::new(7, 0)
+        );
     }
 
     #[test]
