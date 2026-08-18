@@ -3,7 +3,7 @@
 use std::process::ExitCode;
 
 use herdr_client::SessionSnapshot;
-use herdr_picker_herdr::{Item, presentation, run, serve};
+use herdr_picker_sdk::{Item, presentation, run, serve};
 use serde_json::json;
 
 fn main() -> ExitCode {
@@ -32,8 +32,8 @@ fn workspace_items(snapshot: &SessionSnapshot) -> Vec<Item> {
                     })
                     .unwrap_or_else(|| workspace.workspace_id.clone()),
                 badge: workspace.number.to_string(),
-                indicator,
-                tone,
+                indicator: indicator.into(),
+                tone: Some(tone),
                 spinning,
                 search: format!(
                     "{} {} {}",

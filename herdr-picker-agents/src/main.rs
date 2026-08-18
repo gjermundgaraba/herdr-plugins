@@ -3,7 +3,7 @@
 use std::{cmp::Reverse, collections::HashMap, process::ExitCode};
 
 use herdr_client::{AgentStatus, SessionSnapshot};
-use herdr_picker_herdr::{Item, presentation, run, serve};
+use herdr_picker_sdk::{Item, presentation, run, serve};
 use serde_json::json;
 
 fn main() -> ExitCode {
@@ -77,8 +77,8 @@ fn agent_items(snapshot: &SessionSnapshot) -> Vec<Item> {
                 subtitle,
                 detail,
                 badge: kind.unwrap_or_default().into(),
-                indicator,
-                tone,
+                indicator: indicator.into(),
+                tone: Some(tone),
                 spinning,
                 search: format!(
                     "{} {} {} {} {}",
@@ -215,7 +215,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["blocked-new", "blocked-old", "done", "working", "idle"]
         );
-        assert_eq!(items[0].tone, "danger");
+        assert_eq!(items[0].tone, Some(herdr_picker_sdk::Tone::Danger));
         assert!(items[3].spinning);
         assert_eq!(items[0].value["pane_id"], "blocked-new");
     }

@@ -1,8 +1,8 @@
 title = "Workspaces"
-submit = ["herdr-picker-herdr-focus-workspace"]
+submit = ["herdr-picker-focus-workspace"]
 
 [[steps]]
 id = "workspace"
 title = "Choose workspace"
-source = ["herdr-picker-herdr-workspaces"]
+source = ["herdr-picker-workspaces"]
 search = "local"

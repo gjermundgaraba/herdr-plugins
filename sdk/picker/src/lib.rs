@@ -1,7 +1,7 @@
-//! Shared Herdr streaming and submit plumbing for the herdr-picker-herdr
-//! source and focus executables.
+//! Shared wire types and Herdr plumbing for `herdr-picker` examples.
 
 use std::{
+    collections::HashSet,
     io::{self, Write},
     process::ExitCode,
     thread,
@@ -12,8 +12,62 @@ use anyhow::{Context, Result};
 use herdr_client::{
     AgentStatus, Client, Error as ClientError, EventSubscription, SessionSnapshot, Subscription,
 };
-use serde::{Serialize, de::IgnoredAny};
+use serde::{Deserialize, Serialize, de::IgnoredAny};
 use serde_json::{Value, json};
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Tone {
+    Muted,
+    Accent,
+    Success,
+    Warning,
+    Danger,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Item {
+    pub id: String,
+    pub title: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub subtitle: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub badge: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub indicator: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tone: Option<Tone>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub spinning: bool,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub search: String,
+    pub value: Value,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Snapshot<T = Vec<Item>> {
+    pub items: T,
+}
+
+pub fn validate_items(items: &[Item]) -> Result<(), String> {
+    let mut ids = HashSet::new();
+    for (index, item) in items.iter().enumerate() {
+        if item.id.trim().is_empty() {
+            return Err(format!("items[{index}].id must not be empty"));
+        }
+        if item.title.trim().is_empty() {
+            return Err(format!("items[{index}].title must not be empty"));
+        }
+        if !ids.insert(&item.id) {
+            return Err(format!("duplicate item id {:?}", item.id));
+        }
+    }
+    Ok(())
+}
 
 pub fn run(name: &str, result: Result<()>) -> ExitCode {
     match result {
@@ -50,6 +104,9 @@ pub fn serve(items: impl Fn(&SessionSnapshot) -> Vec<Item>) -> Result<()> {
             .context("cannot read Herdr events")?
             .is_some()
         {
+            while events.has_buffered_event() {
+                let _ = events.next_event().context("cannot read Herdr events")?;
+            }
             let snapshot = client.snapshot().context("cannot refresh Herdr session")?;
             publish(&snapshot)?;
             if pane_ids(&snapshot) != subscribed_panes {
@@ -72,32 +129,13 @@ pub fn submit(method: &str, value_field: &str, parameter: &str) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq)]
-pub struct Item {
-    pub id: String,
-    pub title: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub subtitle: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub detail: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub badge: String,
-    #[serde(skip_serializing_if = "str::is_empty")]
-    pub indicator: &'static str,
-    pub tone: &'static str,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub spinning: bool,
-    pub search: String,
-    pub value: Value,
-}
-
-pub fn presentation(status: &AgentStatus) -> (&'static str, &'static str, bool) {
+pub fn presentation(status: &AgentStatus) -> (&'static str, Tone, bool) {
     match status.as_str() {
-        AgentStatus::BLOCKED => ("◉", "danger", false),
-        AgentStatus::DONE => ("●", "accent", false),
-        AgentStatus::WORKING => ("", "warning", true),
-        AgentStatus::IDLE => ("✓", "success", false),
-        _ => ("○", "muted", false),
+        AgentStatus::BLOCKED => ("◉", Tone::Danger, false),
+        AgentStatus::DONE => ("●", Tone::Accent, false),
+        AgentStatus::WORKING => ("", Tone::Warning, true),
+        AgentStatus::IDLE => ("✓", Tone::Success, false),
+        _ => ("○", Tone::Muted, false),
     }
 }
 
@@ -162,14 +200,9 @@ fn pane_ids(snapshot: &SessionSnapshot) -> Vec<&str> {
     ids
 }
 
-#[derive(Serialize)]
-struct ProviderSnapshot<'a> {
-    items: &'a [Item],
-}
-
 fn emit(items: &[Item]) -> Result<()> {
     let mut stdout = io::stdout().lock();
-    serde_json::to_writer(&mut stdout, &ProviderSnapshot { items })
+    serde_json::to_writer(&mut stdout, &Snapshot { items })
         .context("cannot encode provider message")?;
     stdout
         .write_all(b"\n")

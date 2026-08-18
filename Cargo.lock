@@ -336,6 +336,7 @@ version = "0.1.0"
 dependencies = [
  "crossterm",
  "herdr-client",
+ "herdr-picker-sdk",
  "herdr-ratatui",
  "libc",
  "nucleo-matcher",
@@ -348,12 +349,30 @@ dependencies = [
 ]
 
 [[package]]
-name = "herdr-picker-herdr"
+name = "herdr-picker-agents"
+version = "0.1.0"
+dependencies = [
+ "herdr-client",
+ "herdr-picker-sdk",
+ "serde_json",
+]
+
+[[package]]
+name = "herdr-picker-sdk"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "herdr-client",
  "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "herdr-picker-workspaces"
+version = "0.1.0"
+dependencies = [
+ "herdr-client",
+ "herdr-picker-sdk",
  "serde_json",
 ]
 

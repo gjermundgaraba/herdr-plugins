@@ -140,7 +140,9 @@ print(json.dumps({"items": items}), flush=True)
 
 Complete worked examples live in
 [`herdr-picker-scripts`](../herdr-picker-scripts) (plain Python scripts) and
-[`herdr-picker-herdr`](../herdr-picker-herdr) (live streaming executables).
+the live Rust packages
+[`herdr-picker-agents`](../herdr-picker-agents) and
+[`herdr-picker-workspaces`](../herdr-picker-workspaces).
 
 `id` and `title` are required and IDs must be unique. Put domain data under
 `value`. Optional UI fields are `subtitle`, `detail`, `badge`, `indicator`,
@@ -199,13 +201,15 @@ contain only stable item IDs and values:
 ```
 
 Steps run in declaration order. Back returns to the previous step with its query
-and highlighted item restored, then restarts that step's source. The final
-submit runs in a detached worker after the popup closes.
+and highlighted item restored, then restarts that step's source. From a popup,
+the final submit runs in a detached worker after the popup closes. Direct
+terminal invocations wait for submit and report its exit status.
 
-Submit failures are logged to
+Detached popup-submit failures are logged to
 `$XDG_STATE_HOME/herdr-picker/picker.log` or
 `~/.local/state/herdr-picker/picker.log` and sent to Herdr through a best-effort
-notification. Successful submissions stay silent.
+notification. Direct invocations report submit failures on stderr and exit
+unsuccessfully. Successful submissions stay silent.
 
 ## Controls
 
@@ -216,7 +220,8 @@ notification. Successful submissions stay silent.
 | `Up` / `Down`, `Ctrl+N` / `Ctrl+P` | Move |
 | `PageUp` / `PageDown`, `Home` / `End` | Move farther |
 | `Ctrl+U` | Clear search |
-| `Esc` / `Ctrl+C` / click Back or Close | Back or close |
+| `Esc` / click Back or Close | Back or close |
+| `Ctrl+C` | Cancel the workflow |
 
 In Vim mode, use `j` / `k` to move, `/` to search, and `Esc` to return to
 normal mode before going back. The visible Back/Close button always performs

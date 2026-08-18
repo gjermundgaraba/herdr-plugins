@@ -1,9 +1,11 @@
 # herdr-picker-scripts
 
-The same agent and workspace pickers as
-[`herdr-picker-herdr`](../herdr-picker-herdr), implemented as four short Python
-scripts instead of compiled binaries. Use these as a starting point for your
-own pickers, or when you want the pickers without a Rust toolchain.
+One-shot agent and workspace picker examples implemented as four short Python
+scripts. Use these as starting points for your own pickers, or when you want
+examples without compiling additional Rust binaries. The corresponding
+[`agent`](../herdr-picker-agents) and
+[`workspace`](../herdr-picker-workspaces) Rust examples demonstrate live
+streaming and richer item metadata instead.
 
 Each script does one job:
 
@@ -17,8 +19,7 @@ Each script does one job:
 The sources call `herdr api snapshot` once and print one item snapshot, so the
 list is not live while the picker is open; the focus scripts call
 `herdr agent focus` and `herdr workspace focus`. Requires `python3` and the
-`herdr` CLI on `PATH`. For live-updating lists, use the compiled
-`herdr-picker-herdr` binaries instead.
+`herdr` CLI on `PATH`.
 
 ## Try it from a checkout
 
@@ -42,6 +43,10 @@ cp herdr-picker-scripts/{agents,workspaces}.toml ~/.config/herdr-picker/pickers/
 herdr-picker check agents
 herdr-picker check workspaces
 ```
+
+These definitions intentionally use the same picker names as the Rust
+examples. Choose one implementation, or rename a copied definition when
+comparing both.
 
 Add keybindings to `~/.config/herdr/config.toml` and reload with
 `herdr server reload-config`:

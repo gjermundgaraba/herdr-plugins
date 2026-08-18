@@ -1,8 +1,0 @@
-title = "Agents"
-submit = ["herdr-picker-herdr-focus-agent"]
-
-[[steps]]
-id = "agent"
-title = "Choose agent"
-source = ["herdr-picker-herdr-agents"]
-search = "local"

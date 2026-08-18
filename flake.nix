@@ -34,6 +34,7 @@
         herdr-picker = {
           sourceRoots = [
             "herdr-picker"
+            "sdk/picker"
             "sdk/ratatui"
             "sdk/rust"
           ];
@@ -45,22 +46,36 @@
           ];
         };
 
-        herdr-picker-herdr = {
+        herdr-picker-agents = {
           sourceRoots = [
-            "herdr-picker-herdr"
+            "herdr-picker-agents"
+            "sdk/picker"
             "sdk/rust"
           ];
           binaries = [
-            "herdr-picker-herdr-agents"
-            "herdr-picker-herdr-workspaces"
-            "herdr-picker-herdr-focus-agent"
-            "herdr-picker-herdr-focus-workspace"
+            "herdr-picker-agents"
+            "herdr-picker-focus-agent"
           ];
           binOnly = true;
-          exampleFiles = [
-            "agents.toml"
-            "workspaces.toml"
+          exampleFiles = [ "agents.toml" ];
+          platforms = [
+            "darwin"
+            "linux"
           ];
+        };
+
+        herdr-picker-workspaces = {
+          sourceRoots = [
+            "herdr-picker-workspaces"
+            "sdk/picker"
+            "sdk/rust"
+          ];
+          binaries = [
+            "herdr-picker-workspaces"
+            "herdr-picker-focus-workspace"
+          ];
+          binOnly = true;
+          exampleFiles = [ "workspaces.toml" ];
           platforms = [
             "darwin"
             "linux"

@@ -1,52 +1,8 @@
-use std::collections::HashSet;
-
+pub use herdr_picker_sdk::{Item, Tone, validate_items};
 use nucleo_matcher::{
     Config, Matcher, Utf32String,
     pattern::{CaseMatching, Normalization, Pattern},
 };
-use serde::Deserialize;
-use serde_json::Value;
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Tone {
-    Muted,
-    Accent,
-    Success,
-    Warning,
-    Danger,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Item {
-    pub id: String,
-    pub title: String,
-    pub subtitle: String,
-    pub detail: String,
-    pub badge: String,
-    pub indicator: String,
-    pub tone: Option<Tone>,
-    pub spinning: bool,
-    pub search: String,
-    pub value: Value,
-}
-
-pub fn validate_items(items: &[Item]) -> Result<(), String> {
-    let mut ids = HashSet::new();
-    for (index, item) in items.iter().enumerate() {
-        if item.id.trim().is_empty() {
-            return Err(format!("items[{index}].id must not be empty"));
-        }
-        if item.title.trim().is_empty() {
-            return Err(format!("items[{index}].title must not be empty"));
-        }
-        if !ids.insert(&item.id) {
-            return Err(format!("duplicate item id {:?}", item.id));
-        }
-    }
-    Ok(())
-}
 
 pub struct Picker {
     pub items: Vec<Item>,
@@ -130,13 +86,14 @@ impl Picker {
 
     pub fn replace_items(&mut self, items: Vec<Item>) {
         let selected_id = self.selected_item().map(|item| item.id.clone());
+        let selected_row = self.selected.saturating_sub(self.scroll);
         self.items = items;
-        self.rebuild(selected_id.as_deref());
+        self.rebuild(selected_id.as_deref(), Some(selected_row));
     }
 
     pub fn clear_items(&mut self) {
         self.items.clear();
-        self.rebuild(None);
+        self.rebuild(None, None);
     }
 
     pub fn move_selection(&mut self, delta: isize) {
@@ -157,7 +114,7 @@ impl Picker {
         }
     }
 
-    fn rebuild(&mut self, selected_id: Option<&str>) {
+    fn rebuild(&mut self, selected_id: Option<&str>, selected_row: Option<usize>) {
         self.haystacks = self.items.iter().map(haystack).collect();
         self.refilter();
         if let Some(selected_id) = selected_id
@@ -167,6 +124,7 @@ impl Picker {
                 .position(|index| self.items[*index].id == selected_id)
         {
             self.selected = index;
+            self.scroll = index.saturating_sub(selected_row.unwrap_or_default());
             self.ensure_selection_visible();
         }
     }
@@ -235,5 +193,32 @@ mod tests {
         picker.replace_items(vec![item("two", "Updated", ""), item("three", "Three", "")]);
         assert_eq!(picker.len(), 2);
         assert_eq!(picker.selected_item().unwrap().id, "two");
+    }
+
+    #[test]
+    fn streaming_replacement_preserves_the_selected_rows_viewport_position() {
+        let mut picker = Picker::new(
+            vec![
+                item("one", "One", ""),
+                item("two", "Two", ""),
+                item("three", "Three", ""),
+                item("four", "Four", ""),
+            ],
+            false,
+        );
+        picker.visible_rows = 2;
+        picker.selected = 2;
+        picker.scroll = 1;
+
+        picker.replace_items(vec![
+            item("one", "One", ""),
+            item("two", "Two", ""),
+            item("four", "Four", ""),
+            item("three", "Updated", ""),
+        ]);
+
+        assert_eq!(picker.selected_item().unwrap().id, "three");
+        assert_eq!(picker.scroll, 2);
+        assert_eq!(picker.selected - picker.scroll, 1);
     }
 }

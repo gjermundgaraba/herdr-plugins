@@ -5,8 +5,9 @@ Independent plugins and tools for [Herdr](https://herdr.dev/).
 | Package | Description |
 | --- | --- |
 | [herdr-picker](herdr-picker) | Standalone declarative fuzzy picker and workflow runner |
-| [herdr-picker-herdr](herdr-picker-herdr) | Optional live agent and workspace providers for the picker |
-| [herdr-picker-scripts](herdr-picker-scripts) | The same pickers as plain Python scripts, no compilation |
+| [herdr-picker-agents](herdr-picker-agents) | Live Herdr agent picker example in Rust |
+| [herdr-picker-workspaces](herdr-picker-workspaces) | Live Herdr workspace picker example in Rust |
+| [herdr-picker-scripts](herdr-picker-scripts) | One-shot agent and workspace examples in Python |
 | [equalize-splits](equalize-splits) | Automatically equalize pane sizes after splitting |
 | [fork-to-pane](fork-to-pane) | Fork the focused Pi, Codex, or Claude Code session into a new pane |
 | [history](history) | Vim-style back/forward focus history |
@@ -52,12 +53,13 @@ nix build .#herdr-picker
 result/bin/herdr-picker --version
 ```
 
-The other package names are `equalize-splits`, `fork-to-pane`, `history`, and
-`herdr-micro`. `herdr-picker-herdr` is a separate optional binary package.
-`herdr-micro` is exposed only on macOS, matching its plugin manifest; the
-others support Linux and macOS. Plugin packages contain a complete, prebuilt
-plugin root, so linking them never invokes Cargo. The picker packages expose
-their executables under `bin/`.
+The other package names include `herdr-picker-agents`,
+`herdr-picker-workspaces`, `equalize-splits`, `fork-to-pane`, `history`, and
+`herdr-micro`. The two picker examples are independent optional binary
+packages. `herdr-micro` is exposed only on macOS, matching its plugin manifest;
+the others support Linux and macOS. Plugin packages contain a complete,
+prebuilt plugin root, so linking them never invokes Cargo. The picker packages
+expose their executables under `bin/`.
 
 For Home Manager, add the picker package to the profile:
 
@@ -82,10 +84,11 @@ on later activations, so there is no activation-time Rust compilation and no
 binary cache is required.
 
 Each package's filtered source contains its full local path-dependency closure.
-The picker uses both shared SDK crates; its Herdr provider and the other Rust
-plugins use `sdk/rust`; `herdr-micro` also includes `codex-micro`.
-Consequently, editing one plugin does not invalidate unrelated plugin outputs,
-while edits to a shared SDK invalidate packages that include it.
+The picker and its Rust examples share `sdk/picker`; popup chrome lives in
+`sdk/ratatui`; Herdr clients use `sdk/rust`; `herdr-micro` also includes
+`codex-micro`. Consequently, editing one plugin does not invalidate unrelated
+plugin outputs, while edits to a shared SDK invalidate packages that include
+it.
 
 Enter the repository development shell with the same pinned Rust toolchain using
 `nix develop`.
@@ -95,6 +98,9 @@ Enter the repository development shell with the same pinned Rust toolchain using
 [`sdk/ratatui`](sdk/ratatui) provides shared search chrome, key hints,
 and colors for Rust popup integrations, including external consumers such as
 ClankerSnip. It intentionally does not own application state or event loops.
+
+[`sdk/picker`](sdk/picker) provides the picker wire types and shared live Herdr
+provider plumbing used by the independent agent and workspace examples.
 
 The reusable client under [`sdk/rust`](sdk/rust) also validates Herdr's plugin
 environment and supplies the repository file layout:

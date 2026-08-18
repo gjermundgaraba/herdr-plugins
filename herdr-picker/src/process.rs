@@ -16,6 +16,7 @@ use std::{
 };
 
 use herdr_client::{Client, Error, open_rotating_log};
+use herdr_picker_sdk::Snapshot;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -24,12 +25,6 @@ use crate::model::{Item, validate_items};
 const WORKER_FLAG: &str = "--submit-after-popup";
 const MAX_NDJSON_FRAME_BYTES: usize = 1 << 20;
 const MAX_STDERR_BYTES: usize = 64 << 10;
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProviderSnapshot {
-    items: Vec<Item>,
-}
 
 #[derive(Debug)]
 pub enum ProviderEvent {
@@ -84,7 +79,7 @@ impl Provider {
             let mut reader = BufReader::new(stdout);
             loop {
                 match read_frame(&mut reader) {
-                    Ok(Some(frame)) => match serde_json::from_slice::<ProviderSnapshot>(&frame) {
+                    Ok(Some(frame)) => match serde_json::from_slice::<Snapshot>(&frame) {
                         Ok(snapshot) => {
                             if let Err(error) = validate_items(&snapshot.items) {
                                 let _ = fatal_tx.send(format!("provider items: {error}"));
@@ -248,7 +243,31 @@ pub fn maybe_run_submit_worker() -> Option<ExitCode> {
     })
 }
 
-pub fn schedule_submit(argv: &[String], input: &Value) -> Result<(), String> {
+pub fn running_in_popup() -> bool {
+    popup_environment(
+        env::var_os("HERDR_ENV").as_deref(),
+        env::var_os("HERDR_PANE_ID").as_deref(),
+        env::var_os("HERDR_ACTIVE_PANE_ID").as_deref(),
+    )
+}
+
+fn popup_environment(
+    herdr: Option<&OsStr>,
+    pane: Option<&OsStr>,
+    active_pane: Option<&OsStr>,
+) -> bool {
+    herdr == Some(OsStr::new("1")) && pane.is_none() && active_pane.is_some()
+}
+
+pub fn submit(argv: &[String], input: &Value) -> Result<(), String> {
+    if running_in_popup() {
+        schedule_submit(argv, input)
+    } else {
+        run(argv, input)
+    }
+}
+
+fn schedule_submit(argv: &[String], input: &Value) -> Result<(), String> {
     let executable =
         env::current_exe().map_err(|error| format!("cannot resolve executable: {error}"))?;
     let mut command = Command::new(executable);
@@ -292,7 +311,7 @@ fn run_submit_worker() -> Result<(), String> {
     let request: SubmitRequest =
         serde_json::from_str(&input).map_err(|error| format!("invalid submit request: {error}"))?;
 
-    if env::var_os("HERDR_SOCKET_PATH").is_some() {
+    if running_in_popup() {
         let client =
             Client::from_env().map_err(|error| format!("cannot connect to Herdr: {error}"))?;
         match client.call_value("popup.close", &json!({})) {
@@ -528,6 +547,17 @@ fn log_path() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn popup_environment_requires_herdr_without_a_pane_identity() {
+        let one = OsStr::new("1");
+        let pane = OsStr::new("w1:p1");
+
+        assert!(popup_environment(Some(one), None, Some(pane)));
+        assert!(!popup_environment(Some(one), Some(pane), Some(pane)));
+        assert!(!popup_environment(None, None, Some(pane)));
+        assert!(!popup_environment(Some(one), None, None));
+    }
 
     #[test]
     fn provider_receives_context_and_streams_snapshots() {

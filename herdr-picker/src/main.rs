@@ -47,13 +47,11 @@ fn main() -> ExitCode {
     if let Some(code) = process::maybe_run_submit_worker() {
         return code;
     }
+    let pause_on_failure = process::running_in_popup();
     let cli = match parse_cli(env::args_os().skip(1)) {
         Ok(cli) => cli,
-        Err(error) => return fail_visibly(&error, false),
+        Err(error) => return fail_visibly(&error, pause_on_failure),
     };
-    let pause_on_failure = matches!(&cli, Cli::Run { .. })
-        && env::var_os("HERDR_PANE_ID").is_none()
-        && env::var_os("HERDR_ACTIVE_PANE_ID").is_some();
     match execute(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => fail_visibly(&error, pause_on_failure),
@@ -142,7 +140,7 @@ fn run_workflow(name: &str, workflow: &Workflow) -> Result<(), String> {
     drop(terminal);
 
     if let Some(input) = outcome? {
-        process::schedule_submit(&workflow.submit, &input)?;
+        process::submit(&workflow.submit, &input)?;
     }
     Ok(())
 }
@@ -151,7 +149,13 @@ struct TerminalSession(ratatui::DefaultTerminal);
 
 impl TerminalSession {
     fn new() -> io::Result<Self> {
-        let terminal = ratatui::init();
+        let terminal = match ratatui::try_init() {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                ratatui::restore();
+                return Err(error);
+            }
+        };
         if let Err(error) = crossterm::execute!(io::stdout(), EnableMouseCapture) {
             ratatui::restore();
             return Err(error);
@@ -273,53 +277,48 @@ impl StepRuntime {
         true
     }
 
-    fn drain_provider(&mut self) -> bool {
-        let mut changed = false;
+    fn poll_provider(&mut self) -> bool {
         let mut stop = false;
-        loop {
-            let event = match self.provider.as_ref().map(process::Provider::try_recv) {
-                Some(Ok(event)) => event,
-                Some(Err(TryRecvError::Empty)) | None => break,
-                Some(Err(TryRecvError::Disconnected)) => {
-                    stop = true;
-                    break;
-                }
-            };
-            changed = true;
-            match event {
-                process::ProviderEvent::Snapshot(items) => {
-                    self.picker.replace_items(items);
-                    self.received_snapshot = true;
-                    self.loading = false;
-                    self.error = None;
-                }
-                process::ProviderEvent::Error(error) => {
-                    self.fail_provider(error);
-                    stop = true;
-                }
-                process::ProviderEvent::Exited { status, stderr } => {
-                    if !status.success() {
-                        self.fail_provider(if stderr.is_empty() {
-                            format!("provider exited with {status}")
-                        } else {
-                            format!("provider failed: {stderr}")
-                        });
-                    } else if !self.received_snapshot {
-                        self.fail_provider("provider exited before sending a snapshot".into());
-                    }
-                    self.loading = false;
-                    stop = true;
-                }
+        let event = match self.provider.as_ref().map(process::Provider::try_recv) {
+            Some(Ok(event)) => event,
+            Some(Err(TryRecvError::Empty)) | None => return false,
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.provider.take();
+                let changed = self.loading;
+                self.loading = false;
+                return changed;
             }
-            if stop {
-                break;
+        };
+        match event {
+            process::ProviderEvent::Snapshot(items) => {
+                self.picker.replace_items(items);
+                self.received_snapshot = true;
+                self.loading = false;
+                self.error = None;
+            }
+            process::ProviderEvent::Error(error) => {
+                self.fail_provider(error);
+                stop = true;
+            }
+            process::ProviderEvent::Exited { status, stderr } => {
+                if !status.success() {
+                    self.fail_provider(if stderr.is_empty() {
+                        format!("provider exited with {status}")
+                    } else {
+                        format!("provider failed: {stderr}")
+                    });
+                } else if !self.received_snapshot {
+                    self.fail_provider("provider exited before sending a snapshot".into());
+                }
+                self.loading = false;
+                stop = true;
             }
         }
         if stop {
             self.provider.take();
             self.loading = false;
         }
-        changed
+        true
     }
 
     fn fail_provider(&mut self, error: String) {
@@ -385,6 +384,7 @@ fn run_tui(
             &selections,
             &mut runtime,
         )? {
+            ScreenOutcome::Cancel => return Ok(None),
             ScreenOutcome::Back => {
                 let Some(previous) = history.pop() else {
                     return Ok(None);
@@ -441,6 +441,7 @@ fn command_input(
 enum ScreenOutcome {
     Select { item: Box<Item>, query: String },
     Back,
+    Cancel,
 }
 
 fn run_screen(
@@ -456,7 +457,7 @@ fn run_screen(
     loop {
         let now = Instant::now();
         dirty |= runtime.flush_pending(now, name, step, selections);
-        dirty |= runtime.drain_provider();
+        dirty |= runtime.poll_provider();
         dirty |= runtime.tick_spinner(now);
         if dirty {
             let screen = ui::Screen {
@@ -541,9 +542,10 @@ fn handle_key(picker: &mut Picker, mode: &mut Mode, key: KeyEvent) -> Option<Scr
             *mode = Mode::VimNormal;
             return None;
         }
-        (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+        (KeyCode::Esc, _) => {
             return Some(ScreenOutcome::Back);
         }
+        (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Some(ScreenOutcome::Cancel),
         (KeyCode::Enter, _) => {
             return picker
                 .selected_item()
@@ -682,6 +684,29 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_c_cancels_while_escape_navigates_back() {
+        let mut picker = picker();
+        let mut mode = Mode::Direct;
+
+        assert!(matches!(
+            handle_key(
+                &mut picker,
+                &mut mode,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            ),
+            Some(ScreenOutcome::Cancel)
+        ));
+        assert!(matches!(
+            handle_key(
+                &mut picker,
+                &mut mode,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            ),
+            Some(ScreenOutcome::Back)
+        ));
+    }
+
+    #[test]
     fn command_context_contains_only_compact_selections() {
         let step = Step {
             id: "harness".into(),
@@ -769,14 +794,15 @@ mod tests {
 
         runtime.picker.query = "n".into();
         runtime.notice_query_change("");
-        let first_deadline = runtime.pending_query.unwrap();
+        let stale_deadline = Instant::now() + Duration::from_secs(60);
+        runtime.pending_query = Some(stale_deadline);
         assert!(runtime.picker.is_empty());
         assert!(runtime.loading);
         assert!(runtime.error.is_none());
 
         runtime.picker.query = "new".into();
         runtime.notice_query_change("n");
-        assert!(runtime.pending_query.unwrap() >= first_deadline);
+        assert!(runtime.pending_query.unwrap() < stale_deadline);
         assert!(
             handle_key(
                 &mut runtime.picker,
@@ -809,7 +835,7 @@ mod tests {
         let mut runtime = StepRuntime::start("test", &step, &BTreeMap::new(), Mode::Direct, None);
         let deadline = Instant::now() + Duration::from_secs(1);
         while runtime.provider.is_some() && Instant::now() < deadline {
-            runtime.drain_provider();
+            runtime.poll_provider();
             std::thread::sleep(Duration::from_millis(10));
         }
 
@@ -824,6 +850,34 @@ mod tests {
     }
 
     #[test]
+    fn provider_poll_processes_one_snapshot_at_a_time() {
+        let step = Step {
+            id: "source".into(),
+            title: "Source".into(),
+            source: Some(vec![
+                "sh".into(),
+                "-c".into(),
+                concat!(
+                    "read input; ",
+                    "printf '{\"items\":[{\"id\":\"one\",\"title\":\"One\"}]}\\n'; ",
+                    "printf '{\"items\":[{\"id\":\"two\",\"title\":\"Two\"}]}\\n'; ",
+                    "sleep 1"
+                )
+                .into(),
+            ]),
+            search: SearchMode::Local,
+            items: Vec::new(),
+        };
+        let mut runtime = StepRuntime::start("test", &step, &BTreeMap::new(), Mode::Direct, None);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !runtime.poll_provider() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(runtime.picker.selected_item().unwrap().id, "one");
+    }
+
+    #[test]
     fn clean_provider_exit_requires_a_snapshot() {
         let step = Step {
             id: "source".into(),
@@ -835,7 +889,7 @@ mod tests {
         let mut runtime = StepRuntime::start("test", &step, &BTreeMap::new(), Mode::Direct, None);
         let deadline = Instant::now() + Duration::from_secs(1);
         while runtime.provider.is_some() && Instant::now() < deadline {
-            runtime.drain_provider();
+            runtime.poll_provider();
             std::thread::sleep(Duration::from_millis(10));
         }
 
