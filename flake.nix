@@ -34,6 +34,7 @@
         herdr-picker = {
           sourceRoots = [
             "herdr-picker"
+            "sdk/ratatui"
             "sdk/rust"
           ];
           binaries = [ "herdr-picker" ];

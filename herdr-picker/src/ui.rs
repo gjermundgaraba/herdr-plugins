@@ -1,3 +1,4 @@
+use herdr_ratatui::{SearchLine, Separator, key_hints, theme};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -71,7 +72,7 @@ pub fn render(picker: &mut Picker, mode: Mode, screen: &Screen<'_>, frame: &mut 
     picker.ensure_selection_visible();
 
     render_header(picker, mode, screen, frame, rects.header);
-    render_separator(frame, Rect::new(area.x, area.y + 1, area.width, 1));
+    frame.render_widget(Separator, Rect::new(area.x, area.y + 1, area.width, 1));
     render_rows(
         picker,
         screen.loading,
@@ -80,21 +81,22 @@ pub fn render(picker: &mut Picker, mode: Mode, screen: &Screen<'_>, frame: &mut 
         frame,
         rects.body,
     );
-    render_separator(frame, rects.detail_separator);
+    frame.render_widget(Separator, rects.detail_separator);
     render_detail(picker, frame, rects.detail);
     render_footer(mode, screen, frame, rects.footer);
 }
 
 fn render_header(picker: &Picker, mode: Mode, screen: &Screen<'_>, frame: &mut Frame, area: Rect) {
-    let focused = mode != Mode::VimNormal;
-    let search_line = search_line(
-        &picker.query,
-        match mode {
+    let search = SearchLine {
+        query: &picker.query,
+        placeholder: match mode {
             Mode::Direct => "type to search",
             Mode::VimNormal => "to search",
             Mode::VimSearch => "",
         },
-    );
+        focused: mode != Mode::VimNormal,
+    };
+    let search_line = search.line();
     let search_width = search_line.width();
     let context = if screen.workflow_title == screen.step_title {
         format!(
@@ -133,7 +135,7 @@ fn render_header(picker: &Picker, mode: Mode, screen: &Screen<'_>, frame: &mut F
         Span::styled(context, theme::muted()),
     ]);
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
-    if let Some(position) = search_cursor_position(&picker.query, focused, area) {
+    if let Some(position) = search.cursor_position(area) {
         frame.set_cursor_position(position);
     }
 }
@@ -318,7 +320,7 @@ fn render_footer(mode: Mode, screen: &Screen<'_>, frame: &mut Frame, area: Rect)
     frame.render_widget(Paragraph::new(key_hints(&hints)), hints_area);
     frame.render_widget(
         Paragraph::new(format!(" {} ", back_button_label(screen.step_number)))
-            .style(theme::button()),
+            .style(button_style()),
         button,
     );
 }
@@ -337,48 +339,6 @@ fn back_button_label(step_number: usize) -> &'static str {
     if step_number > 1 { "Back" } else { "Close" }
 }
 
-fn search_line<'a>(query: &'a str, placeholder: &'a str) -> Line<'a> {
-    Line::from(vec![
-        Span::styled("/ ", theme::accent()),
-        if query.is_empty() {
-            Span::styled(placeholder, theme::muted())
-        } else {
-            Span::raw(query)
-        },
-    ])
-}
-
-fn search_cursor_position(query: &str, focused: bool, area: Rect) -> Option<(u16, u16)> {
-    if !focused || area.width == 0 || area.height == 0 {
-        return None;
-    }
-    let offset = 2usize
-        .saturating_add(Line::from(query).width())
-        .min(usize::from(area.width.saturating_sub(1))) as u16;
-    Some((area.x.saturating_add(offset), area.y))
-}
-
-fn render_separator(frame: &mut Frame, area: Rect) {
-    frame.render_widget(
-        Line::styled("─".repeat(area.width as usize), theme::muted()),
-        area,
-    );
-}
-
-fn key_hints<'a>(pairs: &[(&'a str, &'a str)]) -> Line<'a> {
-    pairs
-        .iter()
-        .enumerate()
-        .flat_map(|(index, (key, label))| {
-            [
-                Span::raw(if index == 0 { "" } else { "  " }),
-                Span::styled(*key, theme::accent()),
-                Span::styled(format!(" {label}"), theme::muted()),
-            ]
-        })
-        .collect()
-}
-
 fn escape_hint(mode: Mode, step_number: usize) -> &'static str {
     if mode == Mode::VimSearch {
         "normal"
@@ -389,27 +349,11 @@ fn escape_hint(mode: Mode, step_number: usize) -> &'static str {
     }
 }
 
-mod theme {
-    use ratatui::style::{Color, Modifier, Style};
-
-    pub fn accent() -> Style {
-        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-    }
-
-    pub fn muted() -> Style {
-        Style::new().fg(Color::DarkGray)
-    }
-
-    pub fn selection() -> Style {
-        Style::new().bg(Color::Blue).fg(Color::White)
-    }
-
-    pub fn button() -> Style {
-        Style::new()
-            .bg(Color::Cyan)
-            .fg(Color::Black)
-            .add_modifier(Modifier::BOLD)
-    }
+fn button_style() -> Style {
+    Style::new()
+        .bg(Color::Cyan)
+        .fg(Color::Black)
+        .add_modifier(Modifier::BOLD)
 }
 
 fn truncate_end(value: &str, max: usize) -> String {
@@ -447,19 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn local_chrome_matches_picker_modes() {
-        assert_eq!(
-            search_line("agent", "type to search").to_string(),
-            "/ agent"
-        );
-        assert_eq!(
-            search_cursor_position("agent", true, Rect::new(4, 2, 20, 1)),
-            Some((11, 2))
-        );
-        assert_eq!(
-            key_hints(&[("enter", "open"), ("esc", "close")]).to_string(),
-            "enter open  esc close"
-        );
+    fn picker_controls_match_workflow_state() {
         assert_eq!(escape_hint(Mode::VimSearch, 2), "normal");
         assert_eq!(escape_hint(Mode::Direct, 2), "back");
         assert_eq!(escape_hint(Mode::Direct, 1), "close");

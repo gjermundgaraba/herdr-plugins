@@ -8,6 +8,7 @@ members = [
     "herdr-micro",
     "herdr-micro/codex-micro",
     "history",
+    "sdk/ratatui",
     "sdk/rust",
 ]
 
@@ -20,6 +21,7 @@ repository = "https://github.com/gjermundgaraba/herdr-plugins"
 [workspace.dependencies]
 anyhow = "1.0.104"
 herdr-client = { path = "sdk/rust" }
+herdr-ratatui = { path = "sdk/ratatui" }
 libc = "0.2.189"
 objc2-core-foundation = { version = "0.3.2", default-features = false }
 ratatui = { version = "0.30.2", default-features = false }
