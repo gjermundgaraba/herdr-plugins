@@ -9,6 +9,7 @@ description = "Live Herdr data providers for herdr-picker"
 repository.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 herdr-client.workspace = true
 serde.workspace = true
 serde_json.workspace = true

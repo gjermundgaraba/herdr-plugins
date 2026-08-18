@@ -8,17 +8,18 @@ use std::{
     time::Duration,
 };
 
+use anyhow::{Context, Result};
 use herdr_client::{
     AgentStatus, Client, Error as ClientError, EventSubscription, SessionSnapshot, Subscription,
 };
-use serde::Serialize;
+use serde::{Serialize, de::IgnoredAny};
 use serde_json::{Value, json};
 
-pub fn run(name: &str, task: impl FnOnce() -> Result<(), String>) -> ExitCode {
-    match task() {
+pub fn run(name: &str, result: Result<()>) -> ExitCode {
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("{name}: {error}");
+            eprintln!("{name}: {error:#}");
             ExitCode::FAILURE
         }
     }
@@ -26,12 +27,11 @@ pub fn run(name: &str, task: impl FnOnce() -> Result<(), String>) -> ExitCode {
 
 /// Read one picker context from stdin, then stream one item snapshot per
 /// session change while the picker stays open.
-pub fn serve(items: impl Fn(&SessionSnapshot) -> Vec<Item>) -> Result<(), String> {
-    let _: Value = serde_json::from_reader(io::stdin())
-        .map_err(|error| format!("invalid picker context: {error}"))?;
-    let client = Client::from_env().map_err(|error| format!("cannot connect to Herdr: {error}"))?;
-    let mut previous: Option<Vec<Item>> = None;
-    let mut publish = |snapshot: &SessionSnapshot| -> Result<(), String> {
+pub fn serve(items: impl Fn(&SessionSnapshot) -> Vec<Item>) -> Result<()> {
+    let _: IgnoredAny = serde_json::from_reader(io::stdin()).context("invalid picker context")?;
+    let client = Client::from_env().context("cannot connect to Herdr")?;
+    let mut previous = None;
+    let mut publish = |snapshot: &SessionSnapshot| -> Result<()> {
         let next = items(snapshot);
         if previous.as_ref() != Some(&next) {
             emit(&next)?;
@@ -40,42 +40,36 @@ pub fn serve(items: impl Fn(&SessionSnapshot) -> Vec<Item>) -> Result<(), String
         Ok(())
     };
 
-    loop {
+    'resubscribe: loop {
         let (snapshot, mut events) = subscribe_events(&client)?;
         let subscribed_panes = pane_ids(&snapshot);
         publish(&snapshot)?;
 
-        loop {
-            let Some(_) = events
-                .next_event()
-                .map_err(|error| format!("cannot read Herdr events: {error}"))?
-            else {
-                thread::sleep(Duration::from_millis(100));
-                break;
-            };
-            let snapshot = client
-                .snapshot()
-                .map_err(|error| format!("cannot refresh Herdr session: {error}"))?;
-            let topology_changed = pane_ids(&snapshot) != subscribed_panes;
+        while events
+            .next_event()
+            .context("cannot read Herdr events")?
+            .is_some()
+        {
+            let snapshot = client.snapshot().context("cannot refresh Herdr session")?;
             publish(&snapshot)?;
-            if topology_changed {
-                break;
+            if pane_ids(&snapshot) != subscribed_panes {
+                continue 'resubscribe;
             }
         }
+        thread::sleep(Duration::from_millis(100));
     }
 }
 
 /// Read the final picker context from stdin and call `method` with the
 /// `value_field` of the selected item as its `parameter`.
-pub fn submit(method: &str, value_field: &str, parameter: &str) -> Result<(), String> {
-    let context: Value = serde_json::from_reader(io::stdin())
-        .map_err(|error| format!("invalid picker context: {error}"))?;
+pub fn submit(method: &str, value_field: &str, parameter: &str) -> Result<()> {
+    let context: Value = serde_json::from_reader(io::stdin()).context("invalid picker context")?;
     let value = selected_value(&context, value_field)?;
     Client::from_env()
-        .map_err(|error| format!("cannot connect to Herdr: {error}"))?
+        .context("cannot connect to Herdr")?
         .call_value(method, &json!({ (parameter): value }))
-        .map(|_| ())
-        .map_err(|error| format!("{method} failed: {error}"))
+        .with_context(|| format!("{method} failed"))?;
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -88,8 +82,8 @@ pub struct Item {
     pub detail: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub badge: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub indicator: String,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    pub indicator: &'static str,
     pub tone: &'static str,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub spinning: bool,
@@ -129,14 +123,12 @@ fn lifecycle_subscriptions() -> impl Iterator<Item = EventSubscription> {
         "pane.exited",
         "pane.agent_detected",
     ];
-    EVENTS.iter().map(|event| EventSubscription::new(*event))
+    EVENTS.iter().copied().map(EventSubscription::new)
 }
 
-fn subscribe_events(client: &Client) -> Result<(SessionSnapshot, Subscription), String> {
+fn subscribe_events(client: &Client) -> Result<(SessionSnapshot, Subscription)> {
     loop {
-        let before = client
-            .snapshot()
-            .map_err(|error| format!("cannot load Herdr session: {error}"))?;
+        let before = client.snapshot().context("cannot load Herdr session")?;
         let subscriptions = lifecycle_subscriptions()
             .chain(before.panes.iter().map(|pane| {
                 EventSubscription::new("pane.agent_status_changed")
@@ -150,23 +142,21 @@ fn subscribe_events(client: &Client) -> Result<(SessionSnapshot, Subscription), 
                 continue;
             }
             Err(error) => {
-                return Err(format!("cannot subscribe to Herdr events: {error}"));
+                return Err(error).context("cannot subscribe to Herdr events");
             }
         };
-        let after = client
-            .snapshot()
-            .map_err(|error| format!("cannot refresh Herdr session: {error}"))?;
+        let after = client.snapshot().context("cannot refresh Herdr session")?;
         if pane_ids(&before) == pane_ids(&after) {
             return Ok((after, events));
         }
     }
 }
 
-fn pane_ids(snapshot: &SessionSnapshot) -> Vec<String> {
+fn pane_ids(snapshot: &SessionSnapshot) -> Vec<&str> {
     let mut ids = snapshot
         .panes
         .iter()
-        .map(|pane| pane.pane_id.clone())
+        .map(|pane| pane.pane_id.as_str())
         .collect::<Vec<_>>();
     ids.sort_unstable();
     ids
@@ -177,23 +167,23 @@ struct ProviderSnapshot<'a> {
     items: &'a [Item],
 }
 
-fn emit(items: &[Item]) -> Result<(), String> {
+fn emit(items: &[Item]) -> Result<()> {
     let mut stdout = io::stdout().lock();
     serde_json::to_writer(&mut stdout, &ProviderSnapshot { items })
-        .map_err(|error| format!("cannot encode provider message: {error}"))?;
+        .context("cannot encode provider message")?;
     stdout
         .write_all(b"\n")
         .and_then(|_| stdout.flush())
-        .map_err(|error| format!("cannot write provider message: {error}"))
+        .context("cannot write provider message")
 }
 
-fn selected_value<'a>(context: &'a Value, value_field: &str) -> Result<&'a str, String> {
+fn selected_value<'a>(context: &'a Value, value_field: &str) -> Result<&'a str> {
     let step = context["step"]
         .as_str()
-        .ok_or_else(|| "picker context step is missing".to_string())?;
+        .context("picker context step is missing")?;
     context["selections"][step]["value"][value_field]
         .as_str()
-        .ok_or_else(|| format!("selections.{step}.value.{value_field} is missing"))
+        .with_context(|| format!("selections.{step}.value.{value_field} is missing"))
 }
 
 #[cfg(test)]

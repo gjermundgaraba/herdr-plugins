@@ -350,6 +350,7 @@ dependencies = [
 name = "herdr-picker-herdr"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "herdr-client",
  "serde",
  "serde_json",

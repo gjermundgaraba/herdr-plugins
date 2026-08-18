@@ -5,7 +5,6 @@ use std::process::ExitCode;
 use herdr_picker_herdr::{run, submit};
 
 fn main() -> ExitCode {
-    run(env!("CARGO_BIN_NAME"), || {
-        submit("workspace.focus", "workspace_id", "workspace_id")
-    })
+    let result = submit("workspace.focus", "workspace_id", "workspace_id");
+    run(env!("CARGO_BIN_NAME"), result)
 }

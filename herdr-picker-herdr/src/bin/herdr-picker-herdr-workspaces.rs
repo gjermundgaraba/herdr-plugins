@@ -7,11 +7,11 @@ use herdr_picker_herdr::{Item, presentation, run, serve};
 use serde_json::json;
 
 fn main() -> ExitCode {
-    run(env!("CARGO_BIN_NAME"), || serve(workspace_items))
+    run(env!("CARGO_BIN_NAME"), serve(workspace_items))
 }
 
 fn workspace_items(snapshot: &SessionSnapshot) -> Vec<Item> {
-    let mut workspaces = snapshot.workspaces.clone();
+    let mut workspaces = snapshot.workspaces.iter().collect::<Vec<_>>();
     workspaces.sort_by_key(|workspace| workspace.number);
     workspaces
         .into_iter()
@@ -32,7 +32,7 @@ fn workspace_items(snapshot: &SessionSnapshot) -> Vec<Item> {
                     })
                     .unwrap_or_else(|| workspace.workspace_id.clone()),
                 badge: workspace.number.to_string(),
-                indicator: indicator.into(),
+                indicator,
                 tone,
                 spinning,
                 search: format!(
@@ -77,10 +77,7 @@ mod tests {
             focused_workspace_id: None,
             focused_tab_id: None,
             focused_pane_id: None,
-            workspaces: vec![
-                workspace("w2", 2, "second"),
-                workspace("w1", 1, "project"),
-            ],
+            workspaces: vec![workspace("w2", 2, "second"), workspace("w1", 1, "project")],
             tabs: Vec::new(),
             panes: Vec::new(),
             layouts: Vec::new(),

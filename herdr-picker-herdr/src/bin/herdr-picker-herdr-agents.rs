@@ -7,7 +7,7 @@ use herdr_picker_herdr::{Item, presentation, run, serve};
 use serde_json::json;
 
 fn main() -> ExitCode {
-    run(env!("CARGO_BIN_NAME"), || serve(agent_items))
+    run(env!("CARGO_BIN_NAME"), serve(agent_items))
 }
 
 fn agent_items(snapshot: &SessionSnapshot) -> Vec<Item> {
@@ -58,35 +58,26 @@ fn agent_items(snapshot: &SessionSnapshot) -> Vec<Item> {
             let cwd = nonempty(agent.foreground_cwd.as_deref())
                 .or_else(|| nonempty(agent.cwd.as_deref()));
             let kind = nonempty(agent.agent.as_deref());
-            let subtitle = match (cwd, kind) {
-                (Some(path), Some(kind)) => format!("{path} · {kind}"),
-                (Some(path), None) => path.into(),
-                (None, Some(kind)) => kind.into(),
-                (None, None) => String::new(),
-            };
-            let detail = [
-                agent.name.as_deref().unwrap_or(""),
-                agent.agent.as_deref().unwrap_or(""),
-                workspace,
-                tab,
-                agent.title.as_deref().unwrap_or(""),
-                stripped_title.or(terminal_title).unwrap_or(""),
-                cwd.unwrap_or(""),
-                agent.agent_status.as_str(),
-                agent.terminal_id.as_str(),
-            ]
-            .into_iter()
-            .filter(|value| !value.is_empty())
-            .collect::<Vec<_>>()
-            .join(" · ");
+            let subtitle = join_nonempty([cwd, kind]);
+            let detail = join_nonempty([
+                agent.name.as_deref(),
+                agent.agent.as_deref(),
+                Some(workspace),
+                Some(tab),
+                agent.title.as_deref(),
+                stripped_title.or(terminal_title),
+                cwd,
+                Some(agent.agent_status.as_str()),
+                Some(agent.terminal_id.as_str()),
+            ]);
             let (indicator, tone, spinning) = presentation(&agent.agent_status);
             Item {
                 id: agent.pane_id.clone(),
                 title,
                 subtitle,
                 detail,
-                badge: agent.agent.clone().unwrap_or_default(),
-                indicator: indicator.into(),
+                badge: kind.unwrap_or_default().into(),
+                indicator,
                 tone,
                 spinning,
                 search: format!(
@@ -122,6 +113,14 @@ fn explicit_tab_labels(snapshot: &SessionSnapshot) -> HashMap<&str, &str> {
 
 fn nonempty(value: Option<&str>) -> Option<&str> {
     value.filter(|value| !value.trim().is_empty())
+}
+
+fn join_nonempty<'a>(values: impl IntoIterator<Item = Option<&'a str>>) -> String {
+    values
+        .into_iter()
+        .filter_map(nonempty)
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 fn agent_status_priority(status: &AgentStatus) -> u8 {
