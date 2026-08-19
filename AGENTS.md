@@ -8,6 +8,11 @@ Before working on these plugins, read the [Herdr agent guide](https://herdr.dev/
 
 - Before reporting a plugin source change done, rebuild any generated executable it affects
 using the applicable manifest `[[build]]` command(s). Tests and debug builds may not update the artifact used by a locally linked plugin.
+- Plugins with a long-running daemon (currently `history`) swap in a rebuilt
+executable automatically on the next action; in-memory daemon state (focus
+history) resets when the binary actually changed. To verify a change
+immediately instead of waiting for the next keypress, invoke any action after
+rebuilding, e.g. `herdr plugin action invoke gjermundgaraba.herdr-history.activate`.
 - Never suggest "upstreaming a change to herdr itself". If we can't do something in an extension today, we can't do it today. Just plainly say that if this is the case.
 
 

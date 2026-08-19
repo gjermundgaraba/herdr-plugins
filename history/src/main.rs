@@ -20,12 +20,14 @@ use serde_json::json;
 
 const DAEMON_FLAG: &str = "--daemon";
 const ACTIVATE_ACTION: &str = "gjermundgaraba.herdr-history.activate";
+const STALE_REPLY: &str = "stale";
 const MAX_ENTRIES: usize = 100;
 const ECHO_TTL_MS: u64 = 1_500;
 const SOCKET_TIMEOUT: Duration = Duration::from_millis(500);
 const START_TIMEOUT: Duration = Duration::from_secs(2);
 const JUMP_BUDGET: Duration = Duration::from_secs(1);
 const RECONNECT_INTERVAL: Duration = Duration::from_millis(250);
+const EXEC_MISSING_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, PartialEq, Eq)]
 struct Echo {
@@ -109,12 +111,13 @@ struct SessionPaths {
 }
 
 impl SessionPaths {
-    fn new(socket_path: &Path, build: &str) -> Self {
+    fn new(socket_path: &Path) -> Self {
         // SAFETY: geteuid has no preconditions.
         let runtime_dir = std::env::temp_dir().join(format!("hh-{}", unsafe { libc::geteuid() }));
+        let key = runtime_key(socket_path);
         Self {
-            lock_file: runtime_dir.join(format!("{}.lock", runtime_key(socket_path, ""))),
-            control_socket: runtime_dir.join(format!("{}.sock", runtime_key(socket_path, build))),
+            lock_file: runtime_dir.join(format!("{key}.lock")),
+            control_socket: runtime_dir.join(format!("{key}.sock")),
             runtime_dir,
         }
     }
@@ -148,35 +151,46 @@ fn run_invocation() -> Result<(), String> {
         .socket_path
         .as_deref()
         .ok_or("HERDR_SOCKET_PATH is not set")?;
-    let (_, build) = current_executable()?;
-    let paths = SessionPaths::new(socket_path, &build);
+    let paths = SessionPaths::new(socket_path);
+    let build = build_hash()?;
 
     match environment.invocation() {
         Some(PluginInvocation::Startup) | Some(PluginInvocation::Action("activate")) => {
-            activate_daemon(&paths.control_socket)
+            activate_daemon(&paths.control_socket, &build)
         }
-        Some(PluginInvocation::Action("back")) => run_active_command(&paths.control_socket, "back"),
+        Some(PluginInvocation::Action("back")) => {
+            run_active_command(&paths.control_socket, "back", &build)
+        }
         Some(PluginInvocation::Action("forward")) => {
-            run_active_command(&paths.control_socket, "forward")
+            run_active_command(&paths.control_socket, "forward", &build)
         }
         invocation => Err(format!("unknown Herdr invocation: {invocation:?}")),
     }
 }
 
-fn current_executable() -> Result<(PathBuf, String), String> {
+/// Identity is content: identical bytes never swap, changed bytes always do.
+/// Hashed from the executable's path, so a rebuild landing in the instant
+/// between daemon spawn and its self-hash stores the new file's hash under
+/// old code; that misses one swap and self-heals on the next rebuild.
+fn build_hash() -> Result<String, String> {
     let executable =
         std::env::current_exe().map_err(|error| format!("cannot resolve executable: {error}"))?;
-    let identity = file_identity(&executable)
-        .map_err(|error| format!("cannot inspect {}: {error}", executable.display()))?;
-    Ok((executable, identity))
+    fs::read(&executable)
+        .map(fnv)
+        .map_err(|error| format!("cannot read {}: {error}", executable.display()))
 }
 
-fn activate_daemon(control_socket: &Path) -> Result<(), String> {
+fn activate_daemon(control_socket: &Path, build: &str) -> Result<(), String> {
     let deadline = Instant::now() + START_TIMEOUT;
     let mut spawned = false;
     while Instant::now() < deadline {
         if let Ok(stream) = UnixStream::connect(control_socket) {
-            return send_command(stream, "activate");
+            match send_command(stream, "activate", build) {
+                // A daemon built from other bytes retires and unlinks its
+                // socket before replying, so the next pass spawns this build.
+                Err(error) if error == STALE_REPLY => spawned = false,
+                result => return result,
+            }
         }
         if !spawned {
             spawn_daemon()?;
@@ -212,18 +226,31 @@ fn spawn_daemon() -> Result<(), String> {
     Ok(())
 }
 
-fn run_active_command(control_socket: &Path, command: &str) -> Result<(), String> {
-    let stream = UnixStream::connect(control_socket).map_err(|_| {
-        format!("history is not active; run `herdr plugin action invoke {ACTIVATE_ACTION}` first")
-    })?;
-    send_command(stream, command)
+fn run_active_command(control_socket: &Path, command: &str, build: &str) -> Result<(), String> {
+    let stream = UnixStream::connect(control_socket).map_err(|_| inactive_message())?;
+    match send_command(stream, command, build) {
+        // First contact retired a stale daemon and its history with it, so
+        // "refuse late history" no longer protects anything: bring up the
+        // current build and retry once. Connect refusals still refuse.
+        Err(error) if error == STALE_REPLY => {
+            activate_daemon(control_socket, build)?;
+            let stream = UnixStream::connect(control_socket).map_err(|_| inactive_message())?;
+            send_command(stream, command, build)
+        }
+        result => result,
+    }
 }
 
-fn send_command(mut stream: UnixStream, command: &str) -> Result<(), String> {
+fn inactive_message() -> String {
+    format!("history is not active; run `herdr plugin action invoke {ACTIVATE_ACTION}` first")
+}
+
+fn send_command(mut stream: UnixStream, command: &str, build: &str) -> Result<(), String> {
     stream
         .set_read_timeout(Some(START_TIMEOUT))
         .map_err(|error| error.to_string())?;
-    writeln!(stream, "{command}").map_err(|error| format!("cannot send {command}: {error}"))?;
+    writeln!(stream, "{command} {build}")
+        .map_err(|error| format!("cannot send {command}: {error}"))?;
     let mut response = String::new();
     BufReader::new(stream)
         .read_line(&mut response)
@@ -231,6 +258,11 @@ fn send_command(mut stream: UnixStream, command: &str) -> Result<(), String> {
     let response = response.trim();
     if response == "ok" {
         Ok(())
+    } else if response.is_empty() {
+        // The daemon closed without replying (crashed, or its listener was
+        // dropped by a concurrent retire); treat it like a retiring daemon so
+        // callers respawn instead of surfacing a truncated protocol error.
+        Err(STALE_REPLY.into())
     } else if let Some(error) = response.strip_prefix("error ") {
         Err(error.into())
     } else {
@@ -246,8 +278,10 @@ fn run_daemon() -> Result<(), String> {
     let socket_path = environment
         .socket_path
         .ok_or("HERDR_SOCKET_PATH is not set")?;
-    let (executable, build) = current_executable()?;
-    let paths = SessionPaths::new(&socket_path, &build);
+    let executable =
+        std::env::current_exe().map_err(|error| format!("cannot resolve executable: {error}"))?;
+    let build = build_hash()?;
+    let paths = SessionPaths::new(&socket_path);
     create_private_runtime_dir(&paths.runtime_dir)?;
 
     let lock = fs::File::options()
@@ -293,10 +327,21 @@ fn run_daemon() -> Result<(), String> {
     let mut connection = None;
     let mut reconnect_at = Instant::now();
     let mut reconnect_logged = false;
+    let mut executable_missing_since: Option<Instant> = None;
 
     loop {
-        if !executable_is_current(&executable, &build) {
-            return Ok(());
+        // Existence only, deliberately not identity: rebuilds recreate this
+        // path (identity churns on every no-op build), while an uninstall
+        // leaves it gone with no future client to retire this daemon. The
+        // grace period rides out cargo's unlink-then-relink window.
+        if fs::symlink_metadata(&executable).is_err() {
+            let missing_since = *executable_missing_since.get_or_insert_with(Instant::now);
+            if missing_since.elapsed() >= EXEC_MISSING_GRACE {
+                log_error("history daemon retiring: executable was deleted");
+                return Ok(());
+            }
+        } else {
+            executable_missing_since = None;
         }
 
         if connection.is_none() && Instant::now() >= reconnect_at {
@@ -371,23 +416,23 @@ fn run_daemon() -> Result<(), String> {
                     stream
                         .set_nonblocking(false)
                         .map_err(|error| format!("cannot configure history client: {error}"))?;
-                    handle_control(
+                    if !handle_control(
                         stream,
                         connection.as_ref().and_then(|connected| {
                             (connected.replay == ReplayPhase::Live).then_some(&connected.client)
                         }),
                         &mut state,
-                    );
+                        &paths.control_socket,
+                        &build,
+                    ) {
+                        return Ok(());
+                    }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(error) => return Err(format!("cannot accept history command: {error}")),
             },
         }
     }
-}
-
-fn executable_is_current(path: &Path, identity: &str) -> bool {
-    file_identity(path).is_ok_and(|current| current == identity)
 }
 
 struct FocusConnection {
@@ -572,26 +617,59 @@ fn wait_ready(
     }
 }
 
-fn handle_control(mut stream: UnixStream, client: Option<&Client>, state: &mut State) {
+/// Returns false when the daemon must retire because the client runs a
+/// different build.
+fn handle_control(
+    mut stream: UnixStream,
+    client: Option<&Client>,
+    state: &mut State,
+    control_socket: &Path,
+    build: &str,
+) -> bool {
     let _ = stream.set_read_timeout(Some(SOCKET_TIMEOUT));
     let _ = stream.set_write_timeout(Some(SOCKET_TIMEOUT));
-    let mut command = String::new();
+    let mut request = String::new();
+    let mut retire = None;
     let result = peer_is_current_user(&stream)
         .and_then(|()| {
             BufReader::new(&stream)
-                .read_line(&mut command)
+                .read_line(&mut request)
                 .map_err(|error| format!("cannot read history command: {error}"))
         })
-        .and_then(|_| match command.trim() {
-            "activate" => Ok(()),
-            "back" => jump(client.ok_or("history is reconnecting")?, state, -1),
-            "forward" => jump(client.ok_or("history is reconnecting")?, state, 1),
-            command => Err(format!("unknown history command: {command}")),
+        .and_then(|_| {
+            let (command, token) = split_request(&request);
+            // A missing token deliberately passes: liveness probes connect
+            // and drop without writing anything, so requiring a token here
+            // would let a probe retire a healthy daemon.
+            if let Some(token) = token
+                && token != build
+            {
+                retire = Some(format!("build {token} replaces {build}"));
+                return Err(STALE_REPLY.into());
+            }
+            match command {
+                "activate" => Ok(()),
+                "back" => jump(client.ok_or("history is reconnecting")?, state, -1),
+                "forward" => jump(client.ok_or("history is reconnecting")?, state, 1),
+                command => Err(format!("unknown history command: {command}")),
+            }
         });
+    // Unlink before replying: the client's next connect must miss this dying
+    // daemon and spawn a replacement instead of talking to it.
+    if let Some(reason) = &retire {
+        log_error(&format!("history daemon retiring: {reason}"));
+        let _ = remove_socket(control_socket);
+    }
     let _ = match result {
         Ok(()) => writeln!(stream, "ok"),
         Err(error) => writeln!(stream, "error {error}"),
     };
+    retire.is_none()
+}
+
+fn split_request(request: &str) -> (&str, Option<&str>) {
+    let mut fields = request.split_whitespace();
+    (fields.next().unwrap_or_default(), fields.next())
 }
 
 fn file_identity(path: &Path) -> std::io::Result<String> {
@@ -605,18 +683,15 @@ fn file_identity(path: &Path) -> std::io::Result<String> {
     ))
 }
 
-fn runtime_key(path: &Path, build: &str) -> String {
+fn runtime_key(path: &Path) -> String {
+    fnv(path.as_os_str().as_bytes().iter().copied())
+}
+
+fn fnv(bytes: impl IntoIterator<Item = u8>) -> String {
     const OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
     const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
     let mut hash = OFFSET;
-    for byte in path
-        .as_os_str()
-        .as_bytes()
-        .iter()
-        .copied()
-        .chain([0])
-        .chain(build.bytes())
-    {
+    for byte in bytes {
         hash ^= u128::from(byte);
         hash = hash.wrapping_mul(PRIME);
     }
@@ -839,28 +914,111 @@ mod tests {
     }
 
     #[test]
-    fn server_instances_use_distinct_runtime_paths() {
-        let first = SessionPaths::new(Path::new("/tmp/herdr.sock"), "build");
-        let same_server_path = SessionPaths::new(Path::new("/tmp/herdr.sock"), "build");
-        let rebuilt = SessionPaths::new(Path::new("/tmp/herdr.sock"), "rebuilt");
+    fn one_daemon_per_herdr_server() {
+        let first = SessionPaths::new(Path::new("/tmp/herdr.sock"));
+        let same_server = SessionPaths::new(Path::new("/tmp/herdr.sock"));
+        let other_server = SessionPaths::new(Path::new("/tmp/other-herdr.sock"));
 
-        assert_eq!(first.lock_file, same_server_path.lock_file);
-        assert_eq!(first.control_socket, same_server_path.control_socket);
-        assert_ne!(first.control_socket, rebuilt.control_socket);
+        assert_eq!(first.lock_file, same_server.lock_file);
+        assert_eq!(first.control_socket, same_server.control_socket);
+        assert_ne!(first.control_socket, other_server.control_socket);
         assert!(first.control_socket.as_os_str().len() < 104);
     }
 
     #[test]
-    fn notices_executable_replacement() {
-        let path = std::env::temp_dir().join(format!("herdr-history-test-{}", std::process::id()));
-        let replacement = path.with_extension("new");
-        fs::write(&path, b"old").unwrap();
-        let identity = file_identity(&path).unwrap();
-        assert!(executable_is_current(&path, &identity));
-        fs::write(&replacement, b"new").unwrap();
-        fs::rename(&replacement, &path).unwrap();
-        assert!(!executable_is_current(&path, &identity));
-        fs::remove_file(path).unwrap();
+    fn parses_command_and_optional_client_version() {
+        assert_eq!(split_request("back 0.3.0\n"), ("back", Some("0.3.0")));
+        assert_eq!(split_request("activate\n"), ("activate", None));
+        assert_eq!(split_request("\n"), ("", None));
+    }
+
+    /// Feed one request to `handle_control` over a socketpair, against a
+    /// daemon whose build hash is "deadbeef". Returns whether the daemon
+    /// keeps running, the trimmed reply, and whether the control socket path
+    /// survived (a marker file stands in for the bound socket).
+    fn run_control(request: &str, marker_name: &str) -> (bool, String, bool) {
+        let marker = std::env::temp_dir().join(format!(
+            "herdr-history-ctl-{}-{marker_name}",
+            std::process::id()
+        ));
+        fs::write(&marker, b"").unwrap();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(request.as_bytes()).unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut state = State::fresh();
+        let keep = handle_control(server, None, &mut state, &marker, "deadbeef");
+        let mut reply = String::new();
+        BufReader::new(&client).read_line(&mut reply).unwrap();
+        let socket_kept = marker.exists();
+        let _ = fs::remove_file(&marker);
+        (keep, reply.trim().to_owned(), socket_kept)
+    }
+
+    #[test]
+    fn stale_client_retires_daemon_and_unlinks_socket() {
+        let (keep, reply, socket_kept) = run_control("back cafef00d\n", "stale");
+        assert!(!keep);
+        assert_eq!(reply, "error stale");
+        assert!(!socket_kept);
+    }
+
+    #[test]
+    fn probes_and_tokenless_requests_do_not_retire() {
+        // A liveness probe connects and closes without writing anything.
+        let (keep, reply, socket_kept) = run_control("", "probe");
+        assert!(keep);
+        assert!(reply.starts_with("error unknown history command"));
+        assert!(socket_kept);
+
+        let (keep, reply, socket_kept) = run_control("activate\n", "tokenless");
+        assert!(keep);
+        assert_eq!(reply, "ok");
+        assert!(socket_kept);
+    }
+
+    #[test]
+    fn matching_build_without_connection_reports_reconnecting() {
+        let (keep, reply, socket_kept) = run_control("back deadbeef\n", "reconnect");
+        assert!(keep);
+        assert_eq!(reply, "error history is reconnecting");
+        assert!(socket_kept);
+    }
+
+    #[test]
+    fn daemon_closing_without_reply_reads_as_stale() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut line = String::new();
+            BufReader::new(&server).read_line(&mut line).unwrap();
+            line
+        });
+        let error = send_command(client, "back", "deadbeef").unwrap_err();
+        assert_eq!(error, STALE_REPLY);
+        assert_eq!(reader.join().unwrap().trim(), "back deadbeef");
+    }
+
+    #[test]
+    fn build_identity_is_content_not_metadata() {
+        assert_eq!(fnv(b"same".to_vec()), fnv(b"same".to_vec()));
+        assert_ne!(fnv(b"same".to_vec()), fnv(b"diff".to_vec()));
+        assert_eq!(build_hash().unwrap().len(), 24);
+    }
+
+    #[test]
+    fn manifest_and_crate_versions_move_together() {
+        let manifest = include_str!("../herdr-plugin.toml");
+        let version = manifest
+            .lines()
+            .find_map(|line| line.strip_prefix("version = \""))
+            .and_then(|rest| rest.strip_suffix('"'))
+            .expect("herdr-plugin.toml declares a version");
+        assert_eq!(
+            version,
+            env!("CARGO_PKG_VERSION"),
+            "herdr-plugin.toml and Cargo.toml versions must move together: \
+             display-only since the daemon handshake compares binary hashes, \
+             but drift confuses `herdr plugin list` and releases"
+        );
     }
 
     #[test]
