@@ -6,8 +6,7 @@ use std::{
 };
 
 use herdr_client::{
-    AgentSessionInfo, AgentStartParams, AgentStatus, Client, Environment, Error, PaneSplitParams,
-    SplitDirection,
+    AgentSessionInfo, AgentStartParams, Client, Environment, Error, PaneSplitParams, SplitDirection,
 };
 use serde_json::json;
 
@@ -44,9 +43,6 @@ fn run() -> Result<(), String> {
     let source = client
         .current_pane(Some(source_pane_id))
         .map_err(|error| format!("read focused pane: {error}"))?;
-    if source.agent_status.as_str() == AgentStatus::WORKING {
-        return Err("focused agent is working; wait for the current turn to finish".into());
-    }
     let session = source
         .agent_session
         .as_ref()
