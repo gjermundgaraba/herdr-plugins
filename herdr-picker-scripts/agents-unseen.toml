@@ -1,0 +1,12 @@
+title = "Agents"
+mode = "vim"
+# Focus the chosen agent, then mark the pane you left unseen (fork-only API).
+submit = ["herdr-picker-focus-agent-unseen.py"]
+
+[[steps]]
+id = "agent"
+title = "Choose agent (mark this pane unseen)"
+# Python alternative: comment the Rust line below and uncomment this one.
+# source = ["herdr-picker-agents.py"]
+source = ["herdr-picker-agents"]
+search = "local"
