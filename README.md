@@ -7,7 +7,7 @@ Independent plugins and tools for [Herdr](https://herdr.dev/).
 | [herdr-picker](herdr-picker) | Standalone declarative fuzzy picker and workflow runner |
 | [herdr-picker-agents](herdr-picker-agents) | Live Herdr agent picker example in Rust |
 | [herdr-picker-workspaces](herdr-picker-workspaces) | Live Herdr workspace picker example in Rust |
-| [herdr-picker-scripts](herdr-picker-scripts) | One-shot agent and workspace examples in Python |
+| [herdr-picker-scripts](herdr-picker-scripts) | One-shot agent, workspace, and pane-moving examples in Python |
 | [equalize-splits](equalize-splits) | Automatically equalize pane sizes after splitting |
 | [fork-to-pane](fork-to-pane) | Fork the focused Pi, Codex, or Claude Code session into a new pane |
 | [history](history) | Vim-style back/forward focus history |
