@@ -30,6 +30,9 @@
       allWorkspaceMembers =
         (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.members;
 
+      # Only what cannot be derived lives here: the dependency topology
+      # (sourceRoots) and how the output is laid out. Platforms come from each
+      # plugin's herdr-plugin.toml and binaries from the crate itself.
       pluginDefinitions = {
         herdr-picker = {
           sourceRoots = [
@@ -38,12 +41,7 @@
             "sdk/ratatui"
             "sdk/rust"
           ];
-          binaries = [ "herdr-picker" ];
           binOnly = true;
-          platforms = [
-            "darwin"
-            "linux"
-          ];
         };
 
         herdr-picker-agents = {
@@ -52,16 +50,8 @@
             "sdk/picker"
             "sdk/rust"
           ];
-          binaries = [
-            "herdr-picker-agents"
-            "herdr-picker-focus-agent"
-          ];
           binOnly = true;
           exampleFiles = [ "agents.toml" ];
-          platforms = [
-            "darwin"
-            "linux"
-          ];
         };
 
         herdr-picker-workspaces = {
@@ -70,27 +60,14 @@
             "sdk/picker"
             "sdk/rust"
           ];
-          binaries = [
-            "herdr-picker-workspaces"
-            "herdr-picker-focus-workspace"
-          ];
           binOnly = true;
           exampleFiles = [ "workspaces.toml" ];
-          platforms = [
-            "darwin"
-            "linux"
-          ];
         };
 
         equalize-splits = {
           sourceRoots = [
             "equalize-splits"
             "sdk/rust"
-          ];
-          binaries = [ "herdr-equalize-splits" ];
-          platforms = [
-            "darwin"
-            "linux"
           ];
         };
 
@@ -99,22 +76,12 @@
             "fork-to-pane"
             "sdk/rust"
           ];
-          binaries = [ "herdr-fork-to-pane" ];
-          platforms = [
-            "darwin"
-            "linux"
-          ];
         };
 
         history = {
           sourceRoots = [
             "history"
             "sdk/rust"
-          ];
-          binaries = [ "herdr-history" ];
-          platforms = [
-            "darwin"
-            "linux"
           ];
         };
 
@@ -137,18 +104,45 @@
             "herdr-micro/codex-micro"
             "sdk/rust"
           ];
-          binaries = [
-            "herdr-micro"
-            "herdr-micro-hid"
-          ];
           runtimeFiles = [
             "integrations/pi/herdr-effort.js"
             "integrations/thinking-effort.sh"
           ];
-          platforms = [ "darwin" ];
           binLayout = true;
         };
       };
+
+      # Plugin manifests declare "macos"/"linux"; Nix says "darwin"/"linux".
+      # Crates without a manifest are plain CLI tools that build everywhere.
+      platformsFor =
+        name:
+        let
+          manifest = ./. + "/${name}/herdr-plugin.toml";
+        in
+        if builtins.pathExists manifest then
+          map (platform: if platform == "macos" then "darwin" else platform) (
+            (builtins.fromTOML (builtins.readFile manifest)).platforms
+          )
+        else
+          [
+            "darwin"
+            "linux"
+          ];
+
+      # Cargo builds the package binary plus one binary per src/bin file.
+      binariesFor =
+        name: crate:
+        let
+          binDir = ./. + "/${name}/src/bin";
+          extras =
+            if builtins.pathExists binDir then
+              map (nixpkgs.lib.removeSuffix ".rs") (
+                builtins.filter (nixpkgs.lib.hasSuffix ".rs") (builtins.attrNames (builtins.readDir binDir))
+              )
+            else
+              [ ];
+        in
+        [ crate.package.name ] ++ extras;
 
       workspaceMembersText = members: ''
         members = [
@@ -176,7 +170,7 @@
 
           platformName = if pkgs.stdenv.hostPlatform.isDarwin then "darwin" else "linux";
           supportedDefinitions = lib.filterAttrs (
-            _name: definition: lib.elem platformName definition.platforms
+            name: _definition: lib.elem platformName (platformsFor name)
           ) pluginDefinitions;
 
           sourceFor =
@@ -218,7 +212,7 @@
                   ''install -Dm750 "${cargoReleaseDir}/${binary}" "$out/${name}/bin/${binary}"''
                 else
                   ''install -Dm755 "${cargoReleaseDir}/${binary}" "$out/target/release/${binary}"''
-              ) definition.binaries;
+              ) (binariesFor name crate);
               installRuntimeFiles = lib.concatMapStringsSep "\n" (
                 file: ''install -Dm444 "${name}/${file}" "$out/${name}/${file}"''
               ) (definition.runtimeFiles or [ ]);
@@ -272,8 +266,8 @@
                 homepage = "https://github.com/gjermundgaraba/herdr-plugins/tree/main/${name}";
                 license = lib.licenses.asl20;
                 platforms =
-                  (lib.optionals (lib.elem "linux" definition.platforms) lib.platforms.linux)
-                  ++ (lib.optionals (lib.elem "darwin" definition.platforms) lib.platforms.darwin);
+                  (lib.optionals (lib.elem "linux" (platformsFor name)) lib.platforms.linux)
+                  ++ (lib.optionals (lib.elem "darwin" (platformsFor name)) lib.platforms.darwin);
               };
             };
         in
