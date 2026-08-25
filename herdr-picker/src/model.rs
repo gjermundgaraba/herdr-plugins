@@ -177,10 +177,9 @@ mod tests {
     fn validates_item_identity() {
         assert!(validate_items(&[item("one", "One", "")]).is_ok());
         assert!(validate_items(&[]).is_ok());
-        assert!(
-            validate_items(&[item("same", "One", ""), item("same", "Two", "")])
-                .unwrap_err()
-                .contains("duplicate")
+        assert_eq!(
+            validate_items(&[item("same", "One", ""), item("same", "Two", "")]),
+            Err(herdr_picker_sdk::ItemsError::DuplicateId { id: "same".into() })
         );
     }
 

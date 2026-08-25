@@ -1,10 +1,9 @@
+use std::cell::Cell;
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::os::fd::{AsFd, BorrowedFd};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use interprocess::local_socket::traits::Stream as _;
@@ -18,13 +17,12 @@ use crate::{
 };
 
 type LocalStream = interprocess::local_socket::Stream;
-const MAX_NDJSON_FRAME_BYTES: usize = 1 << 20;
 
 #[derive(Debug, Clone)]
 pub struct Client {
     socket_path: PathBuf,
     timeout: Option<Duration>,
-    next_id: Arc<AtomicU64>,
+    next_id: Cell<u64>,
 }
 
 impl Client {
@@ -32,7 +30,7 @@ impl Client {
         Self {
             socket_path: socket_path.into(),
             timeout: None,
-            next_id: Arc::new(AtomicU64::new(1)),
+            next_id: Cell::new(1),
         }
     }
 
@@ -150,11 +148,9 @@ impl Client {
     }
 
     fn request_id(&self) -> String {
-        format!(
-            "herdr-client:{}:{}",
-            std::process::id(),
-            self.next_id.fetch_add(1, Ordering::Relaxed)
-        )
+        let id = self.next_id.get();
+        self.next_id.set(id + 1);
+        format!("herdr-client:{}:{id}", std::process::id())
     }
 
     fn connect(&self) -> Result<LocalStream, Error> {
@@ -200,39 +196,23 @@ impl Subscription {
         if self.ended {
             return Ok(None);
         }
-        loop {
-            let buffered = self.reader.fill_buf()?;
-            if buffered.is_empty() {
-                if self.pending.is_empty() {
+        let frame = match crate::ndjson::read_frame(&mut self.reader, &mut self.pending) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => {
+                self.ended = true;
+                return Ok(None);
+            }
+            Err(error) => {
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::UnexpectedEof | io::ErrorKind::InvalidData
+                ) {
                     self.ended = true;
-                    return Ok(None);
                 }
-                self.pending.clear();
-                self.ended = true;
-                return Err(Error::Io(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "incomplete NDJSON frame",
-                )));
+                return Err(Error::Io(error));
             }
-            let newline = buffered.iter().position(|byte| *byte == b'\n');
-            let consumed = newline.map_or(buffered.len(), |index| index + 1);
-            if self.pending.len() + consumed > MAX_NDJSON_FRAME_BYTES {
-                self.pending.clear();
-                self.ended = true;
-                return Err(Error::Io(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "NDJSON frame exceeds 1 MiB",
-                )));
-            }
-            self.pending.extend_from_slice(&buffered[..consumed]);
-            self.reader.consume(consumed);
-            if newline.is_some() {
-                break;
-            }
-        }
-        let value = serde_json::from_slice::<Value>(&self.pending).map_err(Error::Json);
-        self.pending.clear();
-        let value = value?;
+        };
+        let value = serde_json::from_slice::<Value>(&frame).map_err(Error::Json)?;
         if let Some(error) = value.get("error") {
             return Err(Error::Api(
                 serde_json::from_value(error.clone()).map_err(Error::Json)?,
@@ -640,7 +620,7 @@ mod tests {
     fn subscription_rejects_oversized_frames() {
         let (path, server) = subscription_server("subscription-oversized", |stream| {
             stream
-                .write_all(&vec![b'x'; MAX_NDJSON_FRAME_BYTES + 1])
+                .write_all(&vec![b'x'; crate::ndjson::MAX_FRAME_BYTES + 1])
                 .expect("write oversized event");
         });
 

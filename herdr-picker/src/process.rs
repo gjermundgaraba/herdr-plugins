@@ -2,7 +2,7 @@ use std::{
     env,
     ffi::OsStr,
     fs,
-    io::{self, BufRead, BufReader, Read, Write},
+    io::{self, BufReader, Read, Write},
     os::unix::process::CommandExt,
     path::PathBuf,
     process::{Child, Command, ExitCode, ExitStatus, Stdio},
@@ -15,7 +15,7 @@ use std::{
     time::Duration,
 };
 
-use herdr_client::{Client, Error, open_rotating_log};
+use herdr_client::{Client, Error, ndjson, open_rotating_log};
 use herdr_picker_sdk::Snapshot;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -23,7 +23,6 @@ use serde_json::{Value, json};
 use crate::model::{Item, validate_items};
 
 const WORKER_FLAG: &str = "--submit-after-popup";
-const MAX_NDJSON_FRAME_BYTES: usize = 1 << 20;
 const MAX_STDERR_BYTES: usize = 64 << 10;
 
 #[derive(Debug)]
@@ -77,8 +76,9 @@ impl Provider {
 
         let output_reader = thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
+            let mut pending = Vec::new();
             loop {
-                match read_frame(&mut reader) {
+                match ndjson::read_frame(&mut reader, &mut pending) {
                     Ok(Some(frame)) => match serde_json::from_slice::<Snapshot>(&frame) {
                         Ok(snapshot) => {
                             if let Err(error) = validate_items(&snapshot.items) {
@@ -384,36 +384,6 @@ fn run(argv: &[String], input: &Value) -> Result<(), String> {
         });
     }
     Ok(())
-}
-
-fn read_frame(reader: &mut impl BufRead) -> io::Result<Option<Vec<u8>>> {
-    let mut frame = Vec::new();
-    loop {
-        let buffered = reader.fill_buf()?;
-        if buffered.is_empty() {
-            return if frame.is_empty() {
-                Ok(None)
-            } else {
-                Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "incomplete NDJSON frame",
-                ))
-            };
-        }
-        let newline = buffered.iter().position(|byte| *byte == b'\n');
-        let consumed = newline.map_or(buffered.len(), |index| index + 1);
-        if frame.len() + consumed > MAX_NDJSON_FRAME_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "NDJSON frame exceeds 1 MiB",
-            ));
-        }
-        frame.extend_from_slice(&buffered[..consumed]);
-        reader.consume(consumed);
-        if newline.is_some() {
-            return Ok(Some(frame));
-        }
-    }
 }
 
 fn capture_tail(mut reader: impl Read) -> Vec<u8> {

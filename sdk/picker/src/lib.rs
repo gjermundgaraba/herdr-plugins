@@ -2,6 +2,7 @@
 
 use std::{
     collections::HashSet,
+    fmt,
     io::{self, Write},
     process::ExitCode,
     thread,
@@ -53,17 +54,38 @@ pub struct Snapshot<T = Vec<Item>> {
     pub items: T,
 }
 
-pub fn validate_items(items: &[Item]) -> Result<(), String> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ItemsError {
+    EmptyId { index: usize },
+    EmptyTitle { index: usize },
+    DuplicateId { id: String },
+}
+
+impl fmt::Display for ItemsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyId { index } => write!(f, "items[{index}].id must not be empty"),
+            Self::EmptyTitle { index } => write!(f, "items[{index}].title must not be empty"),
+            Self::DuplicateId { id } => write!(f, "duplicate item id {id:?}"),
+        }
+    }
+}
+
+impl std::error::Error for ItemsError {}
+
+pub fn validate_items(items: &[Item]) -> Result<(), ItemsError> {
     let mut ids = HashSet::new();
     for (index, item) in items.iter().enumerate() {
         if item.id.trim().is_empty() {
-            return Err(format!("items[{index}].id must not be empty"));
+            return Err(ItemsError::EmptyId { index });
         }
         if item.title.trim().is_empty() {
-            return Err(format!("items[{index}].title must not be empty"));
+            return Err(ItemsError::EmptyTitle { index });
         }
         if !ids.insert(&item.id) {
-            return Err(format!("duplicate item id {:?}", item.id));
+            return Err(ItemsError::DuplicateId {
+                id: item.id.clone(),
+            });
         }
     }
     Ok(())
