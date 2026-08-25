@@ -61,22 +61,35 @@ pub fn log(message: impl AsRef<str>) {
 
 fn format_timestamp(time: SystemTime) -> String {
     let elapsed = time.duration_since(UNIX_EPOCH).unwrap_or_default();
-    let seconds = elapsed.as_secs() as libc::time_t;
-    let mut utc: libc::tm = unsafe { std::mem::zeroed() };
-    // SAFETY: `seconds` and `utc` are valid writable C time values for this call.
-    if unsafe { libc::gmtime_r(&seconds, &mut utc) }.is_null() {
-        return "1970-01-01T00:00:00.000Z".into();
-    }
+    let seconds = elapsed.as_secs();
+    let (year, month, day) = civil_from_days(seconds / 86_400);
     format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-        utc.tm_year + 1900,
-        utc.tm_mon + 1,
-        utc.tm_mday,
-        utc.tm_hour,
-        utc.tm_min,
-        utc.tm_sec,
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        seconds / 3_600 % 24,
+        seconds / 60 % 60,
+        seconds % 60,
         elapsed.subsec_millis(),
     )
+}
+
+/// Proleptic Gregorian date for a day count since 1970-01-01
+/// (Howard Hinnant's `civil_from_days`).
+fn civil_from_days(days: u64) -> (u64, u64, u64) {
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let day_of_era = z % 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_point = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_point + 2) / 5 + 1;
+    let month = if month_point < 10 {
+        month_point + 3
+    } else {
+        month_point - 9
+    };
+    let year = year_of_era + era * 400 + u64::from(month <= 2);
+    (year, month, day)
 }
 
 /// Run the bridge in the foreground.  `main`/the start action owns process
@@ -338,6 +351,10 @@ mod tests {
         assert_eq!(
             format_timestamp(UNIX_EPOCH + Duration::from_millis(946_782_245_678)),
             "2000-01-02T03:04:05.678Z"
+        );
+        assert_eq!(
+            format_timestamp(UNIX_EPOCH + Duration::from_secs(1_709_208_000)),
+            "2024-02-29T12:00:00.000Z"
         );
     }
 }

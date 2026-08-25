@@ -9,7 +9,7 @@ use crate::{
     control::request_status,
     ghostty::inspect_ghostty,
     helper_install,
-    hid::HELPER_VERSION,
+    hid::required_helper_version,
     macos::{bundle_is_running, frontmost, post_event_access},
     setup::{PI_EXTENSION, plugin_root},
 };
@@ -91,7 +91,7 @@ pub fn doctor() -> Report {
     });
     check(&mut report, "Privileged USB helper", || {
         helper_install::verify_installed()?;
-        Ok(format!("version {HELPER_VERSION}"))
+        Ok(format!("version {}", required_helper_version()?))
     });
     let resolved_config_path = config_path();
     let config = match &resolved_config_path {

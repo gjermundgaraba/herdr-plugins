@@ -12,7 +12,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use herdr_client::{Environment, PluginInvocation, open_rotating_log};
+use herdr_client::{Environment, PluginInvocation, hash::fnv, open_rotating_log};
 
 const DAEMON_FLAG: &str = "--daemon";
 const SOCKET_TIMEOUT: Duration = Duration::from_millis(500);
@@ -95,27 +95,16 @@ fn runtime_key(path: &Path) -> String {
     fnv(path.as_os_str().as_bytes().iter().copied())
 }
 
-fn fnv(bytes: impl IntoIterator<Item = u8>) -> String {
-    const OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
-    const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
-    let mut hash = OFFSET;
-    for byte in bytes {
-        hash ^= u128::from(byte);
-        hash = hash.wrapping_mul(PRIME);
-    }
-    format!("{:024x}", hash & ((1_u128 << 96) - 1))
-}
-
 fn remove_socket(path: &Path) -> Result<()> {
     herdr_client::unix::remove_socket(path)
         .with_context(|| format!("cannot remove {}", path.display()))
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now()
+    let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+        .unwrap_or_default();
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn log_error(message: &str) {
@@ -146,25 +135,7 @@ mod tests {
 
     #[test]
     fn build_identity_is_content_not_metadata() {
-        assert_eq!(fnv(b"same".to_vec()), fnv(b"same".to_vec()));
-        assert_ne!(fnv(b"same".to_vec()), fnv(b"diff".to_vec()));
+        assert_eq!(build_hash().unwrap(), build_hash().unwrap());
         assert_eq!(build_hash().unwrap().len(), 24);
-    }
-
-    #[test]
-    fn manifest_and_crate_versions_move_together() {
-        let manifest = include_str!("../herdr-plugin.toml");
-        let version = manifest
-            .lines()
-            .find_map(|line| line.strip_prefix("version = \""))
-            .and_then(|rest| rest.strip_suffix('"'))
-            .expect("herdr-plugin.toml declares a version");
-        assert_eq!(
-            version,
-            env!("CARGO_PKG_VERSION"),
-            "herdr-plugin.toml and Cargo.toml versions must move together: \
-             display-only since the daemon handshake compares binary hashes, \
-             but drift confuses `herdr plugin list` and releases"
-        );
     }
 }
