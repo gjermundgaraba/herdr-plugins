@@ -7,44 +7,35 @@ use std::{fs, path::Path};
 #[test]
 fn plugin_manifests_match_their_crate_versions() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let mut checked = Vec::new();
-    let mut pending = vec![root.clone()];
-    while let Some(dir) = pending.pop() {
-        for entry in fs::read_dir(&dir).unwrap() {
-            let path = entry.unwrap().path();
-            let name = entry_name(&path);
-            if !path.is_dir() || name == "target" || name.starts_with('.') {
-                continue;
-            }
-            let manifest = path.join("herdr-plugin.toml");
-            if manifest.is_file() {
-                assert_eq!(
-                    version(&manifest),
-                    version(&path.join("Cargo.toml")),
-                    "{} and its Cargo.toml versions must move together",
-                    manifest.display()
-                );
-                checked.push(manifest);
-            }
-            pending.push(path);
+    let workspace = read_toml(&root.join("Cargo.toml"));
+    let members = workspace["workspace"]["members"]
+        .as_array()
+        .expect("workspace members");
+    assert!(!members.is_empty());
+
+    // Filtered builds (the Nix flake trims the workspace to one plugin's
+    // crates) still check every member they carry.
+    for member in members {
+        let member = root.join(member.as_str().expect("member path"));
+        let manifest = member.join("herdr-plugin.toml");
+        if manifest.is_file() {
+            assert_eq!(
+                version(&manifest),
+                version(&member.join("Cargo.toml")),
+                "{} and its Cargo.toml versions must move together",
+                manifest.display()
+            );
         }
     }
-    assert!(
-        checked.len() >= 4,
-        "expected to find the plugin manifests under {}, found {checked:?}",
-        root.display()
-    );
 }
 
-fn entry_name(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default()
+fn read_toml(path: &Path) -> toml::Value {
+    let contents = fs::read_to_string(path).unwrap();
+    toml::from_str(&contents).unwrap()
 }
 
 fn version(path: &Path) -> String {
-    let contents = fs::read_to_string(path).unwrap();
-    let parsed: toml::Value = toml::from_str(&contents).unwrap();
+    let parsed = read_toml(path);
     let table = match parsed.get("package") {
         Some(package) => package,
         None => &parsed,
