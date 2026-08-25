@@ -1,5 +1,5 @@
 use std::{
-    fs,
+    fmt, fs,
     io::{BufRead, BufReader, Write},
     os::unix::{
         ffi::OsStrExt,
@@ -12,6 +12,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use anyhow::{Context, Result, anyhow, bail};
 use herdr_client::{
     Client, Environment, Error as ClientError, EventSubscription, PluginInvocation, Subscription,
     open_rotating_log,
@@ -29,6 +30,19 @@ const START_TIMEOUT: Duration = Duration::from_secs(2);
 const JUMP_BUDGET: Duration = Duration::from_secs(1);
 const RECONNECT_INTERVAL: Duration = Duration::from_millis(250);
 const EXEC_MISSING_GRACE: Duration = Duration::from_secs(5);
+
+/// The daemon on the control socket was built from different bytes and is
+/// retiring; the caller should spawn the current build and retry.
+#[derive(Debug)]
+struct StaleBuild;
+
+impl fmt::Display for StaleBuild {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("history daemon is from another build")
+    }
+}
+
+impl std::error::Error for StaleBuild {}
 
 #[derive(Debug, PartialEq, Eq)]
 struct Echo {
@@ -134,24 +148,22 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             if daemon {
-                log_error(&error);
+                log_error(&format!("{error:#}"));
             } else {
-                eprintln!("herdr-history: {error}");
+                eprintln!("herdr-history: {error:#}");
             }
             ExitCode::FAILURE
         }
     }
 }
 
-fn run_invocation() -> Result<(), String> {
-    let environment = Environment::load().map_err(|error| error.to_string())?;
-    environment
-        .require_plugin()
-        .map_err(|error| error.to_string())?;
+fn run_invocation() -> Result<()> {
+    let environment = Environment::load()?;
+    environment.require_plugin()?;
     let socket_path = environment
         .socket_path
         .as_deref()
-        .ok_or("HERDR_SOCKET_PATH is not set")?;
+        .context("HERDR_SOCKET_PATH is not set")?;
     let paths = SessionPaths::new(socket_path);
     let build = build_hash()?;
 
@@ -165,7 +177,7 @@ fn run_invocation() -> Result<(), String> {
         Some(PluginInvocation::Action("forward")) => {
             run_active_command(&paths.control_socket, "forward", &build)
         }
-        invocation => Err(format!("unknown Herdr invocation: {invocation:?}")),
+        invocation => bail!("unknown Herdr invocation: {invocation:?}"),
     }
 }
 
@@ -173,15 +185,14 @@ fn run_invocation() -> Result<(), String> {
 /// Hashed from the executable's path, so a rebuild landing in the instant
 /// between daemon spawn and its self-hash stores the new file's hash under
 /// old code; that misses one swap and self-heals on the next rebuild.
-fn build_hash() -> Result<String, String> {
-    let executable =
-        std::env::current_exe().map_err(|error| format!("cannot resolve executable: {error}"))?;
+fn build_hash() -> Result<String> {
+    let executable = std::env::current_exe().context("cannot resolve executable")?;
     fs::read(&executable)
         .map(fnv)
-        .map_err(|error| format!("cannot read {}: {error}", executable.display()))
+        .with_context(|| format!("cannot read {}", executable.display()))
 }
 
-fn activate_daemon(control_socket: &Path, build: &str) -> Result<(), String> {
+fn activate_daemon(control_socket: &Path, build: &str) -> Result<()> {
     let deadline = Instant::now() + START_TIMEOUT;
     let mut spawned = false;
     while Instant::now() < deadline {
@@ -189,7 +200,7 @@ fn activate_daemon(control_socket: &Path, build: &str) -> Result<(), String> {
             match send_command(stream, "activate", build) {
                 // A daemon built from other bytes retires and unlinks its
                 // socket before replying, so the next pass spawns this build.
-                Err(error) if error == STALE_REPLY => spawned = false,
+                Err(error) if error.is::<StaleBuild>() => spawned = false,
                 result => return result,
             }
         }
@@ -199,12 +210,11 @@ fn activate_daemon(control_socket: &Path, build: &str) -> Result<(), String> {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    Err("history daemon did not start".into())
+    bail!("history daemon did not start")
 }
 
-fn spawn_daemon() -> Result<(), String> {
-    let executable =
-        std::env::current_exe().map_err(|error| format!("cannot resolve executable: {error}"))?;
+fn spawn_daemon() -> Result<()> {
+    let executable = std::env::current_exe().context("cannot resolve executable")?;
     let mut command = Command::new(executable);
     command
         .arg(DAEMON_FLAG)
@@ -221,21 +231,20 @@ fn spawn_daemon() -> Result<(), String> {
             }
         });
     }
-    command
-        .spawn()
-        .map_err(|error| format!("cannot start history daemon: {error}"))?;
+    command.spawn().context("cannot start history daemon")?;
     Ok(())
 }
 
-fn run_active_command(control_socket: &Path, command: &str, build: &str) -> Result<(), String> {
-    let stream = UnixStream::connect(control_socket).map_err(|_| inactive_message())?;
+fn run_active_command(control_socket: &Path, command: &str, build: &str) -> Result<()> {
+    let stream = UnixStream::connect(control_socket).map_err(|_| anyhow!(inactive_message()))?;
     match send_command(stream, command, build) {
         // First contact retired a stale daemon and its history with it, so
         // "refuse late history" no longer protects anything: bring up the
         // current build and retry once. Connect refusals still refuse.
-        Err(error) if error == STALE_REPLY => {
+        Err(error) if error.is::<StaleBuild>() => {
             activate_daemon(control_socket, build)?;
-            let stream = UnixStream::connect(control_socket).map_err(|_| inactive_message())?;
+            let stream =
+                UnixStream::connect(control_socket).map_err(|_| anyhow!(inactive_message()))?;
             send_command(stream, command, build)
         }
         result => result,
@@ -246,45 +255,40 @@ fn inactive_message() -> String {
     format!("history is not active; run `herdr plugin action invoke {ACTIVATE_ACTION}` first")
 }
 
-fn send_command(mut stream: UnixStream, command: &str, build: &str) -> Result<(), String> {
-    stream
-        .set_read_timeout(Some(START_TIMEOUT))
-        .map_err(|error| error.to_string())?;
-    writeln!(stream, "{command} {build}")
-        .map_err(|error| format!("cannot send {command}: {error}"))?;
+fn send_command(mut stream: UnixStream, command: &str, build: &str) -> Result<()> {
+    stream.set_read_timeout(Some(START_TIMEOUT))?;
+    writeln!(stream, "{command} {build}").with_context(|| format!("cannot send {command}"))?;
     let mut response = String::new();
     BufReader::new(stream)
         .read_line(&mut response)
-        .map_err(|error| format!("cannot read history daemon response: {error}"))?;
+        .context("cannot read history daemon response")?;
     let response = response.trim();
     if response == "ok" {
         Ok(())
-    } else if response.is_empty() {
-        // The daemon closed without replying (crashed, or its listener was
-        // dropped by a concurrent retire); treat it like a retiring daemon so
-        // callers respawn instead of surfacing a truncated protocol error.
-        Err(STALE_REPLY.into())
+    } else if response.is_empty() || response == format!("error {STALE_REPLY}") {
+        // An empty reply means the daemon closed without replying (crashed,
+        // or its listener was dropped by a concurrent retire); treat it like
+        // a retiring daemon so callers respawn instead of surfacing a
+        // truncated protocol error.
+        Err(anyhow!(StaleBuild))
     } else if let Some(error) = response.strip_prefix("error ") {
-        Err(error.into())
+        Err(anyhow!(error.to_owned()))
     } else {
-        Err(format!("invalid history daemon response: {response}"))
+        Err(anyhow!("invalid history daemon response: {response}"))
     }
 }
 
-fn run_daemon() -> Result<(), String> {
-    let environment = Environment::load().map_err(|error| error.to_string())?;
-    environment
-        .require_plugin()
-        .map_err(|error| error.to_string())?;
+fn run_daemon() -> Result<()> {
+    let environment = Environment::load()?;
+    environment.require_plugin()?;
     let socket_path = environment
         .socket_path
-        .ok_or("HERDR_SOCKET_PATH is not set")?;
-    let executable =
-        std::env::current_exe().map_err(|error| format!("cannot resolve executable: {error}"))?;
+        .context("HERDR_SOCKET_PATH is not set")?;
+    let executable = std::env::current_exe().context("cannot resolve executable")?;
     let build = build_hash()?;
     let paths = SessionPaths::new(&socket_path);
     create_private_dir(&paths.runtime_dir)
-        .map_err(|error| format!("cannot prepare {}: {error}", paths.runtime_dir.display()))?;
+        .with_context(|| format!("cannot prepare {}", paths.runtime_dir.display()))?;
 
     let lock = fs::File::options()
         .read(true)
@@ -293,7 +297,7 @@ fn run_daemon() -> Result<(), String> {
         .truncate(false)
         .mode(0o600)
         .open(&paths.lock_file)
-        .map_err(|error| format!("cannot open {}: {error}", paths.lock_file.display()))?;
+        .with_context(|| format!("cannot open {}", paths.lock_file.display()))?;
     let lock_deadline = Instant::now() + START_TIMEOUT;
     loop {
         match lock.try_lock() {
@@ -303,27 +307,23 @@ fn run_daemon() -> Result<(), String> {
                     return Ok(());
                 }
                 if Instant::now() >= lock_deadline {
-                    return Err("history daemon lock is held without a live control socket".into());
+                    bail!("history daemon lock is held without a live control socket");
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
             Err(fs::TryLockError::Error(error)) => {
-                return Err(format!(
-                    "cannot lock {}: {error}",
-                    paths.lock_file.display()
-                ));
+                return Err(error)
+                    .with_context(|| format!("cannot lock {}", paths.lock_file.display()));
             }
         }
     }
     fs::set_permissions(&paths.lock_file, fs::Permissions::from_mode(0o600))
-        .map_err(|error| format!("cannot chmod {}: {error}", paths.lock_file.display()))?;
+        .with_context(|| format!("cannot chmod {}", paths.lock_file.display()))?;
 
     remove_socket(&paths.control_socket)?;
     let listener = bind_private_socket(&paths.control_socket)
-        .map_err(|error| format!("cannot bind {}: {error}", paths.control_socket.display()))?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|error| error.to_string())?;
+        .with_context(|| format!("cannot bind {}", paths.control_socket.display()))?;
+    listener.set_nonblocking(true)?;
     let _socket_cleanup = SocketCleanup(&paths.control_socket);
     let mut state = State::fresh();
     let mut server_identity = None;
@@ -358,7 +358,7 @@ fn run_daemon() -> Result<(), String> {
                 }
                 Err(error) => {
                     if !reconnect_logged {
-                        log_error(&format!("history reconnect failed: {error}"));
+                        log_error(&format!("history reconnect failed: {error:#}"));
                         reconnect_logged = true;
                     }
                     reconnect_at = Instant::now() + RECONNECT_INTERVAL;
@@ -377,7 +377,7 @@ fn run_daemon() -> Result<(), String> {
                     reconnect_at = Instant::now();
                 }
                 Err(error) => {
-                    log_error(&error);
+                    log_error(&format!("{error:#}"));
                     connection = None;
                     reconnect_at = Instant::now();
                 }
@@ -398,7 +398,7 @@ fn run_daemon() -> Result<(), String> {
                         reconnect_at = Instant::now();
                     }
                     Err(error) => {
-                        log_error(&error);
+                        log_error(&format!("{error:#}"));
                         connection = None;
                         reconnect_at = Instant::now();
                     }
@@ -409,7 +409,7 @@ fn run_daemon() -> Result<(), String> {
                     .as_mut()
                     .map(|connected| connected.finish_replay(&mut state));
                 if let Some(Err(error)) = result {
-                    log_error(&error);
+                    log_error(&format!("{error:#}"));
                     connection = None;
                     reconnect_at = Instant::now();
                 }
@@ -418,7 +418,7 @@ fn run_daemon() -> Result<(), String> {
                 Ok((stream, _)) => {
                     stream
                         .set_nonblocking(false)
-                        .map_err(|error| format!("cannot configure history client: {error}"))?;
+                        .context("cannot configure history client")?;
                     if !handle_control(
                         stream,
                         connection.as_ref().and_then(|connected| {
@@ -432,7 +432,7 @@ fn run_daemon() -> Result<(), String> {
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => return Err(format!("cannot accept history command: {error}")),
+                Err(error) => return Err(error).context("cannot accept history command"),
             },
         }
     }
@@ -454,7 +454,7 @@ enum ReplayPhase {
 }
 
 impl FocusConnection {
-    fn record_next_event(&mut self, state: &mut State) -> Result<bool, String> {
+    fn record_next_event(&mut self, state: &mut State) -> Result<bool> {
         match self.subscription.next_event() {
             Ok(Some(event)) => {
                 if event.event == "pane_focused"
@@ -481,11 +481,11 @@ impl FocusConnection {
             {
                 Ok(true)
             }
-            Err(error) => Err(format!("pane focus subscription ended: {error}")),
+            Err(error) => Err(error).context("pane focus subscription ended"),
         }
     }
 
-    fn finish_replay(&mut self, state: &mut State) -> Result<(), String> {
+    fn finish_replay(&mut self, state: &mut State) -> Result<()> {
         state.expire_echoes(now_ms());
         match self.replay {
             ReplayPhase::Live => {}
@@ -498,7 +498,7 @@ impl FocusConnection {
                 self.baseline_pane = self
                     .client
                     .snapshot()
-                    .map_err(|error| format!("cannot reconcile focused pane: {error}"))?
+                    .context("cannot reconcile focused pane")?
                     .focused_pane_id;
                 self.replay = ReplayPhase::Snapshot;
             }
@@ -539,22 +539,19 @@ fn connect_focus_stream(
     socket_path: &Path,
     state: &mut State,
     server_identity: &mut Option<String>,
-) -> Result<FocusConnection, String> {
-    let identity = file_identity(socket_path)
-        .map_err(|error| format!("cannot inspect Herdr socket: {error}"))?;
+) -> Result<FocusConnection> {
+    let identity = file_identity(socket_path).context("cannot inspect Herdr socket")?;
     let client = Client::new(socket_path).with_timeout(SOCKET_TIMEOUT);
-    let snapshot = client
-        .snapshot()
-        .map_err(|error| format!("cannot snapshot focused pane: {error}"))?;
+    let snapshot = client.snapshot().context("cannot snapshot focused pane")?;
     let subscription = client
         .subscribe(&[EventSubscription::new("pane.focused")])
-        .map_err(|error| format!("cannot subscribe to pane focus events: {error}"))?;
+        .context("cannot subscribe to pane focus events")?;
     if file_identity(socket_path).ok().as_ref() != Some(&identity) {
-        return Err("Herdr server changed while history connected".into());
+        bail!("Herdr server changed while history connected");
     }
     subscription
         .set_receive_timeout(SOCKET_TIMEOUT)
-        .map_err(|error| format!("cannot bound focus event reads: {error}"))?;
+        .context("cannot bound focus event reads")?;
     if server_identity.as_ref() != Some(&identity) {
         *state = State::fresh();
         *server_identity = Some(identity);
@@ -581,7 +578,7 @@ enum Ready {
 fn wait_ready(
     listener: &UnixListener,
     subscription: Option<&herdr_client::Subscription>,
-) -> Result<Ready, String> {
+) -> Result<Ready> {
     let mut descriptors = vec![libc::pollfd {
         fd: listener.as_raw_fd(),
         events: libc::POLLIN,
@@ -603,10 +600,7 @@ fn wait_ready(
         )
     };
     if result < 0 {
-        return Err(format!(
-            "cannot wait for history activity: {}",
-            std::io::Error::last_os_error()
-        ));
+        return Err(std::io::Error::last_os_error()).context("cannot wait for history activity");
     }
     if result == 0 {
         Ok(Ready::Timeout)
@@ -732,9 +726,9 @@ fn jump(client: &Client, state: &mut State, step: isize) -> Result<(), String> {
     Ok(())
 }
 
-fn remove_socket(path: &Path) -> Result<(), String> {
+fn remove_socket(path: &Path) -> Result<()> {
     herdr_client::unix::remove_socket(path)
-        .map_err(|error| format!("cannot remove {}: {error}", path.display()))
+        .with_context(|| format!("cannot remove {}", path.display()))
 }
 
 fn now_ms() -> u64 {
@@ -903,7 +897,7 @@ mod tests {
             line
         });
         let error = send_command(client, "back", "deadbeef").unwrap_err();
-        assert_eq!(error, STALE_REPLY);
+        assert!(error.is::<StaleBuild>());
         assert_eq!(reader.join().unwrap().trim(), "back deadbeef");
     }
 

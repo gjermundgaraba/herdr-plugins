@@ -4,6 +4,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::time::Duration;
 
+use anyhow::{Context, Result, bail};
 use herdr_client::{
     Client, Environment, LayoutExportParams, LayoutNode, LayoutSetSplitRatioParams,
     PluginInvocation, SplitDirection, socket_scope_dir,
@@ -29,20 +30,18 @@ enum Trigger {
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("equalize-splits: {error}");
+        eprintln!("equalize-splits: {error:#}");
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<(), String> {
-    let environment = Environment::load().map_err(|error| error.to_string())?;
-    let plugin = environment
-        .require_plugin()
-        .map_err(|error| error.to_string())?;
+fn run() -> Result<()> {
+    let environment = Environment::load()?;
+    let plugin = environment.require_plugin()?;
     let socket_path = environment
         .socket_path
         .as_deref()
-        .ok_or("HERDR_SOCKET_PATH is not set")?;
+        .context("HERDR_SOCKET_PATH is not set")?;
     let trigger = match environment.invocation() {
         Some(PluginInvocation::Startup) => Trigger::Startup,
         Some(PluginInvocation::Event {
@@ -70,7 +69,7 @@ fn run() -> Result<(), String> {
     };
 
     let run_dir = socket_scope_dir(&plugin.run_dir().join("sessions"), socket_path);
-    fs::create_dir_all(&run_dir).map_err(|error| format!("create run directory: {error}"))?;
+    fs::create_dir_all(&run_dir).context("create run directory")?;
     let lock_path = run_dir.join("equalize.lock");
     let lock = File::options()
         .create(true)
@@ -79,17 +78,13 @@ fn run() -> Result<(), String> {
         .write(true)
         .mode(0o600)
         .open(&lock_path)
-        .map_err(|error| format!("open lock: {error}"))?;
-    fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
-        .map_err(|error| format!("chmod lock: {error}"))?;
-    lock.lock()
-        .map_err(|error| format!("acquire lock: {error}"))?;
+        .context("open lock")?;
+    fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600)).context("chmod lock")?;
+    lock.lock().context("acquire lock")?;
     let client = Client::new(socket_path).with_timeout(SOCKET_TIMEOUT);
-    let snapshot = client
-        .snapshot()
-        .map_err(|error| format!("snapshot session: {error}"))?;
+    let snapshot = client.snapshot().context("snapshot session")?;
     let cache_dir = socket_scope_dir(&plugin.cache_dir().join("sessions"), socket_path);
-    fs::create_dir_all(&cache_dir).map_err(|error| format!("create cache directory: {error}"))?;
+    fs::create_dir_all(&cache_dir).context("create cache directory")?;
     let pane_tabs_path = cache_dir.join("pane-tabs.json");
     let mut pane_tabs = match trigger {
         Trigger::Startup => HashMap::new(),
@@ -130,9 +125,7 @@ fn run() -> Result<(), String> {
             }
         }
     };
-    let mut layout = client
-        .export_layout(&params)
-        .map_err(|error| format!("export layout: {error}"))?;
+    let mut layout = client.export_layout(&params).context("export layout")?;
 
     for _ in 0..MAX_RATIO_UPDATES {
         let plan = match created_pane_id {
@@ -149,9 +142,9 @@ fn run() -> Result<(), String> {
                 path: update.path,
                 ratio: update.ratio,
             })
-            .map_err(|error| format!("set split ratio: {error}"))?;
+            .context("set split ratio")?;
     }
-    Err("layout kept changing while equalizing".into())
+    bail!("layout kept changing while equalizing")
 }
 
 fn refresh_pane_tabs<'a>(
@@ -168,22 +161,21 @@ fn refresh_pane_tabs<'a>(
     removed_tab_id
 }
 
-fn load_pane_tabs(path: &Path) -> Result<HashMap<String, String>, String> {
+fn load_pane_tabs(path: &Path) -> Result<HashMap<String, String>> {
     match fs::read(path) {
         Ok(contents) => Ok(serde_json::from_slice(&contents).unwrap_or_default()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
-        Err(error) => Err(format!("read pane-to-tab cache: {error}")),
+        Err(error) => Err(error).context("read pane-to-tab cache"),
     }
 }
 
-fn save_pane_tabs(path: &Path, pane_tabs: &HashMap<String, String>) -> Result<(), String> {
+fn save_pane_tabs(path: &Path, pane_tabs: &HashMap<String, String>) -> Result<()> {
     let temporary = path.with_extension("json.tmp");
-    let contents = serde_json::to_vec(pane_tabs)
-        .map_err(|error| format!("serialize pane-to-tab cache: {error}"))?;
-    fs::write(&temporary, contents).map_err(|error| format!("write pane-to-tab cache: {error}"))?;
+    let contents = serde_json::to_vec(pane_tabs).context("serialize pane-to-tab cache")?;
+    fs::write(&temporary, contents).context("write pane-to-tab cache")?;
     fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))
-        .map_err(|error| format!("chmod pane-to-tab cache: {error}"))?;
-    fs::rename(&temporary, path).map_err(|error| format!("save pane-to-tab cache: {error}"))
+        .context("chmod pane-to-tab cache")?;
+    fs::rename(&temporary, path).context("save pane-to-tab cache")
 }
 
 /// Equalize the connected same-direction region around a freshly created pane.

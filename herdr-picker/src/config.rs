@@ -4,6 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
 use crate::model::{Item, validate_items};
@@ -49,23 +50,23 @@ pub struct Step {
 }
 
 impl Workflow {
-    pub fn load(name: &str, config_dir: &Path) -> Result<Self, String> {
+    pub fn load(name: &str, config_dir: &Path) -> Result<Self> {
         validate_name(name)?;
         let path = config_dir.join(format!("{name}.toml"));
-        let contents = fs::read_to_string(&path)
-            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-        let workflow: Self = toml::from_str(&contents)
-            .map_err(|error| format!("invalid {}: {error}", path.display()))?;
+        let contents =
+            fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))?;
+        let workflow: Self =
+            toml::from_str(&contents).with_context(|| format!("invalid {}", path.display()))?;
         workflow
             .validate()
-            .map_err(|error| format!("invalid {}: {error}", path.display()))?;
+            .with_context(|| format!("invalid {}", path.display()))?;
         Ok(workflow)
     }
 
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<()> {
         nonempty("title", &self.title)?;
         if self.steps.is_empty() {
-            return Err("steps must contain at least one step".into());
+            bail!("steps must contain at least one step");
         }
         command("submit", &self.submit)?;
 
@@ -74,28 +75,28 @@ impl Workflow {
             let path = format!("steps[{step_index}]");
             identifier(&format!("{path}.id"), &step.id)?;
             if !step_ids.insert(&step.id) {
-                return Err(format!("duplicate step id {:?}", step.id));
+                bail!("duplicate step id {:?}", step.id);
             }
             nonempty(&format!("{path}.title"), &step.title)?;
             match (&step.source, step.items.is_empty()) {
                 (Some(source), true) => command(&format!("{path}.source"), source)?,
                 (None, false) => {
                     if step.search == SearchMode::Provider {
-                        return Err(format!("{path}.search requires a source"));
+                        bail!("{path}.search requires a source");
                     }
-                    validate_items(&step.items).map_err(|error| format!("{path}.items: {error}"))?
+                    validate_items(&step.items).with_context(|| format!("{path}.items"))?
                 }
                 (Some(_), false) => {
-                    return Err(format!("{path} must define source or items, not both"));
+                    bail!("{path} must define source or items, not both");
                 }
-                (None, true) => return Err(format!("{path} must define source or items")),
+                (None, true) => bail!("{path} must define source or items"),
             }
         }
         Ok(())
     }
 }
 
-pub fn config_dir() -> Result<PathBuf, String> {
+pub fn config_dir() -> Result<PathBuf> {
     if let Some(path) = env::var_os(CONFIG_DIR_ENV).filter(|path| !path.is_empty()) {
         return Ok(path.into());
     }
@@ -106,12 +107,12 @@ pub fn config_dir() -> Result<PathBuf, String> {
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .map(|path| path.join(".config").join("herdr-picker").join("pickers"))
-        .ok_or_else(|| format!("set {CONFIG_DIR_ENV}; HOME is unavailable"))
+        .ok_or_else(|| anyhow!("set {CONFIG_DIR_ENV}; HOME is unavailable"))
 }
 
-pub fn list(config_dir: &Path) -> Result<Vec<String>, String> {
+pub fn list(config_dir: &Path) -> Result<Vec<String>> {
     let entries = fs::read_dir(config_dir)
-        .map_err(|error| format!("cannot read {}: {error}", config_dir.display()))?;
+        .with_context(|| format!("cannot read {}", config_dir.display()))?;
     let mut names = entries
         .filter_map(Result::ok)
         .filter_map(|entry| {
@@ -126,11 +127,11 @@ pub fn list(config_dir: &Path) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-fn validate_name(name: &str) -> Result<(), String> {
+fn validate_name(name: &str) -> Result<()> {
     identifier("picker name", name)
 }
 
-fn identifier(path: &str, value: &str) -> Result<(), String> {
+fn identifier(path: &str, value: &str) -> Result<()> {
     if !value.is_empty()
         && value
             .bytes()
@@ -138,23 +139,23 @@ fn identifier(path: &str, value: &str) -> Result<(), String> {
     {
         Ok(())
     } else {
-        Err(format!(
+        Err(anyhow!(
             "{path} must contain only letters, numbers, '-' and '_'"
         ))
     }
 }
 
-fn nonempty(path: &str, value: &str) -> Result<(), String> {
+fn nonempty(path: &str, value: &str) -> Result<()> {
     if value.trim().is_empty() {
-        Err(format!("{path} must not be empty"))
+        Err(anyhow!("{path} must not be empty"))
     } else {
         Ok(())
     }
 }
 
-fn command(path: &str, value: &[String]) -> Result<(), String> {
+fn command(path: &str, value: &[String]) -> Result<()> {
     if value.first().is_none_or(|program| program.is_empty()) {
-        Err(format!("{path} must be a non-empty argv array"))
+        Err(anyhow!("{path} must be a non-empty argv array"))
     } else {
         Ok(())
     }
@@ -200,7 +201,13 @@ value = { command = "claude" }
             title: "Extra".into(),
             ..Item::default()
         });
-        assert!(workflow.validate().unwrap_err().contains("not both"));
+        assert!(
+            workflow
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("not both")
+        );
     }
 
     #[test]
@@ -232,6 +239,7 @@ value = { command = "claude" }
             workflow
                 .validate()
                 .unwrap_err()
+                .to_string()
                 .contains("requires a source")
         );
     }

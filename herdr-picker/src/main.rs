@@ -13,6 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::{Context, Result, bail};
 use config::{InputMode, SearchMode, Step, Workflow};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
@@ -59,7 +60,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn execute(cli: Cli) -> Result<(), String> {
+fn execute(cli: Cli) -> Result<()> {
     match cli {
         Cli::Help => {
             print_help();
@@ -99,15 +100,15 @@ enum Cli {
     Version,
 }
 
-fn parse_cli(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
+fn parse_cli(args: impl IntoIterator<Item = OsString>) -> Result<Cli> {
     let args = args
         .into_iter()
         .map(|argument| {
             argument
                 .into_string()
-                .map_err(|_| "arguments must be valid UTF-8".to_string())
+                .map_err(|_| anyhow::anyhow!("arguments must be valid UTF-8"))
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>>>()?;
 
     match args.as_slice() {
         [command, name] if command == "run" => Ok(Cli::Run { name: name.clone() }),
@@ -116,7 +117,7 @@ fn parse_cli(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
         [] => Ok(Cli::Help),
         [command] if matches!(command.as_str(), "-h" | "--help") => Ok(Cli::Help),
         [command] if matches!(command.as_str(), "-V" | "--version") => Ok(Cli::Version),
-        _ => Err(USAGE.into()),
+        _ => bail!(USAGE),
     }
 }
 
@@ -134,9 +135,8 @@ Picker directory:
     );
 }
 
-fn run_workflow(name: &str, workflow: &Workflow) -> Result<(), String> {
-    let mut terminal =
-        TerminalSession::new().map_err(|error| format!("cannot initialize terminal: {error}"))?;
+fn run_workflow(name: &str, workflow: &Workflow) -> Result<()> {
+    let mut terminal = TerminalSession::new().context("cannot initialize terminal")?;
     let outcome = run_tui(&mut terminal.0, name, workflow);
     drop(terminal);
 
@@ -217,7 +217,7 @@ impl StepRuntime {
                 Ok(provider) => (Some(provider), None),
                 Err(error) => {
                     picker.clear_items();
-                    (None, Some(error))
+                    (None, Some(format!("{error:#}")))
                 }
             },
             None => (None, None),
@@ -273,7 +273,7 @@ impl StepRuntime {
             command_input(name, step, selections, &self.picker.query),
         ) {
             Ok(provider) => self.provider = Some(provider),
-            Err(error) => self.fail_provider(error),
+            Err(error) => self.fail_provider(format!("{error:#}")),
         }
         true
     }
@@ -364,7 +364,7 @@ fn run_tui(
     terminal: &mut ratatui::DefaultTerminal,
     name: &str,
     workflow: &Workflow,
-) -> Result<Option<Value>, String> {
+) -> Result<Option<Value>> {
     let mut selections = BTreeMap::new();
     let mut step_index = 0;
     let mut history: Vec<ScreenState> = Vec::new();
@@ -452,7 +452,7 @@ fn run_screen(
     step_index: usize,
     selections: &BTreeMap<String, Item>,
     runtime: &mut StepRuntime,
-) -> Result<ScreenOutcome, String> {
+) -> Result<ScreenOutcome> {
     let step = &workflow.steps[step_index];
     let mut dirty = true;
     loop {
@@ -470,21 +470,19 @@ fn run_screen(
                 loading: runtime.loading,
                 spinner_frame: runtime.spinner_frame,
             };
-            terminal
-                .draw(|frame| ui::render(&mut runtime.picker, runtime.mode, &screen, frame))
-                .map_err(|error| error.to_string())?;
+            terminal.draw(|frame| ui::render(&mut runtime.picker, runtime.mode, &screen, frame))?;
             dirty = false;
         }
 
         let event = match runtime.wait_duration(Instant::now()) {
             Some(timeout) => {
-                if event::poll(timeout).map_err(|error| error.to_string())? {
-                    Some(event::read().map_err(|error| error.to_string())?)
+                if event::poll(timeout)? {
+                    Some(event::read()?)
                 } else {
                     None
                 }
             }
-            None => Some(event::read().map_err(|error| error.to_string())?),
+            None => Some(event::read()?),
         };
         let Some(event) = event else {
             continue;
@@ -497,7 +495,7 @@ fn run_screen(
                 }
             }
             Event::Mouse(mouse) => {
-                let rects = ui::rects(terminal.size().map_err(|error| error.to_string())?.into());
+                let rects = ui::rects(terminal.size()?.into());
                 match mouse.kind {
                     MouseEventKind::Moved => {
                         if let Some(index) =
@@ -630,8 +628,8 @@ fn row_at(picker: &Picker, body: Rect, column: u16, row: u16) -> Option<usize> {
     (index < picker.len()).then_some(index)
 }
 
-fn fail_visibly(message: &str, pause: bool) -> ExitCode {
-    eprintln!("herdr-picker: {message}");
+fn fail_visibly(error: &anyhow::Error, pause: bool) -> ExitCode {
+    eprintln!("herdr-picker: {error:#}");
     if pause && io::stdin().is_terminal() {
         eprintln!("Press Enter to close.");
         let mut line = String::new();
@@ -740,7 +738,9 @@ mod tests {
                 name: "-sessions".into()
             },
         );
-        let usage = parse_cli(["check"].map(OsString::from)).unwrap_err();
+        let usage = parse_cli(["check"].map(OsString::from))
+            .unwrap_err()
+            .to_string();
         assert!(usage.contains("check <name>"));
         assert!(usage.contains("list"));
     }

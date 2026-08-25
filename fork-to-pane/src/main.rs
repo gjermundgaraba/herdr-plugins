@@ -5,6 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::{Context, Result, anyhow, bail};
 use herdr_client::{
     AgentSessionInfo, AgentStartParams, Client, Environment, Error, PaneSplitParams, SplitDirection,
 };
@@ -18,13 +19,13 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("fork-to-pane: {error}");
+            eprintln!("fork-to-pane: {error:#}");
             if let Ok(client) = Client::from_env() {
                 let _ = client.with_timeout(NOTIFICATION_TIMEOUT).call_value(
                     "notification.show",
                     &json!({
                         "title": "Fork agent failed",
-                        "body": error,
+                        "body": format!("{error:#}"),
                     }),
                 );
             }
@@ -33,20 +34,20 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<(), String> {
-    let environment = Environment::load().map_err(|error| error.to_string())?;
+fn run() -> Result<()> {
+    let environment = Environment::load()?;
     let source_pane_id = environment
         .pane_id
         .as_deref()
-        .ok_or("HERDR_PANE_ID is not set")?;
-    let client = Client::from_env().map_err(|error| error.to_string())?;
+        .context("HERDR_PANE_ID is not set")?;
+    let client = Client::from_env()?;
     let source = client
         .current_pane(Some(source_pane_id))
-        .map_err(|error| format!("read focused pane: {error}"))?;
+        .context("read focused pane")?;
     let session = source
         .agent_session
         .as_ref()
-        .ok_or_else(|| missing_session_message(source.agent.as_deref()))?;
+        .ok_or_else(|| anyhow!(missing_session_message(source.agent.as_deref())))?;
     let (kind, args) = fork_command(session)?;
     let pane = client
         .split_pane(&PaneSplitParams {
@@ -58,7 +59,7 @@ fn run() -> Result<(), String> {
             focus: false,
             env: HashMap::new(),
         })
-        .map_err(|error| format!("split pane: {error}"))?;
+        .context("split pane")?;
 
     if let Err(error) = start_agent_when_shell_ready(
         &client,
@@ -71,7 +72,7 @@ fn run() -> Result<(), String> {
         },
     ) {
         let message = format!("start {kind} fork: {error}");
-        return Err(if start_was_rejected(&error) {
+        bail!(if start_was_rejected(&error) {
             rollback(&client, &pane.pane_id, message)
         } else {
             format!(
@@ -82,7 +83,7 @@ fn run() -> Result<(), String> {
     }
 
     client.focus_pane(&pane.pane_id).map_err(|error| {
-        format!(
+        anyhow!(
             "{kind} fork started in {}, but focus failed: {error}",
             pane.pane_id
         )
@@ -111,9 +112,9 @@ fn start_was_rejected(error: &Error) -> bool {
     matches!(error, Error::Api(_))
 }
 
-fn fork_command(session: &AgentSessionInfo) -> Result<(&'static str, Vec<String>), String> {
+fn fork_command(session: &AgentSessionInfo) -> Result<(&'static str, Vec<String>)> {
     if session.value.is_empty() {
-        return Err("focused agent reported an empty session reference".into());
+        bail!("focused agent reported an empty session reference");
     }
     let value = session.value.clone();
     match (
@@ -127,11 +128,12 @@ fn fork_command(session: &AgentSessionInfo) -> Result<(&'static str, Vec<String>
             "claude",
             vec!["--resume".into(), value, "--fork-session".into()],
         )),
-        (_, agent, _) if matches!(agent, "pi" | "codex" | "claude") => Err(format!(
+        (_, agent, _) if matches!(agent, "pi" | "codex" | "claude") => Err(anyhow!(
             "unsupported {agent} session reference from {} ({})",
-            session.source, session.kind
+            session.source,
+            session.kind
         )),
-        (_, agent, _) => Err(unsupported_agent_message(agent)),
+        (_, agent, _) => Err(anyhow!(unsupported_agent_message(agent))),
     }
 }
 

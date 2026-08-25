@@ -9,5 +9,6 @@ description = "Fork the focused agent session into a new Herdr pane"
 repository.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 herdr-client.workspace = true
 serde_json.workspace = true

@@ -9,5 +9,6 @@ description = "Automatically equalize Herdr pane sizes after splits and closes"
 repository.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 herdr-client.workspace = true
 serde_json.workspace = true
