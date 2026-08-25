@@ -1358,6 +1358,7 @@ fn refresh_owner(state: &mut State, device: &mut Option<HidClient>) -> bool {
     )
     .map(str::to_owned);
     if owner != state.owner {
+        state.next_mapping_probe = owner.is_none().then(Instant::now);
         state.owner = owner;
         if let Some(owner) = &state.owner {
             log(format!("yielding to {owner}"));
@@ -2088,8 +2089,10 @@ printf '%s\n' --call "$@" >> "$HERDR_TEST_LOG"
             title: String::new(),
         });
         let mut device = None;
+        state.next_mapping_probe = Some(Instant::now() - Duration::from_secs(1));
 
         assert!(refresh_owner(&mut state, &mut device));
+        assert!(state.next_mapping_probe.is_none());
         assert!(!refresh_owner(&mut state, &mut device));
     }
 
