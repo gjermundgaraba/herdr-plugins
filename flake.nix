@@ -118,6 +118,18 @@
           ];
         };
 
+        space-meta = {
+          sourceRoots = [
+            "space-meta"
+            "sdk/rust"
+          ];
+          binaries = [ "herdr-space-meta" ];
+          platforms = [
+            "darwin"
+            "linux"
+          ];
+        };
+
         herdr-micro = {
           # This includes codex-micro, the plugin's local path dependency.
           sourceRoots = [

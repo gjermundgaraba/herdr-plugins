@@ -8,6 +8,7 @@ members = [
     "fork-to-pane",
     "herdr-micro",
     "herdr-micro/codex-micro",
+    "space-meta",
     "history",
     "sdk/picker",
     "sdk/ratatui",

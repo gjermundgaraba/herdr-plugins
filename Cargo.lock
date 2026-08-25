@@ -384,6 +384,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "herdr-space-meta"
+version = "0.1.0"
+dependencies = [
+ "herdr-client",
+ "serde_json",
+]
+
+[[package]]
 name = "ident_case"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
