@@ -1,0 +1,343 @@
+//! The long-lived Codex Micro bridge.  Keep the policy here; HID framing,
+//! Herdr parsing, gestures, and macOS operations live in their small modules.
+//! The event loop and logging live in this module, input dispatch in
+//! `dispatch`, and Herdr/device state reconciliation in `reconcile`.
+
+mod dispatch;
+mod reconcile;
+
+use anyhow::{Result, anyhow};
+use herdr_client::open_rotating_log;
+use signal_hook::consts::{SIGINT, SIGTERM};
+use std::io::Write;
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, RecvTimeoutError, TryRecvError},
+    },
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use crate::{
+    actions::GHOSTTY_PROCESS,
+    config::{config_path, enabled_buttons, load, provision},
+    control::listen_for_control,
+};
+use dispatch::{action_worker, input_worker};
+use reconcile::{
+    InputContext, State, apply_config_load, apply_session_update, close_device,
+    handle_input_disconnect, open_device, publish, refresh_frontmost, refresh_mappings,
+    refresh_owner, refresh_routing, refresh_sessions, send_lighting, sync_selected_worker,
+    update_input_context,
+};
+
+const CONFIG_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const SESSION_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const SESSION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+const ROUTING_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
+const WORK_QUEUE_CAPACITY: usize = 16;
+pub const DAEMON_PROTOCOL_VERSION: u32 = 2;
+
+static LOG_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+pub fn log(message: impl AsRef<str>) {
+    let _guard = LOG_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let line = format!(
+        "{} {}",
+        format_timestamp(SystemTime::now()),
+        message.as_ref()
+    );
+    if let Ok(path) = crate::control::log_file()
+        && let Ok(mut file) = open_rotating_log(&path, 10 << 20, 3)
+        && writeln!(file, "{line}").is_ok()
+    {
+        return;
+    }
+    eprintln!("{line}");
+}
+
+fn format_timestamp(time: SystemTime) -> String {
+    let elapsed = time.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let seconds = elapsed.as_secs() as libc::time_t;
+    let mut utc: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: `seconds` and `utc` are valid writable C time values for this call.
+    if unsafe { libc::gmtime_r(&seconds, &mut utc) }.is_null() {
+        return "1970-01-01T00:00:00.000Z".into();
+    }
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        utc.tm_year + 1900,
+        utc.tm_mon + 1,
+        utc.tm_mday,
+        utc.tm_hour,
+        utc.tm_min,
+        utc.tm_sec,
+        elapsed.subsec_millis(),
+    )
+}
+
+/// Run the bridge in the foreground.  `main`/the start action owns process
+/// detachment; this function deliberately owns only the live daemon.
+pub fn run_daemon() -> Result<()> {
+    let config_path = config_path().map_err(|error| anyhow!(error))?;
+    provision(&config_path).map_err(|error| anyhow!(error))?;
+    let config = load(&config_path).map_err(|error| anyhow!(error))?;
+    let startup_enabled_buttons = enabled_buttons(&config.controls);
+    let (device_tx, device_rx) = mpsc::channel();
+    let (input_notice_tx, input_notice_rx) = mpsc::channel();
+    let (work_tx, work_rx) = mpsc::sync_channel(WORK_QUEUE_CAPACITY);
+    let (session_update_tx, session_update_rx) = mpsc::channel();
+    let stopping = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(SIGINT, Arc::clone(&stopping))?;
+    signal_hook::flag::register(SIGTERM, Arc::clone(&stopping))?;
+    let mut state = State::new(config);
+    let input_context = Arc::new(Mutex::new(Arc::new(InputContext::new(&state.config))));
+    let worker = thread::spawn({
+        let routing_generation = Arc::clone(&state.routing_generation);
+        let stopping = Arc::clone(&stopping);
+        move || action_worker(work_rx, routing_generation, stopping)
+    });
+    let input = thread::spawn({
+        let context = Arc::clone(&input_context);
+        let routing_generation = Arc::clone(&state.routing_generation);
+        let work = work_tx.clone();
+        let stopping = Arc::clone(&stopping);
+        move || {
+            input_worker(
+                device_rx,
+                context,
+                routing_generation,
+                work,
+                input_notice_tx,
+                stopping,
+            )
+        }
+    });
+    let status = Arc::new(Mutex::new(state.status()));
+    let server = listen_for_control(
+        {
+            let status = Arc::clone(&status);
+            move || {
+                status
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone()
+            }
+        },
+        Arc::clone(&stopping),
+    )?;
+    let (shutdown_tx, shutdown_rx) = mpsc::channel();
+    let (control_result_tx, control_result_rx) = mpsc::sync_channel(1);
+    let control_thread = thread::spawn(move || {
+        let _ = control_result_tx.send(server.run_with_shutdown(&shutdown_rx));
+    });
+    let mut control_error = None;
+    let mut device = None;
+    let mut routing_due = Instant::now();
+    let mut config_due = Instant::now();
+    let mut sessions_due = Instant::now();
+    let mut sessions_ready = true;
+    let mut session_workers = HashMap::new();
+    let mut worker_generation = 0;
+    log("bridge started");
+    while !stopping.load(Ordering::Acquire) {
+        match control_result_rx.try_recv() {
+            Ok(Ok(())) => {
+                control_error = Some("Micro control server stopped unexpectedly".into());
+                stopping.store(true, Ordering::Release);
+                continue;
+            }
+            Ok(Err(error)) => {
+                control_error = Some(format!("Micro control server failed: {error:#}"));
+                stopping.store(true, Ordering::Release);
+                continue;
+            }
+            Err(TryRecvError::Disconnected) => {
+                control_error = Some("Micro control server thread disconnected".into());
+                stopping.store(true, Ordering::Release);
+                continue;
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+        let mut changed = false;
+        while let Ok(error) = input_notice_rx.try_recv() {
+            changed |= handle_input_disconnect(&mut state, &mut device, error);
+        }
+        while let Ok(update) = session_update_rx.try_recv() {
+            match apply_session_update(&mut state, update, &session_workers, device.as_ref()) {
+                Ok(true) => {
+                    sessions_due = sessions_due.min(Instant::now() + SESSION_RETRY_INTERVAL);
+                }
+                Ok(false) => {}
+                Err(error) => log(format!("Herdr session update failed: {error:#}")),
+            }
+            changed = true;
+        }
+        let now = Instant::now();
+        if now >= config_due {
+            config_due = now + CONFIG_REFRESH_INTERVAL;
+            changed |= apply_config_load(&mut state, load(&config_path), startup_enabled_buttons);
+            if let Some(device) = device.as_ref() {
+                match send_lighting(device, &mut state) {
+                    Ok(()) => state.last_lighting_error.clear(),
+                    Err(error) => {
+                        let error = format!("{error:#}");
+                        if state.last_lighting_error != error {
+                            log(format!("lighting update failed: {error}"));
+                            state.last_lighting_error = error;
+                        }
+                    }
+                }
+            }
+        }
+        if now >= sessions_due {
+            sessions_due = now + SESSION_REFRESH_INTERVAL;
+            if state.owner.is_none() {
+                sessions_ready = match refresh_sessions(
+                    &mut state,
+                    device.as_ref(),
+                    &mut session_workers,
+                    &mut worker_generation,
+                    &session_update_tx,
+                    &stopping,
+                ) {
+                    Ok(shutdown) => {
+                        if shutdown {
+                            log("No Herdr sessions for 60 seconds; releasing device");
+                            stopping.store(true, Ordering::Release);
+                        }
+                        true
+                    }
+                    Err(error) => {
+                        log(format!("refresh failed: {error:#}"));
+                        sessions_due = now + SESSION_RETRY_INTERVAL;
+                        false
+                    }
+                };
+            }
+            changed = true;
+        }
+        if state.owner.is_none()
+            && state
+                .next_mapping_probe
+                .is_some_and(|deadline| now >= deadline)
+        {
+            refresh_mappings(&mut state);
+            changed = true;
+        }
+        if now >= routing_due {
+            routing_due = now + ROUTING_REFRESH_INTERVAL;
+            let input_generation = state.routing_generation();
+            let input_ready = state.routing_ready;
+            let previous_owner = state.owner.clone();
+            changed |= refresh_frontmost(&mut state);
+            changed |= refresh_owner(&mut state, &mut device);
+            if previous_owner.is_some() && state.owner.is_none() {
+                sessions_due = now;
+            }
+            if state.owner.is_none() && sessions_ready {
+                match refresh_routing(&mut state, device.as_ref()) {
+                    Ok(routing_changed) => changed |= routing_changed,
+                    Err(error) => {
+                        state.revoke_routing();
+                        changed = true;
+                        log(format!("refresh failed: {error:#}"));
+                    }
+                }
+                sync_selected_worker(
+                    &mut state,
+                    &mut session_workers,
+                    &mut worker_generation,
+                    &session_update_tx,
+                    &stopping,
+                );
+                match open_device(&mut device, &device_tx, &mut state) {
+                    Ok(device_changed) => changed |= device_changed,
+                    Err(error) => {
+                        changed = true;
+                        log(format!("refresh failed: {error:#}"));
+                    }
+                }
+            }
+            if state.owner.is_some() && state.device_restore_pending {
+                match open_device(&mut device, &device_tx, &mut state) {
+                    Ok(device_changed) => changed |= device_changed,
+                    Err(error) => {
+                        changed = true;
+                        log(format!("native HID recovery failed: {error:#}"));
+                    }
+                }
+            }
+            changed |= input_generation != state.routing_generation()
+                || input_ready != state.routing_ready;
+        }
+        if sessions_ready
+            && state
+                .frontmost
+                .as_ref()
+                .is_some_and(|frontmost| frontmost.process == GHOSTTY_PROCESS)
+            && state.focused_terminal.as_ref().is_some_and(|terminal| {
+                !state
+                    .mappings
+                    .iter()
+                    .any(|mapping| mapping.terminal_id == *terminal)
+            })
+        {
+            sessions_due = sessions_due.min(
+                state
+                    .next_mapping_probe
+                    .unwrap_or(now + SESSION_RETRY_INTERVAL),
+            );
+        }
+        if changed {
+            update_input_context(&input_context, &state);
+            publish(&status, &state);
+        }
+        let deadline = routing_due
+            .min(config_due)
+            .min(sessions_due)
+            .min(state.next_mapping_probe.unwrap_or(sessions_due));
+        match input_notice_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(error) => {
+                if handle_input_disconnect(&mut state, &mut device, error) {
+                    update_input_context(&input_context, &state);
+                    publish(&status, &state);
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    log("stopping");
+    state.revoke_routing();
+    stopping.store(true, Ordering::Release);
+    close_device(&mut device, &mut state, true);
+    drop(device_tx);
+    let _ = input.join();
+    publish(&status, &state);
+    drop(work_tx);
+    let _ = worker.join();
+    let _ = shutdown_tx.send(());
+    let _ = control_thread.join();
+    match control_error {
+        Some(error) => Err(anyhow!(error)),
+        None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timestamps_are_utc_iso_8601() {
+        assert_eq!(format_timestamp(UNIX_EPOCH), "1970-01-01T00:00:00.000Z");
+        assert_eq!(
+            format_timestamp(UNIX_EPOCH + Duration::from_millis(946_782_245_678)),
+            "2000-01-02T03:04:05.678Z"
+        );
+    }
+}
