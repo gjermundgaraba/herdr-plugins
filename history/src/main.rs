@@ -15,6 +15,7 @@ use std::{
 use herdr_client::{
     Client, Environment, Error as ClientError, EventSubscription, PluginInvocation, Subscription,
     open_rotating_log,
+    unix::{SocketCleanup, bind_private_socket, create_private_dir, peer_is_current_user},
 };
 use serde_json::json;
 
@@ -282,7 +283,8 @@ fn run_daemon() -> Result<(), String> {
         std::env::current_exe().map_err(|error| format!("cannot resolve executable: {error}"))?;
     let build = build_hash()?;
     let paths = SessionPaths::new(&socket_path);
-    create_private_runtime_dir(&paths.runtime_dir)?;
+    create_private_dir(&paths.runtime_dir)
+        .map_err(|error| format!("cannot prepare {}: {error}", paths.runtime_dir.display()))?;
 
     let lock = fs::File::options()
         .read(true)
@@ -317,7 +319,8 @@ fn run_daemon() -> Result<(), String> {
         .map_err(|error| format!("cannot chmod {}: {error}", paths.lock_file.display()))?;
 
     remove_socket(&paths.control_socket)?;
-    let listener = bind_private_socket(&paths.control_socket)?;
+    let listener = bind_private_socket(&paths.control_socket)
+        .map_err(|error| format!("cannot bind {}: {error}", paths.control_socket.display()))?;
     listener
         .set_nonblocking(true)
         .map_err(|error| error.to_string())?;
@@ -631,6 +634,7 @@ fn handle_control(
     let mut request = String::new();
     let mut retire = None;
     let result = peer_is_current_user(&stream)
+        .map_err(|error| format!("cannot authorize history client: {error}"))
         .and_then(|()| {
             BufReader::new(&stream)
                 .read_line(&mut request)
@@ -698,57 +702,6 @@ fn fnv(bytes: impl IntoIterator<Item = u8>) -> String {
     format!("{:024x}", hash & ((1_u128 << 96) - 1))
 }
 
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
-fn peer_is_current_user(stream: &UnixStream) -> Result<(), String> {
-    let mut uid = 0;
-    let mut gid = 0;
-    // SAFETY: both output pointers are valid and stream owns a live descriptor.
-    if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
-        return Err(format!(
-            "cannot inspect history client: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    // SAFETY: geteuid has no preconditions.
-    if uid == unsafe { libc::geteuid() } {
-        Ok(())
-    } else {
-        Err("history client belongs to another user".into())
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn peer_is_current_user(stream: &UnixStream) -> Result<(), String> {
-    let mut credentials = libc::ucred {
-        pid: 0,
-        uid: 0,
-        gid: 0,
-    };
-    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: credentials and length are valid writable values for getsockopt.
-    if unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&raw mut credentials).cast(),
-            &raw mut length,
-        )
-    } != 0
-    {
-        return Err(format!(
-            "cannot inspect history client: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    // SAFETY: geteuid has no preconditions.
-    if credentials.uid == unsafe { libc::geteuid() } {
-        Ok(())
-    } else {
-        Err("history client belongs to another user".into())
-    }
-}
-
 fn jump(client: &Client, state: &mut State, step: isize) -> Result<(), String> {
     let deadline = Instant::now() + JUMP_BUDGET;
     while Instant::now() < deadline {
@@ -779,52 +732,9 @@ fn jump(client: &Client, state: &mut State, step: isize) -> Result<(), String> {
     Ok(())
 }
 
-fn create_private_runtime_dir(path: &Path) -> Result<(), String> {
-    fs::create_dir(path)
-        .or_else(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                Ok(())
-            } else {
-                Err(error)
-            }
-        })
-        .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
-    // SAFETY: geteuid has no preconditions.
-    if !metadata.file_type().is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
-        return Err(format!(
-            "{} is not a directory owned by the current user",
-            path.display()
-        ));
-    }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .map_err(|error| format!("cannot chmod {}: {error}", path.display()))
-}
-
-fn bind_private_socket(path: &Path) -> Result<UnixListener, String> {
-    let previous_umask = unsafe { libc::umask(0o077) };
-    let result = UnixListener::bind(path);
-    unsafe {
-        libc::umask(previous_umask);
-    }
-    result.map_err(|error| format!("cannot bind {}: {error}", path.display()))
-}
-
 fn remove_socket(path: &Path) -> Result<(), String> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!("cannot remove {}: {error}", path.display())),
-    }
-}
-
-struct SocketCleanup<'a>(&'a Path);
-
-impl Drop for SocketCleanup<'_> {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(self.0);
-    }
+    herdr_client::unix::remove_socket(path)
+        .map_err(|error| format!("cannot remove {}: {error}", path.display()))
 }
 
 fn now_ms() -> u64 {

@@ -283,6 +283,7 @@ name = "herdr-client"
 version = "0.1.0"
 dependencies = [
  "interprocess",
+ "libc",
  "serde",
  "serde_json",
 ]

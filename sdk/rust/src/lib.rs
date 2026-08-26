@@ -6,7 +6,10 @@
 
 mod client;
 mod env;
+pub mod ndjson;
 mod types;
+#[cfg(unix)]
+pub mod unix;
 
 pub use client::{ApiError, Client, Error, Subscription};
 pub use env::{
