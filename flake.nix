@@ -90,11 +90,6 @@
             "space-meta"
             "sdk/rust"
           ];
-          binaries = [ "herdr-space-meta" ];
-          platforms = [
-            "darwin"
-            "linux"
-          ];
         };
 
         herdr-micro = {
