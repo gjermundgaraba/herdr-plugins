@@ -292,6 +292,7 @@ dependencies = [
 name = "herdr-equalize-splits"
 version = "0.4.0"
 dependencies = [
+ "anyhow",
  "herdr-client",
  "serde_json",
 ]
@@ -300,6 +301,7 @@ dependencies = [
 name = "herdr-fork-to-pane"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "herdr-client",
  "serde_json",
 ]
@@ -308,6 +310,7 @@ dependencies = [
 name = "herdr-history"
 version = "0.4.0"
 dependencies = [
+ "anyhow",
  "herdr-client",
  "libc",
  "serde_json",
@@ -335,6 +338,7 @@ dependencies = [
 name = "herdr-picker"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "crossterm",
  "herdr-client",
  "herdr-picker-sdk",

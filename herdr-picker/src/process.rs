@@ -15,6 +15,7 @@ use std::{
     time::Duration,
 };
 
+use anyhow::{Context, Result, anyhow, bail};
 use herdr_client::{Client, Error, ndjson, open_rotating_log};
 use herdr_picker_sdk::Snapshot;
 use serde::{Deserialize, Serialize};
@@ -39,12 +40,11 @@ pub struct Provider {
 }
 
 impl Provider {
-    pub fn start(argv: &[String], context: Value) -> Result<Self, String> {
+    pub fn start(argv: &[String], context: Value) -> Result<Self> {
         let Some(program) = argv.first() else {
-            return Err("source argv must not be empty".into());
+            bail!("source argv must not be empty");
         };
-        let mut encoded = serde_json::to_vec(&context)
-            .map_err(|error| format!("cannot encode picker context: {error}"))?;
+        let mut encoded = serde_json::to_vec(&context).context("cannot encode picker context")?;
         encoded.push(b'\n');
         let mut child = Command::new(program)
             .args(&argv[1..])
@@ -53,7 +53,7 @@ impl Provider {
             .stderr(Stdio::piped())
             .process_group(0)
             .spawn()
-            .map_err(|error| format!("cannot start {}: {error}", display(argv)))?;
+            .with_context(|| format!("cannot start {}", display(argv)))?;
         let stdin = child.stdin.take().expect("piped");
         let stdout = child.stdout.take().expect("piped");
         let child_stderr = child.stderr.take().expect("piped");
@@ -233,8 +233,9 @@ pub fn maybe_run_submit_worker() -> Option<ExitCode> {
     }
     let result = run_submit_worker();
     if let Err(error) = &result {
-        log_error(error);
-        notify_failure(error);
+        let message = format!("{error:#}");
+        log_error(&message);
+        notify_failure(&message);
     }
     Some(if result.is_ok() {
         ExitCode::SUCCESS
@@ -259,7 +260,7 @@ fn popup_environment(
     herdr == Some(OsStr::new("1")) && pane.is_none() && active_pane.is_some()
 }
 
-pub fn submit(argv: &[String], input: &Value) -> Result<(), String> {
+pub fn submit(argv: &[String], input: &Value) -> Result<()> {
     if running_in_popup() {
         schedule_submit(argv, input)
     } else {
@@ -267,9 +268,8 @@ pub fn submit(argv: &[String], input: &Value) -> Result<(), String> {
     }
 }
 
-fn schedule_submit(argv: &[String], input: &Value) -> Result<(), String> {
-    let executable =
-        env::current_exe().map_err(|error| format!("cannot resolve executable: {error}"))?;
+fn schedule_submit(argv: &[String], input: &Value) -> Result<()> {
+    let executable = env::current_exe().context("cannot resolve executable")?;
     let mut command = Command::new(executable);
     command
         .arg(WORKER_FLAG)
@@ -288,47 +288,39 @@ fn schedule_submit(argv: &[String], input: &Value) -> Result<(), String> {
         });
     }
 
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("cannot schedule submit command: {error}"))?;
+    let mut child = command.spawn().context("cannot schedule submit command")?;
     let request = SubmitRequest {
         command: argv.to_vec(),
         input: input.clone(),
     };
     let mut stdin = child.stdin.take().expect("piped");
-    serde_json::to_writer(&mut stdin, &request)
-        .map_err(|error| format!("cannot encode submit request: {error}"))?;
-    stdin
-        .write_all(b"\n")
-        .map_err(|error| format!("cannot send submit request: {error}"))
+    serde_json::to_writer(&mut stdin, &request).context("cannot encode submit request")?;
+    stdin.write_all(b"\n").context("cannot send submit request")
 }
 
-fn run_submit_worker() -> Result<(), String> {
+fn run_submit_worker() -> Result<()> {
     let mut input = String::new();
     io::stdin()
         .read_to_string(&mut input)
-        .map_err(|error| format!("cannot read submit request: {error}"))?;
-    let request: SubmitRequest =
-        serde_json::from_str(&input).map_err(|error| format!("invalid submit request: {error}"))?;
+        .context("cannot read submit request")?;
+    let request: SubmitRequest = serde_json::from_str(&input).context("invalid submit request")?;
 
     if running_in_popup() {
-        let client =
-            Client::from_env().map_err(|error| format!("cannot connect to Herdr: {error}"))?;
+        let client = Client::from_env().context("cannot connect to Herdr")?;
         match client.call_value("popup.close", &json!({})) {
             Ok(_) => {}
             Err(Error::Api(error)) if error.code == "popup_not_open" => {}
-            Err(error) => return Err(format!("cannot close picker popup: {error}")),
+            Err(error) => return Err(error).context("cannot close picker popup"),
         }
     }
     run(&request.command, &request.input)
 }
 
-fn run(argv: &[String], input: &Value) -> Result<(), String> {
+fn run(argv: &[String], input: &Value) -> Result<()> {
     let Some(program) = argv.first() else {
-        return Err("command argv must not be empty".into());
+        bail!("command argv must not be empty");
     };
-    let mut encoded = serde_json::to_vec(input)
-        .map_err(|error| format!("cannot encode picker context: {error}"))?;
+    let mut encoded = serde_json::to_vec(input).context("cannot encode picker context")?;
     encoded.push(b'\n');
     let mut child = Command::new(program)
         .args(&argv[1..])
@@ -336,13 +328,13 @@ fn run(argv: &[String], input: &Value) -> Result<(), String> {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| format!("cannot start {}: {error}", display(argv)))?;
+        .with_context(|| format!("cannot start {}", display(argv)))?;
     let stderr = child.stderr.take().expect("piped");
     let stdin = child.stdin.take().expect("piped");
     if let Err(error) = set_nonblocking(&stdin).and_then(|()| set_nonblocking(&stderr)) {
         let _ = child.kill();
         let _ = child.wait();
-        return Err(format!("cannot configure command pipes: {error}"));
+        return Err(error).context("cannot configure command pipes");
     }
 
     let stopped = Arc::new(AtomicBool::new(false));
@@ -352,7 +344,7 @@ fn run(argv: &[String], input: &Value) -> Result<(), String> {
     let stderr_reader = thread::spawn(move || capture_tail_until(stderr, &reader_stopped));
     let status_result = child
         .wait()
-        .map_err(|error| format!("cannot wait for {}: {error}", display(argv)));
+        .with_context(|| format!("cannot wait for {}", display(argv)));
     if status_result.is_err() {
         let _ = child.kill();
         let _ = child.wait();
@@ -360,24 +352,22 @@ fn run(argv: &[String], input: &Value) -> Result<(), String> {
     stopped.store(true, Ordering::Relaxed);
     let write_result = writer
         .join()
-        .map_err(|_| format!("input writer for {} panicked", display(argv)))?;
+        .map_err(|_| anyhow!("input writer for {} panicked", display(argv)))?;
     let stderr = stderr_reader
         .join()
-        .map_err(|_| format!("stderr reader for {} panicked", display(argv)))?;
+        .map_err(|_| anyhow!("stderr reader for {} panicked", display(argv)))?;
 
     if let Err(error) = write_result
         && error.kind() != io::ErrorKind::BrokenPipe
     {
-        return Err(format!(
-            "cannot pass picker context to {}: {error}",
-            display(argv)
-        ));
+        return Err(error)
+            .with_context(|| format!("cannot pass picker context to {}", display(argv)));
     }
     let status = status_result?;
     if !status.success() {
         let stderr = String::from_utf8_lossy(&stderr);
         let stderr = stderr.trim();
-        return Err(if stderr.is_empty() {
+        bail!(if stderr.is_empty() {
             format!("{} exited with {status}", display(argv))
         } else {
             format!("{} failed: {stderr}", display(argv))
@@ -586,7 +576,7 @@ printf '{"items":[{"id":"one","title":"One"}]}\n'"#
             "cat >/dev/null; echo nope >&2; exit 7".into(),
         ];
         assert_eq!(
-            run(&argv, &json!({})).unwrap_err(),
+            run(&argv, &json!({})).unwrap_err().to_string(),
             "sh -c cat >/dev/null; echo nope >&2; exit 7 failed: nope"
         );
     }
@@ -596,7 +586,7 @@ printf '{"items":[{"id":"one","title":"One"}]}\n'"#
         let script = "cat >/dev/null; yes x | head -c 131072; yes e | head -c 131072 >&2; exit 7";
         let error = run(&["sh".into(), "-c".into(), script.into()], &json!({})).unwrap_err();
 
-        assert!(error.len() <= MAX_STDERR_BYTES + script.len() + 32);
+        assert!(error.to_string().len() <= MAX_STDERR_BYTES + script.len() + 32);
     }
 
     #[test]
