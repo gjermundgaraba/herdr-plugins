@@ -30,8 +30,6 @@ pub const HID_PROTOCOL_VERSION: u32 = 1;
 pub const HID_LAUNCH_SOCKET_NAME: &str = "Control";
 pub const HID_MAX_LINE_BYTES: usize = 64 * 1024;
 pub const HELPER_LABEL: &str = "dev.herdr.herdr-micro-hid";
-// Increment whenever privileged helper code changes.
-pub const HELPER_VERSION: &str = "15";
 const HID_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const HELPER_SHUTDOWN_TIMEOUT: Duration =
     MicroDevice::NATIVE_WATCHDOG_TIMEOUT.saturating_add(Duration::from_secs(1));
@@ -39,6 +37,29 @@ static HELPER_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn request_helper_shutdown(_signal: c_int) {
     HELPER_SHUTDOWN.store(true, Ordering::Release);
+}
+
+/// The version the running helper reports: the content hash of its own
+/// binary, so a rebuilt helper changes identity mechanically.
+pub fn running_helper_version() -> Result<String> {
+    helper_hash(&std::env::current_exe().context("cannot resolve executable")?)
+}
+
+/// The helper version this build requires: the hash of the helper binary
+/// shipped next to the current executable (the one `install-helper` copies).
+pub fn required_helper_version() -> Result<String> {
+    let exe = std::env::current_exe().context("cannot resolve executable")?;
+    let helper = exe
+        .parent()
+        .context("executable has no parent directory")?
+        .join(crate::helper_install::HELPER_BINARY_NAME);
+    helper_hash(&helper)
+}
+
+fn helper_hash(path: &Path) -> Result<String> {
+    std::fs::read(path)
+        .map(herdr_client::hash::fnv)
+        .with_context(|| format!("cannot read {}", path.display()))
 }
 
 pub fn hid_socket_path(uid: libc::uid_t) -> PathBuf {
@@ -114,13 +135,15 @@ pub struct HidClient {
 
 impl HidClient {
     pub fn connect(event_tx: Sender<DeviceEvent>) -> Result<Self> {
-        Self::connect_at(&current_hid_socket_path(), event_tx, 0)
+        let version = required_helper_version()?;
+        Self::connect_at(&current_hid_socket_path(), event_tx, 0, &version)
     }
 
     fn connect_at(
         path: &Path,
         event_tx: Sender<DeviceEvent>,
         expected_server_uid: libc::uid_t,
+        version: &str,
     ) -> Result<Self> {
         let mut stream = UnixStream::connect(path)
             .with_context(|| format!("connect privileged USB helper at {}", path.display()))?;
@@ -135,12 +158,12 @@ impl HidClient {
             &json!({
                 "v": HID_PROTOCOL_VERSION,
                 "type": "hello",
-                "helperVersion": HELPER_VERSION,
+                "helperVersion": version,
             }),
         )?;
         let mut reader = BufReader::new(stream.try_clone()?);
         let hello = read_message(&mut reader).context("read USB helper handshake")?;
-        validate_hello(&hello)?;
+        validate_hello(&hello, version)?;
         stream.set_read_timeout(None)?;
         stream.set_write_timeout(Some(DEFAULT_REQUEST_TIMEOUT))?;
 
@@ -355,11 +378,11 @@ fn client_reader(
     }
 }
 
-fn validate_hello(message: &Value) -> Result<()> {
+fn validate_hello(message: &Value, version: &str) -> Result<()> {
     match message.get("type").and_then(Value::as_str) {
         Some("hello")
             if require_version(message).is_ok()
-                && message.get("helperVersion").and_then(Value::as_str) == Some(HELPER_VERSION) =>
+                && message.get("helperVersion").and_then(Value::as_str) == Some(version) =>
         {
             Ok(())
         }
@@ -440,6 +463,7 @@ pub fn run_hid_server(allowed_uid: libc::uid_t) -> Result<()> {
 }
 
 fn run_server(listener: UnixListener, allowed_uid: libc::uid_t) -> Result<()> {
+    let version = running_helper_version()?;
     install_signal_handler(
         libc::SIGTERM,
         request_helper_shutdown as *const () as libc::sighandler_t,
@@ -449,20 +473,21 @@ fn run_server(listener: UnixListener, allowed_uid: libc::uid_t) -> Result<()> {
     unblock_helper_signals()?;
     listener.set_nonblocking(true)?;
     let Some((mut stream, reader)) =
-        accept_authenticated_client(&listener, allowed_uid, HID_CONNECT_TIMEOUT)?
+        accept_authenticated_client(&listener, allowed_uid, HID_CONNECT_TIMEOUT, &version)?
     else {
         return Ok(());
     };
     if HELPER_SHUTDOWN.load(Ordering::Acquire) {
         return Ok(());
     }
-    serve_client(&mut stream, reader)
+    serve_client(&mut stream, reader, &version)
 }
 
 fn accept_authenticated_client(
     listener: &UnixListener,
     allowed_uid: libc::uid_t,
     idle_timeout: Duration,
+    version: &str,
 ) -> Result<Option<(UnixStream, BufReader<UnixStream>)>> {
     let idle_deadline = Instant::now() + idle_timeout;
     loop {
@@ -490,7 +515,7 @@ fn accept_authenticated_client(
                     );
                     continue;
                 }
-                let reader = match authenticate_client(&mut stream) {
+                let reader = match authenticate_client(&mut stream, version) {
                     Ok(reader) => reader,
                     Err(error) => {
                         eprintln!("herdr-micro-hid client: {error:#}");
@@ -535,7 +560,7 @@ fn unblock_helper_signals() -> Result<()> {
     Ok(())
 }
 
-fn authenticate_client(stream: &mut UnixStream) -> Result<BufReader<UnixStream>> {
+fn authenticate_client(stream: &mut UnixStream, version: &str) -> Result<BufReader<UnixStream>> {
     stream.set_read_timeout(Some(HID_CONNECT_TIMEOUT))?;
     stream.set_write_timeout(Some(HID_CONNECT_TIMEOUT))?;
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -548,7 +573,7 @@ fn authenticate_client(stream: &mut UnixStream) -> Result<BufReader<UnixStream>>
     };
     if require_version(&hello).is_err()
         || hello.get("type").and_then(Value::as_str) != Some("hello")
-        || hello.get("helperVersion").and_then(Value::as_str) != Some(HELPER_VERSION)
+        || hello.get("helperVersion").and_then(Value::as_str) != Some(version)
     {
         let _ = write_error(
             stream,
@@ -560,7 +585,11 @@ fn authenticate_client(stream: &mut UnixStream) -> Result<BufReader<UnixStream>>
     Ok(reader)
 }
 
-fn serve_client(stream: &mut UnixStream, reader: BufReader<UnixStream>) -> Result<()> {
+fn serve_client(
+    stream: &mut UnixStream,
+    reader: BufReader<UnixStream>,
+    version: &str,
+) -> Result<()> {
     let (event_tx, event_rx) = mpsc::channel();
     let device = match MicroDevice::open_exclusive(event_tx) {
         Ok(device) => device,
@@ -574,7 +603,7 @@ fn serve_client(stream: &mut UnixStream, reader: BufReader<UnixStream>) -> Resul
         &json!({
             "v": HID_PROTOCOL_VERSION,
             "type": "hello",
-            "helperVersion": HELPER_VERSION,
+            "helperVersion": version,
         }),
     )?;
     stream.set_read_timeout(None)?;
@@ -889,6 +918,8 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    const TEST_VERSION: &str = "test-helper-version";
+
     fn test_socket(name: &str) -> PathBuf {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         std::env::temp_dir().join(format!(
@@ -911,7 +942,7 @@ mod tests {
                 &json!({
                     "v": HID_PROTOCOL_VERSION,
                     "type": "hello",
-                    "helperVersion": HELPER_VERSION,
+                    "helperVersion": TEST_VERSION,
                 }),
             )
             .unwrap();
@@ -950,7 +981,7 @@ mod tests {
         let (events, event_rx) = mpsc::channel();
         // SAFETY: getuid has no preconditions.
         let uid = unsafe { libc::getuid() };
-        let mut client = HidClient::connect_at(&path, events, uid).unwrap();
+        let mut client = HidClient::connect_at(&path, events, uid, TEST_VERSION).unwrap();
         assert_eq!(
             client.request("device.status", None).unwrap(),
             json!({"device": "ok"})
@@ -975,7 +1006,7 @@ mod tests {
         let (events, _) = mpsc::channel();
         // SAFETY: getuid has no preconditions.
         let wrong_uid = unsafe { libc::getuid() }.wrapping_add(1);
-        let error = HidClient::connect_at(&path, events, wrong_uid)
+        let error = HidClient::connect_at(&path, events, wrong_uid, TEST_VERSION)
             .err()
             .unwrap();
         assert!(error.to_string().contains("unexpected uid"));
@@ -996,7 +1027,7 @@ mod tests {
                 &json!({
                     "v": HID_PROTOCOL_VERSION,
                     "type": "hello",
-                    "helperVersion": HELPER_VERSION,
+                    "helperVersion": TEST_VERSION,
                 }),
             )
             .unwrap();
@@ -1005,7 +1036,7 @@ mod tests {
         let (events, event_rx) = mpsc::channel();
         // SAFETY: getuid has no preconditions.
         let uid = unsafe { libc::getuid() };
-        let mut client = HidClient::connect_at(&path, events, uid).unwrap();
+        let mut client = HidClient::connect_at(&path, events, uid, TEST_VERSION).unwrap();
         client.disconnect("write failed".into());
         client.disconnect("duplicate".into());
         assert_eq!(
@@ -1028,7 +1059,7 @@ mod tests {
             let (mut stream, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let hello = read_message(&mut reader).unwrap();
-            assert_eq!(hello["helperVersion"], HELPER_VERSION);
+            assert_eq!(hello["helperVersion"], TEST_VERSION);
             write_message(
                 &mut stream,
                 &json!({
@@ -1042,7 +1073,9 @@ mod tests {
         let (events, _) = mpsc::channel();
         // SAFETY: getuid has no preconditions.
         let uid = unsafe { libc::getuid() };
-        let error = HidClient::connect_at(&path, events, uid).err().unwrap();
+        let error = HidClient::connect_at(&path, events, uid, TEST_VERSION)
+            .err()
+            .unwrap();
         assert!(
             error
                 .to_string()
@@ -1072,13 +1105,13 @@ mod tests {
             &json!({
                 "v": HID_PROTOCOL_VERSION,
                 "type": "hello",
-                "helperVersion": HELPER_VERSION,
+                "helperVersion": TEST_VERSION,
             }),
         )
         .unwrap();
 
         assert!(
-            accept_authenticated_client(&listener, uid, Duration::from_secs(1))
+            accept_authenticated_client(&listener, uid, Duration::from_secs(1), TEST_VERSION)
                 .unwrap()
                 .is_some()
         );
@@ -1098,7 +1131,7 @@ mod tests {
         HELPER_SHUTDOWN.store(false, Ordering::Release);
 
         assert!(
-            accept_authenticated_client(&listener, uid, Duration::from_millis(20))
+            accept_authenticated_client(&listener, uid, Duration::from_millis(20), TEST_VERSION)
                 .unwrap()
                 .is_none()
         );
@@ -1111,12 +1144,15 @@ mod tests {
             (HelperErrorCode::Helper, "helper-error"),
             (HelperErrorCode::Unavailable, "unavailable"),
         ] {
-            let error = validate_hello(&json!({
-                "v": HID_PROTOCOL_VERSION,
-                "type": "error",
-                "code": code.as_str(),
-                "error": "rejected",
-            }))
+            let error = validate_hello(
+                &json!({
+                    "v": HID_PROTOCOL_VERSION,
+                    "type": "error",
+                    "code": code.as_str(),
+                    "error": "rejected",
+                }),
+                TEST_VERSION,
+            )
             .unwrap_err();
             assert_eq!(connection_error_state(&error), expected);
         }

@@ -15,7 +15,7 @@ use std::{
     time::Duration,
 };
 
-use crate::hid::{HELPER_LABEL, HELPER_VERSION, HID_LAUNCH_SOCKET_NAME, hid_socket_path};
+use crate::hid::{HELPER_LABEL, HID_LAUNCH_SOCKET_NAME, hid_socket_path, required_helper_version};
 
 pub const HELPER_BINARY_NAME: &str = "herdr-micro-hid";
 pub const HELPER_PATH: &str = "/Library/PrivilegedHelperTools/dev.herdr.herdr-micro-hid";
@@ -48,7 +48,7 @@ pub fn verify_installed() -> Result<()> {
         return command_error("inspect privileged USB helper version", output);
     }
     let installed = String::from_utf8_lossy(&output.stdout);
-    let required = HELPER_VERSION;
+    let required = required_helper_version()?;
     if installed.trim() != required {
         bail!(
             "privileged USB helper {} is installed but {} is required; rerun `sudo ./bin/herdr-micro install-helper`",

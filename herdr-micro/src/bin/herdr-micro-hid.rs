@@ -16,7 +16,7 @@ fn run() -> Result<()> {
         if args.next().is_some() {
             bail!("usage: herdr-micro-hid --version")
         }
-        println!("{}", herdr_micro::hid::HELPER_VERSION);
+        println!("{}", herdr_micro::hid::running_helper_version()?);
         return Ok(());
     }
     // SAFETY: geteuid has no preconditions.

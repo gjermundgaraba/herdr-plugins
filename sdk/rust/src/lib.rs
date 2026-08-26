@@ -6,6 +6,7 @@
 
 mod client;
 mod env;
+pub mod hash;
 pub mod ndjson;
 mod types;
 #[cfg(unix)]
