@@ -227,6 +227,7 @@
                 crate.package.name
               ];
               doCheck = true;
+              nativeCheckInputs = [ pkgs.gitMinimal ];
 
               postPatch = ''
                 substituteInPlace Cargo.toml \
