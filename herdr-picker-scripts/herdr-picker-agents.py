@@ -21,6 +21,8 @@ def load_snapshot():
         api = subprocess.run(command, check=True, capture_output=True, text=True)
     except FileNotFoundError:
         sys.exit(f"{command[0]} is not on PATH")
+    except OSError as error:
+        sys.exit(f"`{command[0]}` failed: {error}")
     except subprocess.CalledProcessError as error:
         sys.exit(f"`{' '.join(command)}` failed: {error.stderr.strip()}")
     return json.loads(api.stdout)["result"]["snapshot"]

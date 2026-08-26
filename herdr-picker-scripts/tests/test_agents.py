@@ -1,6 +1,7 @@
 import importlib.util
 import pathlib
 import unittest
+from unittest import mock
 
 
 SCRIPT = pathlib.Path(__file__).parents[1] / "herdr-picker-agents.py"
@@ -28,6 +29,16 @@ def snapshot(*agents):
 
 
 class AgentsTests(unittest.TestCase):
+    def test_load_snapshot_reports_launch_error(self):
+        with (
+            mock.patch.dict(AGENTS.os.environ, {"HERDR_BIN_PATH": "/herdr"}),
+            mock.patch.object(
+                AGENTS.subprocess, "run", side_effect=PermissionError("denied")
+            ),
+            self.assertRaisesRegex(SystemExit, "`/herdr` failed: denied"),
+        ):
+            AGENTS.load_snapshot()
+
     def test_items_order_by_status_then_recency(self):
         items = AGENTS.build_items(
             snapshot(

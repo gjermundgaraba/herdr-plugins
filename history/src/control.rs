@@ -284,4 +284,18 @@ mod tests {
         assert!(error.is::<StaleBuild>());
         assert_eq!(reader.join().unwrap().trim(), "back deadbeef");
     }
+
+    #[test]
+    fn stale_reply_reads_as_stale() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut line = String::new();
+            BufReader::new(&server).read_line(&mut line).unwrap();
+            writeln!(server, "error stale").unwrap();
+            line
+        });
+        let error = send_command(client, "back", "deadbeef").unwrap_err();
+        assert!(error.is::<StaleBuild>());
+        assert_eq!(reader.join().unwrap().trim(), "back deadbeef");
+    }
 }
