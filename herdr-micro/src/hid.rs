@@ -1,11 +1,13 @@
 //! Privileged Codex Micro access over a local, versioned NDJSON socket.
 
 use anyhow::{Context, Result, anyhow, bail};
+use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::{
     cell::Cell,
     ffi::{CString, c_char, c_int, c_void},
     io::{self, BufRead, BufReader, Read, Write},
+    num::NonZeroU64,
     os::unix::{
         io::{AsRawFd, FromRawFd},
         net::{UnixListener, UnixStream},
@@ -199,6 +201,29 @@ impl HidClient {
         if self.closed.load(Ordering::Acquire) {
             bail!("device disconnected")
         }
+        let wait = DEFAULT_REQUEST_TIMEOUT
+            .checked_add(Duration::from_millis(200))
+            .unwrap_or(DEFAULT_REQUEST_TIMEOUT);
+        self.dispatch(
+            |id| {
+                json!({
+                    "type": kind,
+                    "id": id,
+                    "method": method,
+                    "params": params,
+                })
+            },
+            wait,
+            |id| format!("request {id} timed out"),
+        )
+    }
+
+    fn dispatch(
+        &self,
+        message: impl FnOnce(u64) -> Value,
+        timeout: Duration,
+        timeout_error: impl FnOnce(u64) -> String,
+    ) -> Result<Value> {
         let id = self.next_id.get();
         self.next_id.set(id + 1);
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
@@ -209,26 +234,17 @@ impl HidClient {
         assert!(pending.is_none(), "HID client started a second request");
         *pending = Some((id, reply_tx));
         drop(pending);
-        let message = json!({
-            "type": kind,
-            "id": id,
-            "method": method,
-            "params": params,
-        });
-        if let Err(error) = self.write(&message) {
+        if let Err(error) = self.write(&message(id)) {
             self.remove_pending(id);
             self.disconnect(error.to_string());
             return Err(error);
         }
-        let wait = DEFAULT_REQUEST_TIMEOUT
-            .checked_add(Duration::from_millis(200))
-            .unwrap_or(DEFAULT_REQUEST_TIMEOUT);
-        match reply_rx.recv_timeout(wait) {
+        match reply_rx.recv_timeout(timeout) {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(error)) => Err(anyhow!(error)),
             Err(_) => {
                 self.remove_pending(id);
-                bail!("request {id} timed out")
+                bail!(timeout_error(id))
             }
         }
     }
@@ -281,28 +297,12 @@ impl HidClient {
     }
 
     fn close_remote(&self) -> Result<()> {
-        let id = self.next_id.get();
-        self.next_id.set(id + 1);
-        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        let mut pending = self
-            .pending
-            .lock()
-            .map_err(|_| anyhow!("HID reply table poisoned"))?;
-        assert!(pending.is_none(), "HID client started a second request");
-        *pending = Some((id, reply_tx));
-        drop(pending);
-        if let Err(error) = self.write(&json!({
-            "type": "close",
-            "id": id,
-        })) {
-            self.remove_pending(id);
-            return Err(error);
-        }
-        reply_rx
-            .recv_timeout(HELPER_SHUTDOWN_TIMEOUT)
-            .map_err(|_| anyhow!("USB helper close timed out"))?
-            .map(|_| ())
-            .map_err(anyhow::Error::msg)
+        self.dispatch(
+            |id| json!({"type": "close", "id": id}),
+            HELPER_SHUTDOWN_TIMEOUT,
+            |_| "USB helper close timed out".into(),
+        )
+        .map(|_| ())
     }
 }
 
@@ -320,7 +320,7 @@ fn client_reader(
 ) {
     let result = (|| -> Result<()> {
         loop {
-            let message = read_message(&mut reader)?;
+            let message = read_message::<Value>(&mut reader)?;
             match message.get("type").and_then(Value::as_str) {
                 Some("reply") => {
                     let id = message
@@ -411,7 +411,7 @@ fn require_version(message: &Value) -> Result<()> {
     Ok(())
 }
 
-fn read_message(stream: &mut impl BufRead) -> Result<Value> {
+fn read_message<T: DeserializeOwned>(stream: &mut impl BufRead) -> Result<T> {
     let line = read_line(stream)?;
     serde_json::from_slice(&line).context("parse HID IPC message")
 }
@@ -675,11 +675,7 @@ fn serve_client(
     // Wake the command reader without discarding a final device/error event.
     let _ = stream.shutdown(std::net::Shutdown::Read);
     let closed = if shutting_down {
-        match done_rx.recv_timeout(HELPER_SHUTDOWN_TIMEOUT) {
-            Ok(result) => result.map_err(anyhow::Error::msg),
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(anyhow!("USB helper shutdown timed out")),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow!("HID command reader stopped")),
-        }
+        wait_for_command_completion(&done_rx, "USB helper shutdown timed out")
     } else {
         Ok(())
     };
@@ -696,7 +692,7 @@ fn event_disconnect_result(
     terminal_error: Option<&str>,
 ) -> Result<()> {
     if close_in_progress.load(Ordering::Acquire) {
-        wait_for_command_completion(done_rx, HELPER_SHUTDOWN_TIMEOUT)
+        wait_for_command_completion(done_rx, "Codex Micro disconnected")
     } else {
         Err(anyhow!(
             terminal_error
@@ -708,11 +704,11 @@ fn event_disconnect_result(
 
 fn wait_for_command_completion(
     done_rx: &mpsc::Receiver<std::result::Result<(), String>>,
-    timeout: Duration,
+    timeout_error: &str,
 ) -> Result<()> {
-    match done_rx.recv_timeout(timeout) {
+    match done_rx.recv_timeout(HELPER_SHUTDOWN_TIMEOUT) {
         Ok(result) => result.map_err(anyhow::Error::msg),
-        Err(mpsc::RecvTimeoutError::Timeout) => Err(anyhow!("Codex Micro disconnected")),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(anyhow!(timeout_error.to_owned())),
         Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow!("HID command reader stopped")),
     }
 }
@@ -725,37 +721,36 @@ fn serve_commands(
 ) -> Result<()> {
     let result = (|| -> Result<()> {
         loop {
-            let message = read_message(&mut reader)?;
-            let command = parse_command(&message)?;
+            let command: Incoming = read_message(&mut reader)?;
             match command {
                 Incoming::Close { id } => {
                     close_in_progress.store(true, Ordering::Release);
                     match device.close() {
                         Ok(()) => {
-                            write_reply(&writer, id, Ok(Value::Null))?;
+                            write_reply(&writer, id.get(), Ok(Value::Null))?;
                             return Ok(());
                         }
                         Err(error) => {
-                            write_reply(&writer, id, Err(anyhow!(error.to_string())))?;
+                            write_reply(&writer, id.get(), Err(anyhow!(error.to_string())))?;
                             return Err(error);
                         }
                     }
                 }
-                Incoming::Send { id, method, params } => {
-                    let result = if allowed_send(method) {
-                        device.send(method, params).map(|()| Value::Null)
+                Incoming::Send(Command { id, method, params }) => {
+                    let result = if allowed_send(&method) {
+                        device.send(&method, params).map(|()| Value::Null)
                     } else {
                         Err(anyhow!("HID send method is not allowed: {method}"))
                     };
-                    write_reply(&writer, id, result)?;
+                    write_reply(&writer, id.get(), result)?;
                 }
-                Incoming::Request { id, method, params } => {
-                    let result = if allowed_request(method, params.as_ref()) {
-                        device.request(method, params)
+                Incoming::Request(Command { id, method, params }) => {
+                    let result = if allowed_request(&method, params.as_ref()) {
+                        device.request(&method, params)
                     } else {
                         Err(anyhow!("HID request is not allowed: {method}"))
                     };
-                    write_reply(&writer, id, result)?;
+                    write_reply(&writer, id.get(), result)?;
                 }
             }
         }
@@ -815,50 +810,19 @@ fn write_error(stream: &mut impl Write, code: HelperErrorCode, error: &str) -> R
     )
 }
 
-enum Incoming<'a> {
-    Send {
-        id: u64,
-        method: &'a str,
-        params: Option<Value>,
-    },
-    Request {
-        id: u64,
-        method: &'a str,
-        params: Option<Value>,
-    },
-    Close {
-        id: u64,
-    },
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum Incoming {
+    Send(Command),
+    Request(Command),
+    Close { id: NonZeroU64 },
 }
 
-fn parse_command(message: &Value) -> Result<Incoming<'_>> {
-    match message.get("type").and_then(Value::as_str) {
-        Some("close") => Ok(Incoming::Close {
-            id: message
-                .get("id")
-                .and_then(Value::as_u64)
-                .filter(|id| *id != 0)
-                .ok_or_else(|| anyhow!("HID close command is missing an id"))?,
-        }),
-        Some(kind @ ("send" | "request")) => {
-            let id = message
-                .get("id")
-                .and_then(Value::as_u64)
-                .filter(|id| *id != 0)
-                .ok_or_else(|| anyhow!("HID command is missing an id"))?;
-            let method = message
-                .get("method")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow!("HID command is missing a method"))?;
-            let params = message.get("params").filter(|v| !v.is_null()).cloned();
-            if kind == "send" {
-                Ok(Incoming::Send { id, method, params })
-            } else {
-                Ok(Incoming::Request { id, method, params })
-            }
-        }
-        _ => bail!("unknown HID command"),
-    }
+#[derive(Debug, Deserialize)]
+struct Command {
+    id: NonZeroU64,
+    method: String,
+    params: Option<Value>,
 }
 
 fn allowed_request(method: &str, params: Option<&Value>) -> bool {
@@ -936,7 +900,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
-            assert_eq!(read_message(&mut reader).unwrap()["type"], "hello");
+            assert_eq!(read_message::<Value>(&mut reader).unwrap()["type"], "hello");
             write_message(
                 &mut stream,
                 &json!({
@@ -946,8 +910,15 @@ mod tests {
                 }),
             )
             .unwrap();
-            let request = read_message(&mut reader).unwrap();
-            assert!(request.get("v").is_none());
+            let request = read_message::<Incoming>(&mut reader).unwrap();
+            let request_id = match request {
+                Incoming::Request(Command { id, method, params }) => {
+                    assert_eq!(method, "device.status");
+                    assert!(params.is_none());
+                    id.get()
+                }
+                command => panic!("unexpected command: {command:?}"),
+            };
             write_message(
                 &mut stream,
                 &json!({
@@ -960,19 +931,20 @@ mod tests {
                 &mut stream,
                 &json!({
                     "type": "reply",
-                    "id": request["id"],
+                    "id": request_id,
                     "result": {"device": "ok"},
                 }),
             )
             .unwrap();
-            let close = read_message(&mut reader).unwrap();
-            assert_eq!(close["type"], "close");
-            assert!(close.get("v").is_none());
+            let close_id = match read_message::<Incoming>(&mut reader).unwrap() {
+                Incoming::Close { id } => id.get(),
+                command => panic!("unexpected command: {command:?}"),
+            };
             write_message(
                 &mut stream,
                 &json!({
                     "type": "reply",
-                    "id": close["id"],
+                    "id": close_id,
                     "result": null,
                 }),
             )
@@ -1021,7 +993,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let _ = read_message(&mut reader).unwrap();
+            let _ = read_message::<Value>(&mut reader).unwrap();
             write_message(
                 &mut stream,
                 &json!({
@@ -1031,7 +1003,7 @@ mod tests {
                 }),
             )
             .unwrap();
-            let _ = read_message(&mut reader);
+            let _ = read_message::<Value>(&mut reader);
         });
         let (events, event_rx) = mpsc::channel();
         // SAFETY: getuid has no preconditions.
@@ -1058,7 +1030,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let hello = read_message(&mut reader).unwrap();
+            let hello = read_message::<Value>(&mut reader).unwrap();
             assert_eq!(hello["helperVersion"], TEST_VERSION);
             write_message(
                 &mut stream,
@@ -1115,7 +1087,7 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        let error = read_message(&mut BufReader::new(invalid)).unwrap();
+        let error = read_message::<Value>(&mut BufReader::new(invalid)).unwrap();
         assert_eq!(error["error"], "incompatible HID client protocol");
         HELPER_SHUTDOWN.store(false, Ordering::Release);
         fs::remove_file(path).unwrap();

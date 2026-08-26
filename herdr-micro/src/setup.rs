@@ -109,23 +109,26 @@ fn oai_profile_index(keymap: &Value, managed_link_id: Option<&Value>) -> Result<
 }
 
 fn is_blank_layer(layer: &Value) -> bool {
-    layer.get("layout")
-        == Some(&json!({
-            "keymap": [
-                ["KC_NONE", "KC_NONE"],
-                ["KC_NONE", "KC_NONE", "KC_NONE", "KC_NONE"],
-                ["KC_NONE", "KC_NONE", "KC_NONE", "KC_NONE"],
-                ["KC_NONE", "KC_NONE", "KC_NONE"]
-            ],
-            "encoders": [["KC_NONE", "KC_NONE", "KC_NONE"]],
-            "joystick": {
-                "type": "RADIAL",
-                "sectors": [
-                    {"k": "KI_X", "a1": 0.1875, "a2": 0.3125},
-                    {"k": "KC_NONE", "a1": 0.3125, "a2": 0.1875}
-                ]
-            }
-        }))
+    layer.get("layout") == Some(&blank_layout())
+}
+
+fn blank_layout() -> Value {
+    json!({
+        "keymap": [
+            ["KC_NONE", "KC_NONE"],
+            ["KC_NONE", "KC_NONE", "KC_NONE", "KC_NONE"],
+            ["KC_NONE", "KC_NONE", "KC_NONE", "KC_NONE"],
+            ["KC_NONE", "KC_NONE", "KC_NONE"]
+        ],
+        "encoders": [["KC_NONE", "KC_NONE", "KC_NONE"]],
+        "joystick": {
+            "type": "RADIAL",
+            "sectors": [
+                {"k": "KI_X", "a1": 0.1875, "a2": 0.3125},
+                {"k": "KC_NONE", "a1": 0.3125, "a2": 0.1875}
+            ]
+        }
+    })
 }
 
 /// Copies the compatible Layer 1 layout into blank or previously managed Layer 2.
@@ -356,19 +359,24 @@ fn backup_keymap(bytes: &[u8]) -> Result<PathBuf> {
     let dir = backup_dir()?;
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
     let path = dir.join(format!("keymap-before-setup-{stamp}.json"));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
-        .with_context(|| format!("create {}", path.display()))?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
+    write_new_file(&path, 0o600, bytes)?;
     fs::File::open(&dir)?.sync_all()?;
     if fs::read(&path)? != bytes {
         bail!("keymap backup verification failed: {}", path.display());
     }
     Ok(path)
+}
+
+fn write_new_file(path: &Path, mode: u32, bytes: &[u8]) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(path)
+        .with_context(|| format!("create {}", path.display()))?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
 }
 
 fn update_keymap_with<B, R, W>(
@@ -555,13 +563,7 @@ pub fn install_pi_effort(source: &Path, target: &Path, timestamp: u128) -> Resul
     fs::create_dir_all(parent)?;
     let backup = if let Some(bytes) = current {
         let backup = PathBuf::from(format!("{}.bak-{timestamp}", target.display()));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o644)
-            .open(&backup)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
+        write_new_file(&backup, 0o644, &bytes)?;
         Some(backup)
     } else {
         None
@@ -571,14 +573,8 @@ pub fn install_pi_effort(source: &Path, target: &Path, timestamp: u128) -> Resul
         .and_then(|name| name.to_str())
         .ok_or_else(|| anyhow!("Pi extension target has no file name"))?;
     let temporary = parent.join(format!(".{name}.tmp-{}-{timestamp}", std::process::id()));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o644)
-        .open(&temporary)?;
     let written = (|| -> Result<()> {
-        file.write_all(&bundled)?;
-        file.sync_all()?;
+        write_new_file(&temporary, 0o644, &bundled)?;
         fs::rename(&temporary, target)?;
         fs::File::open(parent)?.sync_all()?;
         Ok(())
@@ -615,22 +611,7 @@ mod tests {
 
     fn blank_layer() -> Value {
         json!({
-            "layout": {
-                "keymap": [
-                    ["KC_NONE", "KC_NONE"],
-                    ["KC_NONE", "KC_NONE", "KC_NONE", "KC_NONE"],
-                    ["KC_NONE", "KC_NONE", "KC_NONE", "KC_NONE"],
-                    ["KC_NONE", "KC_NONE", "KC_NONE"]
-                ],
-                "encoders": [["KC_NONE", "KC_NONE", "KC_NONE"]],
-                "joystick": {
-                    "type": "RADIAL",
-                    "sectors": [
-                        { "k": "KI_X", "a1": 0.1875, "a2": 0.3125 },
-                        { "k": "KC_NONE", "a1": 0.3125, "a2": 0.1875 }
-                    ]
-                }
-            }
+            "layout": blank_layout()
         })
     }
 

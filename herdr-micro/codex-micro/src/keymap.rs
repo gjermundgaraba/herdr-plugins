@@ -45,10 +45,7 @@ where
         if chunk.is_empty() {
             bail!("empty keymap chunk");
         }
-        if offset
-            .checked_add(chunk.len())
-            .is_none_or(|end| end > total)
-        {
+        if chunk.len() > total - offset {
             bail!("invalid keymap chunk size");
         }
         offset += chunk.len();

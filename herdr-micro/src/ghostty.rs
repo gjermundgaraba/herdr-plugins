@@ -1,8 +1,8 @@
 use anyhow::{Result, anyhow, bail};
 use objc2::{class, msg_send, rc::Retained, runtime::AnyObject};
+use objc2_foundation::NSString;
 use serde::Serialize;
 use std::cell::RefCell;
-use std::ffi::{CStr, CString, c_char};
 use std::thread;
 use std::time::Duration;
 
@@ -24,20 +24,12 @@ pub struct GhosttyTerminal {
     pub name: String,
 }
 
-fn ns_string(value: &CStr) -> Result<Retained<AnyObject>> {
-    // SAFETY: NSString copies the valid, NUL-terminated UTF-8 string.
-    let string: Option<Retained<AnyObject>> =
-        unsafe { msg_send![class!(NSString), stringWithUTF8String: value.as_ptr()] };
-    string.ok_or_else(|| anyhow!("could not create native string"))
-}
-
 fn ghostty_application() -> Result<Retained<AnyObject>> {
     GHOSTTY.with_borrow_mut(|cached| {
         if let Some(app) = cached {
             return Ok(app.clone());
         }
-        let bundle_id = CString::new(GHOSTTY_PROCESS).expect("static bundle ID contains NUL");
-        let bundle = ns_string(&bundle_id)?;
+        let bundle = NSString::from_str(GHOSTTY_PROCESS);
         // SAFETY: This is the documented ScriptingBridge application factory.
         let app: Option<Retained<AnyObject>> =
             unsafe { msg_send![class!(SBApplication), applicationWithBundleIdentifier: &*bundle] };
@@ -85,15 +77,10 @@ fn array_items(array: &AnyObject) -> Result<Vec<Retained<AnyObject>>> {
 }
 
 fn string(object: &AnyObject) -> Result<String> {
-    // SAFETY: Ghostty's SDEF declares these values as text (NSString).
-    let value: *const c_char = unsafe { msg_send![object, UTF8String] };
-    if value.is_null() {
-        bail!("Ghostty returned invalid text")
-    }
-    // SAFETY: NSString's UTF8String is NUL-terminated and lives with `object`.
-    Ok(unsafe { CStr::from_ptr(value) }
-        .to_string_lossy()
-        .into_owned())
+    object
+        .downcast_ref::<NSString>()
+        .map(ToString::to_string)
+        .ok_or_else(|| anyhow!("Ghostty returned invalid text"))
 }
 
 fn string_property(
@@ -170,9 +157,7 @@ pub fn scroll_terminal(terminal_id: &str, x: f64, y: f64, notches: i32) -> Resul
         let app = ghostty_application()?;
         let terminals = object(&app, objc2::sel!(terminals))?
             .ok_or_else(|| anyhow!("Ghostty returned no terminals"))?;
-        let terminal_id = CString::new(terminal_id)
-            .map_err(|_| anyhow!("Ghostty terminal ID contains invalid text"))?;
-        let terminal_id = ns_string(&terminal_id)?;
+        let terminal_id = NSString::from_str(terminal_id);
         // SAFETY: SBElementArray.objectWithID: returns the exact terminal specifier for this UUID.
         let terminal: Option<Retained<AnyObject>> =
             unsafe { msg_send![&*terminals, objectWithID: &*terminal_id] };

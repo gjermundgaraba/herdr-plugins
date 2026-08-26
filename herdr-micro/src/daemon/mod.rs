@@ -39,7 +39,7 @@ const SESSION_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const SESSION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const ROUTING_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 const WORK_QUEUE_CAPACITY: usize = 16;
-pub const DAEMON_PROTOCOL_VERSION: u32 = 2;
+pub const DAEMON_PROTOCOL_VERSION: u32 = 3;
 
 static LOG_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -57,6 +57,14 @@ pub fn log(message: impl AsRef<str>) {
         return;
     }
     eprintln!("{line}");
+}
+
+pub(super) fn log_changed(last: &mut String, next: String, prefix: &str) {
+    if *last == next {
+        return;
+    }
+    log(format!("{prefix}{next}"));
+    *last = next;
 }
 
 fn format_timestamp(time: SystemTime) -> String {
@@ -130,18 +138,7 @@ pub fn run_daemon() -> Result<()> {
         }
     });
     let status = Arc::new(Mutex::new(state.status()));
-    let server = listen_for_control(
-        {
-            let status = Arc::clone(&status);
-            move || {
-                status
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .clone()
-            }
-        },
-        Arc::clone(&stopping),
-    )?;
+    let server = listen_for_control(Arc::clone(&status), Arc::clone(&stopping))?;
     let (shutdown_tx, shutdown_rx) = mpsc::channel();
     let (control_result_tx, control_result_rx) = mpsc::sync_channel(1);
     let control_thread = thread::spawn(move || {
@@ -198,10 +195,11 @@ pub fn run_daemon() -> Result<()> {
                     Ok(()) => state.last_lighting_error.clear(),
                     Err(error) => {
                         let error = format!("{error:#}");
-                        if state.last_lighting_error != error {
-                            log(format!("lighting update failed: {error}"));
-                            state.last_lighting_error = error;
-                        }
+                        log_changed(
+                            &mut state.last_lighting_error,
+                            error,
+                            "lighting update failed: ",
+                        );
                     }
                 }
             }

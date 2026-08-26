@@ -1,6 +1,6 @@
 title = "Agents"
 mode = "vim"
-# Focus the chosen agent, then mark the pane you left unseen (fork-only API).
+# Focus the chosen agent, then mark the pane you left unseen (build-specific API).
 submit = ["herdr-picker-focus-agent-unseen.py"]
 
 [[steps]]

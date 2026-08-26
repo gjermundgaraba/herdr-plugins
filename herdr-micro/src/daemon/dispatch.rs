@@ -24,7 +24,7 @@ use crate::{
         Action, Binding, Direction, Modifier, VerticalDirection, key_action_code, key_binding,
     },
     device::DeviceEvent,
-    gestures::{Fired, GestureDispatcher},
+    gestures::{Fired, GestureContext, GestureDispatcher},
     ghostty::{focused_terminal_id, scroll_terminal},
     herdr::{COMMAND_TIMEOUT, Session, current_snapshot, run_command_with_timeout},
     macos,
@@ -32,7 +32,10 @@ use crate::{
     setup::plugin_root,
 };
 
-use super::{log, reconcile::InputContext};
+use super::{
+    log,
+    reconcile::{InputContext, InputRoute},
+};
 
 #[derive(Default)]
 struct InputState {
@@ -40,22 +43,22 @@ struct InputState {
     last_joystick_sector: Option<u8>,
 }
 
-pub(super) enum Work {
+pub(super) struct Work {
+    source: String,
+    session: Session,
+    terminal: String,
+    generation: u64,
+    kind: WorkKind,
+}
+
+enum WorkKind {
     Binding {
         binding: Box<Binding>,
-        source: String,
-        session: Session,
-        terminal: String,
         target: Option<(String, String, Option<String>)>,
-        generation: u64,
     },
     FocusSlot {
         pane_id: String,
         agent_terminal_id: String,
-        source: String,
-        session: Session,
-        terminal: String,
-        generation: u64,
     },
 }
 
@@ -153,15 +156,7 @@ fn execute_scroll(
         .iter()
         .find(|layout| layout.workspace_id == pane.workspace_id && layout.tab_id == pane.tab_id)
         .ok_or_else(|| anyhow!("focused pane layout unavailable"))?;
-    let plan = scroll_plan(
-        pane,
-        layout,
-        match direction {
-            VerticalDirection::Up => "up",
-            VerticalDirection::Down => "down",
-        },
-        percent,
-    )?;
+    let plan = scroll_plan(pane, layout, direction.as_str(), percent)?;
     let cell = lease
         .client()
         .call_value("pane.graphics.info", &json!({ "pane_id": expected_pane }))?;
@@ -183,10 +178,7 @@ fn execute_scroll(
     )?;
     log(format!(
         "scrolled {} {percent}% in {}/{}",
-        match direction {
-            VerticalDirection::Up => "up",
-            VerticalDirection::Down => "down",
-        },
+        direction.as_str(),
         lease.session.name,
         plan.pane_id
     ));
@@ -282,12 +274,7 @@ fn execute_action(
         }
         Action::Script { command, args } => execute_script(command, args, current, lease)?,
         Action::FocusPane { direction } => {
-            let direction = match direction {
-                Direction::Up => "up",
-                Direction::Down => "down",
-                Direction::Left => "left",
-                Direction::Right => "right",
-            };
+            let direction = direction.as_str();
             let pane = require_agent(current)?.pane_id.clone();
             lease.ensure()?;
             focus_pane(&client, &pane, direction)?;
@@ -313,27 +300,23 @@ fn execute_action(
 }
 
 fn execute_work(work: Work, routing_generation: &AtomicU64) -> Result<()> {
-    let generation = match &work {
-        Work::Binding { generation, .. } | Work::FocusSlot { generation, .. } => *generation,
-    };
+    let Work {
+        source,
+        session,
+        terminal,
+        generation,
+        kind,
+    } = work;
     if generation != routing_generation.load(Ordering::Acquire) {
         log("control ignored: stale Herdr routing");
         return Ok(());
     }
-    let (session_info, terminal) = match &work {
-        Work::Binding {
-            session, terminal, ..
-        }
-        | Work::FocusSlot {
-            session, terminal, ..
-        } => (session.clone(), terminal.clone()),
-    };
-    let snapshot = match current_snapshot(&session_info.client()) {
+    let snapshot = match current_snapshot(&session.client()) {
         Ok(snapshot) => snapshot,
         Err(error) => {
             log(format!(
                 "control failed: refresh {}: {error:#}",
-                session_info.name
+                session.name
             ));
             return Ok(());
         }
@@ -343,18 +326,15 @@ fn execute_work(work: Work, routing_generation: &AtomicU64) -> Result<()> {
         return Ok(());
     }
     let lease = DispatchLease {
-        session: &session_info,
+        session: &session,
         terminal: &terminal,
         generation,
         routing_generation,
     };
-    match work {
-        Work::FocusSlot {
+    match kind {
+        WorkKind::FocusSlot {
             pane_id,
             agent_terminal_id,
-            source,
-            session,
-            ..
         } => {
             if !snapshot
                 .agents
@@ -367,13 +347,7 @@ fn execute_work(work: Work, routing_generation: &AtomicU64) -> Result<()> {
             focus_agent(&lease.client(), &pane_id)?;
             log(format!("{source}: focused {}/{pane_id}", session.name));
         }
-        Work::Binding {
-            binding,
-            source,
-            session,
-            target,
-            ..
-        } => {
+        WorkKind::Binding { binding, target } => {
             let current = snapshot.agents.iter().find(|agent| agent.focused);
             if agent_identity(current) != target {
                 log(format!("{source} ignored: focused pane changed"));
@@ -407,6 +381,15 @@ fn execute_work(work: Work, routing_generation: &AtomicU64) -> Result<()> {
     Ok(())
 }
 
+fn queue_work(sender: &SyncSender<Work>, work: Work) {
+    if let Err(error) = sender.try_send(work) {
+        log(match error {
+            TrySendError::Full(_) => "control ignored: action queue full",
+            TrySendError::Disconnected(_) => "control ignored: worker stopped",
+        });
+    }
+}
+
 pub(super) fn action_worker(
     receiver: Receiver<Work>,
     routing_generation: Arc<AtomicU64>,
@@ -436,9 +419,8 @@ fn queue_binding(
     sender: &SyncSender<Work>,
     binding: Binding,
     source: String,
-    route: Option<(Session, String)>,
+    route: Option<InputRoute>,
     target: Option<AgentInfo>,
-    generation: u64,
 ) {
     // Key taps are system-wide by nature: fire from any frontmost app while
     // the bridge owns the device, and never wait on the action queue.
@@ -455,21 +437,24 @@ fn queue_binding(
         return;
     }
     match route {
-        Some((session, terminal)) => {
-            let work = Work::Binding {
-                binding: Box::new(binding),
-                source,
-                session,
-                terminal,
-                target: agent_identity(target.as_ref()),
-                generation,
-            };
-            if let Err(error) = sender.try_send(work) {
-                log(match error {
-                    TrySendError::Full(_) => "control ignored: action queue full",
-                    TrySendError::Disconnected(_) => "control ignored: worker stopped",
-                });
-            }
+        Some(InputRoute {
+            session,
+            terminal,
+            generation,
+        }) => {
+            queue_work(
+                sender,
+                Work {
+                    source,
+                    session,
+                    terminal,
+                    generation,
+                    kind: WorkKind::Binding {
+                        binding: Box::new(binding),
+                        target: agent_identity(target.as_ref()),
+                    },
+                },
+            );
         }
         None => log(format!("{source} ignored: no ready Herdr session")),
     }
@@ -482,11 +467,19 @@ fn handle_fired(
     fired: Vec<Fired>,
 ) {
     for fired in fired {
-        let route = context.selected(routing_generation).filter(|(session, _)| {
+        if fired
+            .context
+            .as_ref()
+            .is_some_and(|context| context.generation != routing_generation.load(Ordering::Acquire))
+        {
+            log(format!("{} ignored: stale Herdr routing", fired.source));
+            continue;
+        }
+        let route = context.selected(routing_generation).filter(|route| {
             fired
                 .context
-                .as_deref()
-                .is_some_and(|name| name == session.name)
+                .as_ref()
+                .is_some_and(|context| context.session == route.session.name)
         });
         queue_binding(
             sender,
@@ -494,7 +487,6 @@ fn handle_fired(
             fired.source,
             route,
             context.target.clone(),
-            context.generation,
         );
     }
 }
@@ -529,21 +521,20 @@ fn handle_device_event(
                 controls.joystick.release_distance,
             );
             state.last_joystick_sector = next.sector;
-            let (action, direction) = match next.direction {
-                Some(Direction::Up) => (&controls.joystick.up, "up"),
-                Some(Direction::Down) => (&controls.joystick.down, "down"),
-                Some(Direction::Left) => (&controls.joystick.left, "left"),
-                Some(Direction::Right) => (&controls.joystick.right, "right"),
+            let (binding, direction) = match next.direction {
+                Some(Direction::Up) => (&controls.joystick.up, Direction::Up),
+                Some(Direction::Down) => (&controls.joystick.down, Direction::Down),
+                Some(Direction::Left) => (&controls.joystick.left, Direction::Left),
+                Some(Direction::Right) => (&controls.joystick.right, Direction::Right),
                 None => return,
             };
-            if let Some(action) = action.clone() {
+            if let Some(binding) = binding.clone() {
                 queue_binding(
                     worker,
-                    Binding::Action(action),
-                    format!("joystick {direction}"),
+                    binding,
+                    format!("joystick {}", direction.as_str()),
                     context.selected(routing_generation),
                     context.target.clone(),
-                    context.generation,
                 );
             }
         }
@@ -553,23 +544,20 @@ fn handle_device_event(
                     let session = context.selected(routing_generation);
                     let agent = context.slots[index].as_ref();
                     match (session, agent) {
-                        (Some((session, terminal)), Some(agent)) => {
-                            let work = Work::FocusSlot {
-                                pane_id: agent.pane_id.clone(),
-                                agent_terminal_id: agent.terminal_id.clone(),
-                                source: key,
-                                session,
-                                terminal,
-                                generation: context.generation,
-                            };
-                            if let Err(error) = worker.try_send(work) {
-                                log(match error {
-                                    TrySendError::Full(_) => "control ignored: action queue full",
-                                    TrySendError::Disconnected(_) => {
-                                        "control ignored: worker stopped"
-                                    }
-                                });
-                            }
+                        (Some(route), Some(agent)) => {
+                            queue_work(
+                                worker,
+                                Work {
+                                    source: key,
+                                    session: route.session,
+                                    terminal: route.terminal,
+                                    generation: route.generation,
+                                    kind: WorkKind::FocusSlot {
+                                        pane_id: agent.pane_id.clone(),
+                                        agent_terminal_id: agent.terminal_id.clone(),
+                                    },
+                                },
+                            );
                         }
                         _ => log(format!("{key} ignored: no ready Agent slot")),
                     }
@@ -578,17 +566,13 @@ fn handle_device_event(
             }
             let binding = key_binding(controls, &key, action);
             let captured = context.selected(routing_generation);
-            let gesture_context = captured.as_ref().map(|(session, _)| session.name.clone());
+            let gesture_context = captured.as_ref().map(|route| GestureContext {
+                session: route.session.name.clone(),
+                generation: route.generation,
+            });
             if matches!(key.as_str(), "ENC_CC" | "ENC_CW") {
                 if let Some(binding) = binding {
-                    queue_binding(
-                        worker,
-                        binding,
-                        key,
-                        captured,
-                        context.target.clone(),
-                        context.generation,
-                    );
+                    queue_binding(worker, binding, key, captured, context.target.clone());
                 }
             } else if matches!(action, 0 | 1) {
                 match binding.as_ref() {
@@ -610,7 +594,6 @@ fn handle_device_event(
                         key,
                         captured,
                         context.target.clone(),
-                        context.generation,
                     ),
                     _ => {}
                 }
@@ -626,8 +609,10 @@ fn refresh_input_context(
     routing_generation: &AtomicU64,
 ) {
     let next = Arc::clone(&shared.lock().unwrap_or_else(|error| error.into_inner()));
-    if next.generation != context.generation
-        || next.generation != routing_generation.load(Ordering::Acquire)
+    let next_generation = next.route.as_ref().map(|route| route.generation);
+    if next_generation != context.route.as_ref().map(|route| route.generation)
+        || next_generation
+            .is_some_and(|generation| generation != routing_generation.load(Ordering::Acquire))
     {
         state.gestures.clear();
         state.last_joystick_sector = None;
@@ -808,12 +793,13 @@ printf '%s\n' --call "$@" >> "$HERDR_TEST_LOG"
         let config = Config::default();
         let context = InputContext {
             controls: config.controls,
-            session: Some(session("work")),
-            terminal: Some("terminal".into()),
+            route: Some(InputRoute {
+                session: session("work"),
+                terminal: "terminal".into(),
+                generation: 0,
+            }),
             target: Some(target),
             slots: vec![None; SLOT_COUNT],
-            routing_ready: true,
-            generation: 0,
         };
         let routing_generation = AtomicU64::new(0);
         let mut state = InputState::default();
@@ -830,8 +816,10 @@ printf '%s\n' --call "$@" >> "$HERDR_TEST_LOG"
             &notices,
         );
         match receiver.recv_timeout(Duration::from_millis(100)).unwrap() {
-            Work::Binding {
-                session, target, ..
+            Work {
+                session,
+                kind: WorkKind::Binding { target, .. },
+                ..
             } => {
                 assert_eq!(session.name, "work");
                 assert_eq!(
@@ -841,6 +829,39 @@ printf '%s\n' --call "$@" >> "$HERDR_TEST_LOG"
             }
             _ => panic!("expected configured binding"),
         }
+    }
+
+    #[test]
+    fn stale_gesture_is_rejected_after_same_session_generation_change() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let config = Config::default();
+        let context = InputContext {
+            controls: config.controls,
+            route: Some(InputRoute {
+                session: session("work"),
+                terminal: "terminal".into(),
+                generation: 2,
+            }),
+            target: None,
+            slots: vec![None; SLOT_COUNT],
+        };
+        let routing_generation = AtomicU64::new(2);
+
+        handle_fired(
+            &sender,
+            &context,
+            &routing_generation,
+            vec![Fired {
+                action: Action::Submit,
+                source: "ACT00 tap".into(),
+                context: Some(GestureContext {
+                    session: "work".into(),
+                    generation: 1,
+                }),
+            }],
+        );
+
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]

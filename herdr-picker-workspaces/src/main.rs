@@ -35,10 +35,7 @@ fn workspace_items(snapshot: &SessionSnapshot) -> Vec<Item> {
                 indicator: indicator.into(),
                 tone: Some(tone),
                 spinning,
-                search: format!(
-                    "{} {} {}",
-                    workspace.workspace_id, workspace.label, workspace.agent_status
-                ),
+                search: String::new(),
                 value: json!({
                     "workspace_id": workspace.workspace_id,
                     "number": workspace.number,

@@ -74,8 +74,10 @@ fn pi_extension() -> Option<PathBuf> {
 
 pub fn doctor() -> Report {
     let mut report = Report::default();
-    check(&mut report, "Rust executable", || {
-        let path = plugin_root()?.join("bin/herdr-micro");
+    check(&mut report, "HID helper executable", || {
+        let path = plugin_root()?
+            .join("bin")
+            .join(helper_install::HELPER_BINARY_NAME);
         let mode = fs::metadata(&path)?.permissions().mode();
         if mode & 0o111 == 0 {
             anyhow::bail!("{} is not executable", path.display());

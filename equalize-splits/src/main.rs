@@ -15,7 +15,7 @@ const SOCKET_TIMEOUT: Duration = Duration::from_secs(1);
 // retries if another client continuously changes the same layout.
 const MAX_RATIO_UPDATES: usize = 64;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 struct RatioUpdate {
     path: Vec<bool>,
     ratio: f64,

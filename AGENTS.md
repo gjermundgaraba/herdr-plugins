@@ -1,4 +1,4 @@
-# herdr-stuff agent instructions
+# herdr-plugins agent instructions
 
 This is a repo with herdr plugins.
 

@@ -11,7 +11,7 @@ run_step() {
   time "$@"
 }
 
-required_packages=(build-essential ca-certificates curl pkg-config)
+required_packages=(build-essential ca-certificates curl)
 missing_packages=()
 for package in "${required_packages[@]}"; do
   if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -Fqx 'install ok installed'; then

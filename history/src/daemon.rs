@@ -75,7 +75,7 @@ pub(crate) fn run_daemon() -> Result<()> {
         .with_context(|| format!("cannot bind {}", paths.control_socket.display()))?;
     listener.set_nonblocking(true)?;
     let _socket_cleanup = SocketCleanup(&paths.control_socket);
-    let mut state = State::fresh();
+    let mut state = State::default();
     let mut server_identity = None;
     let mut connection = None;
     let mut reconnect_at = Instant::now();
@@ -116,29 +116,18 @@ pub(crate) fn run_daemon() -> Result<()> {
             }
         }
 
-        if connection
+        let ready = if connection
             .as_ref()
             .is_some_and(|connected| connected.subscription.has_buffered_event())
         {
-            match connection.as_mut().unwrap().record_next_event(&mut state) {
-                Ok(true) => {}
-                Ok(false) => {
-                    connection = None;
-                    reconnect_at = Instant::now();
-                }
-                Err(error) => {
-                    log_error(&format!("{error:#}"));
-                    connection = None;
-                    reconnect_at = Instant::now();
-                }
-            }
-            continue;
-        }
-
-        match wait_ready(
-            &listener,
-            connection.as_ref().map(|connected| &connected.subscription),
-        )? {
+            Ready::Event
+        } else {
+            wait_ready(
+                &listener,
+                connection.as_ref().map(|connected| &connected.subscription),
+            )?
+        };
+        match ready {
             Ready::Event => {
                 let result = connection.as_mut().unwrap().record_next_event(&mut state);
                 match result {
@@ -283,7 +272,7 @@ fn connect_focus_stream(
         .set_receive_timeout(SOCKET_TIMEOUT)
         .context("cannot bound focus event reads")?;
     if server_identity.as_ref() != Some(&identity) {
-        *state = State::fresh();
+        *state = State::default();
         *server_identity = Some(identity);
     }
     state.expire_echoes(now_ms());

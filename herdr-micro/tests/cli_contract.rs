@@ -8,6 +8,8 @@ use std::{
     thread,
 };
 
+use herdr_micro::daemon::DAEMON_PROTOCOL_VERSION;
+
 const BIN: &str = env!("CARGO_BIN_EXE_herdr-micro");
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -69,14 +71,16 @@ fn status_stop_and_start_use_the_newline_json_socket_without_spawning() {
     let listener = UnixListener::bind(&socket).unwrap();
     let server = thread::spawn(move || {
         for (expected, response) in [
-            ("{\"command\":\"status\"}\n", "{\"fixture\":\"status\"}\n"),
-            ("{\"command\":\"stop\"}\n", "{\"stopping\":true}\n"),
             (
                 "{\"command\":\"status\"}\n",
-                concat!(
-                    "{\"fixture\":\"live\",\"version\":\"",
-                    env!("CARGO_PKG_VERSION"),
-                    "\",\"protocol\":2}\n"
+                "{\"fixture\":\"status\"}\n".into(),
+            ),
+            ("{\"command\":\"stop\"}\n", "{\"stopping\":true}\n".into()),
+            (
+                "{\"command\":\"status\"}\n",
+                format!(
+                    "{{\"fixture\":\"live\",\"version\":\"{}\",\"protocol\":{DAEMON_PROTOCOL_VERSION}}}\n",
+                    env!("CARGO_PKG_VERSION")
                 ),
             ),
         ] {
@@ -87,14 +91,13 @@ fn status_stop_and_start_use_the_newline_json_socket_without_spawning() {
     });
 
     for (args, expected) in [
-        (vec!["status"], "{\n  \"fixture\": \"status\"\n}\n"),
-        (vec!["stop"], "{\n  \"stopping\": true\n}\n"),
+        (vec!["status"], "{\n  \"fixture\": \"status\"\n}\n".into()),
+        (vec!["stop"], "{\n  \"stopping\": true\n}\n".into()),
         (
             vec!["start"],
-            concat!(
-                "{\"fixture\":\"live\",\"protocol\":2,\"version\":\"",
-                env!("CARGO_PKG_VERSION"),
-                "\"}\n"
+            format!(
+                "{{\"fixture\":\"live\",\"protocol\":{DAEMON_PROTOCOL_VERSION},\"version\":\"{}\"}}\n",
+                env!("CARGO_PKG_VERSION")
             ),
         ),
     ] {

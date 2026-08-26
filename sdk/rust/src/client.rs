@@ -18,7 +18,7 @@ use crate::{
 
 type LocalStream = interprocess::local_socket::Stream;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Client {
     socket_path: PathBuf,
     timeout: Option<Duration>,
@@ -45,10 +45,6 @@ impl Client {
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
-    }
-
-    pub fn socket_path(&self) -> &Path {
-        &self.socket_path
     }
 
     /// Call any Herdr socket method and deserialize its `result` object.
@@ -138,7 +134,7 @@ impl Client {
             return Err(Error::UnexpectedResult(ack.kind));
         }
         if self.timeout.is_some() {
-            set_timeout_best_effort(reader.get_ref(), TimeoutKind::Recv, None)?;
+            set_timeout_best_effort(reader.get_ref().set_recv_timeout(None))?;
         }
         Ok(Subscription {
             reader,
@@ -161,8 +157,8 @@ impl Client {
         let Some(timeout) = self.timeout else {
             return Ok(());
         };
-        set_timeout_best_effort(stream, TimeoutKind::Send, Some(timeout))?;
-        set_timeout_best_effort(stream, TimeoutKind::Recv, Some(timeout))
+        set_timeout_best_effort(stream.set_send_timeout(Some(timeout)))?;
+        set_timeout_best_effort(stream.set_recv_timeout(Some(timeout)))
     }
 }
 
@@ -219,14 +215,6 @@ impl Subscription {
             ));
         }
         serde_json::from_value(value).map(Some).map_err(Error::Json)
-    }
-}
-
-impl Iterator for Subscription {
-    type Item = Result<EventEnvelope, Error>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.next_event().transpose()
     }
 }
 
@@ -309,15 +297,11 @@ struct Response<R> {
 
 #[derive(Deserialize)]
 struct SnapshotResult {
-    #[serde(rename = "type")]
-    _kind: String,
     snapshot: SessionSnapshot,
 }
 
 #[derive(Deserialize)]
 struct PaneResult {
-    #[serde(rename = "type")]
-    _kind: String,
     pane: PaneInfo,
 }
 
@@ -353,7 +337,11 @@ fn read_response<T: DeserializeOwned, R: BufRead>(
     reader: &mut R,
     expected_id: &str,
 ) -> Result<T, Error> {
-    let response = read_json_line::<Response<T>, _>(reader)?.ok_or(Error::EmptyResponse)?;
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        return Err(Error::EmptyResponse);
+    }
+    let response: Response<T> = serde_json::from_str(&line).map_err(Error::Json)?;
     if response.id != expected_id {
         return Err(Error::MismatchedResponseId {
             expected: expected_id.to_owned(),
@@ -364,14 +352,6 @@ fn read_response<T: DeserializeOwned, R: BufRead>(
         return Err(Error::Api(error));
     }
     response.result.ok_or(Error::MissingResult)
-}
-
-fn read_json_line<T: DeserializeOwned, R: BufRead>(reader: &mut R) -> Result<Option<T>, Error> {
-    let mut line = String::new();
-    if reader.read_line(&mut line)? == 0 {
-        return Ok(None);
-    }
-    serde_json::from_str(&line).map(Some).map_err(Error::Json)
 }
 
 fn connect_local_stream(path: &Path) -> io::Result<LocalStream> {
@@ -391,20 +371,7 @@ fn connect_local_stream(path: &Path) -> io::Result<LocalStream> {
     }
 }
 
-enum TimeoutKind {
-    Send,
-    Recv,
-}
-
-fn set_timeout_best_effort(
-    stream: &LocalStream,
-    kind: TimeoutKind,
-    timeout: Option<Duration>,
-) -> Result<(), Error> {
-    let result = match kind {
-        TimeoutKind::Send => stream.set_send_timeout(timeout),
-        TimeoutKind::Recv => stream.set_recv_timeout(timeout),
-    };
+fn set_timeout_best_effort(result: io::Result<()>) -> Result<(), Error> {
     match result {
         Ok(()) => Ok(()),
         #[cfg(windows)]
@@ -413,8 +380,24 @@ fn set_timeout_best_effort(
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn api_errors_keep_the_server_code() {
+        let line = br#"{"id":"x","error":{"code":"not_found","message":"pane not found"}}
+"#;
+        let error = read_response::<Value, _>(&mut &line[..], "x").expect_err("error response");
+        match error {
+            Error::Api(error) => assert_eq!(error.code, "not_found"),
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::thread;
 
@@ -490,17 +473,6 @@ mod tests {
         assert_eq!(ping["protocol"], 19);
         server.join().expect("server thread");
         let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn api_errors_keep_the_server_code() {
-        let line = br#"{"id":"x","error":{"code":"not_found","message":"pane not found"}}
-"#;
-        let error = read_response::<Value, _>(&mut &line[..], "x").expect_err("error response");
-        match error {
-            Error::Api(error) => assert_eq!(error.code, "not_found"),
-            other => panic!("unexpected error: {other}"),
-        }
     }
 
     #[test]
@@ -617,25 +589,49 @@ mod tests {
     }
 
     #[test]
-    fn subscription_rejects_oversized_frames() {
-        let (path, server) = subscription_server("subscription-oversized", |stream| {
-            stream
-                .write_all(&vec![b'x'; crate::ndjson::MAX_FRAME_BYTES + 1])
-                .expect("write oversized event");
+    fn subscription_enforces_frame_boundaries() {
+        let (path, server) = subscription_server("subscription-frame-boundaries", |stream| {
+            let mut event = br#"{"event":"pane_focused","data":{"type":"pane_focused","pane_id":"w1:p1","padding":""#
+                .to_vec();
+            let suffix = b"\"}}\n";
+            event.resize(crate::ndjson::MAX_FRAME_BYTES - suffix.len(), b'x');
+            event.extend_from_slice(suffix);
+            assert_eq!(
+                event.len(),
+                crate::ndjson::MAX_FRAME_BYTES,
+                "exact-cap frame size"
+            );
+            stream.write_all(&event).expect("write exact-cap event");
+
+            let mut oversized = vec![b'x'; crate::ndjson::MAX_FRAME_BYTES + 1];
+            *oversized.last_mut().expect("oversized frame is nonempty") = b'\n';
+            stream.write_all(&oversized).expect("write oversized event");
         });
 
         let mut subscription = Client::new(&path)
             .subscribe(&[EventSubscription::new("pane.focused")])
             .expect("subscribe");
-        assert!(matches!(
-            subscription.next_event(),
-            Err(Error::Io(error)) if error.kind() == io::ErrorKind::InvalidData
-        ));
+        assert_eq!(
+            subscription
+                .next_event()
+                .expect("read exact-cap event")
+                .expect("event before close")
+                .data["pane_id"],
+            "w1:p1"
+        );
+        assert!(
+            matches!(
+                subscription.next_event(),
+                Err(Error::Io(error)) if error.kind() == io::ErrorKind::InvalidData
+            ),
+            "cap+1 frame should be rejected as invalid data"
+        );
         assert!(
             subscription
                 .next_event()
-                .expect("read ended state")
-                .is_none()
+                .expect("read ended state after oversized frame")
+                .is_none(),
+            "subscription should remain ended after oversized frame"
         );
         server.join().expect("server thread");
         let _ = std::fs::remove_file(path);

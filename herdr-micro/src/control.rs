@@ -8,7 +8,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
     mpsc::Receiver,
 };
@@ -161,10 +161,10 @@ fn identity(path: &Path) -> Result<Option<SocketIdentity>> {
 /// A bound server. Every connection is served on its own short-lived thread so
 /// status calls overlap.
 pub struct ControlServer {
-    listener: Option<UnixListener>,
+    listener: UnixListener,
     path: PathBuf,
     owned: SocketIdentity,
-    status: Arc<dyn Fn() -> Value + Send + Sync>,
+    status: Arc<Mutex<Value>>,
     stopping: Arc<AtomicBool>,
 }
 
@@ -172,11 +172,7 @@ impl ControlServer {
     /// The synchronous daemon-loop variant for callers that already have a
     /// shutdown channel. Disconnecting the channel also ends the loop.
     pub fn run_with_shutdown(&self, shutdown: &Receiver<()>) -> Result<()> {
-        let listener = self
-            .listener
-            .as_ref()
-            .ok_or_else(|| anyhow!("Micro bridge server is closed"))?;
-        listener.set_nonblocking(true)?;
+        self.listener.set_nonblocking(true)?;
         loop {
             if !matches!(
                 shutdown.try_recv(),
@@ -184,7 +180,7 @@ impl ControlServer {
             ) {
                 break;
             }
-            match listener.accept() {
+            match self.listener.accept() {
                 Ok((stream, _)) => {
                     // Accepted fds inherit O_NONBLOCK from the listener;
                     // reads must block for set_read_timeout to apply.
@@ -207,22 +203,13 @@ impl ControlServer {
             let _ = handle_connection(stream, status, stopping);
         });
     }
-
-    /// Remove the socket only when this server still owns the same filesystem
-    /// entry. It is also performed automatically on drop.
-    pub fn close(&mut self) -> Result<()> {
-        drop(self.listener.take());
-        if identity(&self.path)? == Some(self.owned) {
-            fs::remove_file(&self.path)
-                .with_context(|| format!("remove {}", self.path.display()))?;
-        }
-        Ok(())
-    }
 }
 
 impl Drop for ControlServer {
     fn drop(&mut self) {
-        let _ = self.close();
+        if identity(&self.path).ok().flatten() == Some(self.owned) {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -233,21 +220,18 @@ impl Drop for ControlServer {
 /// `stopping` is shared with the daemon: any shutdown path (stop command,
 /// signal, idle release) sets it, and the server then refuses status so a
 /// racing `start` never mistakes a draining daemon for a live one.
-pub fn listen_for_control<F>(get_status: F, stopping: Arc<AtomicBool>) -> Result<ControlServer>
-where
-    F: Fn() -> Value + Send + Sync + 'static,
-{
-    listen_for_control_at(control_socket()?, get_status, stopping)
+pub fn listen_for_control(
+    status: Arc<Mutex<Value>>,
+    stopping: Arc<AtomicBool>,
+) -> Result<ControlServer> {
+    listen_for_control_at(control_socket()?, status, stopping)
 }
 
-pub fn listen_for_control_at<F>(
+pub fn listen_for_control_at(
     path: PathBuf,
-    get_status: F,
+    status: Arc<Mutex<Value>>,
     stopping: Arc<AtomicBool>,
-) -> Result<ControlServer>
-where
-    F: Fn() -> Value + Send + Sync + 'static,
-{
+) -> Result<ControlServer> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("control socket has no parent"))?;
@@ -277,17 +261,17 @@ where
         .with_context(|| format!("chmod {}", path.display()))?;
     let owned = identity(&path)?.ok_or_else(|| anyhow!("control socket disappeared after bind"))?;
     Ok(ControlServer {
-        listener: Some(listener),
+        listener,
         path,
         owned,
-        status: Arc::new(get_status),
+        status,
         stopping,
     })
 }
 
 fn handle_connection(
     mut stream: UnixStream,
-    status: Arc<dyn Fn() -> Value + Send + Sync>,
+    status: Arc<Mutex<Value>>,
     stopping: Arc<AtomicBool>,
 ) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
@@ -315,7 +299,10 @@ fn handle_connection(
         (_, Some(Command::Status)) if stopping.load(Ordering::Acquire) => {
             json!({ "error": "Micro bridge is stopping" })
         }
-        (_, Some(Command::Status)) => status(),
+        (_, Some(Command::Status)) => status
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone(),
         (_, Some(Command::Stop)) => json!({ "stopping": true }),
         _ => json!({ "error": "unknown command" }),
     };
@@ -364,8 +351,14 @@ mod tests {
         path: PathBuf,
         stopping: Arc<AtomicBool>,
     ) -> (Arc<ControlServer>, mpsc::Sender<()>, thread::JoinHandle<()>) {
-        let server =
-            Arc::new(listen_for_control_at(path, || json!({ "running": true }), stopping).unwrap());
+        let server = Arc::new(
+            listen_for_control_at(
+                path,
+                Arc::new(Mutex::new(json!({ "running": true }))),
+                stopping,
+            )
+            .unwrap(),
+        );
         let (shutdown, shutdown_rx) = mpsc::channel();
         let runner = Arc::clone(&server);
         let thread = thread::spawn(move || runner.run_with_shutdown(&shutdown_rx).unwrap());
@@ -465,7 +458,7 @@ mod tests {
             start_test_server(path.clone(), Arc::new(AtomicBool::new(false)));
         let error = match listen_for_control_at(
             path.clone(),
-            || json!({}),
+            Arc::new(Mutex::new(json!({}))),
             Arc::new(AtomicBool::new(false)),
         ) {
             Ok(_) => panic!("duplicate bind succeeded"),
@@ -485,11 +478,14 @@ mod tests {
         let path = dir.join(SOCKET_NAME);
         drop(UnixListener::bind(&path).unwrap());
         let stale = identity(&path).unwrap().unwrap();
-        let mut server =
-            listen_for_control_at(path.clone(), || json!({}), Arc::new(AtomicBool::new(false)))
-                .unwrap();
+        let server = listen_for_control_at(
+            path.clone(),
+            Arc::new(Mutex::new(json!({}))),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
         assert_ne!(identity(&path).unwrap().unwrap(), stale);
-        server.close().unwrap();
+        drop(server);
         assert!(!path.exists());
         fs::remove_dir_all(dir).unwrap();
     }

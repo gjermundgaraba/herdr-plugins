@@ -1,9 +1,7 @@
 //! Small AppKit/CoreGraphics helpers used by the daemon and doctor.
 //!
-//! AppKit identifies the foreground application; Core Graphics supplies its
-//! visible normal-window title and posts explicitly configured key input.
-
-use std::ptr::NonNull;
+//! AppKit identifies the foreground application; Core Graphics locates its
+//! visible normal window and posts explicitly configured key input.
 
 use anyhow::{Result, anyhow, bail};
 use objc2::rc::Retained;
@@ -15,8 +13,7 @@ use objc2_core_graphics::{
     CGDirectDisplayID, CGDisplayBounds, CGDisplayCopyDisplayMode, CGDisplayMode, CGEvent,
     CGEventFlags, CGEventTapLocation, CGGetDisplaysWithRect, CGPreflightPostEventAccess,
     CGRectIntersection, CGRectMakeWithDictionaryRepresentation, CGWindowListCopyWindowInfo,
-    CGWindowListOption, kCGNullWindowID, kCGWindowBounds, kCGWindowLayer, kCGWindowName,
-    kCGWindowOwnerPID,
+    CGWindowListOption, kCGNullWindowID, kCGWindowBounds, kCGWindowLayer, kCGWindowOwnerPID,
 };
 use objc2_foundation::NSString;
 use serde::Serialize;
@@ -28,7 +25,6 @@ pub struct Frontmost {
     pub app_name: String,
     pub process: String,
     pub pid: i32,
-    pub title: String,
 }
 
 pub fn post_event_access() -> Result<()> {
@@ -74,14 +70,10 @@ pub fn frontmost() -> Result<Frontmost> {
     let app_name = app
         .localizedName()
         .map_or_else(String::new, |value| value.to_string());
-    let title = normal_window_for(&app)
-        .and_then(|window| window_title(&window))
-        .unwrap_or_default();
     Ok(Frontmost {
         app_name,
         process,
         pid: app.processIdentifier(),
-        title,
     })
 }
 
@@ -158,22 +150,13 @@ fn normal_window_for(
     )?;
     // SAFETY: Core Graphics documents this array as CFDictionary window records.
     let windows = unsafe { windows.cast_unchecked::<CFDictionary>() };
-    // The returned CFArray owns each record; callers only need it during this
-    // function. This cannot return a borrowed record, so retain it first.
-    for index in 0..windows.len() {
-        // SAFETY: index is bounded by `len`, and Core Graphics guarantees a
-        // CFDictionary at each position in this window-info array.
-        let window = unsafe { windows.get_unchecked(index as isize) };
+    for window in windows.iter() {
         let typed = unsafe { window.cast_unchecked::<CFString, CFType>() };
         if usable_window_for(
             pid,
             number(typed, unsafe { kCGWindowLayer }),
             number(typed, unsafe { kCGWindowOwnerPID }),
         ) {
-            // SAFETY: the CFArray retains this record. Retaining it gives the
-            // returned handle independent ownership after the array is dropped.
-            let window =
-                unsafe { objc2_core_foundation::CFRetained::retain(NonNull::from(window)) };
             return Some(window);
         }
     }
@@ -191,14 +174,6 @@ fn frontmost_application() -> Option<Retained<NSRunningApplication>> {
 
 fn usable_window_for(pid: i32, layer: Option<f64>, owner_pid: Option<f64>) -> bool {
     layer == Some(0.0) && owner_pid == Some(f64::from(pid))
-}
-
-fn window_title(window: &CFDictionary) -> Option<String> {
-    // SAFETY: Core Graphics window dictionaries use CFString keys and values
-    // of documented CoreFoundation types.
-    let window = unsafe { window.cast_unchecked::<CFString, CFType>() };
-    let value = window.get(unsafe { kCGWindowName })?;
-    value.downcast_ref::<CFString>().map(ToString::to_string)
 }
 
 fn window_bounds(window: &CFDictionary) -> Option<CGRect> {

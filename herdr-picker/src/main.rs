@@ -173,7 +173,6 @@ impl Drop for TerminalSession {
 }
 
 struct ScreenState {
-    step_index: usize,
     picker: Picker,
     mode: Mode,
 }
@@ -183,7 +182,6 @@ struct StepRuntime {
     mode: Mode,
     remote_search: bool,
     provider: Option<process::Provider>,
-    loading: bool,
     error: Option<String>,
     received_snapshot: bool,
     pending_query: Option<Instant>,
@@ -227,7 +225,6 @@ impl StepRuntime {
             picker,
             mode,
             remote_search: step.search == SearchMode::Provider,
-            loading: provider.is_some(),
             provider,
             error,
             received_snapshot: false,
@@ -237,12 +234,15 @@ impl StepRuntime {
         }
     }
 
-    fn into_state(self, step_index: usize) -> ScreenState {
+    fn into_state(self) -> ScreenState {
         ScreenState {
-            step_index,
             picker: self.picker,
             mode: self.mode,
         }
+    }
+
+    fn loading(&self) -> bool {
+        !self.received_snapshot && (self.provider.is_some() || self.pending_query.is_some())
     }
 
     fn notice_query_change(&mut self, previous_query: &str) {
@@ -250,7 +250,6 @@ impl StepRuntime {
             self.provider.take();
             self.picker.clear_items();
             self.error = None;
-            self.loading = true;
             self.received_snapshot = false;
             self.pending_query = Some(Instant::now() + Duration::from_millis(60));
         }
@@ -284,9 +283,8 @@ impl StepRuntime {
             Some(Ok(event)) => event,
             Some(Err(TryRecvError::Empty)) | None => return false,
             Some(Err(TryRecvError::Disconnected)) => {
+                let changed = self.loading();
                 self.provider.take();
-                let changed = self.loading;
-                self.loading = false;
                 return changed;
             }
         };
@@ -294,7 +292,6 @@ impl StepRuntime {
             process::ProviderEvent::Snapshot(items) => {
                 self.picker.replace_items(items);
                 self.received_snapshot = true;
-                self.loading = false;
                 self.error = None;
             }
             process::ProviderEvent::Error(error) => {
@@ -311,13 +308,11 @@ impl StepRuntime {
                 } else if !self.received_snapshot {
                     self.fail_provider("provider exited before sending a snapshot".into());
                 }
-                self.loading = false;
                 stop = true;
             }
         }
         if stop {
             self.provider.take();
-            self.loading = false;
         }
         true
     }
@@ -325,7 +320,6 @@ impl StepRuntime {
     fn fail_provider(&mut self, error: String) {
         self.picker.clear_items();
         self.error = Some(error);
-        self.loading = false;
     }
 
     fn tick_spinner(&mut self, now: Instant) -> bool {
@@ -366,7 +360,6 @@ fn run_tui(
     workflow: &Workflow,
 ) -> Result<Option<Value>> {
     let mut selections = BTreeMap::new();
-    let mut step_index = 0;
     let mut history: Vec<ScreenState> = Vec::new();
     let mut runtime = StepRuntime::start(
         name,
@@ -376,6 +369,7 @@ fn run_tui(
         None,
     );
     loop {
+        let step_index = history.len();
         let step = &workflow.steps[step_index];
         match run_screen(
             terminal,
@@ -390,8 +384,8 @@ fn run_tui(
                 let Some(previous) = history.pop() else {
                     return Ok(None);
                 };
-                selections.remove(&workflow.steps[previous.step_index].id);
-                step_index = previous.step_index;
+                let step_index = history.len();
+                selections.remove(&workflow.steps[step_index].id);
                 runtime = StepRuntime::start(
                     name,
                     &workflow.steps[step_index],
@@ -406,12 +400,10 @@ fn run_tui(
                     return Ok(Some(command_input(name, step, &selections, &query)));
                 }
 
-                let next_index = step_index + 1;
-                history.push(runtime.into_state(step_index));
-                step_index = next_index;
+                history.push(runtime.into_state());
                 runtime = StepRuntime::start(
                     name,
-                    &workflow.steps[next_index],
+                    &workflow.steps[history.len()],
                     &selections,
                     workflow.mode.into(),
                     None,
@@ -467,7 +459,7 @@ fn run_screen(
                 step_number: step_index + 1,
                 step_count: workflow.steps.len(),
                 error: runtime.error.as_deref(),
-                loading: runtime.loading,
+                loading: runtime.loading(),
                 spinner_frame: runtime.spinner_frame,
             };
             terminal.draw(|frame| ui::render(&mut runtime.picker, runtime.mode, &screen, frame))?;
@@ -539,11 +531,8 @@ fn handle_key(picker: &mut Picker, mode: &mut Mode, key: KeyEvent) -> Option<Scr
     match (key.code, key.modifiers) {
         (KeyCode::Esc, _) if *mode == Mode::VimSearch => {
             *mode = Mode::VimNormal;
-            return None;
         }
-        (KeyCode::Esc, _) => {
-            return Some(ScreenOutcome::Back);
-        }
+        (KeyCode::Esc, _) => return Some(ScreenOutcome::Back),
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Some(ScreenOutcome::Cancel),
         (KeyCode::Enter, _) => {
             return picker
@@ -554,10 +543,6 @@ fn handle_key(picker: &mut Picker, mode: &mut Mode, key: KeyEvent) -> Option<Scr
                     query: picker.query.clone(),
                 });
         }
-        _ => {}
-    }
-
-    match (key.code, key.modifiers) {
         (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
             picker.move_selection(-1)
         }
@@ -782,7 +767,6 @@ mod tests {
             mode: Mode::Direct,
             remote_search: true,
             provider: None,
-            loading: false,
             error: Some("old".into()),
             received_snapshot: true,
             pending_query: None,
@@ -795,7 +779,7 @@ mod tests {
         let stale_deadline = Instant::now() + Duration::from_secs(60);
         runtime.pending_query = Some(stale_deadline);
         assert!(runtime.picker.is_empty());
-        assert!(runtime.loading);
+        assert!(runtime.loading());
         assert!(runtime.error.is_none());
 
         runtime.picker.query = "new".into();
@@ -848,7 +832,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_poll_processes_one_snapshot_at_a_time() {
+    fn snapshot_stops_loading_while_provider_remains_live() {
         let step = Step {
             id: "source".into(),
             title: "Source".into(),
@@ -873,6 +857,8 @@ mod tests {
         }
 
         assert_eq!(runtime.picker.selected_item().unwrap().id, "one");
+        assert!(!runtime.loading());
+        assert!(runtime.provider.is_some());
     }
 
     #[test]
@@ -912,7 +898,7 @@ mod tests {
         let runtime = StepRuntime::start("test", &step, &BTreeMap::new(), Mode::Direct, None);
 
         assert!(runtime.provider.is_none());
-        assert!(!runtime.loading);
+        assert!(!runtime.loading());
         assert!(
             runtime
                 .error

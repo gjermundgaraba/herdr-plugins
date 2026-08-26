@@ -21,7 +21,6 @@ fn agent_items(snapshot: &SessionSnapshot) -> Vec<Item> {
         .iter()
         .map(|tab| (tab.tab_id.as_str(), tab.label.as_str()))
         .collect::<HashMap<_, _>>();
-    let explicit_tabs = explicit_tab_labels(snapshot);
     let mut agents = snapshot.agents.iter().collect::<Vec<_>>();
     agents.sort_by_key(|agent| {
         (
@@ -45,7 +44,6 @@ fn agent_items(snapshot: &SessionSnapshot) -> Vec<Item> {
             let terminal_title = nonempty(agent.terminal_title.as_deref());
             let title = [
                 nonempty(agent.name.as_deref()),
-                explicit_tabs.get(agent.tab_id.as_str()).copied(),
                 stripped_title,
                 terminal_title,
                 Some(agent.terminal_id.as_str()),
@@ -80,10 +78,7 @@ fn agent_items(snapshot: &SessionSnapshot) -> Vec<Item> {
                 indicator: indicator.into(),
                 tone: Some(tone),
                 spinning,
-                search: format!(
-                    "{} {} {} {} {}",
-                    agent.pane_id, agent.terminal_id, workspace, tab, agent.agent_status
-                ),
+                search: String::new(),
                 value: json!({
                     "pane_id": agent.pane_id,
                     "workspace_id": agent.workspace_id,
@@ -93,20 +88,6 @@ fn agent_items(snapshot: &SessionSnapshot) -> Vec<Item> {
                     "agent": agent.agent,
                 }),
             }
-        })
-        .collect()
-}
-
-fn explicit_tab_labels(snapshot: &SessionSnapshot) -> HashMap<&str, &str> {
-    let mut positions = HashMap::new();
-    snapshot
-        .tabs
-        .iter()
-        .filter_map(|tab| {
-            let position = positions.entry(tab.workspace_id.as_str()).or_insert(0usize);
-            *position += 1;
-            (!tab.label.trim().is_empty() && tab.label != position.to_string())
-                .then_some((tab.tab_id.as_str(), tab.label.as_str()))
         })
         .collect()
 }
@@ -218,5 +199,17 @@ mod tests {
         assert_eq!(items[0].tone, Some(herdr_picker_sdk::Tone::Danger));
         assert!(items[3].spinning);
         assert_eq!(items[0].value["pane_id"], "blocked-new");
+    }
+
+    #[test]
+    fn tab_label_is_not_used_as_the_agent_title() {
+        let mut agent = agent("pane", "idle", 1);
+        agent.name = None;
+        agent.terminal_title_stripped = Some("shell".into());
+
+        let item = agent_items(&snapshot(vec![agent])).remove(0);
+
+        assert_eq!(item.title, "project: shell");
+        assert!(item.detail.contains("agents"));
     }
 }

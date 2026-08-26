@@ -40,7 +40,7 @@ impl<'a> SearchLine<'a> {
             self.query
         };
         usize::from(SEARCH_PROMPT_WIDTH)
-            .saturating_add(Line::from(text).width())
+            .saturating_add(Span::raw(text).width())
             .saturating_add(usize::from(self.focused && !self.query.is_empty()))
     }
 
@@ -75,7 +75,7 @@ impl<'a> SearchLine<'a> {
             return;
         }
 
-        let query_width = Line::from(self.query).width();
+        let query_width = Span::raw(self.query).width();
         let query_area = Rect {
             width: input_area.width.saturating_sub(u16::from(self.focused)),
             ..input_area

@@ -96,9 +96,7 @@ polling cadence, not a performance guarantee.
 The effort-control rows were exercised through Herdr on 2026-07-26. The
 action runner targeted pane IDs directly rather than the frontmost macOS
 window; the final Layer 2 test confirmed the physical dial integration. Those
-results predate the configurable script adapter. Its explicit pane, operation,
-and `HERDR_BIN_PATH` contract has automated coverage, but this worktree's
-adapter path has not yet been physically exercised.
+results predate the configurable script adapter.
 
 After the 0.6.1 firmware update, an existing BLE host pairing retained stale
 GATT metadata and rejected output reports. Pairing an unused BLE slot restored

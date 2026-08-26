@@ -379,11 +379,13 @@ fn run(argv: &[String], input: &Value) -> Result<()> {
 fn capture_tail(mut reader: impl Read) -> Vec<u8> {
     let mut captured = Vec::new();
     let mut chunk = [0; 4096];
-    while let Ok(count) = reader.read(&mut chunk) {
-        if count == 0 {
-            break;
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => extend_tail(&mut captured, &chunk[..count]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => break,
         }
-        extend_tail(&mut captured, &chunk[..count]);
     }
     captured
 }
@@ -566,6 +568,33 @@ printf '{"items":[{"id":"one","title":"One"}]}\n'"#
 
         assert!(matches!(event, ProviderEvent::Error(error)
                 if error.contains("provider items") && error.contains("source diagnostic")));
+    }
+
+    #[test]
+    fn naturally_exited_provider_closes_descendant_output_promptly() {
+        let provider = Provider::start(
+            &[
+                "sh".into(),
+                "-c".into(),
+                concat!(
+                    "sleep 30 & ",
+                    "printf '{\"items\":[{\"id\":\"one\",\"title\":\"One\"}]}\\n'"
+                )
+                .into(),
+            ],
+            json!({}),
+        )
+        .unwrap();
+        let events = provider.events.as_ref().unwrap();
+
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ProviderEvent::Snapshot(_)
+        ));
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ProviderEvent::Exited { status, .. } if status.success()
+        ));
     }
 
     #[test]

@@ -347,15 +347,9 @@ fn service_is_loaded() -> bool {
 }
 
 fn is_not_loaded(output: &Output) -> bool {
+    let stderr = String::from_utf8_lossy(&output.stderr);
     output.status.code() == Some(3)
-        && (output
-            .stderr
-            .windows(b"No such process".len())
-            .any(|part| part == b"No such process")
-            || output
-                .stderr
-                .windows(b"Could not find service".len())
-                .any(|part| part == b"Could not find service"))
+        && (stderr.contains("No such process") || stderr.contains("Could not find service"))
 }
 
 fn command_ok(command: &mut Command, action: &str) -> Result<()> {

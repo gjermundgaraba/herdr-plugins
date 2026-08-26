@@ -26,9 +26,25 @@
       ];
 
       forAllSystems = nixpkgs.lib.genAttrs systems;
+      workspaceManifest = builtins.fromTOML (builtins.readFile ./Cargo.toml);
 
-      allWorkspaceMembers =
-        (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.members;
+      perSystem = forAllSystems (
+        system:
+        let
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [ (import rust-overlay) ];
+          };
+          rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+        in
+        {
+          inherit pkgs rustToolchain;
+          rustPlatform = pkgs.makeRustPlatform {
+            cargo = rustToolchain;
+            rustc = rustToolchain;
+          };
+        }
+      );
 
       # Only what cannot be derived lives here: the dependency topology
       # (sourceRoots) and how the output is laid out. Platforms come from each
@@ -139,29 +155,13 @@
         in
         [ crate.package.name ] ++ extras;
 
-      workspaceMembersText = members: ''
-        members = [
-        ${nixpkgs.lib.concatMapStringsSep "\n" (member: "    \"${member}\",") members}
-        ]
-      '';
-
-      originalWorkspaceMembers = workspaceMembersText allWorkspaceMembers;
     in
     {
       packages = forAllSystems (
         system:
         let
-          pkgs = import nixpkgs {
-            inherit system;
-            overlays = [ (import rust-overlay) ];
-          };
+          inherit (perSystem.${system}) pkgs rustPlatform;
           inherit (pkgs) lib;
-
-          rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
-          rustPlatform = pkgs.makeRustPlatform {
-            cargo = rustToolchain;
-            rustc = rustToolchain;
-          };
 
           platformName = if pkgs.stdenv.hostPlatform.isDarwin then "darwin" else "linux";
           supportedDefinitions = lib.filterAttrs (
@@ -195,8 +195,13 @@
                 builtins.fromTOML
                   (builtins.readFile (./. + "/${name}/Cargo.toml"));
               pluginSource = sourceFor name definition;
-              selectedWorkspaceMembers = definition.sourceRoots;
-              selectedWorkspaceMembersText = workspaceMembersText selectedWorkspaceMembers;
+              selectedManifest = workspaceManifest // {
+                workspace = workspaceManifest.workspace // {
+                  members = definition.sourceRoots;
+                };
+              };
+              selectedCargoToml =
+                (pkgs.formats.toml { }).generate "Cargo-${name}.toml" selectedManifest;
               linkPath = "${placeholder "out"}/${name}";
               cargoReleaseDir = "target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release";
               installBinaries = lib.concatMapStringsSep "\n" (
@@ -229,9 +234,7 @@
               doCheck = true;
 
               postPatch = ''
-                substituteInPlace Cargo.toml \
-                  --replace-fail ${lib.escapeShellArg originalWorkspaceMembers} \
-                  ${lib.escapeShellArg selectedWorkspaceMembersText}
+                install -m644 ${selectedCargoToml} Cargo.toml
               '';
 
               installPhase = ''
@@ -269,21 +272,12 @@
         lib.mapAttrs buildPlugin supportedDefinitions
       );
 
-      checks = forAllSystems (
-        system:
-        nixpkgs.lib.mapAttrs' (
-          name: package: nixpkgs.lib.nameValuePair "build-${name}" package
-        ) self.packages.${system}
-      );
+      checks = self.packages;
 
       devShells = forAllSystems (
         system:
         let
-          pkgs = import nixpkgs {
-            inherit system;
-            overlays = [ (import rust-overlay) ];
-          };
-          rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+          inherit (perSystem.${system}) pkgs rustToolchain;
         in
         {
           default = pkgs.mkShell {

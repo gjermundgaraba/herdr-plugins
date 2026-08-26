@@ -233,7 +233,7 @@ mod tests {
         let (mut client, server) = UnixStream::pair().unwrap();
         client.write_all(request.as_bytes()).unwrap();
         client.shutdown(std::net::Shutdown::Write).unwrap();
-        let mut state = State::fresh();
+        let mut state = State::default();
         let keep = handle_control(server, None, &mut state, &marker, "deadbeef");
         let mut reply = String::new();
         BufReader::new(&client).read_line(&mut reply).unwrap();

@@ -12,8 +12,8 @@ Publishes two workspace metadata tokens:
 
 Refreshes on startup, workspace lifecycle events (created / updated / renamed /
 closed / moved / reordered / focused), worktree changes, and the `refresh`
-action. PR lookups are cached per repo + branch for 60 seconds, so switching
-between spaces does not hit the network each time.
+action. PR lookups are cached per checkout and current branch for 60 seconds,
+so switching between spaces does not hit the network each time.
 
 ## Setup
 
@@ -58,11 +58,11 @@ herdr plugin action invoke gjermundgaraba.herdr-space-meta.refresh
 - Tokens are display-only metadata held in memory by Herdr: a server restart
   clears them, and the plugin repopulates them on the next event or the
   `refresh` action.
-- Branch/PR metadata resolves from the same directory Herdr derives the
-  sidebar `branch` token from (the first tab's first pane cwd). Branch switches
-  refresh on the next registered event for that workspace. Run the `refresh`
-  action to refresh all workspace branches; PR results remain cached for up to
-  60 seconds.
+- Branch/PR metadata resolves from a workspace's worktree checkout path when
+  available; otherwise it best-effort uses the first snapshot pane in the
+  workspace's first tab. Branch switches refresh on the next registered event
+  for that workspace. Run the `refresh` action to refresh all workspace
+  branches; PR results remain cached for up to 60 seconds.
 - Herdr's plugin snapshot does not expose desktop worktree-group collapse
   state, so numbering remains in stable expanded order while a group is
   collapsed.

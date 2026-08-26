@@ -16,9 +16,7 @@ const USAGE: &str = "usage: herdr-micro <start|doctor|status|configure|setup-pi-
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
-        Ok(code) => u8::try_from(code)
-            .map(ExitCode::from)
-            .unwrap_or(ExitCode::FAILURE),
+        Ok(code) => code,
         Err(error) => {
             eprintln!("error: {error}");
             ExitCode::FAILURE
@@ -26,7 +24,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(args: Vec<OsString>) -> Result<i32> {
+fn run(args: Vec<OsString>) -> Result<ExitCode> {
     let Some(command) = args.first().and_then(|arg| arg.to_str()) else {
         bail!(USAGE);
     };
@@ -41,13 +39,13 @@ fn run(args: Vec<OsString>) -> Result<i32> {
                 daemon::log(format!("bridge failed: {error:#}"));
                 return Err(error);
             }
-            Ok(0)
+            Ok(ExitCode::SUCCESS)
         }
-        "doctor" if rest.is_empty() => Ok(doctor::run_doctor()),
+        "doctor" if rest.is_empty() => Ok(ExitCode::from(doctor::run_doctor() as u8)),
         "status" if rest.is_empty() => status(),
         "configure" if rest.is_empty() => {
             println!("{}", setup::configure()?.display());
-            Ok(0)
+            Ok(ExitCode::SUCCESS)
         }
         "setup-pi-effort" if rest.is_empty() => setup_pi_effort(),
         "stop" if rest.is_empty() => stop(),
@@ -55,18 +53,18 @@ fn run(args: Vec<OsString>) -> Result<i32> {
         "install-helper" if rest.is_empty() => {
             helper_install::install()?;
             println!("Installed privileged Codex Micro USB helper");
-            Ok(0)
+            Ok(ExitCode::SUCCESS)
         }
         "uninstall-helper" if rest.is_empty() => {
             helper_install::uninstall()?;
             println!("Uninstalled privileged Codex Micro USB helper");
-            Ok(0)
+            Ok(ExitCode::SUCCESS)
         }
         _ => bail!(USAGE),
     }
 }
 
-fn start() -> Result<i32> {
+fn start() -> Result<ExitCode> {
     let root = setup::plugin_root()?;
     let executable = env::current_exe()?;
     let status = start_daemon_versioned(
@@ -98,25 +96,25 @@ fn start() -> Result<i32> {
         Duration::from_secs(15),
     )?;
     println!("{}", serde_json::to_string(&status)?);
-    Ok(0)
+    Ok(ExitCode::SUCCESS)
 }
 
-fn status() -> Result<i32> {
+fn status() -> Result<ExitCode> {
     let status = request_status(Duration::from_secs(2))?;
     println!("{}", serde_json::to_string_pretty(&status)?);
     // An error payload (e.g. a stopping bridge) is not a healthy status.
-    Ok(i32::from(status.get("error").is_some()))
+    Ok(ExitCode::from(status.get("error").is_some() as u8))
 }
 
-fn stop() -> Result<i32> {
+fn stop() -> Result<ExitCode> {
     println!(
         "{}",
         serde_json::to_string_pretty(&request_stop(Duration::from_secs(2))?)?
     );
-    Ok(0)
+    Ok(ExitCode::SUCCESS)
 }
 
-fn setup_pi_effort() -> Result<i32> {
+fn setup_pi_effort() -> Result<ExitCode> {
     let result = setup::setup_pi_effort()?;
     if result.unchanged {
         println!(
@@ -130,10 +128,10 @@ fn setup_pi_effort() -> Result<i32> {
         println!("Previous extension backup: {}", backup.display());
     }
     println!("Run /reload in existing Pi sessions.");
-    Ok(0)
+    Ok(ExitCode::SUCCESS)
 }
 
-fn setup_micro() -> Result<i32> {
+fn setup_micro() -> Result<ExitCode> {
     let report = setup::setup_micro()?;
     if let Some(backup) = report.backup {
         println!(
@@ -148,5 +146,5 @@ fn setup_micro() -> Result<i32> {
         report.firmware
     );
     println!("Config: {}", report.config.display());
-    Ok(0)
+    Ok(ExitCode::SUCCESS)
 }

@@ -5,7 +5,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     symbols,
     text::{Line, Span},
-    widgets::{Block, Fill, Paragraph, Wrap},
+    widgets::{Fill, Paragraph, Wrap},
 };
 use unicode_truncate::UnicodeTruncateStr;
 use unicode_width::UnicodeWidthStr;
@@ -108,18 +108,14 @@ fn render_header(picker: &Picker, mode: Mode, screen: &Screen<'_>, frame: &mut F
     } else {
         (screen.workflow_title, " › ")
     };
+    let loading = if screen.loading { " · loading" } else { "" };
     let context = format!(
-        "{workflow}{separator}{} · {}/{} · {} ",
+        "{workflow}{separator}{} · {}/{} · {}{loading} ",
         screen.step_title,
         screen.step_number,
         screen.step_count,
         picker.len(),
     );
-    let context = if screen.loading {
-        format!("{} · loading ", context.trim_end())
-    } else {
-        context
-    };
     let desired_search_width = u16::try_from(search.desired_width())
         .unwrap_or(u16::MAX)
         .min(area.width);
@@ -212,8 +208,6 @@ fn render_row(item: &Item, selected: bool, spinner_frame: usize, frame: &mut Fra
     } else {
         Style::default()
     };
-    frame.render_widget(Block::default().style(style), area);
-
     let badge = (!item.badge.is_empty()).then(|| format!(" {} ", item.badge));
     let indicator = if item.spinning {
         ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][spinner_frame % 10]
@@ -230,10 +224,6 @@ fn render_row(item: &Item, selected: bool, spinner_frame: usize, frame: &mut Fra
         .saturating_sub(prefix_width as u16)
         .saturating_sub(1) as usize;
     let title = truncate_end(&item.title, title_budget);
-    let gap = area
-        .width
-        .saturating_sub(prefix_width as u16)
-        .saturating_sub(title.width() as u16) as usize;
     let badge_style = if selected {
         style.add_modifier(Modifier::BOLD)
     } else {
@@ -251,10 +241,7 @@ fn render_row(item: &Item, selected: bool, spinner_frame: usize, frame: &mut Fra
     if let Some(badge) = badge {
         spans.push(Span::styled(badge, badge_style));
     }
-    spans.extend([
-        Span::styled(title, style.add_modifier(Modifier::BOLD)),
-        Span::styled(" ".repeat(gap), style),
-    ]);
+    spans.push(Span::styled(title, style.add_modifier(Modifier::BOLD)));
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(style),
         Rect::new(area.x, area.y, area.width, 1),

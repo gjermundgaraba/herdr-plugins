@@ -32,18 +32,9 @@ fn status(agent: &AgentInfo) -> AgentStatus {
         _ => AgentStatus::Unknown,
     }
 }
-fn priority(agent: &AgentInfo) -> u8 {
-    match status(agent) {
-        AgentStatus::Unknown => 0,
-        AgentStatus::Idle => 1,
-        AgentStatus::Working => 2,
-        AgentStatus::Done => 3,
-        AgentStatus::Blocked => 4,
-    }
-}
 fn compare(a: &AgentInfo, b: &AgentInfo) -> std::cmp::Ordering {
-    priority(b)
-        .cmp(&priority(a))
+    status(a)
+        .cmp(&status(b))
         .then_with(|| b.state_change_seq.cmp(&a.state_change_seq))
 }
 pub fn assign_slots(previous: &[Option<String>], agents: &[AgentInfo]) -> Vec<Option<String>> {
@@ -84,7 +75,7 @@ pub fn assign_slots(previous: &[Option<String>], agents: &[AgentInfo]) -> Vec<Op
             }
         });
         let displaced = by_id[slots[victim].as_ref().unwrap().as_str()];
-        if priority(candidate) <= priority(displaced) {
+        if status(candidate) >= status(displaced) {
             break;
         }
         slotted.remove(&displaced.terminal_id);
@@ -111,12 +102,7 @@ pub fn slot_lighting(
                     }
                     l
                 })
-                .unwrap_or(Light {
-                    c: 0,
-                    b: 0.0,
-                    e: 0,
-                    s: 0.0,
-                })
+                .unwrap_or_default()
         })
         .collect()
 }
@@ -131,17 +117,12 @@ pub fn aggregate_lighting(
         .flatten()
         .filter_map(|id| by_id.get(id.as_str()))
         .min_by(|a, b| compare(a, b));
-    let light = best.map(|a| config.light(status(a))).unwrap_or(Light {
-        c: 0,
-        b: 0.0,
-        e: 0,
-        s: 0.0,
-    });
+    let light = best.map(|a| config.light(status(a))).unwrap_or_default();
     ["ambient", "keys"]
         .into_iter()
         .filter(|zone| match *zone {
-            "ambient" => config.ambient.as_deref() == Some("status"),
-            _ => config.keys.as_deref() == Some("status"),
+            "ambient" => config.ambient,
+            _ => config.keys,
         })
         .map(|zone| (zone.to_owned(), light))
         .collect()
@@ -214,12 +195,7 @@ mod tests {
         let config = Config::default().lighting;
         let mut focused_idle = config.light(AgentStatus::Idle);
         focused_idle.b = focused_idle.b.max(config.focused_brightness);
-        let empty = Light {
-            c: 0,
-            b: 0.0,
-            e: 0,
-            s: 0.0,
-        };
+        let empty = Light::default();
         assert_eq!(
             slot_lighting(&slots, &agents, &config),
             [config.light(AgentStatus::Working), focused_idle]

@@ -56,7 +56,9 @@ let log = plugin.logs_dir().join("plugin.log");
 
 `data`, `cache`, `run`, and `logs` are repository conventions beneath
 `HERDR_PLUGIN_STATE_DIR`; create only the directories an entrypoint uses.
-`open_rotating_log` creates private append-only logs with bounded retention.
+`open_rotating_log` creates private append-only logs and rotates them on the
+next open after the active file reaches its size limit. The final write can
+cross that limit.
 
 `Client::subscribe` uses Herdr 0.8.0's retained lifecycle-event stream. The
 stable API has no snapshot cursor or server-generation token, so consumers

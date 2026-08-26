@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 use std::{
     fs, io,
@@ -86,11 +86,29 @@ pub enum Direction {
     Left,
     Right,
 }
+impl Direction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Up => "up",
+            Self::Down => "down",
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VerticalDirection {
     Up,
     Down,
+}
+impl VerticalDirection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Up => "up",
+            Self::Down => "down",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Default)]
@@ -215,32 +233,17 @@ pub fn requires_accessibility(controls: &Controls) -> bool {
     controls
         .buttons
         .values()
+        .chain([
+            &controls.dial.press,
+            &controls.dial.clockwise,
+            &controls.dial.counterclockwise,
+            &controls.joystick.up,
+            &controls.joystick.down,
+            &controls.joystick.left,
+            &controls.joystick.right,
+        ])
         .flatten()
         .any(binding_requires_accessibility)
-        || controls
-            .dial
-            .press
-            .as_ref()
-            .is_some_and(binding_requires_accessibility)
-        || controls
-            .dial
-            .clockwise
-            .as_ref()
-            .is_some_and(binding_requires_accessibility)
-        || controls
-            .dial
-            .counterclockwise
-            .as_ref()
-            .is_some_and(binding_requires_accessibility)
-        || [
-            controls.joystick.up.as_ref(),
-            controls.joystick.down.as_ref(),
-            controls.joystick.left.as_ref(),
-            controls.joystick.right.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .any(|action| matches!(action, Action::Key { .. }))
 }
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -254,10 +257,10 @@ pub struct Dial {
 pub struct Joystick {
     pub engage_distance: f64,
     pub release_distance: f64,
-    pub up: Option<Action>,
-    pub down: Option<Action>,
-    pub left: Option<Action>,
-    pub right: Option<Action>,
+    pub up: Option<Binding>,
+    pub down: Option<Binding>,
+    pub left: Option<Binding>,
+    pub right: Option<Binding>,
 }
 
 fn parse_controls(value: &Value) -> Result<Controls, String> {
@@ -277,22 +280,16 @@ fn parse_controls(value: &Value) -> Result<Controls, String> {
     for (label, binding) in [
         ("dial.clockwise", &controls.dial.clockwise),
         ("dial.counterclockwise", &controls.dial.counterclockwise),
+        ("joystick.up", &controls.joystick.up),
+        ("joystick.down", &controls.joystick.down),
+        ("joystick.left", &controls.joystick.left),
+        ("joystick.right", &controls.joystick.right),
     ] {
         if binding
             .as_ref()
             .is_some_and(|binding| matches!(binding, Binding::Gesture(_)))
         {
             return Err(format!("{label} does not support gesture bindings"));
-        }
-    }
-    for (label, action) in [
-        ("joystick.up", &controls.joystick.up),
-        ("joystick.down", &controls.joystick.down),
-        ("joystick.left", &controls.joystick.left),
-        ("joystick.right", &controls.joystick.right),
-    ] {
-        if let Some(action) = action {
-            validate_action(action, label)?;
         }
     }
     Ok(controls)
@@ -418,8 +415,9 @@ fn valid_agent(agent: &str) -> bool {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd, Deserialize)]
 #[serde(rename_all = "lowercase")]
+// Declaration order is agent display priority, highest first.
 pub enum AgentStatus {
     Blocked,
     Done,
@@ -427,7 +425,7 @@ pub enum AgentStatus {
     Idle,
     Unknown,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Effect {
     Off,
@@ -451,7 +449,7 @@ impl Effect {
         }
     }
 }
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LightConfig {
     pub color: String,
@@ -459,21 +457,21 @@ pub struct LightConfig {
     pub effect: Effect,
     pub speed: f64,
 }
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Light {
     pub c: u32,
     pub b: f64,
     pub e: u8,
     pub s: f64,
 }
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LightingConfig {
     pub states: std::collections::BTreeMap<AgentStatus, LightConfig>,
     #[serde(rename = "focusedBrightness")]
     pub focused_brightness: f64,
-    pub ambient: Option<String>,
-    pub keys: Option<String>,
+    pub ambient: bool,
+    pub keys: bool,
 }
 fn parse_lighting(value: Value) -> Result<LightingConfig, String> {
     let config: LightingConfig = serde_json::from_value(value).map_err(|e| e.to_string())?;
@@ -494,11 +492,6 @@ fn parse_lighting(value: Value) -> Result<LightingConfig, String> {
     }
     if !unit(config.focused_brightness) {
         return Err("focusedBrightness must be between 0 and 1".into());
-    }
-    if !matches!(config.ambient.as_deref(), None | Some("status"))
-        || !matches!(config.keys.as_deref(), None | Some("status"))
-    {
-        return Err("ambient and keys must be \"status\" or null".into());
     }
     Ok(config)
 }
@@ -525,7 +518,7 @@ pub fn config_path() -> Result<PathBuf, String> {
         .map_err(|error| error.to_string())?
         .config_file("config.json"))
 }
-fn ensure_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
+fn ensure_json(path: &Path, value: &impl serde::Serialize) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -590,8 +583,8 @@ fn config_json() -> Value {
                 "unknown":{"color":"#ffffff","brightness":0.08,"effect":"solid","speed":0}
             },
             "focusedBrightness":1,
-            "ambient":"status",
-            "keys":null
+            "ambient":true,
+            "keys":false
         },
     })
 }
@@ -602,6 +595,20 @@ fn read_json(path: &Path) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_status_declaration_order_is_display_priority() {
+        assert!(
+            [
+                AgentStatus::Blocked,
+                AgentStatus::Done,
+                AgentStatus::Working,
+                AgentStatus::Idle,
+                AgentStatus::Unknown,
+            ]
+            .is_sorted()
+        );
+    }
 
     #[test]
     fn controls_reject_unknown_fields_and_map_reversed_dial_labels() {
@@ -703,6 +710,17 @@ mod tests {
         }
         assert_eq!(key_action_code(Some("F19"), None), Ok(0x50));
         assert_eq!(key_action_code(None, Some(0x50)), Ok(0x50));
+
+        let mut joystick = config_json();
+        joystick["controls"]["joystick"]["left"] =
+            serde_json::json!({"byAgent":{"codex":{"action":"submit"},"default":null}});
+        joystick["controls"]["joystick"]["right"] = serde_json::json!({"action":"key","key":"F19"});
+        let joystick = parse_config(&joystick).unwrap().controls;
+        assert_eq!(
+            joystick.joystick.left.as_ref().unwrap().resolve("codex"),
+            Some(Action::Submit)
+        );
+        assert!(requires_accessibility(&joystick));
     }
 
     #[test]
@@ -713,15 +731,25 @@ mod tests {
         assert!(parse_config(&config).is_err());
         let mut lighting = config_json();
         lighting["lighting"] =
-            serde_json::json!({"states":{},"focusedBrightness":1,"ambient":"status","keys":null});
+            serde_json::json!({"states":{},"focusedBrightness":1,"ambient":true,"keys":false});
         assert!(parse_config(&lighting).is_err());
     }
 
     #[test]
-    fn dial_rotation_rejects_gesture_bindings() {
+    fn continuous_controls_reject_gesture_bindings() {
         for direction in ["clockwise", "counterclockwise"] {
             let mut config = config_json();
             config["controls"]["dial"][direction] = serde_json::json!({"tap":{"action":"submit"}});
+            assert!(
+                parse_config(&config)
+                    .unwrap_err()
+                    .contains("does not support gesture bindings")
+            );
+        }
+        for direction in ["up", "down", "left", "right"] {
+            let mut config = config_json();
+            config["controls"]["joystick"][direction] =
+                serde_json::json!({"tap":{"action":"submit"}});
             assert!(
                 parse_config(&config)
                     .unwrap_err()

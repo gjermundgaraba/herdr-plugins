@@ -9,7 +9,7 @@ pub(crate) struct Echo {
     pub(crate) created_at_ms: u64,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct State {
     pub(crate) entries: Vec<String>,
     pub(crate) cursor: usize,
@@ -17,14 +17,6 @@ pub(crate) struct State {
 }
 
 impl State {
-    pub(crate) fn fresh() -> Self {
-        Self {
-            entries: Vec::new(),
-            cursor: 0,
-            echoes: Vec::new(),
-        }
-    }
-
     pub(crate) fn expire_echoes(&mut self, now: u64) {
         self.echoes
             .retain(|echo| now.saturating_sub(echo.created_at_ms) < ECHO_TTL_MS);
@@ -66,9 +58,7 @@ impl State {
         if index <= self.cursor {
             self.cursor -= 1;
         }
-        if let Some(index) = self.echoes.iter().rposition(|echo| echo.pane_id == target) {
-            self.echoes.remove(index);
-        }
+        self.cancel_echo(&target);
     }
 
     pub(crate) fn cancel_echo(&mut self, pane_id: &str) {
@@ -147,7 +137,7 @@ mod tests {
 
     #[test]
     fn stops_at_ends_and_caps_history() {
-        let mut state = fresh();
+        let mut state = State::default();
         assert_eq!(state.plan_jump(-1), None);
         for index in 0..MAX_ENTRIES + 20 {
             state.record(format!("p{index}"));
@@ -160,7 +150,7 @@ mod tests {
 
     #[test]
     fn expires_and_cancels_echoes() {
-        let mut state = fresh();
+        let mut state = State::default();
         state.push_echo("A".into(), 1_000);
         state.expire_echoes(1_000 + ECHO_TTL_MS);
         assert!(state.echoes.is_empty());
@@ -194,14 +184,10 @@ mod tests {
     }
 
     fn visited(panes: &[&str]) -> State {
-        let mut state = fresh();
+        let mut state = State::default();
         for pane in panes {
             state.record((*pane).into());
         }
         state
-    }
-
-    fn fresh() -> State {
-        State::fresh()
     }
 }

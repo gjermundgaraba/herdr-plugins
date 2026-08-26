@@ -6,7 +6,6 @@
 use std::{
     cell::Cell,
     ffi::{CStr, c_void},
-    pin::Pin,
     ptr::{self, NonNull},
     sync::{
         Arc, Mutex, OnceLock,
@@ -56,11 +55,11 @@ pub enum DeviceEvent {
     Disconnected { error: String },
 }
 
-enum CallbackEvent {
-    ReadComplete { result: i32, length: usize },
+struct CallbackEvent {
+    result: i32,
+    length: usize,
 }
 
-/// Pinned until the async source is removed and the interface is closed.
 struct CallbackContext {
     callback_tx: Sender<CallbackEvent>,
 }
@@ -174,10 +173,11 @@ impl MicroDevice {
                 reply: reply_tx,
             })
             .map_err(|_| self.disconnected_error())?;
-        await_send_reply(
+        await_reply(
             reply_rx,
             DEFAULT_REQUEST_TIMEOUT + RESPONSE_SLACK,
             &self.terminal_error,
+            || anyhow!("device write timed out"),
         )
     }
 
@@ -196,16 +196,12 @@ impl MicroDevice {
                 reply: reply_tx,
             })
             .map_err(|_| self.disconnected_error())?;
-        reply_rx
-            .recv_timeout(DEFAULT_REQUEST_TIMEOUT + RESPONSE_SLACK)
-            .map_err(|_| {
-                self.terminal_error
-                    .get()
-                    .cloned()
-                    .map(anyhow::Error::msg)
-                    .unwrap_or_else(|| anyhow!("request {id} timed out"))
-            })?
-            .map_err(|error| anyhow!(error))
+        await_reply(
+            reply_rx,
+            DEFAULT_REQUEST_TIMEOUT + RESPONSE_SLACK,
+            &self.terminal_error,
+            || anyhow!("request {id} timed out"),
+        )
     }
 
     pub fn close(&mut self) -> Result<()> {
@@ -237,11 +233,12 @@ impl MicroDevice {
     }
 }
 
-fn await_send_reply(
-    reply_rx: Receiver<std::result::Result<(), String>>,
+fn await_reply<T>(
+    reply_rx: Receiver<std::result::Result<T, String>>,
     timeout: Duration,
     terminal_error: &OnceLock<String>,
-) -> Result<()> {
+    timeout_error: impl FnOnce() -> anyhow::Error,
+) -> Result<T> {
     reply_rx
         .recv_timeout(timeout)
         .map_err(|_| {
@@ -249,7 +246,7 @@ fn await_send_reply(
                 .get()
                 .cloned()
                 .map(anyhow::Error::msg)
-                .unwrap_or_else(|| anyhow!("device write timed out"))
+                .unwrap_or_else(timeout_error)
         })?
         .map_err(|error| anyhow!(error))
 }
@@ -291,7 +288,8 @@ struct Owner {
     run_loop_mode: &'static CFString,
     async_source: CFRetained<CFRunLoopSource>,
     input_buffer: Box<[u8; REPORT_SIZE]>,
-    context: Option<Pin<Box<CallbackContext>>>,
+    // Box keeps a stable address; teardown leaks it if abort never completes.
+    context: Option<Box<CallbackContext>>,
     callback_rx: Receiver<CallbackEvent>,
     command_rx: Receiver<Command>,
     event_tx: Sender<DeviceEvent>,
@@ -315,9 +313,9 @@ impl Owner {
         let device_service = find_micro_device()?;
         let mut device = UsbDevice::new(device_service.0)?;
         device.verify_identity()?;
-        if let Err(error) = device.capture() {
-            return Err(restore_after_open_error(&mut device, error));
-        }
+        device
+            .capture()
+            .map_err(|error| restore_after_open_error(&mut device, error))?;
 
         let setup = (|| {
             let interface_service = wait_for_interface_zero(&device)?;
@@ -345,13 +343,10 @@ impl Owner {
             ))
         })();
         let (interface_service, interface, pipe, run_loop, run_loop_mode, async_source) =
-            match setup {
-                Ok(setup) => setup,
-                Err(error) => return Err(restore_after_open_error(&mut device, error)),
-            };
+            setup.map_err(|error| restore_after_open_error(&mut device, error))?;
 
         let (callback_tx, callback_rx) = mpsc::channel();
-        let context = Box::pin(CallbackContext { callback_tx });
+        let context = Box::new(CallbackContext { callback_tx });
         let mut owner = Self {
             device,
             interface,
@@ -448,7 +443,7 @@ impl Owner {
 
     fn pump(&mut self) {
         let _ = CFRunLoop::run_in_mode(Some(self.run_loop_mode), 0.01, true);
-        while let Ok(CallbackEvent::ReadComplete { result, length }) = self.callback_rx.try_recv() {
+        while let Ok(CallbackEvent { result, length }) = self.callback_rx.try_recv() {
             self.read_pending = false;
             if result != kIOReturnSuccess {
                 self.disconnect(format!("interrupt read failed: 0x{:08X}", result as u32));
@@ -480,8 +475,7 @@ impl Owner {
             .context
             .as_ref()
             .expect("callback context is live before teardown")
-            .as_ref()
-            .get_ref() as *const CallbackContext as *mut c_void;
+            .as_ref() as *const CallbackContext as *mut c_void;
         self.interface
             .read_async(self.pipe, self.input_buffer.as_mut_ptr().cast(), context)?;
         self.read_pending = true;
@@ -620,7 +614,7 @@ impl Owner {
         let deadline = Instant::now() + DEFAULT_REQUEST_TIMEOUT;
         while self.read_pending && Instant::now() < deadline {
             let _ = CFRunLoop::run_in_mode(Some(self.run_loop_mode), 0.01, true);
-            while let Ok(CallbackEvent::ReadComplete { .. }) = self.callback_rx.try_recv() {
+            while let Ok(CallbackEvent { .. }) = self.callback_rx.try_recv() {
                 self.read_pending = false;
             }
         }
@@ -695,9 +689,9 @@ unsafe extern "C-unwind" fn read_callback(context: *mut c_void, result: i32, len
     if context.is_null() {
         return;
     }
-    // SAFETY: Owner pins this context until after abort, source removal, and close.
+    // SAFETY: Owner keeps this boxed context alive until completion or leaks it.
     let context = unsafe { &*context.cast::<CallbackContext>() };
-    let _ = context.callback_tx.send(CallbackEvent::ReadComplete {
+    let _ = context.callback_tx.send(CallbackEvent {
         result,
         length: length as usize,
     });
@@ -1331,26 +1325,9 @@ fn error_message(error: &Value) -> String {
 }
 
 fn uuid(bytes: [u8; 16]) -> CFRetained<CFUUID> {
-    let [
-        b0,
-        b1,
-        b2,
-        b3,
-        b4,
-        b5,
-        b6,
-        b7,
-        b8,
-        b9,
-        b10,
-        b11,
-        b12,
-        b13,
-        b14,
-        b15,
-    ] = bytes;
     CFUUID::constant_uuid_with_bytes(
-        None, b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15,
+        None, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
     )
     .expect("constant UUID")
 }
@@ -1487,13 +1464,15 @@ mod tests {
     fn late_reply_disconnect_keeps_the_terminal_failure() {
         let terminal_error = OnceLock::new();
         terminal_error.set("write failed".into()).unwrap();
-        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        let (reply_tx, reply_rx) = mpsc::sync_channel::<std::result::Result<(), String>>(1);
         drop(reply_tx);
 
         assert_eq!(
-            await_send_reply(reply_rx, Duration::ZERO, &terminal_error)
-                .unwrap_err()
-                .to_string(),
+            await_reply(reply_rx, Duration::ZERO, &terminal_error, || panic!(
+                "timeout error must stay lazy"
+            ),)
+            .unwrap_err()
+            .to_string(),
             "write failed"
         );
     }

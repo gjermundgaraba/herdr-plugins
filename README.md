@@ -57,12 +57,12 @@ result/bin/herdr-picker --version
 ```
 
 The other package names include `herdr-picker-agents`,
-`herdr-picker-workspaces`, `equalize-splits`, `fork-to-pane`, `history`, and
-`herdr-micro`. The two picker examples are independent optional binary
-packages. `herdr-micro` is exposed only on macOS, matching its plugin manifest;
-the others support Linux and macOS. Plugin packages contain a complete,
-prebuilt plugin root, so linking them never invokes Cargo. The picker packages
-expose their executables under `bin/`.
+`herdr-picker-workspaces`, `equalize-splits`, `fork-to-pane`, `history`,
+`space-meta`, and `herdr-micro`. The two picker examples are independent
+optional binary packages. `herdr-micro` is exposed only on macOS, matching its
+plugin manifest; every other package supports Linux and macOS. Plugin packages
+contain a complete, prebuilt plugin root, so linking them never invokes Cargo.
+The picker packages expose their executables under `bin/`.
 
 For Home Manager, add the picker package to the profile:
 

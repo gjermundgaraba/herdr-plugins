@@ -27,7 +27,7 @@ use crate::{
     },
 };
 
-use super::{DAEMON_PROTOCOL_VERSION, dispatch::agent_identity, log};
+use super::{DAEMON_PROTOCOL_VERSION, dispatch::agent_identity, log, log_changed};
 
 const MAPPING_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const DEVICE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
@@ -37,13 +37,11 @@ const NO_SESSIONS_SHUTDOWN: Duration = Duration::from_secs(60);
 pub(super) struct State {
     pub(super) config: Config,
     pub(super) sessions: Vec<Session>,
-    pub(super) session_agents: HashMap<String, Vec<AgentInfo>>,
     pub(super) mappings: Vec<SessionTerminalMapping>,
-    pub(super) selected_session: Option<String>,
+    selected: Option<Selected>,
     pub(super) routing_verified: bool,
     pub(super) routing_ready: bool,
     pub(super) routing_generation: Arc<AtomicU64>,
-    pub(super) session_slots: HashMap<String, Vec<Option<String>>>,
     pub(super) agents: Vec<AgentInfo>,
     pub(super) slots: Vec<Option<String>>,
     pub(super) device_state: String,
@@ -58,7 +56,7 @@ pub(super) struct State {
     pub(super) last_routing_error: String,
     pub(super) last_lighting_error: String,
     pub(super) last_lighting: String,
-    pub(super) last_focused_app: String,
+    pub(super) last_sent_layer: Option<usize>,
     pub(super) managed_aggregate_zones: HashSet<String>,
     pub(super) no_sessions_at: Option<Instant>,
     pub(super) next_mapping_probe: Option<Instant>,
@@ -81,8 +79,8 @@ impl State {
             "device": if self.owner.is_some() { "yielded" } else { &self.device_state },
             "deviceError": (!self.last_device_error.is_empty()).then_some(&self.last_device_error),
             "owner": self.owner,
-            "session": self.selected_session,
-            "routing": if self.routing_ready { "ready" } else if self.selected_session.is_some() { "unavailable" } else { "none" },
+            "session": self.selected.as_ref().map(|selected| &selected.session),
+            "routing": if self.routing_ready { "ready" } else if self.selected.is_some() { "unavailable" } else { "none" },
             "version": env!("CARGO_PKG_VERSION"),
             "protocol": DAEMON_PROTOCOL_VERSION,
             "sessions": self.sessions.iter().map(|session| &session.name).collect::<Vec<_>>(),
@@ -95,7 +93,6 @@ impl State {
             "frontmost": self.frontmost.as_ref().map(|frontmost| json!({
                 "appName": frontmost.app_name,
                 "process": frontmost.process,
-                "title": frontmost.title,
             })),
             "focusedTerminal": self.focused_terminal,
             "slots": self.slots.iter().map(|id| id.as_ref().and_then(|id| {
@@ -125,43 +122,49 @@ impl State {
     }
 }
 
+struct Selected {
+    session: String,
+    generation: u64,
+    pending_agents: Option<Vec<AgentInfo>>,
+    pending_slots: Vec<Option<String>>,
+}
+
+#[derive(Clone)]
+pub(super) struct InputRoute {
+    pub(super) session: Session,
+    pub(super) terminal: String,
+    pub(super) generation: u64,
+}
+
 #[derive(Clone)]
 pub(super) struct InputContext {
     pub(super) controls: Controls,
-    pub(super) session: Option<Session>,
-    pub(super) terminal: Option<String>,
+    pub(super) route: Option<InputRoute>,
     pub(super) target: Option<AgentInfo>,
     pub(super) slots: Vec<Option<AgentInfo>>,
-    pub(super) routing_ready: bool,
-    pub(super) generation: u64,
 }
 
 impl InputContext {
     pub(super) fn new(config: &Config) -> Self {
         Self {
             controls: config.controls.clone(),
-            session: None,
-            terminal: None,
+            route: None,
             target: None,
             slots: vec![None; SLOT_COUNT],
-            routing_ready: false,
-            generation: 0,
         }
     }
 
-    pub(super) fn selected(&self, routing_generation: &AtomicU64) -> Option<(Session, String)> {
-        (self.routing_ready && self.generation == routing_generation.load(Ordering::Acquire))
-            .then(|| self.session.clone().zip(self.terminal.clone()))
-            .flatten()
+    pub(super) fn selected(&self, routing_generation: &AtomicU64) -> Option<InputRoute> {
+        self.route
+            .as_ref()
+            .filter(|route| route.generation == routing_generation.load(Ordering::Acquire))
+            .cloned()
     }
 }
 
 fn device_failure(state: &mut State, context: &str, error: String) {
     state.device_state = "helper-error".into();
-    if state.last_device_error != error {
-        log(format!("{context}: {error}"));
-        state.last_device_error = error;
-    }
+    log_changed(&mut state.last_device_error, error, &format!("{context}: "));
 }
 
 fn device_disconnected(state: &mut State, error: String) {
@@ -180,15 +183,7 @@ pub(super) fn send_lighting(device: &HidClient, state: &mut State) -> Result<()>
     let next_zones: HashSet<_> = aggregate.keys().cloned().collect();
     for zone in &state.managed_aggregate_zones {
         if !next_zones.contains(zone) {
-            aggregate.insert(
-                zone.clone(),
-                crate::config::Light {
-                    c: 0,
-                    b: 0.0,
-                    e: 0,
-                    s: 0.0,
-                },
-            );
+            aggregate.insert(zone.clone(), crate::config::Light::default());
         }
     }
     let aggregate_value: serde_json::Map<String, Value> = aggregate
@@ -233,7 +228,7 @@ pub(super) fn close_device(device: &mut Option<HidClient>, state: &mut State, bl
             .collect();
         let _ = device.send("v.oai.thstatus", Some(Value::Array(blank)));
     }
-    state.last_focused_app.clear();
+    state.last_sent_layer = None;
     if let Err(error) = select_layer(Some(&device), state, Some(1)) {
         log(format!("safe layer selection failed: {error:#}"));
     }
@@ -256,11 +251,12 @@ fn select_layer(device: Option<&HidClient>, state: &mut State, layer: Option<usi
     let Some(layer) = layer else { return Ok(()) };
     state.active_layer = Some(layer);
     let Some(device) = device else { return Ok(()) };
-    let app = layer_identity(layer);
-    let signature = serde_json::to_string(&app)?;
-    if signature != state.last_focused_app {
-        device.send("host.focused_app", Some(serde_json::to_value(app)?))?;
-        state.last_focused_app = signature;
+    if state.last_sent_layer != Some(layer) {
+        device.send(
+            "host.focused_app",
+            Some(serde_json::to_value(layer_identity(layer))?),
+        )?;
+        state.last_sent_layer = Some(layer);
         log(format!("layer {layer} selected"));
     }
     Ok(())
@@ -271,18 +267,23 @@ fn select_session(
     state: &mut State,
     next: Option<String>,
 ) -> Result<()> {
-    if state.selected_session == next {
+    if state.selected.as_ref().map(|selected| &selected.session) == next.as_ref() {
         return Ok(());
     }
     reset_selected_route(state);
-    state.selected_session = next;
+    state.selected = next.map(|session| Selected {
+        session,
+        generation: 0,
+        pending_agents: None,
+        pending_slots: Vec::new(),
+    });
     if let Some(device) = device {
         send_lighting(device, state)?;
     }
     log(state
-        .selected_session
+        .selected
         .as_ref()
-        .map(|session| format!("Herdr session selected: {session}"))
+        .map(|selected| format!("Herdr session selected: {}", selected.session))
         .unwrap_or_else(|| "Herdr session unselected".into()));
     Ok(())
 }
@@ -295,11 +296,11 @@ fn reset_selected_route(state: &mut State) {
 }
 
 fn routing_failure(state: &mut State, message: impl Into<String>) {
-    let message = message.into();
-    if state.last_routing_error != message {
-        state.last_routing_error = message.clone();
-        log(format!("Herdr session routing failed: {message}"));
-    }
+    log_changed(
+        &mut state.last_routing_error,
+        message.into(),
+        "Herdr session routing failed: ",
+    );
 }
 
 pub(super) fn refresh_sessions(
@@ -326,7 +327,10 @@ pub(super) fn refresh_sessions(
         state.no_sessions_at = None;
     }
     let changed = discovered != state.sessions;
-    let selected = state.selected_session.as_deref();
+    let selected = state
+        .selected
+        .as_ref()
+        .map(|selected| selected.session.as_str());
     let previous_selected =
         selected.and_then(|name| state.sessions.iter().find(|session| session.name == name));
     let discovered_selected =
@@ -334,8 +338,11 @@ pub(super) fn refresh_sessions(
     let selected_changed = previous_selected != discovered_selected;
     if selected_changed {
         workers.clear();
-        state.session_agents.clear();
-        state.session_slots.clear();
+        if let Some(selected) = &mut state.selected {
+            selected.generation = 0;
+            selected.pending_agents = None;
+            selected.pending_slots.clear();
+        }
         if previous_selected.is_some() && discovered_selected.is_some() {
             reset_selected_route(state);
             if let Some(device) = device {
@@ -344,11 +351,12 @@ pub(super) fn refresh_sessions(
         }
     }
     state.sessions = discovered;
-    if state
-        .selected_session
-        .as_ref()
-        .is_some_and(|name| !state.sessions.iter().any(|session| session.name == *name))
-    {
+    if state.selected.as_ref().is_some_and(|selected| {
+        !state
+            .sessions
+            .iter()
+            .any(|session| session.name == selected.session)
+    }) {
         select_session(device, state, None)?;
     }
     sync_selected_worker(state, workers, worker_generation, updates, stopping);
@@ -368,32 +376,37 @@ pub(super) fn sync_selected_worker(
     updates: &Sender<SessionUpdate>,
     stopping: &Arc<AtomicBool>,
 ) {
-    workers.retain(|name, _| state.selected_session.as_deref() == Some(name));
-    state
-        .session_agents
-        .retain(|name, _| state.selected_session.as_deref() == Some(name));
-    state
-        .session_slots
-        .retain(|name, _| state.selected_session.as_deref() == Some(name));
-    let Some(session) = state
-        .selected_session
-        .as_ref()
-        .and_then(|name| state.sessions.iter().find(|session| session.name == *name))
-    else {
+    workers.retain(|name, _| {
+        state
+            .selected
+            .as_ref()
+            .is_some_and(|selected| selected.session == *name)
+    });
+    let Some(session) = state.selected.as_ref().and_then(|selected| {
+        state
+            .sessions
+            .iter()
+            .find(|session| session.name == selected.session)
+    }) else {
         return;
     };
-    if !workers.contains_key(&session.name) {
-        *worker_generation += 1;
-        workers.insert(
-            session.name.clone(),
-            spawn_session_worker(
-                session.clone(),
-                *worker_generation,
-                updates.clone(),
-                Arc::clone(stopping),
-            ),
-        );
+    if workers.contains_key(&session.name) {
+        return;
     }
+    let session = session.clone();
+    *worker_generation += 1;
+    if let Some(selected) = &mut state.selected {
+        selected.generation = *worker_generation;
+    }
+    workers.insert(
+        session.name.clone(),
+        spawn_session_worker(
+            session,
+            *worker_generation,
+            updates.clone(),
+            Arc::clone(stopping),
+        ),
+    );
 }
 
 pub(super) fn refresh_mappings(state: &mut State) {
@@ -500,10 +513,10 @@ pub(super) fn refresh_routing(state: &mut State, device: Option<&HidClient>) -> 
 }
 
 fn apply_selected_agents(state: &mut State, device: Option<&HidClient>) -> Result<()> {
-    let Some(session) = state.selected_session.clone() else {
+    let Some(selected) = &state.selected else {
         return Ok(());
     };
-    let (available, agents) = match state.session_agents.get(&session) {
+    let (available, agents) = match &selected.pending_agents {
         Some(agents) => (true, (*agents != state.agents).then(|| agents.clone())),
         None => (false, None),
     };
@@ -514,18 +527,23 @@ fn apply_selected_agents(state: &mut State, device: Option<&HidClient>) -> Resul
     }
     match agents {
         Some(agents) => {
+            let pending_slots = state
+                .selected
+                .as_ref()
+                .expect("selected session")
+                .pending_slots
+                .clone();
             if agent_identity(state.agents.iter().find(|agent| agent.focused))
                 != agent_identity(agents.iter().find(|agent| agent.focused))
             {
                 state.invalidate_routing();
             }
-            let previous = state
-                .session_slots
-                .get(&session)
-                .cloned()
-                .unwrap_or_default();
-            let slots = assign_slots(&previous, &agents);
-            state.session_slots.insert(session, slots.clone());
+            let slots = assign_slots(&pending_slots, &agents);
+            state
+                .selected
+                .as_mut()
+                .expect("selected session")
+                .pending_slots = slots.clone();
             state.agents = agents;
             state.slots = slots;
             state.routing_ready = true;
@@ -570,14 +588,22 @@ pub(super) fn apply_session_update(
             ..
         } => (session, *generation),
     };
-    if workers.get(session).map(|worker| worker.generation) != Some(generation) {
+    if workers.get(session).map(|worker| worker.generation) != Some(generation)
+        || !state.selected.as_ref().is_some_and(|selected| {
+            selected.session == *session && selected.generation == generation
+        })
+    {
         return Ok(false);
     }
     match update {
         SessionUpdate::Agents {
             session, agents, ..
         } => {
-            state.session_agents.insert(session.clone(), agents);
+            state
+                .selected
+                .as_mut()
+                .expect("validated selected session")
+                .pending_agents = Some(agents);
             if session_route_is_verified(state, &session) {
                 state.last_herdr_error.clear();
                 apply_selected_agents(state, device)?;
@@ -585,21 +611,30 @@ pub(super) fn apply_session_update(
             Ok(false)
         }
         SessionUpdate::Unavailable { session, error, .. } => {
-            let became_unavailable = state.session_agents.remove(&session).is_some();
-            if state.selected_session.as_deref() == Some(&session) {
-                apply_selected_agents(state, device)?;
-                if state.last_herdr_error != error {
-                    state.last_herdr_error = error.clone();
-                    log(format!("Herdr session {session} unavailable: {error}"));
-                }
-            }
+            let became_unavailable = state
+                .selected
+                .as_mut()
+                .expect("validated selected session")
+                .pending_agents
+                .take()
+                .is_some();
+            apply_selected_agents(state, device)?;
+            log_changed(
+                &mut state.last_herdr_error,
+                error,
+                &format!("Herdr session {session} unavailable: "),
+            );
             Ok(became_unavailable)
         }
     }
 }
 
 fn session_route_is_verified(state: &State, session: &str) -> bool {
-    state.routing_verified && state.selected_session.as_deref() == Some(session)
+    state.routing_verified
+        && state
+            .selected
+            .as_ref()
+            .is_some_and(|selected| selected.session == session)
 }
 
 pub(super) fn refresh_frontmost(state: &mut State) -> bool {
@@ -609,10 +644,11 @@ pub(super) fn refresh_frontmost(state: &mut State) -> bool {
         Err(error) => {
             let changed = state.frontmost.take().is_some();
             state.revoke_routing();
-            if state.last_frontmost_error != error.to_string() {
-                state.last_frontmost_error = error.to_string();
-                log(format!("frontmost window unavailable: {error}"));
-            }
+            log_changed(
+                &mut state.last_frontmost_error,
+                error.to_string(),
+                "frontmost window unavailable: ",
+            );
             return changed;
         }
     }
@@ -626,8 +662,11 @@ pub(super) fn refresh_frontmost(state: &mut State) -> bool {
         Err(error) if state.last_frontmost_error != error.to_string() => {
             let changed = state.frontmost.take().is_some();
             state.revoke_routing();
-            state.last_frontmost_error = error.to_string();
-            log(format!("frontmost window unavailable: {error}"));
+            log_changed(
+                &mut state.last_frontmost_error,
+                error.to_string(),
+                "frontmost window unavailable: ",
+            );
             changed
         }
         Err(_) => {
@@ -681,7 +720,7 @@ pub(super) fn open_device(
     state.next_device_open = None;
     match HidClient::connect(event_tx.clone()) {
         Ok(mut opened) if state.owner.is_some() => {
-            state.last_focused_app.clear();
+            state.last_sent_layer = None;
             if let Err(error) = select_layer(Some(&opened), state, Some(1)) {
                 log(format!(
                     "safe layer selection during recovery failed: {error:#}"
@@ -715,10 +754,11 @@ pub(super) fn open_device(
             state.next_device_open = Some(Instant::now() + DEVICE_RETRY_INTERVAL);
             let message = error.to_string();
             state.device_state = connection_error_state(&error).into();
-            if state.last_device_error != message {
-                state.last_device_error = message.clone();
-                log(format!("device open failed: {message}"));
-            }
+            log_changed(
+                &mut state.last_device_error,
+                message,
+                "device open failed: ",
+            );
         }
     }
     Ok(true)
@@ -730,14 +770,21 @@ pub(super) fn publish(status: &Arc<Mutex<Value>>, state: &State) {
 
 pub(super) fn update_input_context(context: &Mutex<Arc<InputContext>>, state: &State) {
     let target = state.agents.iter().find(|agent| agent.focused);
-    let session = state
-        .selected_session
-        .as_ref()
-        .and_then(|name| state.sessions.iter().find(|session| session.name == *name));
+    let route = state.routing_ready.then(|| {
+        let selected = state.selected.as_ref()?;
+        let session = state
+            .sessions
+            .iter()
+            .find(|session| session.name == selected.session)?;
+        Some(InputRoute {
+            session: session.clone(),
+            terminal: state.focused_terminal.clone()?,
+            generation: state.routing_generation(),
+        })
+    });
     *context.lock().unwrap_or_else(|error| error.into_inner()) = Arc::new(InputContext {
         controls: state.config.controls.clone(),
-        session: session.cloned(),
-        terminal: state.focused_terminal.clone(),
+        route: route.flatten(),
         target: target.cloned(),
         slots: state
             .slots
@@ -748,8 +795,6 @@ pub(super) fn update_input_context(context: &Mutex<Arc<InputContext>>, state: &S
                     .cloned()
             })
             .collect(),
-        routing_ready: state.routing_ready,
-        generation: state.routing_generation(),
     });
 }
 
@@ -832,7 +877,12 @@ mod tests {
     #[test]
     fn status_matches_the_control_contract() {
         let mut state = State::new(Config::default());
-        state.selected_session = Some("work".into());
+        state.selected = Some(Selected {
+            session: "work".into(),
+            generation: 1,
+            pending_agents: None,
+            pending_slots: Vec::new(),
+        });
         state.routing_ready = true;
         state.sessions = vec![Session {
             name: "work".into(),
@@ -882,7 +932,12 @@ mod tests {
     #[test]
     fn resetting_selected_route_revokes_published_identities() {
         let mut state = State::new(Config::default());
-        state.selected_session = Some("work".into());
+        state.selected = Some(Selected {
+            session: "work".into(),
+            generation: 1,
+            pending_agents: None,
+            pending_slots: Vec::new(),
+        });
         state.sessions = vec![session("work")];
         state.routing_verified = true;
         state.routing_ready = true;
@@ -912,14 +967,16 @@ mod tests {
     #[test]
     fn selected_session_requires_a_live_snapshot() {
         let mut state = State::new(Config::default());
-        state.selected_session = Some("work".into());
-        state
-            .session_agents
-            .insert("work".into(), vec![agent("terminal", "pane", "codex")]);
+        state.selected = Some(Selected {
+            session: "work".into(),
+            generation: 1,
+            pending_agents: Some(vec![agent("terminal", "pane", "codex")]),
+            pending_slots: Vec::new(),
+        });
 
         apply_selected_agents(&mut state, None).unwrap();
         assert!(state.routing_ready);
-        state.session_agents.clear();
+        state.selected.as_mut().unwrap().pending_agents = None;
         apply_selected_agents(&mut state, None).unwrap();
         assert!(!state.routing_ready);
         assert!(state.agents.is_empty());
@@ -928,13 +985,17 @@ mod tests {
     #[test]
     fn agent_updates_require_a_verified_terminal_route() {
         let mut state = State::new(Config::default());
-        state.selected_session = Some("work".into());
+        state.selected = Some(Selected {
+            session: "work".into(),
+            generation: 7,
+            pending_agents: None,
+            pending_slots: Vec::new(),
+        });
         state.focused_terminal = Some("terminal".into());
         state.frontmost = Some(macos::Frontmost {
             app_name: "Ghostty".into(),
             process: GHOSTTY_PROCESS.into(),
             pid: 1,
-            title: String::new(),
         });
         let stopping = Arc::new(AtomicBool::new(true));
         let (updates, _) = mpsc::channel();
@@ -955,9 +1016,47 @@ mod tests {
     }
 
     #[test]
+    fn agent_updates_reject_wrong_sessions_and_stale_workers() {
+        let mut state = State::new(Config::default());
+        state.selected = Some(Selected {
+            session: "work".into(),
+            generation: 7,
+            pending_agents: None,
+            pending_slots: Vec::new(),
+        });
+        let stopping = Arc::new(AtomicBool::new(true));
+        let (updates, _) = mpsc::channel();
+        let workers = HashMap::from([
+            (
+                "work".into(),
+                spawn_session_worker(session("work"), 7, updates.clone(), Arc::clone(&stopping)),
+            ),
+            (
+                "other".into(),
+                spawn_session_worker(session("other"), 7, updates, stopping),
+            ),
+        ]);
+        let update = |session: &str| SessionUpdate::Agents {
+            session: session.into(),
+            generation: 7,
+            agents: Vec::new(),
+        };
+
+        assert!(!apply_session_update(&mut state, update("other"), &workers, None).unwrap());
+        state.selected.as_mut().unwrap().generation = 6;
+        assert!(!apply_session_update(&mut state, update("work"), &workers, None).unwrap());
+        assert!(state.selected.unwrap().pending_agents.is_none());
+    }
+
+    #[test]
     fn live_session_unavailability_requests_one_discovery() {
         let mut state = State::new(Config::default());
-        state.session_agents.insert("work".into(), Vec::new());
+        state.selected = Some(Selected {
+            session: "work".into(),
+            generation: 7,
+            pending_agents: Some(Vec::new()),
+            pending_slots: Vec::new(),
+        });
         let stopping = Arc::new(AtomicBool::new(true));
         let (updates, _) = mpsc::channel();
         let worker = spawn_session_worker(session("work"), 7, updates, Arc::clone(&stopping));
@@ -979,7 +1078,6 @@ mod tests {
             app_name: "ChatGPT".into(),
             process: crate::actions::CHATGPT_BUNDLE_IDS[0].into(),
             pid: 1,
-            title: String::new(),
         });
         let mut device = None;
         state.next_mapping_probe = Some(Instant::now() - Duration::from_secs(1));

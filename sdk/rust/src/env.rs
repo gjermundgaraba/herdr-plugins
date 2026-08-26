@@ -1,6 +1,6 @@
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
@@ -43,7 +43,14 @@ impl Environment {
             plugin_state_dir: path_var("HERDR_PLUGIN_STATE_DIR"),
             action_id: string_var("HERDR_PLUGIN_ACTION_ID"),
             event_name: string_var("HERDR_PLUGIN_EVENT"),
-            event: json_var("HERDR_PLUGIN_EVENT_JSON")?,
+            event: string_var("HERDR_PLUGIN_EVENT_JSON")
+                .map(|json| {
+                    serde_json::from_str(&json).map_err(|source| EnvironmentError {
+                        variable: "HERDR_PLUGIN_EVENT_JSON",
+                        source,
+                    })
+                })
+                .transpose()?,
             entrypoint_id: string_var("HERDR_PLUGIN_ENTRYPOINT_ID"),
             pane_id: string_var("HERDR_PANE_ID"),
         })
@@ -182,7 +189,6 @@ pub fn open_rotating_log(path: &Path, max_bytes: u64, retained_files: usize) -> 
             }
             match fs::rename(&source, &target) {
                 Ok(()) => {
-                    retain_log_tail(&target, max_bytes)?;
                     make_private(&target)?;
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -209,29 +215,6 @@ fn numbered_log(path: &Path, index: usize) -> io::Result<PathBuf> {
         .to_os_string();
     name.push(format!(".{index}"));
     Ok(path.with_file_name(name))
-}
-
-fn retain_log_tail(path: &Path, max_bytes: u64) -> io::Result<()> {
-    let length = fs::metadata(path)?.len();
-    if length <= max_bytes {
-        return Ok(());
-    }
-    let mut source = File::open(path)?;
-    source.seek(SeekFrom::Start(length - max_bytes))?;
-    let mut name = path.file_name().unwrap().to_os_string();
-    name.push(format!(".trim-{}.tmp", std::process::id()));
-    let temporary = path.with_file_name(name);
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut target = options.open(&temporary)?;
-    io::copy(&mut source.take(max_bytes), &mut target)?;
-    target.flush()?;
-    drop(target);
-    fs::remove_file(path)?;
-    fs::rename(&temporary, path)?;
-    Ok(())
 }
 
 #[cfg(unix)]
@@ -276,21 +259,10 @@ fn path_var(name: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn json_var<T: serde::de::DeserializeOwned>(
-    name: &'static str,
-) -> Result<Option<T>, EnvironmentError> {
-    string_var(name)
-        .map(|json| {
-            serde_json::from_str(&json).map_err(|source| EnvironmentError {
-                variable: name,
-                source,
-            })
-        })
-        .transpose()
-}
-
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
+
     use super::*;
 
     #[test]
@@ -369,17 +341,25 @@ mod tests {
     }
 
     #[test]
-    fn rotates_and_caps_private_logs() {
+    fn rotates_private_logs_with_one_write_overshoot() {
         let dir = std::env::temp_dir().join(format!("herdr-client-log-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let path = dir.join("plugin.log");
         fs::create_dir_all(&dir).unwrap();
-        fs::write(&path, b"abcdef").unwrap();
+        fs::write(&path, b"abcde\n").unwrap();
         let mut file = open_rotating_log(&path, 4, 3).unwrap();
         file.write_all(b"new").unwrap();
         drop(file);
         assert_eq!(fs::read(&path).unwrap(), b"new");
-        assert_eq!(fs::read(dir.join("plugin.log.1")).unwrap(), b"cdef");
+        assert_eq!(fs::read(dir.join("plugin.log.1")).unwrap(), b"abcde\n");
+
+        fs::write(&path, b"ghijk\n").unwrap();
+        drop(open_rotating_log(&path, 4, 3).unwrap());
+        fs::write(&path, b"stuvw\n").unwrap();
+        drop(open_rotating_log(&path, 4, 3).unwrap());
+        assert_eq!(fs::read(dir.join("plugin.log.1")).unwrap(), b"stuvw\n");
+        assert_eq!(fs::read(dir.join("plugin.log.2")).unwrap(), b"ghijk\n");
+        assert!(!dir.join("plugin.log.3").exists());
         #[cfg(unix)]
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,

@@ -124,8 +124,7 @@ fn mark_pending(path: &Path) -> Result<(), String> {
     options
         .open(path)
         .map_err(|error| format!("mark refresh pending: {error}"))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .map_err(|error| format!("chmod pending marker: {error}"))
+    Ok(())
 }
 
 fn claim_pending(run_dir: &Path) -> Result<usize, String> {
@@ -398,6 +397,10 @@ fn format_sidebar_tokens(
 }
 
 fn workspace_cwd(snapshot: &SessionSnapshot, workspace: &WorkspaceInfo) -> Option<PathBuf> {
+    if let Some(worktree) = &workspace.worktree {
+        return Some(PathBuf::from(&worktree.checkout_path));
+    }
+
     let tab = snapshot
         .tabs
         .iter()
@@ -407,12 +410,6 @@ fn workspace_cwd(snapshot: &SessionSnapshot, workspace: &WorkspaceInfo) -> Optio
         .iter()
         .find(|pane| pane.tab_id == tab.tab_id)
         .and_then(|pane| pane.cwd.as_deref())
-        .or_else(|| {
-            workspace
-                .worktree
-                .as_ref()
-                .map(|wt| wt.checkout_path.as_str())
-        })
         .map(PathBuf::from)
 }
 
@@ -724,35 +721,60 @@ mod tests {
     }
 
     #[test]
-    fn workspace_cwd_uses_the_root_pane_cwd_not_its_foreground_process() {
+    fn workspace_cwd_uses_worktree_or_first_pane_cwd() {
         let mut snapshot = snapshot(vec![workspace("workspace", None)]);
-        snapshot.tabs = serde_json::from_value(json!([{
-            "tab_id": "tab",
-            "workspace_id": "workspace",
-            "number": 1,
-            "label": "tab",
-            "focused": true,
-            "pane_count": 1,
-            "agent_status": "unknown"
-        }]))
+        snapshot.tabs = serde_json::from_value(json!([
+            {
+                "tab_id": "first-tab",
+                "workspace_id": "workspace",
+                "number": 1,
+                "label": "first",
+                "focused": true,
+                "pane_count": 2,
+                "agent_status": "unknown"
+            }
+        ]))
         .unwrap();
-        snapshot.panes = serde_json::from_value(json!([{
-            "pane_id": "pane",
-            "terminal_id": "terminal",
-            "workspace_id": "workspace",
-            "tab_id": "tab",
-            "focused": true,
-            "cwd": "/workspace",
-            "foreground_cwd": "/workspace/nested/other-repo",
-            "agent_status": "unknown",
-            "revision": 0
-        }]))
+        snapshot.panes = serde_json::from_value(json!([
+            {
+                "pane_id": "first-pane",
+                "terminal_id": "first-terminal",
+                "workspace_id": "workspace",
+                "tab_id": "first-tab",
+                "focused": false,
+                "cwd": "/first-pane",
+                "foreground_cwd": "/first-pane/nested/other-repo",
+                "agent_status": "unknown",
+                "revision": 0
+            },
+            {
+                "pane_id": "second-pane",
+                "terminal_id": "second-terminal",
+                "workspace_id": "workspace",
+                "tab_id": "first-tab",
+                "focused": false,
+                "cwd": "/second-pane",
+                "agent_status": "unknown",
+                "revision": 0
+            }
+        ]))
         .unwrap();
 
+        // Without worktree metadata, use the first pane's CWD, not its foreground CWD.
+        assert_eq!(
+            workspace_cwd(&snapshot, &snapshot.workspaces[0]),
+            Some(PathBuf::from("/first-pane"))
+        );
+
+        snapshot.workspaces[0].worktree = workspace("workspace", Some(("repo", true))).worktree;
         assert_eq!(
             workspace_cwd(&snapshot, &snapshot.workspaces[0]),
             Some(PathBuf::from("/workspace"))
         );
+
+        snapshot.workspaces[0].worktree = None;
+        snapshot.panes[0].cwd = None;
+        assert_eq!(workspace_cwd(&snapshot, &snapshot.workspaces[0]), None);
     }
 
     #[test]
