@@ -3,7 +3,29 @@
 This is the durable evidence behind `herdr-micro`. It intentionally omits the
 superseded option surveys, experiment plans, and implementation diary.
 
-## Physically verified facts
+## Current cutover baseline (2026-08-26)
+
+- The connected Codex Micro reported stock firmware `0.6.2` from a successful
+  `device.status` round trip over USB.
+- The clean-break implementation uses shared, unprivileged IOHIDManager access
+  with USB preferred and Bluetooth Low Energy supported. At this checkpoint,
+  the complete new service path has not yet been physically exercised end to
+  end, and BLE has not yet been reverified on firmware 0.6.2. Do not interpret
+  the older traces below as that verification.
+- The service alone enforces the official-writer gate: it closes the physical
+  device while Work Louder Input is running or ChatGPT/Codex desktop is
+  frontmost, then reopens and replays state after the gate clears. Herdr may
+  read the same detector only to suppress routing. Physical verification of
+  this gate is included in the pending end-to-end check above.
+- The new per-user service consumes Button 5 (`ACT10`) and launches Handy with
+  `--toggle-transcription` directly. Physical end-to-end verification of this
+  new no-CGEvent path is pending at this checkpoint.
+
+## Historical physical evidence
+
+The following experiments established the hardware and protocol behavior used
+by the redesign. Exclusive-helper and synthetic-key traces are preserved as
+evidence, but their ownership architecture and F19 action path are superseded.
 
 - The Codex Micro vendor HID interface is `0x303A:0x8360`, usage page
   `0xFF00`, Report ID 6. Direct macOS IOKit transport completed
@@ -39,15 +61,21 @@ press position. Dual events are therefore expected mechanical behavior, not
 evidence that `ACT11` is unusable; bind the two switches independently only
 when that is the intended interaction.
 
-### Native Layer 2 action trace (2026-08-08)
+### Historical native Layer 2 action trace (2026-08-08)
 
 After programming Layer 2 with native OAI action codes under exclusive USB
 capture, physical `ACT12` submitted to the focused Codex pane. Physical
-`ACT10` produced the configured synthetic F19 tap; Handy received `fn+f19`,
-recorded, transcribed, and pasted successfully. Both inputs arrived through
-the helper's exclusive vendor-event path; no host keyboard report was involved.
+`ACT10` produced the then-configured synthetic F19 tap; Handy received it and
+completed record, transcription, and paste. Both inputs arrived through the
+old helper's exclusive vendor-event path; no host keyboard report was involved.
+This proves the switch and vendor event, not the current service action. The
+current design consumes `ACT10` and invokes Handy directly without F19 or a
+CGEvent.
 
-### USB ownership recovery and focus handoff (2026-08-04)
+### Historical exclusive-helper recovery and focus handoff (2026-08-04)
+
+These results apply only to the deleted USB-seize/root-helper architecture.
+They are retained as failure and latency evidence, not as current behavior.
 
 - With the user daemon frozen, `SIGKILL` left the Micro captured and absent
   from `hidutil` after five seconds. A fresh helper recaptured it, and a
@@ -86,6 +114,7 @@ polling cadence, not a performance guarantee.
 |---|---|
 | Codex Micro firmware 0.4.1 | USB and BLE vendor channel, controls, routing, and RGB passed |
 | Codex Micro firmware 0.6.1 | USB passed; BLE passed after pairing a fresh host slot |
+| Codex Micro firmware 0.6.2 | USB `device.status` passed; full new service and BLE checks pending |
 | Work Louder Input 0.17.2 | OAI-enabled Layer 2 clone and read-back passed |
 | Work Louder Input 0.18.0 | Firmware 0.6.1 update and retained keymap passed |
 | Herdr 0.8.0 | Direct snapshots, targeting, and effort actions passed |
@@ -125,6 +154,7 @@ change can break this integration without notice.
 - [Work Louder Codex Micro product page](https://worklouder.cc/codex-micro)
 - [Work Louder Codex Micro setup and BLE pairing](https://worklouder.cc/openai-micro-setup)
 - [Work Louder firmware 0.6.1 release](https://github.com/worklouder/cm-v2-fw-releases/releases/tag/v0.6.1)
+- [Work Louder firmware 0.6.2 release](https://github.com/worklouder/cm-v2-fw-releases/releases/tag/v0.6.2)
 - [OpenAI × Work Louder product page](https://openai.com/supply/co-lab/work-louder/)
 - [FreeMicro transport implementation and hardware record](https://github.com/eliBenven/freemicro/tree/1e78198c1b4bfe43b7e4aee3246c73314b9bcc0f)
 - [house-of-herdr behavioral reference](https://github.com/alasano/house-of-herdr/tree/7d8eadaed41a1bb4456565d6bcba8cdb7380b77e/packages/codex-micro)

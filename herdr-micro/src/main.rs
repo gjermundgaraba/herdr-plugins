@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use herdr_micro::{
     control::{request_status, request_stop, start_daemon_versioned},
-    daemon, doctor, helper_install, setup,
+    daemon, doctor, setup,
 };
 use std::{
     env,
@@ -12,7 +12,7 @@ use std::{
     time::Duration,
 };
 
-const USAGE: &str = "usage: herdr-micro <start|doctor|status|configure|setup-pi-effort|stop|setup|install-helper|uninstall-helper>";
+const USAGE: &str = "usage: herdr-micro <start|doctor|status|configure|setup-pi-effort|stop|setup>";
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
@@ -50,16 +50,6 @@ fn run(args: Vec<OsString>) -> Result<ExitCode> {
         "setup-pi-effort" if rest.is_empty() => setup_pi_effort(),
         "stop" if rest.is_empty() => stop(),
         "setup" if rest.is_empty() => setup_micro(),
-        "install-helper" if rest.is_empty() => {
-            helper_install::install()?;
-            println!("Installed privileged Codex Micro USB helper");
-            Ok(ExitCode::SUCCESS)
-        }
-        "uninstall-helper" if rest.is_empty() => {
-            helper_install::uninstall()?;
-            println!("Uninstalled privileged Codex Micro USB helper");
-            Ok(ExitCode::SUCCESS)
-        }
         _ => bail!(USAGE),
     }
 }
@@ -67,11 +57,11 @@ fn run(args: Vec<OsString>) -> Result<ExitCode> {
 fn start() -> Result<ExitCode> {
     let root = setup::plugin_root()?;
     let executable = env::current_exe()?;
+    setup::ensure_service()?;
     let status = start_daemon_versioned(
         env!("CARGO_PKG_VERSION"),
         daemon::DAEMON_PROTOCOL_VERSION,
         || {
-            helper_install::verify_installed()?;
             let mut command = Command::new(&executable);
             command
                 .arg("daemon")
@@ -91,9 +81,8 @@ fn start() -> Result<ExitCode> {
             command.spawn().context("start Micro bridge")?;
             Ok(())
         },
-        // Must outlast a draining daemon's teardown (device close and USB
-        // release can block for ~13s); success returns as soon as it is ready.
-        Duration::from_secs(15),
+        // Each teardown/startup wait is best effort; retry after slow work finishes.
+        Duration::from_secs(40),
     )?;
     println!("{}", serde_json::to_string(&status)?);
     Ok(ExitCode::SUCCESS)

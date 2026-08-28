@@ -7,7 +7,7 @@ members = [
     "equalize-splits",
     "fork-to-pane",
     "herdr-micro",
-    "herdr-micro/codex-micro",
+    "codex-micro",
     "space-meta",
     "history",
     "sdk/picker",

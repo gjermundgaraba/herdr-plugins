@@ -1,108 +1,148 @@
 # herdr-micro
 
-Unofficial macOS [Herdr](https://herdr.dev/) plugin for the Work Louder Codex
-Micro. It shows Herdr agent state on the six Agent keys and routes the keys,
-dial, and joystick to the focused Codex, Claude Code, or Pi agent.
+Unofficial macOS [Herdr](https://herdr.dev/) integration for the Work Louder
+Codex Micro. It shows Herdr agent state on the six Agent keys and routes the
+configurable controls to the focused Codex, Claude Code, or Pi agent.
+
+The device transport is a separate per-user service. It uses the stock Codex
+Micro firmware and shared macOS IOHIDManager access over USB or Bluetooth Low
+Energy; USB is preferred when both are present. It does not seize USB, install
+a root helper, or use `sudo`.
 
 ## Requirements
 
-- macOS and a Codex Micro
+- macOS and a Codex Micro; the current hardware baseline is stock firmware
+  0.6.2
 - [Herdr](https://herdr.dev/docs/install/) 0.8.0 or newer (socket protocol 19)
 - Herdr `[experimental].kitty_graphics = true` for exact pane scrolling
 - Ghostty 1.3 or newer
 - Rust 1.89 or newer when building from source
+- An Apple Development code-signing identity when building from source
 - Work Louder Input for the one-time Layer 2 setup
-- Administrator access for the one-time privileged USB-helper installation
+- macOS Input Monitoring permission for the installed Codex Micro service
 - macOS Automation permission for Ghostty inspection
-- macOS Accessibility permission for configured `key` bindings
-- [Hunk](https://www.hunk.dev/) only for the optional `diff` action
+- macOS Accessibility permission only for configured system `key` bindings
+- Handy installed at `/Applications/Handy.app` for the reserved voice-control
+  button and [Hunk](https://www.hunk.dev/) only for the optional `diff` action
 
-The bridge uses an unsupported proprietary device protocol. See the
+The bridge uses an unsupported proprietary device protocol. Read the
 [compatibility and safety notes](docs/micro-bridge.md) before setup.
 
 ## Install
 
 ```sh
 herdr plugin install gjermundgaraba/herdr-plugins/herdr-micro
-HERDR_MICRO_ROOT="$(herdr plugin list --plugin gjermundgaraba.herdr-micro --json | plutil -extract result.plugins.0.plugin_root raw -o - -)"
-sudo "$HERDR_MICRO_ROOT/bin/herdr-micro" install-helper
 herdr plugin enable gjermundgaraba.herdr-micro
+herdr plugin action invoke service-authorize \
+  --plugin gjermundgaraba.herdr-micro
 ```
 
-The explicit `sudo` step installs a root-owned, USB-only launchd helper. While
-Herdr owns the Micro, the helper captures its USB interface so macOS and
-ChatGPT cannot receive the same Agent-key reports.
+`herdr-micro start`, including the plugin startup hook, installs or refreshes
+the per-user `dev.herdr.codex-micro` LaunchAgent automatically. The stable
+service executable lives under
+`~/Library/Application Support/dev.herdr.codex-micro/`; grant Input Monitoring
+to that installed executable when macOS prompts. On a fresh install,
+`service-authorize` installs the stable service first and asks the running
+service process to request access. If no entry appears, open **System Settings
+→ Privacy & Security → Input Monitoring**, click **+**, authenticate, and add
+`~/Library/Application Support/dev.herdr.codex-micro/codex-micro`; then rerun
+`service-authorize`.
+
+The build signs the service as `dev.herdr.codex-micro`, so one Input Monitoring
+grant survives later builds signed by the same Apple Development identity.
+Changing the signing identity requires one new grant.
 
 For local development:
 
 ```sh
 git clone https://github.com/gjermundgaraba/herdr-plugins.git
 cd herdr-plugins/herdr-micro
-cargo build --release --locked
+cargo build --release --locked \
+  --package herdr-micro --bin herdr-micro \
+  --package codex-micro --bin codex-micro
 mkdir -p bin
 install -m 750 ../target/release/herdr-micro bin/.herdr-micro.new
+install -m 750 ../target/release/codex-micro bin/.codex-micro.new
+/usr/bin/codesign --force --timestamp=none --sign "Apple Development" \
+  --identifier dev.herdr.codex-micro bin/.codex-micro.new
 mv -f bin/.herdr-micro.new bin/herdr-micro
-install -m 750 ../target/release/herdr-micro-hid bin/.herdr-micro-hid.new
-mv -f bin/.herdr-micro-hid.new bin/herdr-micro-hid
-sudo ./bin/herdr-micro install-helper
+mv -f bin/.codex-micro.new bin/codex-micro
 herdr plugin link . --enabled
+herdr plugin action invoke service-authorize \
+  --plugin gjermundgaraba.herdr-micro
 ```
 
 ## Set up the Micro
 
-1. In Work Louder Input, create a blank Layer 2. Connect by USB, then quit
-   Input and the Codex desktop app.
+1. In Work Louder Input, create a blank Layer 2, then quit Work Louder Input
+   and the Codex desktop app.
 
-2. Clone the device's OAI controls into Layer 2. The guarded setup accepts only
-   a blank or previously managed layer, backs up the keymap, and verifies the
-   write.
+2. If the Micro bridge is running, stop it before changing the keymap. On a
+   fresh install nothing is running yet; skip this step.
+
+   ```sh
+   herdr plugin action invoke micro-stop --plugin gjermundgaraba.herdr-micro
+   ```
+
+3. Clone the device's OAI controls into Layer 2. Setup accepts only a blank or
+   previously managed layer, backs up the keymap, and verifies the write.
 
    ```sh
    herdr plugin action invoke micro-setup --plugin gjermundgaraba.herdr-micro
    ```
 
-3. Start and check the bridge.
+4. Start and check the integration.
 
    ```sh
    herdr plugin action invoke micro-start --plugin gjermundgaraba.herdr-micro
    herdr plugin action invoke doctor --plugin gjermundgaraba.herdr-micro
    ```
 
-4. Find the live configuration directory.
+## Configuration and controls
 
-   ```sh
-   herdr plugin config-dir gjermundgaraba.herdr-micro
-   ```
+Run **Configure Herdr Micro** or locate the live configuration directory:
 
-   `config.json` contains controls and lighting. Runtime files use the plugin
-state directory: `run/micro.sock`, `logs/micro.log`, and `data/backups/` for
-verified keymap backups. The daemon keeps three 10 MiB log files.
-
-Run **Configure Herdr Micro** in Herdr to open `config.json`. Binding
-changes are validated and reloaded while the bridge runs. `buttons` maps the
-seven action switches to bindings; `null` disables a switch. Each bound switch
-uses a fixed internal HID code that macOS maps to no virtual keycode, so an
-uncaptured Micro cannot type anything. Agent presses focus their slot directly
-through Herdr. The only way a button reaches macOS is an explicit `key`
-binding, which taps a configured key system-wide from any frontmost app while
-the bridge owns the device (useful for app hotkeys such as dictation):
-
-```json
-"5": { "action": "key", "key": "F19" }
+```sh
+herdr plugin config-dir gjermundgaraba.herdr-micro
 ```
 
-Names cover F13–F20; `keycode` accepts any macOS virtual keycode (0–127)
+`config.json` contains Herdr controls and lighting. The service reserves Button
+5 (`ACT10`) for Handy and consumes its press directly by running
+`handy --toggle-transcription`. This works without Herdr and does not synthesize
+F19 or any other CGEvent, so Secure Input does not block it. Keep
+`controls.buttons["5"]` set to `null`.
+
+The other buttons, dial, joystick, gestures, routing, and lighting policy stay
+in the Herdr client. The stock wide keycap spans switches 5 and 6, so Button 6
+is also `null` by default. Changing which non-reserved buttons are enabled
+requires stopping the bridge, rerunning `micro-setup`, and restarting it.
+
+The two top-level fields, `controls` and `lighting`, are required. Besides the
+Herdr actions in the default configuration, a binding can tap a system key from
+any frontmost app (requires Accessibility):
+
+```json
+"2": { "action": "key", "key": "F19" }
+```
+
+`key` names cover F13–F20; `keycode` accepts any macOS virtual keycode (0–127)
 instead of `key`, and optional `modifiers` adds any of `cmd`, `shift`, `alt`,
 `ctrl`, and `fn`.
-The stock wide keycap spans switches 5 and 6, so `controls.buttons["6"]`
-stays `null` by default. The two top-level fields—`controls` and `lighting`—are
-required.
 
-The privileged helper captures the USB-connected Micro so ChatGPT cannot also
-receive Layer 2 events. Binding a previously unbound switch (or the reverse)
-alters the device keymap: stop the bridge, run **Set up Micro Layer 2** again,
-then restart it. Every changed keymap is backed up and verified before setup
-succeeds.
+The actions are `prompt`, `submit`, `fast`, `diff`, `scroll`, `focus-pane`,
+`script`, and `key`; the default configuration demonstrates most of them plus
+`byAgent` variants. Buttons also accept gesture bindings:
+
+```json
+"1": { "tap": { "action": "submit" }, "hold": { "action": "fast" }, "holdMs": 400 }
+```
+
+`tap`, `doubleTap`, `hold`, and `release` each take an action; `holdMs` and
+`doubleTapMs` tune the timing.
+
+Runtime files use the plugin state directory: `run/micro.sock`,
+`logs/micro.log`, and `data/backups/`. The device service writes its own log to
+`~/Library/Logs/dev.herdr.codex-micro/service.log`.
 
 ## Effort controls
 
@@ -114,46 +154,26 @@ herdr plugin action invoke setup-pi-effort \
   --plugin gjermundgaraba.herdr-micro
 ```
 
-Codex CLI reads TUI shortcuts from `~/.codex/config.toml`; Codex Desktop's
-`~/.codex/keybindings.json` is unrelated. The default Micro configuration
-runs the bundled adapter with Codex's native `alt+.` and `alt+,` defaults, so
-no Codex configuration is required. If those TUI bindings are overridden,
-update the adapter arguments in `config.json`. Claude Code uses the same
-adapter with its `/effort` picker. See [effort
-control](docs/micro-bridge.md#thinking-effort-control) for operational
+Codex uses its native `alt+.` and `alt+,` TUI defaults; if those bindings are
+overridden in `~/.codex/config.toml`, update the adapter arguments in
+`config.json`. Claude Code uses the same adapter with its `/effort` picker. See
+[thinking-effort control](docs/micro-bridge.md#thinking-effort-control) for the
 boundaries.
-
-## Script actions
-
-A binding can run a command synchronously from the plugin root:
-
-```json
-{
-  "action": "script",
-  "command": "/bin/sh",
-  "args": ["./integrations/thinking-effort.sh", "alt+."]
-}
-```
-
-Scripts inherit `HERDR_BIN_PATH` and receive the frozen target as
-`HERDR_SOCKET_PATH`, `HERDR_SESSION`, and `HERDR_PANE_ID`.
-Stale inherited Herdr target selectors are removed. Each script has a
-five-second timeout. Output is bounded, and failures report the binding, exit
-status, and stderr. Each accepted input runs its script once; see the
-[architecture guide](docs/micro-bridge.md#current-architecture) for scheduling
-details.
 
 ## Routing and operation
 
-One bridge serves the default and named Herdr sessions. Native ScriptingBridge
-queries map each running session to its Ghostty terminal UUID. Herdr snapshots
-drive routing and lighting. Built-in actions use direct socket requests;
-configured scripts run only after the same frozen session, pane, agent, and
-routing identity have been revalidated.
+One Herdr client can route the Micro across default and named Herdr sessions.
+It maps Ghostty terminal UUIDs to sessions and revalidates the target before
+each action. The device service remains available when Herdr is absent, but
+only its reserved Handy action is local; gestures and all other actions need
+the Herdr client.
 
-- Codex desktop frontmost: Layer 1 and device ownership yielded to Codex
-- Mapped Ghostty terminal frontmost: Layer 2 and the matching Herdr session
-- Other app frontmost: preserve the last applicable layer; dispatch nothing
+- Work Louder Input running or ChatGPT/Codex desktop frontmost: Herdr
+  suppresses routing
+- Independently, the service enforces the gate by closing the physical device
+- Official writer inactive: the service reopens USB or BLE and replays state
+- Mapped Ghostty terminal frontmost: Herdr selects Layer 2 and routes to that
+  session; other apps dispatch no Herdr action
 
 Useful actions:
 
@@ -163,25 +183,18 @@ herdr plugin action invoke micro-stop --plugin gjermundgaraba.herdr-micro
 herdr plugin log list --plugin gjermundgaraba.herdr-micro --limit 20
 ```
 
-Quit Work Louder Input while the bridge runs and keep the Micro connected by
-USB. The helper owns the device while Layer 2 is active, then restores the
-normal macOS HID driver when the bridge yields to ChatGPT/Codex. The user
-daemon blanks the LEDs and stops after 60 seconds without a running Herdr
-session; the disconnected helper restores native HID ownership and exits.
-launchd starts a fresh helper for the next device lease.
-
-Herdr v1 has no plugin teardown hook. Run `micro-stop` before updating. Ordinary
-plugin updates keep using the installed helper; rerun `install-helper` only
-when the helper build changes or `doctor` reports a version mismatch. Before
-uninstalling or unlinking, stop the bridge and run:
+Before unlinking or uninstalling the plugin, remove its per-user service:
 
 ```sh
-sudo "$HERDR_MICRO_ROOT/bin/herdr-micro" uninstall-helper
+HERDR_MICRO_ROOT="$(herdr plugin list --plugin gjermundgaraba.herdr-micro --json | plutil -extract result.plugins.0.plugin_root raw -o - -)"
+"$HERDR_MICRO_ROOT/bin/codex-micro" uninstall
 ```
 
-Current architecture, compatibility, ownership, and limitations are in
-[the bridge guide](docs/micro-bridge.md). Durable hardware and version evidence
-is indexed in [the research record](docs/research/README.md).
+No administrator access is needed.
+
+Architecture, ownership, and limitations are in [the bridge
+guide](docs/micro-bridge.md). Hardware and version evidence is indexed in [the
+research record](docs/research/README.md).
 
 ## License
 

@@ -5,14 +5,10 @@ pub mod daemon;
 pub mod doctor;
 pub mod gestures;
 pub mod ghostty;
-pub mod helper_install;
 pub mod herdr;
-pub mod hid;
 pub mod macos;
 pub mod protocol;
 pub mod setup;
-
-pub use codex_micro as device;
 
 pub const PLUGIN_ID: &str = "gjermundgaraba.herdr-micro";
 

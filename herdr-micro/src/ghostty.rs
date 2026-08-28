@@ -3,6 +3,7 @@ use objc2::{class, msg_send, rc::Retained, runtime::AnyObject};
 use objc2_foundation::NSString;
 use serde::Serialize;
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -213,11 +214,16 @@ fn set_session_title(session: &Session, title: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn find_token<I>(inspect: &mut I, token: &str) -> Result<Option<GhosttyTerminal>>
+fn find_token<I>(
+    inspect: &mut I,
+    token: &str,
+    stopping: &AtomicBool,
+) -> Result<Option<GhosttyTerminal>>
 where
     I: FnMut() -> Result<Vec<GhosttyTerminal>>,
 {
     for attempt in 0..10 {
+        check_stopping(stopping)?;
         let matches: Vec<_> = inspect()?
             .into_iter()
             .filter(|terminal| terminal.name == token)
@@ -235,11 +241,17 @@ where
     Ok(None)
 }
 
-fn wait_for_title<I>(inspect: &mut I, terminal_id: &str, title: &str) -> Result<bool>
+fn wait_for_title<I>(
+    inspect: &mut I,
+    terminal_id: &str,
+    title: &str,
+    stopping: &AtomicBool,
+) -> Result<bool>
 where
     I: FnMut() -> Result<Vec<GhosttyTerminal>>,
 {
     for attempt in 0..10 {
+        check_stopping(stopping)?;
         if inspect()?
             .iter()
             .any(|terminal| terminal.id == terminal_id && terminal.name == title)
@@ -260,11 +272,19 @@ pub struct SessionTerminalMapping {
     pub terminal_id: String,
 }
 
+fn check_stopping(stopping: &AtomicBool) -> Result<()> {
+    if stopping.load(Ordering::Acquire) {
+        bail!("Micro bridge is stopping")
+    }
+    Ok(())
+}
+
 pub fn probe_session_terminals_with<I, S, T>(
     sessions: &[String],
     mut inspect: I,
     mut set_title: S,
     mut create_token: T,
+    stopping: &AtomicBool,
 ) -> Result<Vec<SessionTerminalMapping>>
 where
     I: FnMut() -> Result<Vec<GhosttyTerminal>>,
@@ -273,7 +293,10 @@ where
 {
     let mut mappings = Vec::new();
     for session_name in sessions {
+        check_stopping(stopping)?;
         let before = inspect()?;
+        // A stop during the inspection must not start a title mutation.
+        check_stopping(stopping)?;
         let originals: std::collections::BTreeMap<_, _> = before
             .iter()
             .map(|terminal| (terminal.id.clone(), terminal.name.clone()))
@@ -286,7 +309,7 @@ where
 
         let mut restored = false;
         let probed = (|| {
-            let terminal = find_token(&mut inspect, &token)?
+            let terminal = find_token(&mut inspect, &token, stopping)?
                 .ok_or_else(|| anyhow!("Herdr session {session_name} did not appear in Ghostty"))?;
             let original = originals
                 .get(&terminal.id)
@@ -296,7 +319,7 @@ where
                 .any(|mapping: &SessionTerminalMapping| mapping.terminal_id == terminal.id);
             set_title(session_name, Some(original))?;
             restored = true;
-            if !wait_for_title(&mut inspect, &terminal.id, original)? {
+            if !wait_for_title(&mut inspect, &terminal.id, original, stopping)? {
                 bail!("failed to restore {session_name} terminal title");
             }
             Ok((terminal, duplicate))
@@ -324,7 +347,10 @@ where
     Ok(mappings)
 }
 
-pub fn probe_session_terminals(sessions: &[Session]) -> Result<Vec<SessionTerminalMapping>> {
+pub fn probe_session_terminals(
+    sessions: &[Session],
+    stopping: &AtomicBool,
+) -> Result<Vec<SessionTerminalMapping>> {
     let names: Vec<_> = sessions
         .iter()
         .map(|session| session.name.clone())
@@ -340,6 +366,7 @@ pub fn probe_session_terminals(sessions: &[Session]) -> Result<Vec<SessionTermin
             set_session_title(session, title)
         },
         |session| format!("__herdr_micro_{session}_{}__", unique_token()),
+        stopping,
     )
 }
 
@@ -368,6 +395,31 @@ mod tests {
                 name: name.into(),
             })
             .collect()
+    }
+
+    #[test]
+    fn cancellation_during_inspection_mutates_no_title() {
+        let stopping = AtomicBool::new(false);
+        let calls = RefCell::new(Vec::new());
+        let error = probe_session_terminals_with(
+            &["default".into()],
+            || {
+                stopping.store(true, Ordering::Release);
+                Ok(state(vec![("terminal", "original")]))
+            },
+            |session, title| {
+                calls
+                    .borrow_mut()
+                    .push((session.to_owned(), title.map(str::to_owned)));
+                Ok(())
+            },
+            |_| "probe".into(),
+            &stopping,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "Micro bridge is stopping");
+        assert!(calls.into_inner().is_empty());
     }
 
     #[test]
@@ -413,6 +465,7 @@ mod tests {
                 Ok(())
             },
             |session| format!("probe-{session}"),
+            &AtomicBool::new(false),
         )
         .unwrap();
         assert_eq!(
@@ -458,6 +511,7 @@ mod tests {
                 title.map(|_| ()).ok_or_else(|| anyhow!("cleanup failed"))
             },
             |_| "probe".into(),
+            &AtomicBool::new(false),
         )
         .unwrap_err();
         assert_eq!(error.to_string(), "inspection failed");
@@ -488,6 +542,7 @@ mod tests {
                 },
                 "terminal",
                 "original",
+                &AtomicBool::new(false),
             )
             .unwrap()
         );
@@ -518,6 +573,7 @@ mod tests {
                 Ok(())
             },
             |_| "probe".into(),
+            &AtomicBool::new(false),
         )
         .unwrap_err();
         assert_eq!(

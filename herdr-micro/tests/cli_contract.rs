@@ -1,6 +1,7 @@
 use std::{
     env, fs,
     io::{BufRead, BufReader, Write},
+    os::unix::fs::PermissionsExt,
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     process::{Command, Output},
@@ -67,6 +68,16 @@ fn status_stop_and_start_use_the_newline_json_socket_without_spawning() {
     let state = dir.join("state");
     let run = state.join("run");
     fs::create_dir_all(&run).unwrap();
+    let service = dir.join("plugin/bin/codex-micro");
+    fs::create_dir_all(service.parent().unwrap()).unwrap();
+    fs::write(
+        &service,
+        "#!/bin/sh\nprintf '%s\\n' \"$1\" > \"$HERDR_PLUGIN_STATE_DIR/service-command\"\nprintf 'installer noise\\n'\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&service).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&service, permissions).unwrap();
     let socket = run.join("micro.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let server = thread::spawn(move || {
@@ -110,6 +121,10 @@ fn status_stop_and_start_use_the_newline_json_socket_without_spawning() {
         assert_eq!(String::from_utf8(result.stdout).unwrap(), expected);
     }
     server.join().unwrap();
+    assert_eq!(
+        fs::read_to_string(state.join("service-command")).unwrap(),
+        "install\n"
+    );
 
     fs::remove_dir_all(dir).unwrap();
 }

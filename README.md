@@ -57,12 +57,12 @@ result/bin/herdr-picker --version
 ```
 
 The other package names include `herdr-picker-agents`,
-`herdr-picker-workspaces`, `equalize-splits`, `fork-to-pane`, `history`,
-`space-meta`, and `herdr-micro`. The two picker examples are independent
-optional binary packages. `herdr-micro` is exposed only on macOS, matching its
-plugin manifest; every other package supports Linux and macOS. Plugin packages
-contain a complete, prebuilt plugin root, so linking them never invokes Cargo.
-The picker packages expose their executables under `bin/`.
+`herdr-picker-workspaces`, `equalize-splits`, `fork-to-pane`, `history`, and
+`space-meta`. The two picker examples are independent optional binary packages.
+Every package supports Linux and macOS. Plugin packages contain a complete,
+prebuilt plugin root, so linking them never invokes Cargo. The picker packages
+expose their executables under `bin/`. `herdr-micro` has no Nix package: its
+service binary must be codesigned with a local Apple Development identity.
 
 For Home Manager, add the picker package to the profile:
 
@@ -88,10 +88,9 @@ binary cache is required.
 
 Each package's filtered source contains its full local path-dependency closure.
 The picker and its Rust examples share `sdk/picker`; popup chrome lives in
-`sdk/ratatui`; Herdr clients use `sdk/rust`; `herdr-micro` also includes
-`codex-micro`. Consequently, editing one plugin does not invalidate unrelated
-plugin outputs, while edits to a shared SDK invalidate packages that include
-it.
+`sdk/ratatui`; Herdr clients use `sdk/rust`. Consequently, editing one plugin
+does not invalidate unrelated plugin outputs, while edits to a shared SDK
+invalidate packages that include it.
 
 Enter the repository development shell with the same pinned Rust toolchain using
 `nix develop`.

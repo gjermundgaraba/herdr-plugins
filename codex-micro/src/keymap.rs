@@ -1,11 +1,12 @@
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
+use std::time::Instant;
 
 const READ_CHUNK: usize = 512;
 const WRITE_CHUNK: usize = 384;
 // ponytail: Codex keymaps are much smaller; raise this only if firmware grows past it.
-const MAX_KEYMAP_SIZE: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_KEYMAP_SIZE: usize = 8 * 1024 * 1024;
 
 fn keymap_chunk(value: Value) -> Result<(Vec<u8>, usize)> {
     let data = value
@@ -21,7 +22,14 @@ fn keymap_chunk(value: Value) -> Result<(Vec<u8>, usize)> {
     Ok((STANDARD.decode(data).context("invalid keymap data")?, total))
 }
 
-fn read_keymap_with<F>(mut read: F) -> Result<Vec<u8>>
+fn check_deadline(deadline: Instant, operation: &str) -> Result<()> {
+    if Instant::now() >= deadline {
+        bail!("keymap {operation} timed out");
+    }
+    Ok(())
+}
+
+fn read_keymap_with<F>(mut read: F, deadline: Instant) -> Result<Vec<u8>>
 where
     F: FnMut(usize) -> Result<Value>,
 {
@@ -29,6 +37,7 @@ where
     let mut expected_total = None;
     let mut body = Vec::new();
     loop {
+        check_deadline(deadline, "read")?;
         let (chunk, total) = keymap_chunk(read(offset)?)?;
         if total > MAX_KEYMAP_SIZE {
             bail!("keymap exceeds {MAX_KEYMAP_SIZE} bytes");
@@ -56,16 +65,22 @@ where
     }
 }
 
-pub fn read_keymap(request: impl Fn(&str, Option<Value>) -> Result<Value>) -> Result<Vec<u8>> {
-    read_keymap_with(|offset| {
-        request(
-            "fs.readbin",
-            Some(json!({ "file": "keymap.json", "offset": offset, "len": READ_CHUNK })),
-        )
-    })
+pub(crate) fn read_keymap_until(
+    request: impl Fn(&str, Option<Value>) -> Result<Value>,
+    deadline: Instant,
+) -> Result<Vec<u8>> {
+    read_keymap_with(
+        |offset| {
+            request(
+                "fs.readbin",
+                Some(json!({ "file": "keymap.json", "offset": offset, "len": READ_CHUNK })),
+            )
+        },
+        deadline,
+    )
 }
 
-fn write_keymap_chunks_with<F>(bytes: &[u8], mut write: F) -> Result<()>
+fn write_keymap_chunks_with<F>(bytes: &[u8], deadline: Instant, mut write: F) -> Result<()>
 where
     F: FnMut(usize, &[u8], bool) -> Result<()>,
 {
@@ -74,16 +89,18 @@ where
     }
     for (offset, chunk) in bytes.chunks(WRITE_CHUNK).enumerate() {
         let offset = offset * WRITE_CHUNK;
+        check_deadline(deadline, "write")?;
         write(offset, chunk, offset + chunk.len() == bytes.len())?;
     }
     Ok(())
 }
 
-pub fn write_keymap(
+pub(crate) fn write_keymap_until(
     request: impl Fn(&str, Option<Value>) -> Result<Value>,
     bytes: &[u8],
+    deadline: Instant,
 ) -> Result<()> {
-    write_keymap_chunks_with(bytes, |offset, data, completed| {
+    write_keymap_chunks_with(bytes, deadline, |offset, data, completed| {
         request(
             "fs.writebin",
             Some(json!({
@@ -102,23 +119,33 @@ pub fn write_keymap(
 mod tests {
     use super::*;
 
+    fn far_deadline() -> Instant {
+        Instant::now() + std::time::Duration::from_secs(3600)
+    }
+
     #[test]
     fn rejects_oversized_or_changing_keymaps() {
-        let oversized = read_keymap_with(|_| {
-            Ok(json!({
-                "data": STANDARD.encode(b"a"),
-                "total_size": MAX_KEYMAP_SIZE + 1
-            }))
-        })
+        let oversized = read_keymap_with(
+            |_| {
+                Ok(json!({
+                    "data": STANDARD.encode(b"a"),
+                    "total_size": MAX_KEYMAP_SIZE + 1
+                }))
+            },
+            far_deadline(),
+        )
         .unwrap_err();
         assert!(oversized.to_string().contains("exceeds"));
 
-        let changing = read_keymap_with(|offset| {
-            Ok(json!({
-                "data": STANDARD.encode(b"a"),
-                "total_size": if offset == 0 { 2 } else { 3 }
-            }))
-        })
+        let changing = read_keymap_with(
+            |offset| {
+                Ok(json!({
+                    "data": STANDARD.encode(b"a"),
+                    "total_size": if offset == 0 { 2 } else { 3 }
+                }))
+            },
+            far_deadline(),
+        )
         .unwrap_err();
         assert!(changing.to_string().contains("size changed"));
     }
@@ -126,14 +153,17 @@ mod tests {
     #[test]
     fn reads_and_writes_exact_chunks() {
         let bytes = b"abcdef".to_vec();
-        let read = read_keymap_with(|offset| {
-            let chunk = &bytes[offset..bytes.len().min(offset + 2)];
-            Ok(json!({ "data": STANDARD.encode(chunk), "total_size": bytes.len() }))
-        })
+        let read = read_keymap_with(
+            |offset| {
+                let chunk = &bytes[offset..bytes.len().min(offset + 2)];
+                Ok(json!({ "data": STANDARD.encode(chunk), "total_size": bytes.len() }))
+            },
+            far_deadline(),
+        )
         .unwrap();
         assert_eq!(read, bytes);
         let mut chunks = Vec::new();
-        write_keymap_chunks_with(&vec![1; 800], |offset, data, completed| {
+        write_keymap_chunks_with(&vec![1; 800], far_deadline(), |offset, data, completed| {
             chunks.push((offset, data.len(), completed));
             Ok(())
         })
@@ -142,5 +172,27 @@ mod tests {
             chunks,
             [(0, 384, false), (384, 384, false), (768, 32, true)]
         );
+    }
+
+    #[test]
+    fn expired_deadline_stops_before_any_request() {
+        let deadline = Instant::now();
+        let requests = std::cell::Cell::new(0);
+        let count = |_: &str, _: Option<Value>| {
+            requests.set(requests.get() + 1);
+            Ok(Value::Null)
+        };
+
+        assert_eq!(
+            read_keymap_until(count, deadline).unwrap_err().to_string(),
+            "keymap read timed out"
+        );
+        assert_eq!(
+            write_keymap_until(count, &[0; 1], deadline)
+                .unwrap_err()
+                .to_string(),
+            "keymap write timed out"
+        );
+        assert_eq!(requests.get(), 0);
     }
 }

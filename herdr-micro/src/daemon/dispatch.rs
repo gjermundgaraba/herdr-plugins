@@ -2,6 +2,7 @@
 //! and the action worker executes it against the routed Herdr session.
 
 use anyhow::{Context, Result, anyhow, bail};
+use codex_micro::DeviceEvent;
 use herdr_client::{AgentInfo, Client, SessionSnapshot};
 use serde_json::{Value, json};
 use std::{
@@ -23,7 +24,6 @@ use crate::{
     config::{
         Action, Binding, Direction, Modifier, VerticalDirection, key_action_code, key_binding,
     },
-    device::DeviceEvent,
     gestures::{Fired, GestureContext, GestureDispatcher},
     ghostty::{focused_terminal_id, scroll_terminal},
     herdr::{COMMAND_TIMEOUT, Session, current_snapshot, run_command_with_timeout},
@@ -299,7 +299,7 @@ fn execute_action(
     Ok(true)
 }
 
-fn execute_work(work: Work, routing_generation: &AtomicU64) -> Result<()> {
+fn execute_work(work: Work, routing_generation: &AtomicU64, stopping: &AtomicBool) -> Result<()> {
     let Work {
         source,
         session,
@@ -323,6 +323,10 @@ fn execute_work(work: Work, routing_generation: &AtomicU64) -> Result<()> {
     };
     if generation != routing_generation.load(Ordering::Acquire) {
         log("control ignored: stale Herdr routing");
+        return Ok(());
+    }
+    // A stop between the snapshot and the action must not start the action.
+    if stopping.load(Ordering::Acquire) {
         return Ok(());
     }
     let lease = DispatchLease {
@@ -404,7 +408,7 @@ pub(super) fn action_worker(
         if stopping.load(Ordering::Acquire) {
             break;
         }
-        if let Err(error) = execute_work(work, &routing_generation) {
+        if let Err(error) = execute_work(work, &routing_generation, &stopping) {
             log(format!("control failed: {error:#}"));
         }
     }

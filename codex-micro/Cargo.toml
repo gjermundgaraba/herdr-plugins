@@ -1,23 +1,21 @@
 [package]
-name = "herdr-micro"
+name = "codex-micro"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "Control Herdr from a Work Louder Codex Micro"
+description = "Per-user device service and client for the Work Louder Codex Micro"
 repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-codex-micro = { path = "../codex-micro" }
-herdr-client.workspace = true
+base64 = "0.23.1"
 libc.workspace = true
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSRunningApplication", "NSWorkspace", "libc"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSString"] }
 objc2-core-foundation = { workspace = true, features = ["CFArray", "CFDictionary", "CFNumber", "CFRunLoop", "CFSet", "CFString"] }
-objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["CGDirectDisplay", "CGError", "CGEvent", "CGEventSource", "CGEventTypes", "CGGeometry", "CGRemoteOperation", "CGWindow"] }
+objc2-io-kit = { version = "0.3.2", default-features = false, features = ["hid", "hidsystem", "objc2", "std"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSString"] }
 serde.workspace = true
 serde_json.workspace = true
-signal-hook = "0.4.4"

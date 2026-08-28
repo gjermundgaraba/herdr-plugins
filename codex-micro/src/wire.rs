@@ -41,19 +41,24 @@ pub struct Reassembler {
 
 impl Reassembler {
     pub fn push(&mut self, report: &[u8]) -> Vec<Result<Value, serde_json::Error>> {
-        if report.get(0..2) != Some(&[REPORT_ID, CHANNEL_RPC]) {
+        let offset = if report.get(0..2) == Some(&[REPORT_ID, CHANNEL_RPC]) {
+            1
+        } else if report.first() == Some(&CHANNEL_RPC) {
+            0
+        } else {
             return vec![];
-        }
-        if report.len() < 3 {
+        };
+        if report.len() < offset + 2 {
             self.buffer.clear();
             return vec![];
         }
-        let length = report[2] as usize;
-        if length > MAX_PAYLOAD || length + 3 > report.len() {
+        let length = report[offset + 1] as usize;
+        if length > MAX_PAYLOAD || length + offset + 2 > report.len() {
             self.buffer.clear();
             return vec![];
         }
-        self.buffer.extend_from_slice(&report[3..3 + length]);
+        self.buffer
+            .extend_from_slice(&report[offset + 2..offset + 2 + length]);
         let mut messages = Vec::new();
         while let Some(newline) = self.buffer.iter().position(|b| *b == b'\n') {
             let line: Vec<_> = self.buffer.drain(..=newline).collect();
@@ -71,7 +76,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accepts_reports_and_rejects_bad_reports() {
+    fn accepts_transport_report_variants_and_rejects_bad_reports() {
         let params = serde_json::json!({"ok":true});
         let reports = encode_message("event", Some(&params), Some(1)).unwrap();
         let mut reassembler = Reassembler::default();
@@ -79,6 +84,7 @@ mod tests {
             reassembler.push(&reports[0])[0].as_ref().unwrap()["method"],
             "event"
         );
+        assert_eq!(Reassembler::default().push(&reports[0][1..]).len(), 1);
         assert!(
             Reassembler::default()
                 .push(&[REPORT_ID, CHANNEL_RPC, 62])

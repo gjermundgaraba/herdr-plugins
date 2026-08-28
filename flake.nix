@@ -108,19 +108,9 @@
           ];
         };
 
-        herdr-micro = {
-          # This includes codex-micro, the plugin's local path dependency.
-          sourceRoots = [
-            "herdr-micro"
-            "herdr-micro/codex-micro"
-            "sdk/rust"
-          ];
-          runtimeFiles = [
-            "integrations/pi/herdr-effort.js"
-            "integrations/thinking-effort.sh"
-          ];
-          binLayout = true;
-        };
+        # herdr-micro is deliberately absent: its service binary must be
+        # codesigned with a local Apple Development identity, which a pure Nix
+        # build cannot do. Build it through the plugin manifest instead.
       };
 
       # Plugin manifests declare "macos"/"linux"; Nix says "darwin"/"linux".
@@ -208,14 +198,9 @@
                 binary:
                 if definition.binOnly or false then
                   ''install -Dm755 "${cargoReleaseDir}/${binary}" "$out/bin/${binary}"''
-                else if definition.binLayout or false then
-                  ''install -Dm750 "${cargoReleaseDir}/${binary}" "$out/${name}/bin/${binary}"''
                 else
                   ''install -Dm755 "${cargoReleaseDir}/${binary}" "$out/target/release/${binary}"''
               ) (binariesFor name crate);
-              installRuntimeFiles = lib.concatMapStringsSep "\n" (
-                file: ''install -Dm444 "${name}/${file}" "$out/${name}/${file}"''
-              ) (definition.runtimeFiles or [ ]);
               installExampleFiles = lib.concatMapStringsSep "\n" (
                 file:
                 ''install -Dm444 "${name}/examples/${file}" "$out/share/herdr-picker/examples/${file}"''
@@ -244,7 +229,6 @@
                   install -Dm444 "${name}/herdr-plugin.toml" "$out/${name}/herdr-plugin.toml"
                 ''}
                 ${installBinaries}
-                ${installRuntimeFiles}
                 ${installExampleFiles}
 
                 runHook postInstall

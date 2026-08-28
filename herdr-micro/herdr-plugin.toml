@@ -6,22 +6,28 @@ description = "Control Herdr from a Work Louder Codex Micro."
 platforms = ["macos"]
 
 [[build]]
-command = ["cargo", "build", "--release", "--locked"]
+command = ["cargo", "build", "--release", "--locked", "--package", "herdr-micro", "--bin", "herdr-micro", "--package", "codex-micro", "--bin", "codex-micro"]
 
 [[build]]
 command = ["mkdir", "-p", "bin"]
 
+# Stage both binaries and sign the service before either rename, so a signing
+# failure leaves the live pair untouched and the live path never holds an
+# unsigned binary.
 [[build]]
 command = ["install", "-m", "750", "../target/release/herdr-micro", "bin/.herdr-micro.new"]
+
+[[build]]
+command = ["install", "-m", "750", "../target/release/codex-micro", "bin/.codex-micro.new"]
+
+[[build]]
+command = ["/usr/bin/codesign", "--force", "--timestamp=none", "--sign", "Apple Development", "--identifier", "dev.herdr.codex-micro", "bin/.codex-micro.new"]
 
 [[build]]
 command = ["mv", "-f", "bin/.herdr-micro.new", "bin/herdr-micro"]
 
 [[build]]
-command = ["install", "-m", "750", "../target/release/herdr-micro-hid", "bin/.herdr-micro-hid.new"]
-
-[[build]]
-command = ["mv", "-f", "bin/.herdr-micro-hid.new", "bin/herdr-micro-hid"]
+command = ["mv", "-f", "bin/.codex-micro.new", "bin/codex-micro"]
 
 [[startup]]
 command = ["bin/herdr-micro", "start"]
@@ -38,6 +44,11 @@ command = ["hunk", "diff", "--watch"]
 id = "doctor"
 title = "Check Herdr Micro setup"
 command = ["bin/herdr-micro", "doctor"]
+
+[[actions]]
+id = "service-authorize"
+title = "Authorize Codex Micro input access"
+command = ["bin/codex-micro", "authorize"]
 
 [[actions]]
 id = "micro-start"

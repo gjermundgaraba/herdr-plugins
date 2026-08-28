@@ -1,26 +1,13 @@
-use crate::{
-    actions::CHATGPT_BUNDLE_IDS,
-    config::{AgentStatus, Direction, Light, LightingConfig},
-};
+use crate::config::{AgentStatus, Direction, Light, LightingConfig};
 use herdr_client::AgentInfo;
 use std::collections::{HashMap, HashSet};
 
 pub const SLOT_COUNT: usize = 6;
-pub const INPUT_BUNDLE_ID: &str = "it.focusense.input-app";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct JoystickEvent {
     pub sector: Option<u8>,
     pub direction: Option<Direction>,
-}
-
-pub fn device_owner(input_running: bool, frontmost_bundle: Option<&str>) -> Option<&'static str> {
-    if input_running {
-        return Some("Input");
-    }
-    frontmost_bundle
-        .is_some_and(|bundle| CHATGPT_BUNDLE_IDS.contains(&bundle))
-        .then_some("ChatGPT")
 }
 
 fn status(agent: &AgentInfo) -> AgentStatus {
@@ -204,21 +191,6 @@ mod tests {
                 .collect::<Vec<_>>()
         );
     }
-    #[test]
-    fn device_owners_use_bundle_identity() {
-        assert_eq!(device_owner(true, None), Some("Input"));
-
-        assert_eq!(
-            device_owner(false, Some("com.openai.codex")),
-            Some("ChatGPT")
-        );
-        assert_eq!(
-            device_owner(false, Some("com.openai.chat")),
-            Some("ChatGPT")
-        );
-        assert_eq!(device_owner(false, Some("com.example.other")), None);
-    }
-
     #[test]
     fn joystick_changes_direction_at_an_angular_boundary() {
         let first = joystick_event(0.124, 0.9, None, 0.75, 0.3);

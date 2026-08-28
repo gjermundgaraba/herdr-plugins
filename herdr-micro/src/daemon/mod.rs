@@ -28,10 +28,10 @@ use crate::{
 };
 use dispatch::{action_worker, input_worker};
 use reconcile::{
-    InputContext, State, apply_config_load, apply_session_update, close_device,
-    handle_input_disconnect, open_device, publish, refresh_frontmost, refresh_mappings,
-    refresh_owner, refresh_routing, refresh_sessions, send_lighting, sync_selected_worker,
-    update_input_context,
+    InputContext, State, apply_config_load, apply_session_update, handle_input_disconnect,
+    open_device, publish, refresh_device_status, refresh_frontmost, refresh_mappings,
+    refresh_owner, refresh_routing, refresh_sessions, send_lighting, shutdown_device,
+    sync_selected_worker, update_input_context,
 };
 
 const CONFIG_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -39,7 +39,7 @@ const SESSION_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const SESSION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const ROUTING_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 const WORK_QUEUE_CAPACITY: usize = 16;
-pub const DAEMON_PROTOCOL_VERSION: u32 = 3;
+pub const DAEMON_PROTOCOL_VERSION: u32 = 4;
 
 static LOG_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -176,7 +176,9 @@ pub fn run_daemon() -> Result<()> {
         while let Ok(error) = input_notice_rx.try_recv() {
             changed |= handle_input_disconnect(&mut state, &mut device, error);
         }
-        while let Ok(update) = session_update_rx.try_recv() {
+        while !stopping.load(Ordering::Acquire)
+            && let Ok(update) = session_update_rx.try_recv()
+        {
             match apply_session_update(&mut state, update, &session_workers, device.as_ref()) {
                 Ok(true) => {
                     sessions_due = sessions_due.min(Instant::now() + SESSION_RETRY_INTERVAL);
@@ -190,7 +192,11 @@ pub fn run_daemon() -> Result<()> {
         if now >= config_due {
             config_due = now + CONFIG_REFRESH_INTERVAL;
             changed |= apply_config_load(&mut state, load(&config_path), startup_enabled_buttons);
-            if let Some(device) = device.as_ref() {
+            // A stop between device calls must not start another slow cluster.
+            if !stopping.load(Ordering::Acquire)
+                && let Some(device) = device.as_ref()
+            {
+                changed |= refresh_device_status(device, &mut state);
                 match send_lighting(device, &mut state) {
                     Ok(()) => state.last_lighting_error.clear(),
                     Err(error) => {
@@ -206,7 +212,7 @@ pub fn run_daemon() -> Result<()> {
         }
         if now >= sessions_due {
             sessions_due = now + SESSION_REFRESH_INTERVAL;
-            if state.owner.is_none() {
+            if state.owner.is_none() && !stopping.load(Ordering::Acquire) {
                 sessions_ready = match refresh_sessions(
                     &mut state,
                     device.as_ref(),
@@ -217,7 +223,7 @@ pub fn run_daemon() -> Result<()> {
                 ) {
                     Ok(shutdown) => {
                         if shutdown {
-                            log("No Herdr sessions for 60 seconds; releasing device");
+                            log("No Herdr sessions for 60 seconds; stopping bridge");
                             stopping.store(true, Ordering::Release);
                         }
                         true
@@ -232,25 +238,31 @@ pub fn run_daemon() -> Result<()> {
             changed = true;
         }
         if state.owner.is_none()
+            && !stopping.load(Ordering::Acquire)
             && state
                 .next_mapping_probe
                 .is_some_and(|deadline| now >= deadline)
         {
-            refresh_mappings(&mut state);
+            refresh_mappings(&mut state, &stopping);
             changed = true;
         }
         if now >= routing_due {
             routing_due = now + ROUTING_REFRESH_INTERVAL;
             let input_generation = state.routing_generation();
             let input_ready = state.routing_ready;
-            let previous_owner = state.owner.clone();
+            let previous_owner = state.owner;
             changed |= refresh_frontmost(&mut state);
-            changed |= refresh_owner(&mut state, &mut device);
+            changed |= refresh_owner(&mut state);
             if previous_owner.is_some() && state.owner.is_none() {
                 sessions_due = now;
+                if !stopping.load(Ordering::Acquire)
+                    && let Some(device) = device.as_ref()
+                {
+                    changed |= refresh_device_status(device, &mut state);
+                }
             }
-            if state.owner.is_none() && sessions_ready {
-                match refresh_routing(&mut state, device.as_ref()) {
+            if state.owner.is_none() && sessions_ready && !stopping.load(Ordering::Acquire) {
+                match refresh_routing(&mut state, device.as_ref(), &stopping) {
                     Ok(routing_changed) => changed |= routing_changed,
                     Err(error) => {
                         state.revoke_routing();
@@ -265,20 +277,11 @@ pub fn run_daemon() -> Result<()> {
                     &session_update_tx,
                     &stopping,
                 );
-                match open_device(&mut device, &device_tx, &mut state) {
+                match open_device(&mut device, &device_tx, &mut state, &stopping) {
                     Ok(device_changed) => changed |= device_changed,
                     Err(error) => {
                         changed = true;
                         log(format!("refresh failed: {error:#}"));
-                    }
-                }
-            }
-            if state.owner.is_some() && state.device_restore_pending {
-                match open_device(&mut device, &device_tx, &mut state) {
-                    Ok(device_changed) => changed |= device_changed,
-                    Err(error) => {
-                        changed = true;
-                        log(format!("native HID recovery failed: {error:#}"));
                     }
                 }
             }
@@ -325,7 +328,7 @@ pub fn run_daemon() -> Result<()> {
     log("stopping");
     state.revoke_routing();
     stopping.store(true, Ordering::Release);
-    close_device(&mut device, &mut state, true);
+    shutdown_device(&mut device, &mut state);
     drop(device_tx);
     let _ = input.join();
     publish(&status, &state);

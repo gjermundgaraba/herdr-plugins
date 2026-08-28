@@ -1,11 +1,9 @@
 use anyhow::{Result, anyhow};
 use herdr_client::{AgentInfo, Client, PaneInfo, PaneLayoutSnapshot};
-use serde::Serialize;
 use serde_json::json;
 
 use crate::PLUGIN_ID;
 
-pub const CHATGPT_BUNDLE_IDS: [&str; 2] = ["com.openai.codex", "com.openai.chat"];
 pub const GHOSTTY_PROCESS: &str = "com.mitchellh.ghostty";
 pub const HERDR_LAYER: usize = 2;
 
@@ -103,42 +101,17 @@ pub fn scroll_plan(
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct LayerIdentity {
-    #[serde(rename = "appName")]
-    pub app_name: String,
-    pub process: String,
-}
-
-pub fn layer_identity(layer: usize) -> LayerIdentity {
-    LayerIdentity {
-        app_name: format!("Herdr Micro Layer {layer}"),
-        process: format!("{PLUGIN_ID}.layer-{layer}"),
-    }
-}
-pub fn automatic_layer(
-    frontmost_process: Option<&str>,
-    focused_herdr_session: Option<&str>,
-) -> Option<usize> {
-    if frontmost_process.is_some_and(|process| CHATGPT_BUNDLE_IDS.contains(&process)) {
-        Some(1)
-    } else if frontmost_process == Some(GHOSTTY_PROCESS) && focused_herdr_session.is_some() {
-        Some(HERDR_LAYER)
-    } else {
-        None
-    }
-}
+pub use codex_micro::service::layer_identity;
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
     #[test]
-    fn known_chatgpt_bundles_select_layer_one() {
-        for process in CHATGPT_BUNDLE_IDS {
-            assert_eq!(automatic_layer(Some(process), None), Some(1));
-        }
+    fn layer_identity_matches_the_plugin_id() {
+        assert_eq!(layer_identity(2).process, format!("{PLUGIN_ID}.layer-2"));
     }
+
     #[test]
     fn computes_scroll_geometry() {
         let pane: PaneInfo = serde_json::from_value(json!({

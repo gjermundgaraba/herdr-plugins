@@ -1,17 +1,22 @@
 //! Non-destructive installation checks for the Micro plugin.
 
 use anyhow::Result;
-use std::{env, fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Command, time::Duration};
+use codex_micro::{
+    InputMonitoringAccess,
+    service::{Client as DeviceClient, ServiceStatus},
+};
+use std::{
+    env, fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Command, sync::mpsc,
+    time::Duration,
+};
 
 use crate::{
     actions::GHOSTTY_PROCESS,
     config::{config_path, load, requires_accessibility},
     control::request_status,
     ghostty::inspect_ghostty,
-    helper_install,
-    hid::required_helper_version,
     macos::{bundle_is_running, frontmost, post_event_access},
-    setup::{PI_EXTENSION, plugin_root},
+    setup::{PI_EXTENSION, plugin_root, service_executable},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -72,28 +77,82 @@ fn pi_extension() -> Option<PathBuf> {
     env::var_os("HOME").map(|home| PathBuf::from(home).join(PI_EXTENSION))
 }
 
+fn service_status() -> Result<ServiceStatus> {
+    let (events, _event_rx) = mpsc::channel();
+    let mut client = DeviceClient::connect(events)?;
+    let status = client.status();
+    let close = client.close();
+    match (status, close) {
+        (Ok(status), Ok(())) => Ok(status),
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+    }
+}
+
 pub fn doctor() -> Report {
     let mut report = Report::default();
-    check(&mut report, "HID helper executable", || {
-        let path = plugin_root()?
-            .join("bin")
-            .join(helper_install::HELPER_BINARY_NAME);
-        let mode = fs::metadata(&path)?.permissions().mode();
+    check(&mut report, "Codex Micro service executable", || {
+        let path = service_executable()?;
+        let metadata = fs::metadata(&path)?;
+        if !metadata.is_file() {
+            anyhow::bail!("{} is not a file", path.display());
+        }
+        let mode = metadata.permissions().mode();
         if mode & 0o111 == 0 {
             anyhow::bail!("{} is not executable", path.display());
         }
         Ok(path.display().to_string())
     });
+    let service_status = match service_status() {
+        Ok(status) => {
+            let detail = if let Some(owner) = status.external_owner {
+                format!("running; device owned by {owner}")
+            } else {
+                status.device.as_ref().map_or_else(
+                    || {
+                        status
+                            .last_error
+                            .as_ref()
+                            .map_or_else(|| "running".into(), |error| format!("running; {error}"))
+                    },
+                    |device| {
+                        format!(
+                            "running; transport={:?}; firmware={}",
+                            device.transport, device.firmware
+                        )
+                    },
+                )
+            };
+            report.push(Level::Ok, format!("Codex Micro service IPC: {detail}"));
+            Some(status)
+        }
+        Err(error) => {
+            report.push(Level::Fail, format!("Codex Micro service IPC: {error}"));
+            None
+        }
+    };
+    if let Some(status) = service_status {
+        match status.input_monitoring {
+            InputMonitoringAccess::Granted => {
+                report.push(Level::Ok, "Codex Micro Input Monitoring: granted")
+            }
+            InputMonitoringAccess::Denied | InputMonitoringAccess::Unknown => {
+                report.push(
+                    Level::Fail,
+                    format!(
+                        "Codex Micro Input Monitoring: {:?}; run `herdr plugin action invoke \
+                         service-authorize --plugin gjermundgaraba.herdr-micro`",
+                        status.input_monitoring
+                    ),
+                );
+            }
+        }
+    }
     check(&mut report, "Thinking-effort adapter", || {
         let path = plugin_root()?.join("integrations/thinking-effort.sh");
         if !fs::metadata(&path)?.is_file() {
             anyhow::bail!("{} is not a file", path.display());
         }
         Ok(path.display().to_string())
-    });
-    check(&mut report, "Privileged USB helper", || {
-        helper_install::verify_installed()?;
-        Ok(format!("version {}", required_helper_version()?))
     });
     let resolved_config_path = config_path();
     let config = match &resolved_config_path {
@@ -169,7 +228,7 @@ pub fn doctor() -> Report {
                 }
             }
         }
-        // A stopped bridge is a normal state (micro-stop, 60s idle release),
+        // A stopped bridge is a normal state (micro-stop, 60s idle shutdown),
         // not an installation failure.
         Err(error) => report.push(Level::Warn, format!("Micro bridge is not running: {error}")),
     }

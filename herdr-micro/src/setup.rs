@@ -1,6 +1,7 @@
 //! One-shot setup and small action helpers for the Micro plugin.
 
 use anyhow::{Context, Result, anyhow, bail};
+use codex_micro::{DeviceEvent, external_owner, service::Client as DeviceClient};
 use serde_json::{Value, json};
 use std::{
     env,
@@ -18,11 +19,6 @@ use crate::{
     actions::{HERDR_LAYER, layer_identity},
     config::{Config, Controls, config_path, load, provision},
     control::{backup_dir, request_status},
-    device::{
-        DeviceEvent,
-        keymap::{read_keymap, write_keymap},
-    },
-    hid::HidClient,
 };
 
 pub(crate) const PI_EXTENSION: &str = ".pi/agent/extensions/herdr-micro-effort.ts";
@@ -67,6 +63,32 @@ pub fn plugin_root_from(plugin_root: Option<OsString>, executable: &Path) -> Res
 
 pub fn plugin_root() -> Result<PathBuf> {
     plugin_root_from(env::var_os("HERDR_PLUGIN_ROOT"), &env::current_exe()?)
+}
+
+pub fn service_executable() -> Result<PathBuf> {
+    Ok(plugin_root()?.join("bin").join("codex-micro"))
+}
+
+pub fn ensure_service() -> Result<()> {
+    let executable = service_executable()?;
+    let output = Command::new(&executable)
+        .arg("install")
+        .output()
+        .with_context(|| format!("run {} install", executable.display()))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(if output.stderr.is_empty() {
+            &output.stdout
+        } else {
+            &output.stderr
+        });
+        bail!(
+            "{} install exited with {}: {}",
+            executable.display(),
+            output.status,
+            detail.trim()
+        );
+    }
+    Ok(())
 }
 
 fn oai_profile_index(keymap: &Value, managed_link_id: Option<&Value>) -> Result<usize> {
@@ -346,15 +368,6 @@ fn set_hid_codes(layout: &mut Value, controls: &Controls) -> Result<()> {
     Ok(())
 }
 
-fn active_owner() -> Result<Option<String>> {
-    let frontmost = crate::macos::frontmost()?;
-    Ok(crate::protocol::device_owner(
-        crate::macos::bundle_is_running(crate::protocol::INPUT_BUNDLE_ID),
-        Some(&frontmost.process),
-    )
-    .map(str::to_owned))
-}
-
 fn backup_keymap(bytes: &[u8]) -> Result<PathBuf> {
     let dir = backup_dir()?;
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
@@ -436,7 +449,7 @@ pub struct SetupReport {
 fn update_micro_keymap(
     configure: impl FnOnce(&mut Value) -> Result<()>,
 ) -> Result<(String, Option<PathBuf>)> {
-    if let Some(owner) = active_owner()? {
+    if let Some(owner) = external_owner() {
         bail!("quit {owner} first");
     }
     if let Ok(status) = request_status(Duration::from_millis(250)) {
@@ -447,17 +460,14 @@ fn update_micro_keymap(
         bail!("stop the Micro bridge first");
     }
     let (event_tx, _events) = mpsc::channel::<DeviceEvent>();
-    let mut device = HidClient::connect(event_tx)?;
-    let result = (|| {
-        let status = device.request("device.status", None)?;
-        let firmware = status
-            .get("version")
-            .and_then(Value::as_str)
-            .filter(|version| !version.is_empty())
-            .ok_or_else(|| anyhow!("device did not report a firmware version"))?
-            .to_owned();
-        let request = |method: &str, params: Option<Value>| device.request(method, params);
-        let before = read_keymap(request)?;
+    let mut device = DeviceClient::connect(event_tx)?;
+    let acquired = device.acquire();
+    let result = acquired.and_then(|info| {
+        let firmware = info.firmware;
+        if firmware.is_empty() {
+            bail!("device did not report a firmware version");
+        }
+        let before = device.read_keymap()?;
         let mut keymap: Value = serde_json::from_slice(&before).context("invalid keymap JSON")?;
         let canonical_before = serde_json::to_vec(&keymap)?;
         configure(&mut keymap)?;
@@ -469,19 +479,23 @@ fn update_micro_keymap(
                 &before,
                 &after,
                 backup_keymap,
-                || read_keymap(request),
-                |bytes| write_keymap(request, bytes),
+                || device.read_keymap(),
+                |bytes| device.write_keymap(bytes),
             )?
         };
         Ok((firmware, backup))
-    })();
+    });
+    let safe = device.set_focused_app(layer_identity(1));
     let close = device.close();
-    match (result, close) {
+    let cleanup = safe
+        .context("select safe device layer")
+        .and(close.context("close device service client"));
+    match (result, cleanup) {
         (Ok(report), Ok(())) => Ok(report),
         (Err(error), _) => Err(error),
         (Ok((_, Some(backup))), Err(error)) => Err(error).with_context(|| {
             format!(
-                "device close failed after the verified keymap update; backup: {}",
+                "device service cleanup failed after the verified keymap update; backup: {}",
                 backup.display()
             )
         }),
@@ -490,6 +504,7 @@ fn update_micro_keymap(
 }
 
 pub fn setup_micro() -> Result<SetupReport> {
+    ensure_service()?;
     let config = config_path().map_err(|error| anyhow!(error))?;
     provision(&config).map_err(|error| anyhow!(error))?;
     let parsed = load(&config).map_err(|error| anyhow!(error))?;
@@ -728,7 +743,7 @@ mod tests {
         );
         assert_eq!(
             keymap.pointer("/profiles/0/layers/1/layout/keymap/3/0"),
-            Some(&json!("KC_NONE"))
+            Some(&json!("KV_OAI_ACT10"))
         );
         let configured = keymap.clone();
         configure_micro(&mut keymap).unwrap();
@@ -751,7 +766,7 @@ mod tests {
         // A managed layer may contain the previous configured button codes;
         // setup must replace them without overwriting unrelated layouts.
         let mut restored = oai_layout();
-        *restored.pointer_mut("/keymap/3/0").unwrap() = json!("KC_F19");
+        *restored.pointer_mut("/keymap/3/1").unwrap() = json!("KC_F18");
         let mut keymap = json!({
             "activeProfileId": 1,
             "linkedApps": [
@@ -781,7 +796,7 @@ mod tests {
         );
         assert_eq!(
             keymap.pointer("/profiles/0/layers/1/layout/keymap/3/0"),
-            Some(&json!("KC_NONE"))
+            Some(&json!("KV_OAI_ACT10"))
         );
         assert_eq!(
             keymap.pointer("/profiles/0/layers/1/layout/keymap/2/2"),
@@ -801,7 +816,7 @@ mod tests {
     fn refuses_an_unmarked_layer_with_function_keys() {
         let source = oai_layout();
         let mut target = source.clone();
-        *target.pointer_mut("/keymap/3/0").unwrap() = json!("KC_F19");
+        *target.pointer_mut("/keymap/3/1").unwrap() = json!("KC_F18");
         let mut keymap = json!({
             "profiles": [{ "id": 0, "layers": [
                 { "layout": source },

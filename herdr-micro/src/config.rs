@@ -219,13 +219,14 @@ pub fn device_button(key: &str) -> Option<u8> {
         .filter(|button| (1..=7).contains(button))
 }
 
-/// A switch is live exactly when its button is bound.
+/// Button 5 is always live because the device service owns its Handy action.
 pub fn enabled_buttons(controls: &Controls) -> [bool; 7] {
     std::array::from_fn(|index| {
-        controls
-            .buttons
-            .get(&(index as u8 + 1))
-            .is_some_and(Option::is_some)
+        index == 4
+            || controls
+                .buttons
+                .get(&(index as u8 + 1))
+                .is_some_and(Option::is_some)
     })
 }
 
@@ -268,6 +269,9 @@ fn parse_controls(value: &Value) -> Result<Controls, String> {
         serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
     if controls.buttons.keys().any(|id| !(1..=7).contains(id)) {
         return Err("button IDs must be integers from 1 to 7".into());
+    }
+    if matches!(controls.buttons.get(&5), Some(Some(_))) {
+        return Err("button 5 is reserved for the Codex Micro service and must be null".into());
     }
     if !(controls.joystick.release_distance >= 0.0
         && controls.joystick.release_distance < controls.joystick.engage_distance
@@ -457,13 +461,7 @@ pub struct LightConfig {
     pub effect: Effect,
     pub speed: f64,
 }
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Light {
-    pub c: u32,
-    pub b: f64,
-    pub e: u8,
-    pub s: f64,
-}
+pub use codex_micro::service::Light;
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LightingConfig {
@@ -661,11 +659,20 @@ mod tests {
         assert_eq!(device_button("F13"), None);
         assert_eq!(
             enabled_buttons(&controls),
-            [false, false, true, true, false, false, true]
+            [false, false, true, true, true, false, true]
         );
-        let mut rebound = controls.clone();
-        rebound.buttons.insert(5, controls.buttons[&7].clone());
-        assert_ne!(enabled_buttons(&rebound), enabled_buttons(&controls));
+        let mut reserved = config_json();
+        reserved["controls"]["buttons"]["5"] = serde_json::json!({"action":"submit"});
+        assert_eq!(
+            parse_config(&reserved).unwrap_err(),
+            "button 5 is reserved for the Codex Micro service and must be null"
+        );
+        let mut omitted = config_json();
+        omitted["controls"]["buttons"]
+            .as_object_mut()
+            .unwrap()
+            .remove("5");
+        assert!(parse_config(&omitted).is_ok());
         let mut stale = config_json();
         stale["controls"]["actionDeviceKeys"] = serde_json::json!({});
         assert!(parse_config(&stale).is_err());
@@ -685,15 +692,15 @@ mod tests {
     fn key_actions_resolve_names_or_raw_keycodes() {
         assert!(!requires_accessibility(&Config::default().controls));
         let mut named = config_json();
-        named["controls"]["buttons"]["5"] = serde_json::json!({"action":"key","key":"F19"});
+        named["controls"]["buttons"]["6"] = serde_json::json!({"action":"key","key":"F19"});
         let named = parse_config(&named).unwrap().controls;
         assert!(requires_accessibility(&named));
         assert!(matches!(
-            named.buttons[&5],
+            named.buttons[&6],
             Some(Binding::Action(Action::Key { .. }))
         ));
         let mut raw = config_json();
-        raw["controls"]["buttons"]["5"] =
+        raw["controls"]["buttons"]["6"] =
             serde_json::json!({"action":"key","keycode":80,"modifiers":["cmd","shift"]});
         assert!(parse_config(&raw).is_ok());
         for invalid in [
@@ -705,7 +712,7 @@ mod tests {
             serde_json::json!({"byAgent":{"codex":{"action":"key","key":"F19"}}}),
         ] {
             let mut bad = config_json();
-            bad["controls"]["buttons"]["5"] = invalid;
+            bad["controls"]["buttons"]["6"] = invalid;
             assert!(parse_config(&bad).is_err());
         }
         assert_eq!(key_action_code(Some("F19"), None), Ok(0x50));
