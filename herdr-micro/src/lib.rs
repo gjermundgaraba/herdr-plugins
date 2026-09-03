@@ -4,7 +4,6 @@ pub mod control;
 pub mod daemon;
 pub mod doctor;
 pub mod gestures;
-pub mod ghostty;
 pub mod herdr;
 pub mod macos;
 pub mod protocol;

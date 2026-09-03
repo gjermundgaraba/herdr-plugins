@@ -43,6 +43,10 @@ pub struct SessionSnapshot {
     pub focused_tab_id: Option<String>,
     #[serde(default)]
     pub focused_pane_id: Option<String>,
+    /// Whether the session's attached terminal window reports focus; absent
+    /// until the terminal reports focus once.
+    #[serde(default)]
+    pub client_focused: Option<bool>,
     pub workspaces: Vec<WorkspaceInfo>,
     pub tabs: Vec<TabInfo>,
     pub panes: Vec<PaneInfo>,

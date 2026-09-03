@@ -74,6 +74,7 @@ mod tests {
             focused_workspace_id: None,
             focused_tab_id: None,
             focused_pane_id: None,
+            client_focused: None,
             workspaces: vec![workspace("w2", 2, "second"), workspace("w1", 1, "project")],
             tabs: Vec::new(),
             panes: Vec::new(),

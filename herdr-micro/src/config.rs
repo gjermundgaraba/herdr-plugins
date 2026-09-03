@@ -28,10 +28,6 @@ pub enum Action {
     FocusPane {
         direction: Direction,
     },
-    Scroll {
-        direction: VerticalDirection,
-        percent: f64,
-    },
     Key {
         #[serde(default)]
         key: Option<String>,
@@ -96,21 +92,6 @@ impl Direction {
         }
     }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum VerticalDirection {
-    Up,
-    Down,
-}
-impl VerticalDirection {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Up => "up",
-            Self::Down => "down",
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct GestureBinding {
@@ -379,13 +360,6 @@ fn validate_action(action: &Action, label: &str) -> Result<(), String> {
         Action::Prompt { prompt, .. } if prompt.trim().is_empty() => {
             Err(format!("{label}.prompt must be a non-empty string"))
         }
-        Action::Scroll { percent, .. }
-            if !percent.is_finite() || *percent <= 0.0 || *percent > 100.0 =>
-        {
-            Err(format!(
-                "{label}.percent must be greater than 0 and at most 100"
-            ))
-        }
         Action::Script { command, .. } if command.trim().is_empty() => {
             Err(format!("{label}.command must be a non-empty string"))
         }
@@ -570,7 +544,7 @@ fn config_json() -> Value {
                 }},
                 "press":{"action":"prompt","prompt":"/model","submit":true}
             },
-            "joystick":{"engageDistance":0.75,"releaseDistance":0.3,"up":{"action":"scroll","direction":"up","percent":50},"down":{"action":"scroll","direction":"down","percent":50},"left":{"action":"focus-pane","direction":"left"},"right":{"action":"focus-pane","direction":"right"}}
+            "joystick":{"engageDistance":0.75,"releaseDistance":0.3,"up":null,"down":null,"left":{"action":"focus-pane","direction":"left"},"right":{"action":"focus-pane","direction":"right"}}
         },
         "lighting": {
             "states": {
@@ -611,6 +585,8 @@ mod tests {
     #[test]
     fn controls_reject_unknown_fields_and_map_reversed_dial_labels() {
         let controls = Config::default().controls;
+        assert!(controls.joystick.up.is_none());
+        assert!(controls.joystick.down.is_none());
         for action in [-1, 0, 1, 2, 3] {
             assert!(key_binding(&controls, "ENC_CC", action).is_some());
         }

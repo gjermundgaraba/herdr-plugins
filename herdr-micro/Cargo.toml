@@ -15,9 +15,8 @@ herdr-client.workspace = true
 libc.workspace = true
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSRunningApplication", "NSWorkspace", "libc"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSString"] }
-objc2-core-foundation = { workspace = true, features = ["CFArray", "CFDictionary", "CFNumber", "CFRunLoop", "CFSet", "CFString"] }
-objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["CGDirectDisplay", "CGError", "CGEvent", "CGEventSource", "CGEventTypes", "CGGeometry", "CGRemoteOperation", "CGWindow"] }
+objc2-core-foundation = { workspace = true, features = ["CFRunLoop"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["CGEvent", "CGEventTypes", "CGRemoteOperation"] }
 serde.workspace = true
 serde_json.workspace = true
 signal-hook = "0.4.4"

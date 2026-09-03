@@ -3,8 +3,9 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use codex_micro::DeviceEvent;
-use herdr_client::{AgentInfo, Client, SessionSnapshot};
-use serde_json::{Value, json};
+use herdr_client::{AgentInfo, AgentStatus, Client};
+#[cfg(test)]
+use serde_json::json;
 use std::{
     path::Path,
     process::Command,
@@ -17,15 +18,9 @@ use std::{
 };
 
 use crate::{
-    actions::{
-        GHOSTTY_PROCESS, focus_agent, focus_pane, open_diff, prompt as send_prompt, scroll_plan,
-        submit,
-    },
-    config::{
-        Action, Binding, Direction, Modifier, VerticalDirection, key_action_code, key_binding,
-    },
+    actions::{focus_agent, focus_pane, open_diff, prompt as send_prompt, submit},
+    config::{Action, Binding, Direction, Modifier, key_action_code, key_binding},
     gestures::{Fired, GestureContext, GestureDispatcher},
-    ghostty::{focused_terminal_id, scroll_terminal},
     herdr::{COMMAND_TIMEOUT, Session, current_snapshot, run_command_with_timeout},
     macos,
     protocol::{SLOT_COUNT, joystick_event},
@@ -46,7 +41,6 @@ struct InputState {
 pub(super) struct Work {
     source: String,
     session: Session,
-    terminal: String,
     generation: u64,
     kind: WorkKind,
 }
@@ -78,13 +72,15 @@ pub(super) fn agent_identity(
     })
 }
 
+/// Match Herdr's own `agent.prompt` gate: only a blocked agent refuses text.
+/// Herdr reports `unknown` for several seconds after it first detects a Claude
+/// or Codex process, and typing into a `working` agent just queues the input.
 fn ready_agent(agent: Option<&AgentInfo>) -> Result<&AgentInfo> {
     let agent = require_agent(agent)?;
-    if matches!(agent.agent_status.as_str(), "idle" | "done") {
-        Ok(agent)
-    } else {
-        bail!("focused agent is {}", agent.agent_status)
+    if agent.agent_status.as_str() == AgentStatus::BLOCKED {
+        bail!("focused agent is blocked")
     }
+    Ok(agent)
 }
 
 fn action_name(action: &Action) -> &'static str {
@@ -95,14 +91,12 @@ fn action_name(action: &Action) -> &'static str {
         Action::Submit => "submit",
         Action::Script { .. } => "script",
         Action::FocusPane { .. } => "focus-pane",
-        Action::Scroll { .. } => "scroll",
         Action::Key { .. } => "key",
     }
 }
 
 struct DispatchLease<'a> {
     session: &'a Session,
-    terminal: &'a str,
     generation: u64,
     routing_generation: &'a AtomicU64,
 }
@@ -112,77 +106,12 @@ impl DispatchLease<'_> {
         self.session.client()
     }
 
-    fn ensure(&self) -> Result<String> {
+    fn ensure(&self) -> Result<()> {
         if self.generation != self.routing_generation.load(Ordering::Acquire) {
             bail!("stale Herdr routing")
         }
-        if !macos::frontmost_bundle_is(GHOSTTY_PROCESS) {
-            bail!("Herdr session is no longer frontmost")
-        }
-        let terminal = focused_terminal_id()?;
-        if self.generation != self.routing_generation.load(Ordering::Acquire)
-            || !macos::frontmost_bundle_is(GHOSTTY_PROCESS)
-        {
-            bail!("stale Herdr routing")
-        }
-        if terminal != self.terminal {
-            bail!("Herdr session is no longer frontmost")
-        }
-        Ok(terminal)
+        Ok(())
     }
-}
-
-fn execute_scroll(
-    direction: VerticalDirection,
-    percent: f64,
-    expected_pane: &str,
-    snapshot: &SessionSnapshot,
-    lease: &DispatchLease<'_>,
-) -> Result<bool> {
-    if snapshot.focused_pane_id.as_deref() != Some(expected_pane) {
-        log(format!(
-            "scroll ignored: focused pane changed in {}",
-            lease.session.name
-        ));
-        return Ok(false);
-    }
-    let pane = snapshot
-        .panes
-        .iter()
-        .find(|pane| pane.pane_id == expected_pane)
-        .ok_or_else(|| anyhow!("focused pane disappeared"))?;
-    let layout = snapshot
-        .layouts
-        .iter()
-        .find(|layout| layout.workspace_id == pane.workspace_id && layout.tab_id == pane.tab_id)
-        .ok_or_else(|| anyhow!("focused pane layout unavailable"))?;
-    let plan = scroll_plan(pane, layout, direction.as_str(), percent)?;
-    let cell = lease
-        .client()
-        .call_value("pane.graphics.info", &json!({ "pane_id": expected_pane }))?;
-    let cell_width = cell
-        .get("cell_width_px")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| anyhow!("Herdr host cell width is unavailable"))?;
-    let cell_height = cell
-        .get("cell_height_px")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| anyhow!("Herdr host cell height is unavailable"))?;
-    let scale = macos::frontmost_window_scale()?;
-    let terminal = lease.ensure()?;
-    scroll_terminal(
-        &terminal,
-        plan.column * cell_width as f64 / scale,
-        plan.row * cell_height as f64 / scale,
-        i32::try_from(plan.notches).map_err(|_| anyhow!("scroll distance is too large"))?,
-    )?;
-    log(format!(
-        "scrolled {} {percent}% in {}/{}",
-        direction.as_str(),
-        lease.session.name,
-        plan.pane_id
-    ));
-    Ok(true)
 }
 
 fn script_command(
@@ -233,9 +162,8 @@ fn execute_script(
 fn execute_action(
     action: &Action,
     current: Option<&AgentInfo>,
-    snapshot: &SessionSnapshot,
     lease: &DispatchLease<'_>,
-) -> Result<bool> {
+) -> Result<()> {
     let client = lease.client();
     match action {
         Action::Prompt { prompt, submit } => {
@@ -283,27 +211,17 @@ fn execute_action(
                 lease.session.name
             ));
         }
-        Action::Scroll { direction, percent } => {
-            return execute_scroll(
-                *direction,
-                *percent,
-                &require_agent(current)?.pane_id,
-                snapshot,
-                lease,
-            );
-        }
         // Key actions cannot reach the worker: top-level keys execute inline in
         // queue_binding and byAgent keys are rejected at parse.
         Action::Key { .. } => bail!("key action routed to the session worker"),
     }
-    Ok(true)
+    Ok(())
 }
 
 fn execute_work(work: Work, routing_generation: &AtomicU64, stopping: &AtomicBool) -> Result<()> {
     let Work {
         source,
         session,
-        terminal,
         generation,
         kind,
     } = work;
@@ -325,13 +243,19 @@ fn execute_work(work: Work, routing_generation: &AtomicU64, stopping: &AtomicBoo
         log("control ignored: stale Herdr routing");
         return Ok(());
     }
+    if snapshot.client_focused != Some(true) {
+        log(format!(
+            "{source} ignored: Herdr session {} is not focused",
+            session.name
+        ));
+        return Ok(());
+    }
     // A stop between the snapshot and the action must not start the action.
     if stopping.load(Ordering::Acquire) {
         return Ok(());
     }
     let lease = DispatchLease {
         session: &session,
-        terminal: &terminal,
         generation,
         routing_generation,
     };
@@ -364,22 +288,20 @@ fn execute_work(work: Work, routing_generation: &AtomicU64, stopping: &AtomicBoo
             ) else {
                 return Ok(());
             };
-            let executed = execute_action(&action, current, &snapshot, &lease)
+            execute_action(&action, current, &lease)
                 .with_context(|| format!("{source}: {}", action_name(&action)))?;
-            if executed {
-                log(format!(
-                    "{source}: {} in {}{}",
-                    action_name(&action),
-                    session.name,
-                    current
-                        .map(|agent| format!(
-                            " for {} in {}",
-                            agent.agent.as_deref().unwrap_or("unknown"),
-                            agent.pane_id
-                        ))
-                        .unwrap_or_default()
-                ));
-            }
+            log(format!(
+                "{source}: {} in {}{}",
+                action_name(&action),
+                session.name,
+                current
+                    .map(|agent| format!(
+                        " for {} in {}",
+                        agent.agent.as_deref().unwrap_or("unknown"),
+                        agent.pane_id
+                    ))
+                    .unwrap_or_default()
+            ));
         }
     }
     Ok(())
@@ -443,7 +365,6 @@ fn queue_binding(
     match route {
         Some(InputRoute {
             session,
-            terminal,
             generation,
         }) => {
             queue_work(
@@ -451,7 +372,6 @@ fn queue_binding(
                 Work {
                     source,
                     session,
-                    terminal,
                     generation,
                     kind: WorkKind::Binding {
                         binding: Box::new(binding),
@@ -554,7 +474,6 @@ fn handle_device_event(
                                 Work {
                                     source: key,
                                     session: route.session,
-                                    terminal: route.terminal,
                                     generation: route.generation,
                                     kind: WorkKind::FocusSlot {
                                         pane_id: agent.pane_id.clone(),
@@ -777,12 +696,33 @@ printf '%s\n' --call "$@" >> "$HERDR_TEST_LOG"
     }
 
     #[test]
+    fn only_blocked_agents_refuse_prompts() {
+        let with_status = |status: &str| -> AgentInfo {
+            let mut value = serde_json::to_value(agent("terminal", "pane", "claude")).unwrap();
+            value["agent_status"] = json!(status);
+            serde_json::from_value(value).unwrap()
+        };
+        for status in ["idle", "done", "working", "unknown"] {
+            assert!(ready_agent(Some(&with_status(status))).is_ok(), "{status}");
+        }
+        assert_eq!(
+            ready_agent(Some(&with_status("blocked")))
+                .unwrap_err()
+                .to_string(),
+            "focused agent is blocked"
+        );
+        assert_eq!(
+            ready_agent(None).unwrap_err().to_string(),
+            "no focused Herdr agent"
+        );
+    }
+
+    #[test]
     fn scripts_require_a_focused_agent() {
         let routing_generation = AtomicU64::new(3);
         let session = session("work");
         let lease = DispatchLease {
             session: &session,
-            terminal: "terminal",
             generation: 3,
             routing_generation: &routing_generation,
         };
@@ -799,7 +739,6 @@ printf '%s\n' --call "$@" >> "$HERDR_TEST_LOG"
             controls: config.controls,
             route: Some(InputRoute {
                 session: session("work"),
-                terminal: "terminal".into(),
                 generation: 0,
             }),
             target: Some(target),
@@ -843,7 +782,6 @@ printf '%s\n' --call "$@" >> "$HERDR_TEST_LOG"
             controls: config.controls,
             route: Some(InputRoute {
                 session: session("work"),
-                terminal: "terminal".into(),
                 generation: 2,
             }),
             target: None,

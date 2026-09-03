@@ -1,5 +1,5 @@
-//! Bridge state and its reconciliation with Herdr sessions, terminal
-//! mappings, macOS frontmost/ownership, and the HID device.
+//! Bridge state and its reconciliation with Herdr sessions and their terminal
+//! focus, macOS frontmost/ownership, and the HID device.
 
 use anyhow::Result;
 use codex_micro::{
@@ -19,17 +19,14 @@ use std::{
 };
 
 use crate::{
-    actions::{GHOSTTY_PROCESS, HERDR_LAYER, layer_identity},
+    actions::{HERDR_LAYER, layer_identity},
     config::{Config, Controls, enabled_buttons},
-    ghostty::{SessionTerminalMapping, focused_terminal_id, probe_session_terminals},
     herdr::{Session, SessionUpdate, SessionWorker, discover_sessions, spawn_session_worker},
-    macos,
     protocol::{SLOT_COUNT, aggregate_lighting, assign_slots, slot_lighting},
 };
 
 use super::{DAEMON_PROTOCOL_VERSION, dispatch::agent_identity, log, log_changed};
 
-const MAPPING_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const DEVICE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const NO_SESSIONS_SHUTDOWN: Duration = Duration::from_secs(60);
 
@@ -37,29 +34,25 @@ const NO_SESSIONS_SHUTDOWN: Duration = Duration::from_secs(60);
 pub(super) struct State {
     pub(super) config: Config,
     pub(super) sessions: Vec<Session>,
-    pub(super) mappings: Vec<SessionTerminalMapping>,
+    pub(super) sessions_ready: bool,
+    /// Latest outer terminal focus reported by each running session.
+    pub(super) focus: HashMap<String, Option<bool>>,
     selected: Option<Selected>,
-    pub(super) routing_verified: bool,
     pub(super) routing_ready: bool,
     pub(super) routing_generation: Arc<AtomicU64>,
     pub(super) agents: Vec<AgentInfo>,
     pub(super) slots: Vec<Option<String>>,
     pub(super) device_state: String,
     pub(super) owner: Option<ExternalOwner>,
-    pub(super) frontmost: Option<macos::Frontmost>,
-    pub(super) focused_terminal: Option<String>,
     pub(super) active_layer: Option<usize>,
     pub(super) last_device_error: String,
     pub(super) last_herdr_error: String,
-    pub(super) last_frontmost_error: String,
     pub(super) last_controls_error: String,
-    pub(super) last_routing_error: String,
     pub(super) last_lighting_error: String,
     pub(super) last_lighting: String,
     pub(super) last_sent_layer: Option<usize>,
     pub(super) managed_aggregate_zones: HashSet<String>,
     pub(super) no_sessions_at: Option<Instant>,
-    pub(super) next_mapping_probe: Option<Instant>,
     pub(super) next_device_open: Option<Instant>,
 }
 
@@ -83,17 +76,9 @@ impl State {
             "version": env!("CARGO_PKG_VERSION"),
             "protocol": DAEMON_PROTOCOL_VERSION,
             "sessions": self.sessions.iter().map(|session| &session.name).collect::<Vec<_>>(),
-            "sessionMappings": self.mappings.iter().map(|mapping| json!({
-                "session": mapping.session_name,
-                "terminal": mapping.terminal_id,
-            })).collect::<Vec<_>>(),
+            "focus": self.focus.iter().map(|(name, focused)| (name.clone(), json!(focused))).collect::<serde_json::Map<_, _>>(),
             "layer": self.active_layer,
             "agents": self.agents.len(),
-            "frontmost": self.frontmost.as_ref().map(|frontmost| json!({
-                "appName": frontmost.app_name,
-                "process": frontmost.process,
-            })),
-            "focusedTerminal": self.focused_terminal,
             "slots": self.slots.iter().map(|id| id.as_ref().and_then(|id| {
                 self.agents.iter().find(|agent| agent.terminal_id == *id).map(|agent| json!({
                     "pane": agent.pane_id,
@@ -102,11 +87,6 @@ impl State {
                 }))
             })).collect::<Vec<_>>(),
         })
-    }
-
-    pub(super) fn revoke_routing(&mut self) {
-        self.routing_verified = false;
-        self.invalidate_routing();
     }
 
     pub(super) fn invalidate_routing(&mut self) {
@@ -119,11 +99,14 @@ impl State {
     pub(super) fn routing_generation(&self) -> u64 {
         self.routing_generation.load(Ordering::Acquire)
     }
+
+    pub(super) fn routing_authorized(&self) -> bool {
+        self.owner.is_none() && self.sessions_ready
+    }
 }
 
 struct Selected {
     session: String,
-    generation: u64,
     pending_agents: Option<Vec<AgentInfo>>,
     pending_slots: Vec<Option<String>>,
 }
@@ -131,7 +114,6 @@ struct Selected {
 #[derive(Clone)]
 pub(super) struct InputRoute {
     pub(super) session: Session,
-    pub(super) terminal: String,
     pub(super) generation: u64,
 }
 
@@ -278,7 +260,6 @@ fn select_session(
     reset_selected_route(state);
     state.selected = next.map(|session| Selected {
         session,
-        generation: 0,
         pending_agents: None,
         pending_slots: Vec::new(),
     });
@@ -294,18 +275,10 @@ fn select_session(
 }
 
 fn reset_selected_route(state: &mut State) {
-    state.revoke_routing();
+    state.invalidate_routing();
     state.agents.clear();
     state.slots.fill(None);
     state.last_lighting.clear();
-}
-
-fn routing_failure(state: &mut State, message: impl Into<String>) {
-    log_changed(
-        &mut state.last_routing_error,
-        message.into(),
-        "Herdr session routing failed: ",
-    );
 }
 
 pub(super) fn refresh_sessions(
@@ -317,16 +290,14 @@ pub(super) fn refresh_sessions(
     stopping: &Arc<AtomicBool>,
 ) -> Result<bool> {
     let discovered = discover_sessions();
-    // A stop during discovery must not start lighting, workers, or mapping.
+    // A stop during discovery must not start lighting or workers.
     if stopping.load(Ordering::Acquire) {
         return Ok(false);
     }
     let discovered = match discovered {
         Ok(sessions) => sessions,
         Err(error) => {
-            state.revoke_routing();
-            state.mappings.clear();
-            routing_failure(state, error.to_string());
+            state.invalidate_routing();
             return Err(error);
         }
     };
@@ -336,189 +307,119 @@ pub(super) fn refresh_sessions(
     } else {
         state.no_sessions_at = None;
     }
-    let changed = discovered != state.sessions;
-    let selected = state
+    // A session that vanished or came back on another socket needs a fresh
+    // worker and must not keep a stale focus report.
+    workers.retain(|name, _| {
+        discovered
+            .iter()
+            .any(|session| session.name == *name && state.sessions.contains(session))
+    });
+    state.focus.retain(|name, _| workers.contains_key(name));
+    let selected_name = state
         .selected
         .as_ref()
-        .map(|selected| selected.session.as_str());
-    let previous_selected =
-        selected.and_then(|name| state.sessions.iter().find(|session| session.name == name));
-    let discovered_selected =
-        selected.and_then(|name| discovered.iter().find(|session| session.name == name));
-    let selected_changed = previous_selected != discovered_selected;
-    if selected_changed {
-        workers.clear();
-        if let Some(selected) = &mut state.selected {
-            selected.generation = 0;
-            selected.pending_agents = None;
-            selected.pending_slots.clear();
-        }
-        if previous_selected.is_some() && discovered_selected.is_some() {
+        .map(|selected| selected.session.clone());
+    let selected_replaced = selected_name.as_ref().is_some_and(|name| {
+        state.sessions.iter().find(|session| session.name == *name)
+            != discovered.iter().find(|session| session.name == *name)
+    });
+    state.sessions = discovered;
+    if selected_replaced {
+        let still_running = selected_name
+            .as_ref()
+            .is_some_and(|name| state.sessions.iter().any(|session| session.name == *name));
+        if still_running {
             reset_selected_route(state);
+            if let Some(selected) = &mut state.selected {
+                selected.pending_agents = None;
+                selected.pending_slots.clear();
+            }
             if let Some(device) = device {
                 send_lighting(device, state)?;
             }
+        } else {
+            let selected_name = selected_name.expect("replaced selected session");
+            if !follow_sole_other_focused_session(device, state, workers, &selected_name)? {
+                select_session(device, state, None)?;
+            }
         }
     }
-    state.sessions = discovered;
-    if state.selected.as_ref().is_some_and(|selected| {
-        !state
-            .sessions
-            .iter()
-            .any(|session| session.name == selected.session)
-    }) {
-        select_session(device, state, None)?;
-    }
-    sync_selected_worker(state, workers, worker_generation, updates, stopping);
-    if changed {
-        state.mappings.clear();
-        refresh_mappings(state, stopping);
-    }
+    sync_session_workers(state, workers, worker_generation, updates, stopping);
     Ok(state
         .no_sessions_at
         .is_some_and(|at| now.duration_since(at) >= NO_SESSIONS_SHUTDOWN))
 }
 
-pub(super) fn sync_selected_worker(
-    state: &mut State,
+/// Keep one snapshot worker per running session so every session can report
+/// whether its terminal window is focused.
+pub(super) fn sync_session_workers(
+    state: &State,
     workers: &mut HashMap<String, SessionWorker>,
     worker_generation: &mut u64,
     updates: &Sender<SessionUpdate>,
     stopping: &Arc<AtomicBool>,
 ) {
-    workers.retain(|name, _| {
-        state
-            .selected
-            .as_ref()
-            .is_some_and(|selected| selected.session == *name)
-    });
-    let Some(session) = state.selected.as_ref().and_then(|selected| {
-        state
-            .sessions
-            .iter()
-            .find(|session| session.name == selected.session)
-    }) else {
-        return;
-    };
-    if workers.contains_key(&session.name) {
-        return;
-    }
-    let session = session.clone();
-    *worker_generation += 1;
-    if let Some(selected) = &mut state.selected {
-        selected.generation = *worker_generation;
-    }
-    workers.insert(
-        session.name.clone(),
-        spawn_session_worker(
-            session,
-            *worker_generation,
-            updates.clone(),
-            Arc::clone(stopping),
-        ),
-    );
-}
-
-pub(super) fn refresh_mappings(state: &mut State, stopping: &AtomicBool) {
-    state.next_mapping_probe = None;
-    if state.sessions.is_empty() {
-        state.revoke_routing();
-        state.mappings.clear();
-        return;
-    }
-    match probe_session_terminals(&state.sessions, stopping) {
-        Ok(found) => {
-            let changed = state.mappings != found;
-            if changed {
-                state.revoke_routing();
-                state.mappings = found;
-            }
-            state.next_mapping_probe = Some(Instant::now() + MAPPING_REFRESH_INTERVAL);
-            state.last_routing_error.clear();
-            if changed {
-                log(format!(
-                    "Herdr sessions mapped: {}",
-                    state
-                        .mappings
-                        .iter()
-                        .map(|mapping| format!("{}={}", mapping.session_name, mapping.terminal_id))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
+    workers.retain(|name, _| state.sessions.iter().any(|session| session.name == *name));
+    for session in &state.sessions {
+        if workers.contains_key(&session.name) {
+            continue;
         }
-        Err(error) => {
-            // Cancelled or failed probes both leave no trusted mappings, but a
-            // cancelled one is not a routing failure and needs no retry.
-            state.revoke_routing();
-            state.mappings.clear();
-            if stopping.load(Ordering::Acquire) {
-                return;
-            }
-            state.next_mapping_probe = Some(Instant::now() + MAPPING_REFRESH_INTERVAL);
-            routing_failure(state, error.to_string());
-        }
+        *worker_generation += 1;
+        workers.insert(
+            session.name.clone(),
+            spawn_session_worker(
+                session.clone(),
+                *worker_generation,
+                updates.clone(),
+                Arc::clone(stopping),
+            ),
+        );
     }
 }
 
-pub(super) fn refresh_routing(
-    state: &mut State,
+fn follow_sole_other_focused_session(
     device: Option<&DeviceClient>,
-    stopping: &AtomicBool,
+    state: &mut State,
+    workers: &HashMap<String, SessionWorker>,
+    except: &str,
 ) -> Result<bool> {
-    let Some(frontmost_process) = state
-        .frontmost
-        .as_ref()
-        .map(|frontmost| frontmost.process.clone())
-    else {
-        state.revoke_routing();
+    let mut focused = state
+        .focus
+        .iter()
+        .filter(|(name, focused)| name.as_str() != except && **focused == Some(true))
+        .map(|(name, _)| name.clone());
+    let Some(next) = focused.next() else {
         return Ok(false);
     };
-    if frontmost_process != GHOSTTY_PROCESS {
-        let changed = state.focused_terminal.take().is_some();
-        state.next_mapping_probe = None;
-        state.revoke_routing();
-        return Ok(changed);
+    if focused.next().is_some() {
+        return Ok(false);
     }
-    match focused_terminal_id() {
-        Ok(terminal) => {
-            let terminal_changed = state.focused_terminal.as_deref() != Some(&terminal);
-            let previous_layer = state.active_layer;
-            state.focused_terminal = Some(terminal.clone());
-            let mut session = state
-                .mappings
-                .iter()
-                .find(|mapping| mapping.terminal_id == terminal)
-                .map(|mapping| mapping.session_name.clone());
-            if terminal_changed && session.is_none() {
-                refresh_mappings(state, stopping);
-                session = state
-                    .mappings
-                    .iter()
-                    .find(|mapping| mapping.terminal_id == terminal)
-                    .map(|mapping| mapping.session_name.clone());
-            }
-            let Some(session) =
-                session.filter(|name| state.sessions.iter().any(|session| session.name == *name))
-            else {
-                state.next_mapping_probe.get_or_insert(Instant::now());
-                state.revoke_routing();
-                return Ok(terminal_changed);
-            };
-            select_session(device, state, Some(session.clone()))?;
-            select_layer(device, state, Some(HERDR_LAYER))?;
-            state.routing_verified = true;
-            state.last_routing_error.clear();
-            apply_selected_agents(state, device)?;
-            return Ok(terminal_changed || previous_layer != state.active_layer);
-        }
-        Err(error) => {
-            state.focused_terminal = None;
-            routing_failure(state, error.to_string());
-            state.revoke_routing();
-        }
+    select_session(device, state, Some(next.clone()))?;
+    if let Some(worker) = workers.get(&next) {
+        worker.refresh();
     }
-    Ok(false)
+    Ok(true)
+}
+
+fn selected_session_focused(state: &State) -> bool {
+    state
+        .selected
+        .as_ref()
+        .is_some_and(|selected| state.focus.get(&selected.session).copied().flatten() == Some(true))
+}
+
+/// Route to the selected session only while its terminal window reports
+/// focus; other frontmost apps keep the last layer and dispatch nothing.
+pub(super) fn refresh_routing(state: &mut State, device: Option<&DeviceClient>) -> Result<bool> {
+    let previous_ready = state.routing_ready;
+    let previous_layer = state.active_layer;
+    if state.routing_authorized() && selected_session_focused(state) {
+        select_layer(device, state, Some(HERDR_LAYER))?;
+        apply_selected_agents(state, device)?;
+    } else {
+        state.invalidate_routing();
+    }
+    Ok(previous_ready != state.routing_ready || previous_layer != state.active_layer)
 }
 
 fn apply_selected_agents(state: &mut State, device: Option<&DeviceClient>) -> Result<()> {
@@ -597,29 +498,60 @@ pub(super) fn apply_session_update(
             ..
         } => (session, *generation),
     };
-    if workers.get(session).map(|worker| worker.generation) != Some(generation)
-        || !state.selected.as_ref().is_some_and(|selected| {
-            selected.session == *session && selected.generation == generation
-        })
-    {
+    if workers.get(session).map(|worker| worker.generation) != Some(generation) {
         return Ok(false);
     }
     match update {
         SessionUpdate::Agents {
-            session, agents, ..
+            session,
+            agents,
+            client_focused,
+            ..
         } => {
-            state
-                .selected
-                .as_mut()
-                .expect("validated selected session")
-                .pending_agents = Some(agents);
-            if session_route_is_verified(state, &session) {
-                state.last_herdr_error.clear();
-                apply_selected_agents(state, device)?;
+            let previously_focused = state
+                .focus
+                .insert(session.clone(), client_focused)
+                .flatten();
+            let is_selected = |state: &State| {
+                state
+                    .selected
+                    .as_ref()
+                    .is_some_and(|selected| selected.session == session)
+            };
+            // Only a fresh focus gain moves routing, so a session whose window
+            // closed while focused cannot keep claiming the device.
+            if client_focused == Some(true)
+                && previously_focused != Some(true)
+                && !is_selected(state)
+            {
+                select_session(device, state, Some(session.clone()))?;
+            }
+            // The selected session lost focus. A session that lost and regained
+            // focus inside one poll never reports a new transition, so if
+            // exactly one other session still reports focus, follow it and
+            // ask its worker to resend its agents.
+            if client_focused != Some(true) && is_selected(state) {
+                follow_sole_other_focused_session(device, state, workers, &session)?;
+            }
+            if is_selected(state) {
+                state
+                    .selected
+                    .as_mut()
+                    .expect("validated selected session")
+                    .pending_agents = Some(agents);
+                refresh_routing(state, device)?;
             }
             Ok(false)
         }
         SessionUpdate::Unavailable { session, error, .. } => {
+            state.focus.insert(session.clone(), None);
+            if state
+                .selected
+                .as_ref()
+                .is_none_or(|selected| selected.session != session)
+            {
+                return Ok(false);
+            }
             let became_unavailable = state
                 .selected
                 .as_mut()
@@ -628,6 +560,7 @@ pub(super) fn apply_session_update(
                 .take()
                 .is_some();
             apply_selected_agents(state, device)?;
+            follow_sole_other_focused_session(device, state, workers, &session)?;
             log_changed(
                 &mut state.last_herdr_error,
                 error,
@@ -638,62 +571,19 @@ pub(super) fn apply_session_update(
     }
 }
 
-fn session_route_is_verified(state: &State, session: &str) -> bool {
-    state.routing_verified
-        && state
-            .selected
-            .as_ref()
-            .is_some_and(|selected| selected.session == session)
-}
-
-pub(super) fn refresh_frontmost(state: &mut State) -> bool {
-    match macos::frontmost_pid() {
-        Ok(pid) if state.frontmost.as_ref().is_some_and(|app| app.pid == pid) => return false,
-        Ok(_) => {}
-        Err(error) => {
-            let changed = state.frontmost.take().is_some();
-            state.revoke_routing();
-            log_changed(
-                &mut state.last_frontmost_error,
-                error.to_string(),
-                "frontmost window unavailable: ",
-            );
-            return changed;
-        }
-    }
-    match macos::frontmost() {
-        Ok(frontmost) => {
-            let changed = state.frontmost.as_ref() != Some(&frontmost);
-            state.frontmost = Some(frontmost);
-            state.last_frontmost_error.clear();
-            changed
-        }
-        Err(error) if state.last_frontmost_error != error.to_string() => {
-            let changed = state.frontmost.take().is_some();
-            state.revoke_routing();
-            log_changed(
-                &mut state.last_frontmost_error,
-                error.to_string(),
-                "frontmost window unavailable: ",
-            );
-            changed
-        }
-        Err(_) => {
-            let changed = state.frontmost.take().is_some();
-            state.revoke_routing();
-            changed
-        }
-    }
-}
-
 pub(super) fn refresh_owner(state: &mut State) -> bool {
-    let owner = external_owner();
+    apply_owner(state, external_owner())
+}
+
+fn apply_owner(state: &mut State, owner: Option<ExternalOwner>) -> bool {
     if owner != state.owner {
-        state.next_mapping_probe = owner.is_none().then(Instant::now);
         state.owner = owner;
         if let Some(owner) = state.owner {
+            // Discovery pauses while another app owns the device, so require a
+            // fresh session list before routing resumes.
+            state.sessions_ready = false;
             log(format!("device owned by {owner}"));
-            state.revoke_routing();
+            state.invalidate_routing();
         } else {
             log("device owner cleared");
             state.next_device_open = None;
@@ -778,7 +668,6 @@ pub(super) fn update_input_context(context: &Mutex<Arc<InputContext>>, state: &S
             .find(|session| session.name == selected.session)?;
         Some(InputRoute {
             session: session.clone(),
-            terminal: state.focused_terminal.clone()?,
             generation: state.routing_generation(),
         })
     });
@@ -807,7 +696,7 @@ pub(super) fn handle_input_disconnect(
         return false;
     }
     device_disconnected(state, error);
-    state.revoke_routing();
+    state.invalidate_routing();
     state.last_lighting.clear();
     state.last_sent_layer = None;
     if let Some(mut client) = device.take() {
@@ -883,7 +772,6 @@ mod tests {
         let mut state = State::new(Config::default());
         state.selected = Some(Selected {
             session: "work".into(),
-            generation: 1,
             pending_agents: None,
             pending_slots: Vec::new(),
         });
@@ -892,23 +780,18 @@ mod tests {
             name: "work".into(),
             socket_path: "/tmp/herdr.sock".into(),
         }];
-        state.mappings = vec![SessionTerminalMapping {
-            session_name: "work".into(),
-            terminal_id: "t1".into(),
-        }];
+        state.focus.insert("work".into(), Some(true));
+        state.focus.insert("other".into(), None);
         let status = state.status();
         assert!(status["deviceError"].is_null());
         state.last_device_error = "USB restoration failed".into();
         let status = state.status();
         assert_eq!(status["routing"], "ready");
-        assert_eq!(
-            status["sessionMappings"],
-            json!([{"session":"work","terminal":"t1"}])
-        );
+        assert_eq!(status["focus"], json!({"work": true, "other": null}));
         assert_eq!(status["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(status["protocol"], DAEMON_PROTOCOL_VERSION);
         assert_eq!(status["deviceError"], "USB restoration failed");
-        assert_eq!(status.as_object().unwrap().len(), 14);
+        assert_eq!(status.as_object().unwrap().len(), 12);
     }
 
     #[test]
@@ -954,8 +837,24 @@ mod tests {
         let mut state = State::new(Config::default());
         state.routing_ready = true;
         let queued = state.routing_generation();
-        state.revoke_routing();
+        state.invalidate_routing();
         assert_ne!(queued, state.routing_generation());
+    }
+
+    #[test]
+    fn external_owner_requires_fresh_discovery_before_routing_resumes() {
+        let mut state = State::new(Config::default());
+        state.sessions_ready = true;
+        state.routing_ready = true;
+        let queued = state.routing_generation();
+
+        assert!(apply_owner(&mut state, Some(ExternalOwner::Input)));
+        assert!(!state.sessions_ready);
+        assert!(!state.routing_ready);
+        assert_ne!(queued, state.routing_generation());
+
+        assert!(apply_owner(&mut state, None));
+        assert!(!state.routing_authorized());
     }
 
     #[test]
@@ -963,30 +862,17 @@ mod tests {
         let mut state = State::new(Config::default());
         state.selected = Some(Selected {
             session: "work".into(),
-            generation: 1,
             pending_agents: None,
             pending_slots: Vec::new(),
         });
         state.sessions = vec![session("work")];
-        state.routing_verified = true;
         state.routing_ready = true;
         state.agents = vec![agent("terminal", "pane", "codex")];
         state.slots[0] = Some("terminal".into());
         let queued = state.routing_generation();
-        let replacement = Session {
-            name: "work".into(),
-            socket_path: "/tmp/replacement.sock".into(),
-        };
 
-        let previous = state.sessions.iter().find(|session| session.name == "work");
-        let discovered = [replacement];
-        let replacement = discovered.iter().find(|session| session.name == "work");
-        assert_ne!(previous, replacement);
-        if previous.is_some() && replacement.is_some() {
-            reset_selected_route(&mut state);
-        }
+        reset_selected_route(&mut state);
 
-        assert!(!state.routing_verified);
         assert!(!state.routing_ready);
         assert_ne!(queued, state.routing_generation());
         assert!(state.agents.is_empty());
@@ -998,7 +884,6 @@ mod tests {
         let mut state = State::new(Config::default());
         state.selected = Some(Selected {
             session: "work".into(),
-            generation: 1,
             pending_agents: Some(vec![agent("terminal", "pane", "codex")]),
             pending_slots: Vec::new(),
         });
@@ -1012,44 +897,191 @@ mod tests {
     }
 
     #[test]
-    fn agent_updates_require_a_verified_terminal_route() {
+    fn agent_updates_require_routing_authorization_and_focus() {
         let mut state = State::new(Config::default());
+        state.sessions_ready = true;
         state.selected = Some(Selected {
             session: "work".into(),
-            generation: 7,
             pending_agents: None,
             pending_slots: Vec::new(),
-        });
-        state.focused_terminal = Some("terminal".into());
-        state.frontmost = Some(macos::Frontmost {
-            app_name: "Ghostty".into(),
-            process: GHOSTTY_PROCESS.into(),
-            pid: 1,
         });
         let stopping = Arc::new(AtomicBool::new(true));
         let (updates, _) = mpsc::channel();
         let worker = spawn_session_worker(session("work"), 7, updates, stopping);
         let workers = HashMap::from([("work".into(), worker)]);
-        let update = || SessionUpdate::Agents {
+        let update = |client_focused: Option<bool>| SessionUpdate::Agents {
             session: "work".into(),
             generation: 7,
             agents: vec![agent("terminal", "pane", "codex")],
+            client_focused,
         };
 
-        apply_session_update(&mut state, update(), &workers, None).unwrap();
+        apply_session_update(&mut state, update(None), &workers, None).unwrap();
         assert!(!state.routing_ready);
 
-        state.routing_verified = true;
-        apply_session_update(&mut state, update(), &workers, None).unwrap();
+        apply_session_update(&mut state, update(Some(true)), &workers, None).unwrap();
         assert!(state.routing_ready);
+        assert_eq!(state.active_layer, Some(HERDR_LAYER));
+
+        let queued = state.routing_generation();
+        apply_session_update(&mut state, update(Some(false)), &workers, None).unwrap();
+        assert!(!state.routing_ready);
+        assert_ne!(queued, state.routing_generation());
+        assert_eq!(state.agents.len(), 1, "losing focus keeps lighting state");
+
+        apply_session_update(&mut state, update(Some(true)), &workers, None).unwrap();
+        assert!(state.routing_ready);
+        let queued = state.routing_generation();
+        state.sessions_ready = false;
+        apply_session_update(&mut state, update(Some(true)), &workers, None).unwrap();
+        assert!(!state.routing_ready);
+        assert_ne!(queued, state.routing_generation());
+
+        state.sessions_ready = true;
+        apply_session_update(&mut state, update(Some(true)), &workers, None).unwrap();
+        assert!(state.routing_ready);
+        let queued = state.routing_generation();
+        state.owner = Some(ExternalOwner::Input);
+        apply_session_update(&mut state, update(Some(true)), &workers, None).unwrap();
+        assert!(!state.routing_ready);
+        assert_ne!(queued, state.routing_generation());
     }
 
     #[test]
-    fn agent_updates_reject_wrong_sessions_and_stale_workers() {
+    fn a_fresh_focus_gain_selects_that_session() {
+        let mut state = State::new(Config::default());
+        state.sessions_ready = true;
+        state.sessions = vec![session("work"), session("other")];
+        let stopping = Arc::new(AtomicBool::new(true));
+        let (updates, _) = mpsc::channel();
+        let workers = HashMap::from([
+            (
+                "work".into(),
+                spawn_session_worker(session("work"), 7, updates.clone(), Arc::clone(&stopping)),
+            ),
+            (
+                "other".into(),
+                spawn_session_worker(session("other"), 8, updates, stopping),
+            ),
+        ]);
+        let update =
+            |name: &str, generation: u64, client_focused: Option<bool>| SessionUpdate::Agents {
+                session: name.into(),
+                generation,
+                agents: Vec::new(),
+                client_focused,
+            };
+        let selected = |state: &State| {
+            state
+                .selected
+                .as_ref()
+                .map(|selected| selected.session.clone())
+        };
+
+        apply_session_update(&mut state, update("other", 8, Some(true)), &workers, None).unwrap();
+        assert_eq!(selected(&state).as_deref(), Some("other"));
+        assert!(state.routing_ready);
+
+        apply_session_update(&mut state, update("work", 7, Some(true)), &workers, None).unwrap();
+        assert_eq!(selected(&state).as_deref(), Some("work"));
+
+        // A session still reporting focus from before does not steal routing back.
+        apply_session_update(&mut state, update("other", 8, Some(true)), &workers, None).unwrap();
+        assert_eq!(selected(&state).as_deref(), Some("work"));
+
+        apply_session_update(&mut state, update("other", 8, Some(false)), &workers, None).unwrap();
+        apply_session_update(&mut state, update("other", 8, Some(true)), &workers, None).unwrap();
+        assert_eq!(selected(&state).as_deref(), Some("other"));
+    }
+
+    #[test]
+    fn losing_focus_falls_back_to_the_sole_other_focused_session() {
+        let mut state = State::new(Config::default());
+        state.sessions_ready = true;
+        state.sessions = vec![session("a"), session("b")];
+        let stopping = Arc::new(AtomicBool::new(true));
+        let (updates, _) = mpsc::channel();
+        let workers = HashMap::from([
+            (
+                "a".into(),
+                spawn_session_worker(session("a"), 1, updates.clone(), Arc::clone(&stopping)),
+            ),
+            (
+                "b".into(),
+                spawn_session_worker(session("b"), 2, updates, stopping),
+            ),
+        ]);
+        let update =
+            |name: &str, generation: u64, client_focused: Option<bool>| SessionUpdate::Agents {
+                session: name.into(),
+                generation,
+                agents: vec![agent("terminal", "pane", "codex")],
+                client_focused,
+            };
+        let selected = |state: &State| {
+            state
+                .selected
+                .as_ref()
+                .map(|selected| selected.session.clone())
+        };
+
+        // A is focused; the user peeks at B and returns to A within one poll,
+        // so A never reports a change.
+        apply_session_update(&mut state, update("a", 1, Some(true)), &workers, None).unwrap();
+        apply_session_update(&mut state, update("b", 2, Some(true)), &workers, None).unwrap();
+        assert_eq!(selected(&state).as_deref(), Some("b"));
+        apply_session_update(&mut state, update("b", 2, Some(false)), &workers, None).unwrap();
+        assert_eq!(selected(&state).as_deref(), Some("a"));
+        assert!(workers["a"].refresh_requested());
+
+        // The refreshed worker resends A unchanged and routing resumes.
+        apply_session_update(&mut state, update("a", 1, Some(true)), &workers, None).unwrap();
+        assert!(state.routing_ready);
+
+        // With two other candidates nothing is guessed.
+        apply_session_update(&mut state, update("b", 2, Some(true)), &workers, None).unwrap();
+        state.focus.insert("c".into(), Some(true));
+        apply_session_update(&mut state, update("b", 2, Some(false)), &workers, None).unwrap();
+        assert_eq!(selected(&state).as_deref(), Some("b"));
+        assert!(!state.routing_ready);
+    }
+
+    #[test]
+    fn vanished_session_uses_the_sole_live_focused_fallback() {
+        let mut state = State::new(Config::default());
+        state.sessions_ready = true;
+        state.sessions = vec![session("other")];
+        state.focus.insert("other".into(), Some(true));
+        state.selected = Some(Selected {
+            session: "gone".into(),
+            pending_agents: Some(Vec::new()),
+            pending_slots: Vec::new(),
+        });
+        state.routing_ready = true;
+        let stopping = Arc::new(AtomicBool::new(true));
+        let (updates, _) = mpsc::channel();
+        let workers = HashMap::from([(
+            "other".into(),
+            spawn_session_worker(session("other"), 1, updates, stopping),
+        )]);
+
+        assert!(follow_sole_other_focused_session(None, &mut state, &workers, "gone").unwrap());
+        assert_eq!(
+            state
+                .selected
+                .as_ref()
+                .map(|selected| selected.session.as_str()),
+            Some("other")
+        );
+        assert!(workers["other"].refresh_requested());
+        assert!(!state.routing_ready);
+    }
+
+    #[test]
+    fn agent_updates_reject_stale_workers_and_keep_other_sessions_pending() {
         let mut state = State::new(Config::default());
         state.selected = Some(Selected {
             session: "work".into(),
-            generation: 7,
             pending_agents: None,
             pending_slots: Vec::new(),
         });
@@ -1065,31 +1097,44 @@ mod tests {
                 spawn_session_worker(session("other"), 7, updates, stopping),
             ),
         ]);
-        let update = |session: &str| SessionUpdate::Agents {
-            session: session.into(),
-            generation: 7,
+        let update = |name: &str, generation: u64| SessionUpdate::Agents {
+            session: name.into(),
+            generation,
             agents: Vec::new(),
+            client_focused: None,
         };
 
-        assert!(!apply_session_update(&mut state, update("other"), &workers, None).unwrap());
-        state.selected.as_mut().unwrap().generation = 6;
-        assert!(!apply_session_update(&mut state, update("work"), &workers, None).unwrap());
+        assert!(!apply_session_update(&mut state, update("other", 7), &workers, None).unwrap());
+        assert!(state.focus.contains_key("other"));
+        assert!(!apply_session_update(&mut state, update("work", 6), &workers, None).unwrap());
+        assert!(!state.focus.contains_key("work"));
         assert!(state.selected.unwrap().pending_agents.is_none());
     }
 
     #[test]
-    fn live_session_unavailability_requests_one_discovery() {
+    fn selected_session_unavailability_falls_back_and_requests_discovery() {
         let mut state = State::new(Config::default());
+        state.sessions_ready = true;
+        state.sessions = vec![session("work"), session("other")];
+        state.focus.insert("work".into(), Some(true));
+        state.focus.insert("other".into(), Some(true));
         state.selected = Some(Selected {
             session: "work".into(),
-            generation: 7,
             pending_agents: Some(Vec::new()),
             pending_slots: Vec::new(),
         });
         let stopping = Arc::new(AtomicBool::new(true));
         let (updates, _) = mpsc::channel();
-        let worker = spawn_session_worker(session("work"), 7, updates, Arc::clone(&stopping));
-        let workers = HashMap::from([("work".into(), worker)]);
+        let workers = HashMap::from([
+            (
+                "work".into(),
+                spawn_session_worker(session("work"), 7, updates.clone(), Arc::clone(&stopping)),
+            ),
+            (
+                "other".into(),
+                spawn_session_worker(session("other"), 8, updates, stopping),
+            ),
+        ]);
         let unavailable = || SessionUpdate::Unavailable {
             session: "work".into(),
             generation: 7,
@@ -1097,6 +1142,15 @@ mod tests {
         };
 
         assert!(apply_session_update(&mut state, unavailable(), &workers, None).unwrap());
+        assert_eq!(
+            state
+                .selected
+                .as_ref()
+                .map(|selected| selected.session.as_str()),
+            Some("other")
+        );
+        assert!(workers["other"].refresh_requested());
+        assert!(!state.routing_ready);
         assert!(!apply_session_update(&mut state, unavailable(), &workers, None).unwrap());
     }
 

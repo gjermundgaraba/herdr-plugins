@@ -22,16 +22,14 @@ use std::{
 };
 
 use crate::{
-    actions::GHOSTTY_PROCESS,
     config::{config_path, enabled_buttons, load, provision},
     control::listen_for_control,
 };
 use dispatch::{action_worker, input_worker};
 use reconcile::{
     InputContext, State, apply_config_load, apply_session_update, handle_input_disconnect,
-    open_device, publish, refresh_device_status, refresh_frontmost, refresh_mappings,
-    refresh_owner, refresh_routing, refresh_sessions, send_lighting, shutdown_device,
-    sync_selected_worker, update_input_context,
+    open_device, publish, refresh_device_status, refresh_owner, refresh_routing, refresh_sessions,
+    send_lighting, shutdown_device, update_input_context,
 };
 
 const CONFIG_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -39,7 +37,9 @@ const SESSION_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const SESSION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const ROUTING_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 const WORK_QUEUE_CAPACITY: usize = 16;
-pub const DAEMON_PROTOCOL_VERSION: u32 = 4;
+/// A main-loop phase this slow leaves the published input context stale.
+const SLOW_PHASE: Duration = Duration::from_millis(250);
+pub const DAEMON_PROTOCOL_VERSION: u32 = 5;
 
 static LOG_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -57,6 +57,21 @@ pub fn log(message: impl AsRef<str>) {
         return;
     }
     eprintln!("{line}");
+}
+
+/// Run one main-loop phase and report it when it holds the loop long enough
+/// for device input to capture a stale focused agent.
+fn timed<T>(phase: &str, run: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    let result = run();
+    let elapsed = started.elapsed();
+    if elapsed >= SLOW_PHASE {
+        log(format!(
+            "slow main loop phase: {phase} took {:.2}s",
+            elapsed.as_secs_f64()
+        ));
+    }
+    result
 }
 
 pub(super) fn log_changed(last: &mut String, next: String, prefix: &str) {
@@ -149,7 +164,6 @@ pub fn run_daemon() -> Result<()> {
     let mut routing_due = Instant::now();
     let mut config_due = Instant::now();
     let mut sessions_due = Instant::now();
-    let mut sessions_ready = true;
     let mut session_workers = HashMap::new();
     let mut worker_generation = 0;
     log("bridge started");
@@ -179,7 +193,9 @@ pub fn run_daemon() -> Result<()> {
         while !stopping.load(Ordering::Acquire)
             && let Ok(update) = session_update_rx.try_recv()
         {
-            match apply_session_update(&mut state, update, &session_workers, device.as_ref()) {
+            match timed("session update", || {
+                apply_session_update(&mut state, update, &session_workers, device.as_ref())
+            }) {
                 Ok(true) => {
                     sessions_due = sessions_due.min(Instant::now() + SESSION_RETRY_INTERVAL);
                 }
@@ -191,13 +207,17 @@ pub fn run_daemon() -> Result<()> {
         let now = Instant::now();
         if now >= config_due {
             config_due = now + CONFIG_REFRESH_INTERVAL;
-            changed |= apply_config_load(&mut state, load(&config_path), startup_enabled_buttons);
+            changed |= timed("config load", || {
+                apply_config_load(&mut state, load(&config_path), startup_enabled_buttons)
+            });
             // A stop between device calls must not start another slow cluster.
             if !stopping.load(Ordering::Acquire)
                 && let Some(device) = device.as_ref()
             {
-                changed |= refresh_device_status(device, &mut state);
-                match send_lighting(device, &mut state) {
+                changed |= timed("device status", || {
+                    refresh_device_status(device, &mut state)
+                });
+                match timed("lighting", || send_lighting(device, &mut state)) {
                     Ok(()) => state.last_lighting_error.clear(),
                     Err(error) => {
                         let error = format!("{error:#}");
@@ -213,37 +233,30 @@ pub fn run_daemon() -> Result<()> {
         if now >= sessions_due {
             sessions_due = now + SESSION_REFRESH_INTERVAL;
             if state.owner.is_none() && !stopping.load(Ordering::Acquire) {
-                sessions_ready = match refresh_sessions(
-                    &mut state,
-                    device.as_ref(),
-                    &mut session_workers,
-                    &mut worker_generation,
-                    &session_update_tx,
-                    &stopping,
-                ) {
+                let result = timed("session discovery", || {
+                    refresh_sessions(
+                        &mut state,
+                        device.as_ref(),
+                        &mut session_workers,
+                        &mut worker_generation,
+                        &session_update_tx,
+                        &stopping,
+                    )
+                });
+                state.sessions_ready = result.is_ok();
+                match result {
                     Ok(shutdown) => {
                         if shutdown {
                             log("No Herdr sessions for 60 seconds; stopping bridge");
                             stopping.store(true, Ordering::Release);
                         }
-                        true
                     }
                     Err(error) => {
                         log(format!("refresh failed: {error:#}"));
                         sessions_due = now + SESSION_RETRY_INTERVAL;
-                        false
                     }
-                };
+                }
             }
-            changed = true;
-        }
-        if state.owner.is_none()
-            && !stopping.load(Ordering::Acquire)
-            && state
-                .next_mapping_probe
-                .is_some_and(|deadline| now >= deadline)
-        {
-            refresh_mappings(&mut state, &stopping);
             changed = true;
         }
         if now >= routing_due {
@@ -251,8 +264,7 @@ pub fn run_daemon() -> Result<()> {
             let input_generation = state.routing_generation();
             let input_ready = state.routing_ready;
             let previous_owner = state.owner;
-            changed |= refresh_frontmost(&mut state);
-            changed |= refresh_owner(&mut state);
+            changed |= timed("external owner", || refresh_owner(&mut state));
             if previous_owner.is_some() && state.owner.is_none() {
                 sessions_due = now;
                 if !stopping.load(Ordering::Acquire)
@@ -261,23 +273,20 @@ pub fn run_daemon() -> Result<()> {
                     changed |= refresh_device_status(device, &mut state);
                 }
             }
-            if state.owner.is_none() && sessions_ready && !stopping.load(Ordering::Acquire) {
-                match refresh_routing(&mut state, device.as_ref(), &stopping) {
+            if state.routing_authorized() && !stopping.load(Ordering::Acquire) {
+                match timed("routing refresh", || {
+                    refresh_routing(&mut state, device.as_ref())
+                }) {
                     Ok(routing_changed) => changed |= routing_changed,
                     Err(error) => {
-                        state.revoke_routing();
+                        state.invalidate_routing();
                         changed = true;
                         log(format!("refresh failed: {error:#}"));
                     }
                 }
-                sync_selected_worker(
-                    &mut state,
-                    &mut session_workers,
-                    &mut worker_generation,
-                    &session_update_tx,
-                    &stopping,
-                );
-                match open_device(&mut device, &device_tx, &mut state, &stopping) {
+                match timed("device open", || {
+                    open_device(&mut device, &device_tx, &mut state, &stopping)
+                }) {
                     Ok(device_changed) => changed |= device_changed,
                     Err(error) => {
                         changed = true;
@@ -288,32 +297,11 @@ pub fn run_daemon() -> Result<()> {
             changed |= input_generation != state.routing_generation()
                 || input_ready != state.routing_ready;
         }
-        if sessions_ready
-            && state
-                .frontmost
-                .as_ref()
-                .is_some_and(|frontmost| frontmost.process == GHOSTTY_PROCESS)
-            && state.focused_terminal.as_ref().is_some_and(|terminal| {
-                !state
-                    .mappings
-                    .iter()
-                    .any(|mapping| mapping.terminal_id == *terminal)
-            })
-        {
-            sessions_due = sessions_due.min(
-                state
-                    .next_mapping_probe
-                    .unwrap_or(now + SESSION_RETRY_INTERVAL),
-            );
-        }
         if changed {
             update_input_context(&input_context, &state);
             publish(&status, &state);
         }
-        let deadline = routing_due
-            .min(config_due)
-            .min(sessions_due)
-            .min(state.next_mapping_probe.unwrap_or(sessions_due));
+        let deadline = routing_due.min(config_due).min(sessions_due);
         match input_notice_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
             Ok(error) => {
                 if handle_input_disconnect(&mut state, &mut device, error) {
@@ -326,7 +314,7 @@ pub fn run_daemon() -> Result<()> {
         }
     }
     log("stopping");
-    state.revoke_routing();
+    state.invalidate_routing();
     stopping.store(true, Ordering::Release);
     shutdown_device(&mut device, &mut state);
     drop(device_tx);

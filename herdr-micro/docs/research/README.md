@@ -38,8 +38,8 @@ evidence, but their ownership architecture and F19 action path are superseded.
   thread IDs 6–12 did not light the seven lower keys; lower-key backlight and
   perimeter lighting are aggregate zones.
 - Agent-key focus, configured prompts/actions, dial effort changes for Codex,
-  Claude Code, and Pi, joystick scrolling, automatic Layer 1/2 selection, and
-  default/named Herdr session routing were exercised on the physical device.
+  Claude Code, and Pi, automatic Layer 1/2 selection, and default/named Herdr
+  session routing were exercised on the physical device.
 - USB/BLE reconnect and BLE standby recovery repaint the current Herdr state.
   The device enters battery standby after about 15 minutes and requires a
   physical input to wake.
@@ -82,11 +82,6 @@ They are retained as failure and latency evidence, not as current behavior.
   controlled close restored both native HID services in 100 ms without an
   unplug. A second forced helper death recovered in 1.09 s with helper build 2
   while ChatGPT was frontmost; status cleared and both HID services returned.
-- Twenty-five ChatGPT/Ghostty round trips reached the correct ownership state
-  in all 50 transitions. Median latency was 1.22 s, p95 was 2.24 s, and maximum
-  was 2.97 s; two transitions exceeded two seconds. The automated run did not
-  press a physical key. After the close-race fix, five further round trips
-  completed without false device errors.
 - With one-shot helper build 13 on 2026-08-09, a clean daemon stop removed both
   processes and the next start received a fresh launchd helper PID. Killing the
   captured helper with `SIGKILL` produced a disconnect at `11:28:21.019`, a
@@ -96,17 +91,7 @@ They are retained as failure and latency evidence, not as current behavior.
 - With helper build 14, killing captured helper PID 39224 produced a disconnect
   at `16:32:48.577`, a fresh helper and device connection 94 ms later, and
   Layer 2 after 145 ms without a replug. F19, Submit, Agent focus and lighting,
-  effort, Diff, and vertical and horizontal scrolling all passed afterward.
-
-### Clean-break latency evidence (2026-08-07)
-
-A local native ScriptingBridge microbenchmark cached the Ghostty application
-proxy and ran the exact focused-terminal UUID query planned for routing. With
-50 ms between calls, observed calls were approximately 0.8–1.2 ms. The same
-query in an unpaced burst took approximately 16.9 ms per call, showing that
-the result is rate-sensitive. This was one local-machine experiment, not a
-distribution or p95 measurement; it establishes feasibility at the proposed
-polling cadence, not a performance guarantee.
+  effort, and Diff all passed afterward.
 
 ## Tested version boundaries
 

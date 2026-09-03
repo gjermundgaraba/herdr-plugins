@@ -11,11 +11,9 @@ use std::{
 };
 
 use crate::{
-    actions::GHOSTTY_PROCESS,
     config::{config_path, load, requires_accessibility},
     control::request_status,
-    ghostty::inspect_ghostty,
-    macos::{bundle_is_running, frontmost, post_event_access},
+    macos::{frontmost, post_event_access},
     setup::{PI_EXTENSION, plugin_root, service_executable},
 };
 
@@ -192,23 +190,6 @@ pub fn doctor() -> Report {
             Level::Warn,
             format!("Frontmost application could not be inspected: {error}"),
         ),
-    }
-    if bundle_is_running(GHOSTTY_PROCESS) {
-        match inspect_ghostty() {
-            Ok(terminals) => report.push(
-                Level::Ok,
-                format!(
-                    "Ghostty native bridge: {} terminal(s) visible",
-                    terminals.len()
-                ),
-            ),
-            Err(error) => report.push(Level::Fail, format!("Ghostty native bridge: {error}")),
-        }
-    } else {
-        report.push(
-            Level::Warn,
-            "Ghostty native bridge was not checked because Ghostty is not running",
-        );
     }
     match request_status(Duration::from_millis(750)) {
         Ok(status) => {

@@ -21,7 +21,7 @@ use std::{
 pub const DEFAULT_HERDR_BIN: &str = "herdr";
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const COMMAND_OUTPUT_LIMIT: usize = 64 * 1024;
-const MIN_HERDR_PROTOCOL: u32 = 19;
+const MIN_HERDR_PROTOCOL: u32 = 20;
 const SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +42,7 @@ pub enum SessionUpdate {
         session: String,
         generation: u64,
         agents: Vec<AgentInfo>,
+        client_focused: Option<bool>,
     },
     Unavailable {
         session: String,
@@ -53,7 +54,21 @@ pub enum SessionUpdate {
 pub struct SessionWorker {
     pub generation: u64,
     active: Arc<AtomicBool>,
+    refresh: Arc<AtomicBool>,
     thread: thread::Thread,
+}
+
+impl SessionWorker {
+    /// Resend the next snapshot even if nothing changed.
+    pub fn refresh(&self) {
+        self.refresh.store(true, Ordering::Release);
+        self.thread.unpark();
+    }
+
+    #[cfg(test)]
+    pub fn refresh_requested(&self) -> bool {
+        self.refresh.load(Ordering::Acquire)
+    }
 }
 
 impl Drop for SessionWorker {
@@ -71,17 +86,18 @@ pub fn spawn_session_worker(
 ) -> SessionWorker {
     let active = Arc::new(AtomicBool::new(true));
     let worker_active = Arc::clone(&active);
+    let refresh = Arc::new(AtomicBool::new(false));
+    let worker_refresh = Arc::clone(&refresh);
     let worker = thread::spawn(move || {
         let mut retry = Duration::from_millis(250);
         while worker_active.load(Ordering::Acquire) && !stopping.load(Ordering::Acquire) {
-            let client = session.client();
             let mut connected = false;
             let result = follow_session(
-                &client,
-                &session.name,
+                &session,
                 generation,
                 &updates,
                 &worker_active,
+                &worker_refresh,
                 &stopping,
                 &mut connected,
             );
@@ -108,28 +124,34 @@ pub fn spawn_session_worker(
     SessionWorker {
         generation,
         active,
+        refresh,
         thread,
     }
 }
 
 fn follow_session(
-    client: &Client,
-    session: &str,
+    session: &Session,
     generation: u64,
     updates: &Sender<SessionUpdate>,
     active: &AtomicBool,
+    refresh: &AtomicBool,
     stopping: &AtomicBool,
     connected: &mut bool,
 ) -> Result<()> {
     if !active.load(Ordering::Acquire) || stopping.load(Ordering::Acquire) {
         return Ok(());
     }
+    let client = session.client();
     let mut previous = None;
     loop {
-        let agents = current_snapshot(client)?.agents;
-        if previous.as_ref() != Some(&agents) {
-            send_agents(session, generation, updates, agents.clone())?;
-            previous = Some(agents);
+        let snapshot = current_snapshot(&client)?;
+        let next = (snapshot.client_focused, snapshot.agents);
+        if refresh.swap(false, Ordering::AcqRel) {
+            previous = None;
+        }
+        if previous.as_ref() != Some(&next) {
+            send_agents(&session.name, generation, updates, next.1.clone(), next.0)?;
+            previous = Some(next);
         }
         *connected = true;
         thread::park_timeout(SNAPSHOT_POLL_INTERVAL);
@@ -170,12 +192,14 @@ fn send_agents(
     generation: u64,
     updates: &Sender<SessionUpdate>,
     agents: Vec<AgentInfo>,
+    client_focused: Option<bool>,
 ) -> Result<()> {
     updates
         .send(SessionUpdate::Agents {
             session: session.into(),
             generation,
             agents,
+            client_focused,
         })
         .map_err(|_| anyhow::anyhow!("Micro daemon stopped"))
 }
@@ -478,6 +502,8 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         let active = Arc::new(AtomicBool::new(true));
         let server_active = Arc::clone(&active);
+        let refresh = Arc::new(AtomicBool::new(false));
+        let server_refresh = Arc::clone(&refresh);
         let server = thread::spawn(move || {
             let (mut before, _) = listener.accept().unwrap();
             let request = read_request(&before);
@@ -487,32 +513,40 @@ mod tests {
             let (mut after_event, _) = listener.accept().unwrap();
             let request = read_request(&after_event);
             assert_eq!(request["method"], "session.snapshot");
-            reply(
-                &mut after_event,
-                &request,
-                snapshot(serde_json::json!([{
-                    "terminal_id": "term1",
-                    "agent": "codex",
-                    "agent_status": "working",
-                    "workspace_id": "w1",
-                    "tab_id": "w1:t1",
-                    "pane_id": "w1:p1",
-                    "focused": true,
-                    "revision": 2
-                }])),
-            );
+            let mut second = snapshot(serde_json::json!([{
+                "terminal_id": "term1",
+                "agent": "codex",
+                "agent_status": "working",
+                "workspace_id": "w1",
+                "tab_id": "w1:t1",
+                "pane_id": "w1:p1",
+                "focused": true,
+                "revision": 2
+            }]));
+            second["snapshot"]["client_focused"] = serde_json::json!(true);
+            reply(&mut after_event, &request, second.clone());
+
+            let (mut refreshed, _) = listener.accept().unwrap();
+            // A refresh request resends an unchanged snapshot.
+            server_refresh.store(true, Ordering::Release);
+            let request = read_request(&refreshed);
+            reply(&mut refreshed, &request, second);
             server_active.store(false, Ordering::Release);
         });
 
         let (updates, received) = mpsc::channel();
         let stopping = AtomicBool::new(false);
         let mut connected = false;
+        let session = Session {
+            name: "default".into(),
+            socket_path: path.clone(),
+        };
         follow_session(
-            &Client::new(&path).with_timeout(Duration::from_secs(1)),
-            "default",
+            &session,
             7,
             &updates,
             &active,
+            &refresh,
             &stopping,
             &mut connected,
         )
@@ -521,12 +555,16 @@ mod tests {
         let agent_counts: Vec<_> = received
             .try_iter()
             .map(|update| match update {
-                SessionUpdate::Agents { agents, .. } => agents.len(),
+                SessionUpdate::Agents {
+                    agents,
+                    client_focused,
+                    ..
+                } => (agents.len(), client_focused),
                 SessionUpdate::Unavailable { .. } => unreachable!(),
             })
             .collect();
         assert!(connected);
-        assert_eq!(agent_counts, [0, 1]);
+        assert_eq!(agent_counts, [(0, None), (1, Some(true)), (1, Some(true))]);
         server.join().unwrap();
         let _ = std::fs::remove_file(path);
     }

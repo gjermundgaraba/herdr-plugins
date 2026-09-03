@@ -153,6 +153,7 @@ mod tests {
             focused_workspace_id: None,
             focused_tab_id: None,
             focused_pane_id: None,
+            client_focused: None,
             workspaces: vec![WorkspaceInfo {
                 workspace_id: "w1".into(),
                 number: 1,

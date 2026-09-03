@@ -771,7 +771,7 @@ mod tests {
             "activeProfileId": 1,
             "linkedApps": [
                 {"id": 10, "process": "gjermundgaraba.herdr-micro.layer-2"},
-                {"id": 11, "process": "com.mitchellh.ghostty"}
+                {"id": 11, "process": "com.example.unrelated"}
             ],
             "profiles": [
                 {"id": 0, "layers": [

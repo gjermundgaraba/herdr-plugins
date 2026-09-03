@@ -1,7 +1,7 @@
 id = "gjermundgaraba.herdr-micro"
 name = "Herdr Micro"
 version = "0.1.0"
-min_herdr_version = "0.8.0"
+min_herdr_version = "0.8.2"
 description = "Control Herdr from a Work Louder Codex Micro."
 platforms = ["macos"]
 
