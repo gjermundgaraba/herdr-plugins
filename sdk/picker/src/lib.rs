@@ -55,6 +55,13 @@ pub struct Snapshot<T = Vec<Item>> {
     pub items: T,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum ProviderMessage<T = Vec<Item>> {
+    Snapshot(Snapshot<T>),
+    Error { error: String },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ItemsError {
     EmptyId { index: usize },
@@ -137,11 +144,10 @@ pub fn presentation(status: &AgentStatus) -> (&'static str, Tone, bool) {
 fn consume(
     events: impl IntoIterator<Item = herdr_hub_client::Result<ServerMessage>>,
     items: impl Fn(&Model) -> Vec<Item>,
-    mut output: impl FnMut(&[Item]) -> Result<()>,
+    mut output: impl FnMut(ProviderMessage<&[Item]>) -> Result<()>,
 ) -> Result<()> {
     let mut model = None;
     let mut previous = None;
-    let mut outage = false;
 
     for event in events {
         match event {
@@ -150,7 +156,6 @@ fn consume(
                 model: replacement,
             }) => {
                 model = Some(replacement);
-                outage = false;
             }
             Ok(message) => {
                 let Some(model) = model.as_mut() else {
@@ -158,13 +163,12 @@ fn consume(
                 };
                 HubClient::apply(model, &message);
             }
-            Err(_) => {
+            Err(error) => {
                 model = None;
-                if !outage {
-                    output(&[])?;
-                    previous = Some(Vec::new());
-                    outage = true;
-                }
+                previous = None;
+                output(ProviderMessage::Error {
+                    error: format!("Herdr hub unavailable: {error}. Reconnecting…"),
+                })?;
                 continue;
             }
         }
@@ -174,17 +178,16 @@ fn consume(
         };
         let next = items(model);
         if previous.as_ref() != Some(&next) {
-            output(&next)?;
+            output(ProviderMessage::Snapshot(Snapshot { items: &next }))?;
             previous = Some(next);
         }
     }
     Ok(())
 }
 
-fn emit(items: &[Item]) -> Result<()> {
+fn emit(message: ProviderMessage<&[Item]>) -> Result<()> {
     let mut stdout = io::stdout().lock();
-    serde_json::to_writer(&mut stdout, &Snapshot { items })
-        .context("cannot encode provider message")?;
+    serde_json::to_writer(&mut stdout, &message).context("cannot encode provider message")?;
     stdout
         .write_all(b"\n")
         .and_then(|_| stdout.flush())
@@ -271,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_applies_deltas_and_clears_once_per_outage() {
+    fn stream_reports_outage_and_recovers_with_an_empty_snapshot() {
         let events = [
             Ok(ServerMessage::Hello {
                 protocol: herdr_hub_client::PROTOCOL,
@@ -282,33 +285,44 @@ mod tests {
                 key: Some("local/two".into()),
             }),
             Err(herdr_hub_client::Error::Disconnected),
-            Err(herdr_hub_client::Error::Disconnected),
             Ok(ServerMessage::Active {
                 version: 3,
                 key: Some("ignored/without-hello".into()),
             }),
             Ok(ServerMessage::Hello {
                 protocol: herdr_hub_client::PROTOCOL,
-                model: model(Some("local/three"), 4),
+                model: model(None, 4),
             }),
         ];
-        let mut snapshots = Vec::new();
+        let mut messages = Vec::new();
 
-        consume(events, active_item, |items| {
-            snapshots.push(items.iter().map(|item| item.id.clone()).collect::<Vec<_>>());
+        consume(events, active_item, |message| {
+            messages.push(serde_json::to_value(message)?);
             Ok(())
         })
         .unwrap();
 
         assert_eq!(
-            snapshots,
+            messages,
             [
-                vec!["local/one".to_owned()],
-                vec!["local/two".to_owned()],
-                Vec::new(),
-                vec!["local/three".to_owned()],
+                json!({ "items": active_item(&model(Some("local/one"), 1)) }),
+                json!({ "items": active_item(&model(Some("local/two"), 2)) }),
+                json!({ "error": "Herdr hub unavailable: hub disconnected. Reconnecting…" }),
+                json!({ "items": [] }),
             ]
         );
+    }
+
+    #[test]
+    fn provider_messages_reject_mixed_or_malformed_frames() {
+        for frame in [
+            json!({}),
+            json!({ "items": [], "error": "offline" }),
+            json!({ "error": 42 }),
+            json!({ "error": "offline", "unknown": true }),
+        ] {
+            assert!(serde_json::from_value::<ProviderMessage>(frame).is_err());
+        }
     }
 
     #[test]

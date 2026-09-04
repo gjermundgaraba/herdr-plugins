@@ -169,6 +169,8 @@ query. Only one source and one pending query can exist.
 - `{"items":[]}` is a successful empty result.
 - Exit zero after at least one snapshot is successful one-shot completion.
 - A source may stay open and continue streaming snapshots.
+- `{"error":"Service unavailable; reconnecting…"}` clears rows and displays an
+  error while the source stays open. The next item snapshot clears the error.
 - Exit zero before a snapshot, exit nonzero, malformed output, and invalid items
   are errors. Failed-source rows are cleared.
 - The final 64 KiB of stderr is captured for failures and shown as wrapped popup

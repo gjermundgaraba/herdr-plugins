@@ -214,7 +214,7 @@ pub fn doctor() -> Report {
                 }
             }
         }
-        // A stopped bridge is a normal state (micro-stop, 60s idle shutdown),
+        // A stopped bridge is a normal state (micro-stop),
         // not an installation failure.
         Err(error) => report.push(Level::Warn, format!("Micro bridge is not running: {error}")),
     }

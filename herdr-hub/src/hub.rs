@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use herdr_client::Client;
-use herdr_hub_client::{HostState, ServerMessage, SessionState};
+use herdr_hub_client::{HostState, ServerMessage};
 use serde_json::Value;
 use signal_hook::{
     consts::{SIGINT, SIGTERM},
@@ -102,9 +102,23 @@ fn event_loop(
                     start_call(core.tx.clone(), stream, id, socket_path, method, params);
                 }
                 Some(Route::Remote { host, epoch }) => {
+                    let caller = stream
+                        .try_clone()
+                        .context("retain remote caller connection");
                     let token = core.track_remote_call(host.clone(), epoch, stream, id);
-                    if let Err(error) = remote.call(&host, epoch, token, &session, method, params)
-                        && let Some(reply) = core.take_remote_call(token)
+                    if let Err(error) = caller.and_then(|caller| {
+                        remote.call(
+                            &host,
+                            remote::Call {
+                                epoch,
+                                token,
+                                session,
+                                method,
+                                params,
+                                caller,
+                            },
+                        )
+                    }) && let Some(reply) = core.take_remote_call(token)
                     {
                         server::reply_call(reply.stream, reply.id, Err(error.to_string()));
                     }
@@ -374,26 +388,21 @@ impl Core {
                 }) {
                     applied.messages.push(message);
                 }
-                for mut session in sessions {
-                    if valid_remote_session(&host, &session) {
-                        session.client_focused = None;
-                        applied.messages.extend(self.model.publish_session(session));
-                    }
+                for session in sessions {
+                    applied.messages.extend(self.model.publish_session(session));
                 }
             }
             remote::Event::Session {
                 host,
                 epoch,
-                mut session,
+                session,
             } => {
-                if self.remote_is_current(&host, epoch) && valid_remote_session(&host, &session) {
-                    session.client_focused = None;
+                if self.remote_is_current(&host, epoch) {
                     applied.messages.extend(self.model.publish_session(session));
                 }
             }
             remote::Event::SessionRemoved { host, epoch, key } => {
                 if self.remote_is_current(&host, epoch)
-                    && valid_remote_key(&host, &key).is_some()
                     && let Some(message) = self.model.remove_session(&key)
                 {
                     applied.messages.push(message);
@@ -583,17 +592,6 @@ impl Core {
             watcher,
         })
     }
-}
-
-fn valid_remote_key<'a>(host: &str, key: &'a str) -> Option<&'a str> {
-    let name = key.strip_prefix(&format!("{host}/"))?;
-    (!name.is_empty() && !name.contains('/')).then_some(name)
-}
-
-fn valid_remote_session(host: &str, session: &SessionState) -> bool {
-    session.host == host
-        && session.socket_path.is_none()
-        && valid_remote_key(host, &session.key) == Some(session.name.as_str())
 }
 
 #[cfg(test)]
@@ -834,7 +832,6 @@ mod tests {
         session.key = "workbox/default".into();
         session.host = "workbox".into();
         session.socket_path = None;
-        session.client_focused = Some(true);
         let connected = core.apply_remote(remote::Event::Connected {
             host: "workbox".into(),
             epoch: 2,
@@ -884,7 +881,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_updates_fail_closed_for_stale_or_malformed_sessions() {
+    fn remote_updates_fail_closed_for_stale_sessions() {
         let (tx, _rx) = mpsc::sync_channel(64);
         let hosts = [HostConfig {
             key: "workbox".into(),
@@ -896,20 +893,6 @@ mod tests {
             epoch: 3,
             sessions: Vec::new(),
         });
-
-        let mut nested = state("hidden", true);
-        nested.key = "nested/hidden".into();
-        nested.host = "nested".into();
-        nested.socket_path = None;
-        assert!(
-            core.apply_remote(remote::Event::Session {
-                host: "workbox".into(),
-                epoch: 3,
-                session: nested,
-            })
-            .messages
-            .is_empty()
-        );
 
         let mut stale = state("old", true);
         stale.key = "workbox/old".into();

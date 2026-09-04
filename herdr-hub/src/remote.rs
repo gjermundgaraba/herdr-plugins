@@ -60,12 +60,13 @@ pub(crate) enum Event {
     },
 }
 
-struct Call {
-    epoch: u64,
-    token: u64,
-    session: String,
-    method: String,
-    params: Value,
+pub(crate) struct Call {
+    pub epoch: u64,
+    pub token: u64,
+    pub session: String,
+    pub method: String,
+    pub params: Value,
+    pub caller: UnixStream,
 }
 
 struct HostHandle {
@@ -157,34 +158,19 @@ impl Supervisor {
         Ok(Self { hosts: handles })
     }
 
-    pub(crate) fn call(
-        &self,
-        host: &str,
-        epoch: u64,
-        token: u64,
-        session: &str,
-        method: String,
-        params: Value,
-    ) -> Result<()> {
+    pub(crate) fn call(&self, host: &str, mut call: Call) -> Result<()> {
         let handle = self
             .hosts
             .get(host)
             .ok_or_else(|| anyhow!("unknown remote host {host:?}"))?;
-        let session = relay_session_key(host, session)?;
+        call.session = relay_session_key(host, &call.session)?;
         let current_epoch = handle.epoch.load(Ordering::Acquire);
         if current_epoch == 0 {
             bail!("remote host {host:?} is disconnected")
         }
-        if current_epoch != epoch {
+        if current_epoch != call.epoch {
             bail!("remote host {host:?} connection changed")
         }
-        let call = Call {
-            epoch,
-            token,
-            session,
-            method,
-            params,
-        };
         match handle.commands.try_send(call) {
             Ok(()) => {
                 wake(&handle.wake);
@@ -391,16 +377,7 @@ impl HostWorker {
                 });
             }
         };
-        let stdin = match child.stdin.take() {
-            Some(stdin) => stdin,
-            None => {
-                stop_child(&mut child);
-                return Err(ConnectionFailure {
-                    connected: false,
-                    error: anyhow!("relay process has no stdin"),
-                });
-            }
-        };
+        let stdin = child.stdin.take().expect("piped stdin");
         if let Err(error) = set_nonblocking(stdin.as_raw_fd()) {
             stop_child(&mut child);
             return Err(ConnectionFailure {
@@ -408,16 +385,7 @@ impl HostWorker {
                 error: anyhow!("make relay stdin nonblocking: {error}"),
             });
         }
-        let stdout = match child.stdout.take() {
-            Some(stdout) => stdout,
-            None => {
-                stop_child(&mut child);
-                return Err(ConnectionFailure {
-                    connected: false,
-                    error: anyhow!("relay process has no stdout"),
-                });
-            }
-        };
+        let stdout = child.stdout.take().expect("piped stdout");
         let (incoming_tx, incoming) = mpsc::sync_channel(RELAY_QUEUE);
         let reader_wake = match self.wake_tx.try_clone() {
             Ok(wake) => wake,
@@ -595,13 +563,21 @@ impl Connection<'_> {
                         .checked_add(1)
                         .ok_or_else(|| anyhow!("relay call counter overflowed"))?;
                     self.in_flight.insert(id, call.token);
-                    self.write_message(&ClientMessage::Call {
-                        protocol: PROTOCOL,
-                        id,
-                        session: call.session,
-                        method: call.method,
-                        params: call.params,
-                    })?;
+                    if !self.write_message(
+                        &ClientMessage::Call {
+                            protocol: PROTOCOL,
+                            id,
+                            session: call.session,
+                            method: call.method,
+                            params: call.params,
+                        },
+                        &call.caller,
+                    )? {
+                        self.finish_call(
+                            id,
+                            Err("caller disconnected before call was sent".into()),
+                        )?;
+                    }
                 }
                 Ok(call) => self.reply(
                     call.epoch,
@@ -625,12 +601,19 @@ impl Connection<'_> {
         }
     }
 
-    fn write_message(&mut self, message: &impl Serialize) -> Result<()> {
+    fn write_message(&mut self, message: &impl Serialize, caller: &UnixStream) -> Result<bool> {
         let bytes = encode_message(message)?;
         let mut remaining = bytes.as_slice();
         while !remaining.is_empty() {
             if self.stop.load(Ordering::Acquire) {
                 bail!("remote supervisor stopped while writing relay message")
+            }
+            if !caller_connected(caller) {
+                if remaining.len() == bytes.len() {
+                    return Ok(false);
+                }
+                // A partial frame cannot be retracted or followed by another call.
+                bail!("caller disconnected while writing relay message")
             }
             match self.stdin.write(remaining) {
                 Ok(0) => bail!("relay stdin closed while writing message"),
@@ -644,7 +627,7 @@ impl Connection<'_> {
                 Err(error) => return Err(error).context("write relay message"),
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     fn apply_message(&mut self, message: ServerMessage) -> Result<()> {
@@ -699,26 +682,42 @@ impl Connection<'_> {
         token: u64,
         result: std::result::Result<Value, String>,
     ) -> Result<()> {
-        if self.emit(Event::Reply {
+        self.emit_required(Event::Reply {
             host: self.host.key.clone(),
             epoch,
             token,
             result,
-        }) {
-            Ok(())
-        } else {
-            bail!("hub stopped")
-        }
-    }
-
-    fn emit(&self, event: Event) -> bool {
-        send_event(self.events, self.stop, event)
+        })
     }
 
     fn emit_required(&self, event: Event) -> Result<()> {
-        self.emit(event)
+        send_event(self.events, self.stop, event)
             .then_some(())
             .ok_or_else(|| anyhow!("hub stopped"))
+    }
+}
+
+fn caller_connected(caller: &UnixStream) -> bool {
+    loop {
+        // A zero-byte send checks the reply side without changing the wire stream.
+        // Read EOF alone would also reject callers that only half-close their input.
+        // SAFETY: the socket is valid; the null buffer has zero length. Suppress SIGPIPE.
+        let sent = unsafe {
+            libc::send(
+                caller.as_raw_fd(),
+                std::ptr::null(),
+                0,
+                libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
+            )
+        };
+        if sent >= 0 {
+            return true;
+        }
+        match io::Error::last_os_error().kind() {
+            io::ErrorKind::Interrupted => continue,
+            io::ErrorKind::WouldBlock => return true,
+            _ => return false,
+        }
     }
 }
 
@@ -1006,11 +1005,34 @@ mod tests {
 
     use super::*;
 
+    const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
     fn host() -> HostConfig {
         HostConfig {
             key: "workbox".into(),
             ssh: "ssh-target".into(),
         }
+    }
+
+    fn call(token: u64, method: &str, params: Value, caller: &UnixStream) -> Call {
+        Call {
+            epoch: 1,
+            token,
+            session: "workbox/default".into(),
+            method: method.into(),
+            params,
+            caller: caller.try_clone().unwrap(),
+        }
+    }
+
+    #[test]
+    fn caller_connection_accepts_write_half_close_but_rejects_closed_peer() {
+        let (caller, peer) = UnixStream::pair().unwrap();
+        assert!(caller_connected(&caller));
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+        assert!(caller_connected(&caller));
+        drop(peer);
+        assert!(!caller_connected(&caller));
     }
 
     fn session(key: &str, host: &str, name: &str) -> SessionState {
@@ -1129,12 +1151,12 @@ mod tests {
         let directory = temp_directory("version-descendant");
         std::fs::create_dir_all(&directory).unwrap();
         let script = directory.join("fake-ssh");
-        let marker = directory.join("descendant-survived");
+        let pid_path = directory.join("descendant-pid");
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\n(sleep 0.2; touch '{}') &\nexec printf 'herdr-hub {}\\n'\n",
-                marker.display(),
+                "#!/bin/sh\nsleep 30 &\nprintf '%s\\n' \"$!\" > '{}'\nprintf 'herdr-hub {}\\n'\n",
+                pid_path.display(),
                 env!("CARGO_PKG_VERSION")
             ),
         )
@@ -1143,20 +1165,29 @@ mod tests {
 
         let started = Instant::now();
         assert_eq!(
-            check_version_with_program_and_timeout(
-                &host(),
-                script.as_os_str(),
-                Duration::from_secs(1),
-            )
-            .unwrap(),
+            check_version_with_program_and_timeout(&host(), script.as_os_str(), TEST_TIMEOUT,)
+                .unwrap(),
             format!("herdr-hub {}", env!("CARGO_PKG_VERSION"))
         );
-        assert!(started.elapsed() < Duration::from_millis(500));
-        thread::sleep(Duration::from_millis(300));
-        assert!(
-            !marker.exists(),
-            "version-check descendant survived successful leader exit"
-        );
+        assert!(started.elapsed() < TEST_TIMEOUT);
+        let descendant: i32 = std::fs::read_to_string(pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + TEST_TIMEOUT;
+        loop {
+            // SAFETY: signal zero only checks existence of this test's descendant.
+            if unsafe { libc::kill(descendant, 0) } == -1 {
+                assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "version-check descendant survived successful leader exit"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1275,7 +1306,7 @@ mod tests {
         let supervisor =
             Supervisor::spawn_with_program(vec![host()], events_tx, script.into_os_string())
                 .unwrap();
-        let connected = events.recv_timeout(Duration::from_secs(2)).unwrap();
+        let connected = events.recv_timeout(TEST_TIMEOUT).unwrap();
         match connected {
             Event::Connected {
                 host,
@@ -1291,14 +1322,11 @@ mod tests {
             }
             other => panic!("expected Connected, got {other:?}"),
         }
+        let (caller, _peer) = UnixStream::pair().unwrap();
         supervisor
             .call(
                 "workbox",
-                1,
-                91,
-                "workbox/default",
-                "pane.focus".into(),
-                json!({"pane_id": "w1:p1"}),
+                call(91, "pane.focus", json!({"pane_id": "w1:p1"}), &caller),
             )
             .unwrap();
 
@@ -1307,7 +1335,7 @@ mod tests {
         let mut saw_reply = false;
         let mut saw_disconnect = false;
         for _ in 0..4 {
-            match events.recv_timeout(Duration::from_secs(2)).unwrap() {
+            match events.recv_timeout(TEST_TIMEOUT).unwrap() {
                 Event::Session {
                     host,
                     epoch,
@@ -1385,21 +1413,15 @@ mod tests {
             Supervisor::spawn_with_program(vec![host()], events_tx, script.into_os_string())
                 .unwrap();
         assert!(matches!(
-            events.recv_timeout(Duration::from_secs(2)).unwrap(),
+            events.recv_timeout(TEST_TIMEOUT).unwrap(),
             Event::Connected { epoch: 1, .. }
         ));
+        let (caller, _peer) = UnixStream::pair().unwrap();
         supervisor
-            .call(
-                "workbox",
-                1,
-                77,
-                "workbox/default",
-                "pane.focus".into(),
-                json!({}),
-            )
+            .call("workbox", call(77, "pane.focus", json!({}), &caller))
             .unwrap();
         assert!(matches!(
-            events.recv_timeout(Duration::from_secs(2)).unwrap(),
+            events.recv_timeout(TEST_TIMEOUT).unwrap(),
             Event::Reply {
                 epoch: 1,
                 token: 77,
@@ -1408,7 +1430,7 @@ mod tests {
             }
         ));
         assert!(matches!(
-            events.recv_timeout(Duration::from_secs(2)).unwrap(),
+            events.recv_timeout(TEST_TIMEOUT).unwrap(),
             Event::Disconnected { epoch: 1, .. }
         ));
         drop(supervisor);
@@ -1444,21 +1466,18 @@ mod tests {
             Supervisor::spawn_with_program(vec![host()], events_tx, script.into_os_string())
                 .unwrap();
         assert!(matches!(
-            events.recv_timeout(Duration::from_secs(2)).unwrap(),
+            events.recv_timeout(TEST_TIMEOUT).unwrap(),
             Event::Connected { epoch: 1, .. }
         ));
 
         let params = Value::String("x".repeat(256 * 1024));
+        let (caller, _peer) = UnixStream::pair().unwrap();
         let mut queue_filled = false;
         for token in 1..=100 {
             if supervisor
                 .call(
                     "workbox",
-                    1,
-                    token,
-                    "workbox/default",
-                    "pane.focus".into(),
-                    params.clone(),
+                    call(token, "pane.focus", params.clone(), &caller),
                 )
                 .is_err()
             {
@@ -1507,21 +1526,15 @@ mod tests {
             Supervisor::spawn_with_program(vec![host()], events_tx, script.into_os_string())
                 .unwrap();
         assert!(matches!(
-            events.recv_timeout(Duration::from_secs(2)).unwrap(),
+            events.recv_timeout(TEST_TIMEOUT).unwrap(),
             Event::Connected { epoch: 1, .. }
         ));
 
         let mut accepted = 0;
         let mut rejected = 0;
+        let (caller, _peer) = UnixStream::pair().unwrap();
         for token in 1..=(MAX_IN_FLIGHT + COMMAND_QUEUE + 64) as u64 {
-            match supervisor.call(
-                "workbox",
-                1,
-                token,
-                "workbox/default",
-                "pane.focus".into(),
-                json!({}),
-            ) {
+            match supervisor.call("workbox", call(token, "pane.focus", json!({}), &caller)) {
                 Ok(()) => accepted += 1,
                 Err(_) => rejected += 1,
             }
@@ -1538,10 +1551,12 @@ mod tests {
     }
 
     #[test]
-    fn reply_burst_releases_queued_calls_without_an_extra_wake() {
+    fn reply_burst_skips_abandoned_calls_and_releases_live_calls_without_an_extra_wake() {
         let directory = temp_directory("reply-burst");
         std::fs::create_dir_all(&directory).unwrap();
         let script = directory.join("fake-ssh");
+        let release = directory.join("release");
+        let forwarded = directory.join("forwarded");
         let hello = ServerMessage::Hello {
             protocol: PROTOCOL,
             model: Model {
@@ -1561,7 +1576,8 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let final_counter = MAX_IN_FLIGHT as u64 + 1;
+        let abandoned = MAX_IN_FLIGHT as u64 + 1;
+        let final_counter = abandoned + 1;
         let final_reply = serde_json::to_string(&ServerMessage::Reply {
             id: final_counter,
             result: json!({"counter": final_counter}),
@@ -1570,10 +1586,12 @@ mod tests {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' '{}'\ni=0\nwhile [ \"$i\" -lt {} ]; do\n  IFS= read -r call || exit 1\n  i=$((i + 1))\ndone\nsleep 0.2\nprintf '%s\\n' '{}'\nIFS= read -r final || exit 1\nprintf '%s\\n' '{}'\n",
+                "#!/bin/sh\nprintf '%s\\n' '{}'\ni=0\nwhile [ \"$i\" -lt {} ]; do\n  IFS= read -r call || exit 1\n  i=$((i + 1))\ndone\nwhile [ ! -e '{}' ]; do sleep 0.01; done\nprintf '%s\\n' '{}'\nIFS= read -r final || exit 1\nprintf '%s\\n' \"$final\" > '{}'\nprintf '%s\\n' '{}'\n",
                 serde_json::to_string(&hello).unwrap(),
                 MAX_IN_FLIGHT,
+                release.display(),
                 replies,
+                forwarded.display(),
                 final_reply,
             ),
         )
@@ -1585,22 +1603,24 @@ mod tests {
             Supervisor::spawn_with_program(vec![host()], events_tx, script.into_os_string())
                 .unwrap();
         assert!(matches!(
-            events.recv_timeout(Duration::from_secs(2)).unwrap(),
+            events.recv_timeout(TEST_TIMEOUT).unwrap(),
             Event::Connected { epoch: 1, .. }
         ));
 
+        let (caller, _peer) = UnixStream::pair().unwrap();
+        let (expired_caller, mut expired_peer) = UnixStream::pair().unwrap();
+        let queue_deadline = Instant::now() + TEST_TIMEOUT;
         for token in 1..=final_counter {
             loop {
-                match supervisor.call(
-                    "workbox",
-                    1,
-                    token,
-                    "workbox/default",
-                    "test".into(),
-                    json!({}),
-                ) {
+                let (method, connection) = if token == abandoned {
+                    ("pane.focus", &expired_caller)
+                } else {
+                    ("test", &caller)
+                };
+                match supervisor.call("workbox", call(token, method, json!({}), connection)) {
                     Ok(()) => break,
                     Err(error) if error.to_string().contains("call queue is full") => {
+                        assert!(Instant::now() < queue_deadline, "call queue remained full");
                         thread::sleep(Duration::from_millis(1));
                     }
                     Err(error) => panic!("cannot queue call {token}: {error:#}"),
@@ -1608,11 +1628,28 @@ mod tests {
             }
         }
 
+        // A timed-out SDK call drops its dedicated socket. Hold all 64 slots until
+        // that happens, so the focus request is definitely abandoned while queued.
+        expired_peer
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        let error = expired_peer.read(&mut [0]).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ));
+        drop(expired_peer);
+        std::fs::write(&release, "").unwrap();
+
         let mut replied = std::collections::HashSet::new();
         while replied.len() < final_counter as usize {
             match events.recv_timeout(Duration::from_secs(5)).unwrap() {
                 Event::Reply { token, result, .. } => {
-                    assert_eq!(result.unwrap(), json!({"counter": token}));
+                    if token == abandoned {
+                        assert!(result.unwrap_err().contains("caller disconnected"));
+                    } else {
+                        assert_eq!(result.unwrap(), json!({"counter": token}));
+                    }
                     replied.insert(token);
                 }
                 Event::Disconnected { error, .. } => {
@@ -1622,6 +1659,11 @@ mod tests {
             }
         }
         assert!(replied.contains(&final_counter));
+        let final_call: ClientMessage =
+            serde_json::from_str(&std::fs::read_to_string(forwarded).unwrap()).unwrap();
+        assert!(
+            matches!(final_call, ClientMessage::Call { id, method, .. } if id == final_counter && method == "test")
+        );
 
         drop(supervisor);
         std::fs::remove_dir_all(directory).unwrap();
@@ -1671,31 +1713,21 @@ mod tests {
             Supervisor::spawn_with_program(vec![host()], events_tx, script.into_os_string())
                 .unwrap();
         assert!(matches!(
-            events.recv_timeout(Duration::from_secs(2)).unwrap(),
+            events.recv_timeout(TEST_TIMEOUT).unwrap(),
             Event::Connected { epoch: 1, .. }
         ));
+        let (caller, _peer) = UnixStream::pair().unwrap();
         supervisor
-            .call(
-                "workbox",
-                1,
-                41,
-                "workbox/default",
-                "first".into(),
-                json!({}),
-            )
+            .call("workbox", call(41, "first", json!({}), &caller))
             .unwrap();
         assert!(matches!(
-            events.recv_timeout(Duration::from_secs(2)).unwrap(),
+            events.recv_timeout(TEST_TIMEOUT).unwrap(),
             Event::Session { session, .. } if session.key == "workbox/marker"
         ));
         supervisor
             .call(
                 "workbox",
-                1,
-                42,
-                "workbox/default",
-                "second".into(),
-                Value::String("x".repeat(256 * 1024)),
+                call(42, "second", Value::String("x".repeat(256 * 1024)), &caller),
             )
             .unwrap();
 

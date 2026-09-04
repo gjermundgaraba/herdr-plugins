@@ -218,7 +218,7 @@ impl Drop for ControlServer {
 /// payload counts as live.
 ///
 /// `stopping` is shared with the daemon: any shutdown path (stop command,
-/// signal, idle shutdown) sets it, and the server then refuses status so a
+/// signal) sets it, and the server then refuses status so a
 /// racing `start` never mistakes a draining daemon for a live one.
 pub fn listen_for_control(
     status: Arc<Mutex<Value>>,
@@ -536,7 +536,7 @@ mod tests {
         let path = dir.join(SOCKET_NAME);
         let stopping = Arc::new(AtomicBool::new(false));
         let (server, shutdown, runner) = start_test_server(path.clone(), Arc::clone(&stopping));
-        // A signal or idle shutdown sets the daemon's flag without any stop
+        // A signal sets the daemon's flag without any stop
         // command; the server must still refuse status.
         stopping.store(true, Ordering::Release);
         assert_eq!(

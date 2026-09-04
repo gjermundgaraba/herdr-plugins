@@ -17,7 +17,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use herdr_client::{Client, Error, ndjson, open_rotating_log};
-use herdr_picker_sdk::Snapshot;
+use herdr_picker_sdk::ProviderMessage;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -29,6 +29,7 @@ const MAX_STDERR_BYTES: usize = 64 << 10;
 #[derive(Debug)]
 pub enum ProviderEvent {
     Snapshot(Vec<Item>),
+    Unavailable(String),
     Error(String),
     Exited { status: ExitStatus, stderr: String },
 }
@@ -79,22 +80,25 @@ impl Provider {
             let mut pending = Vec::new();
             loop {
                 match ndjson::read_frame(&mut reader, &mut pending) {
-                    Ok(Some(frame)) => match serde_json::from_slice::<Snapshot>(&frame) {
-                        Ok(snapshot) => {
-                            if let Err(error) = validate_items(&snapshot.items) {
+                    Ok(Some(frame)) => match serde_json::from_slice::<ProviderMessage>(&frame) {
+                        Ok(ProviderMessage::Snapshot(snapshot)) => {
+                            let items = snapshot.items;
+                            if let Err(error) = validate_items(&items) {
                                 let _ = fatal_tx.send(format!("provider items: {error}"));
                                 return;
                             }
-                            if event_tx
-                                .send(ProviderEvent::Snapshot(snapshot.items))
-                                .is_err()
-                            {
+                            if event_tx.send(ProviderEvent::Snapshot(items)).is_err() {
+                                return;
+                            }
+                        }
+                        Ok(ProviderMessage::Error { error }) => {
+                            if event_tx.send(ProviderEvent::Unavailable(error)).is_err() {
                                 return;
                             }
                         }
                         Err(error) => {
                             let _ = fatal_tx
-                                .send(format!("provider returned invalid snapshot: {error}"));
+                                .send(format!("provider returned invalid message: {error}"));
                             return;
                         }
                     },

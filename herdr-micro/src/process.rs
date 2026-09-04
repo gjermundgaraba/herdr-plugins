@@ -51,11 +51,11 @@ fn terminate_process_group(process_group: i32) -> io::Result<()> {
     }
 }
 
-pub(crate) fn run_command_with_timeout(command: &mut Command, timeout: Duration) -> Result<String> {
+pub(crate) fn run_command_with_timeout(command: &mut Command, timeout: Duration) -> Result<()> {
     let program = command.get_program().to_string_lossy().into_owned();
     command
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .process_group(0);
     let mut child = command
@@ -69,9 +69,7 @@ pub(crate) fn run_command_with_timeout(command: &mut Command, timeout: Duration)
             return Err(error).context("child process ID is too large");
         }
     };
-    let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
-    let stdout_reader = thread::spawn(move || capture_output(stdout));
     let stderr_reader = thread::spawn(move || capture_output(stderr));
     let started = Instant::now();
     let waited = (|| -> Result<_> {
@@ -101,10 +99,7 @@ pub(crate) fn run_command_with_timeout(command: &mut Command, timeout: Duration)
     let (status, timed_out) = waited?;
     terminate_process_group(process_group)
         .with_context(|| format!("terminate descendants of {program}"))?;
-    let captured_stdout = join_output(stdout_reader, "stdout", &program);
-    let captured_stderr = join_output(stderr_reader, "stderr", &program);
-    let captured_stdout = captured_stdout?;
-    let captured_stderr = captured_stderr?;
+    let captured_stderr = join_output(stderr_reader, "stderr", &program)?;
     let detail = String::from_utf8_lossy(&captured_stderr.bytes)
         .trim()
         .to_owned();
@@ -119,7 +114,7 @@ pub(crate) fn run_command_with_timeout(command: &mut Command, timeout: Duration)
     if !status.success() {
         bail!("{program} failed with {status}: {detail}{truncated}");
     }
-    Ok(String::from_utf8_lossy(&captured_stdout.bytes).into_owned())
+    Ok(())
 }
 
 #[cfg(test)]
@@ -169,14 +164,16 @@ mod tests {
         assert!(!marker.exists(), "background descendant survived");
 
         let noisy = format!(
-            "/usr/bin/yes x | /usr/bin/head -c {}",
+            "/usr/bin/yes x | /usr/bin/head -c {} >&2; exit 7",
             COMMAND_OUTPUT_LIMIT * 2
         );
-        let output = run_command_with_timeout(
+        let error = run_command_with_timeout(
             Command::new("/bin/sh").args(["-c", &noisy]),
             Duration::from_secs(1),
         )
-        .unwrap();
-        assert_eq!(output.len(), COMMAND_OUTPUT_LIMIT);
+        .unwrap_err();
+        let detail = error.to_string();
+        assert!(detail.ends_with(" (stderr truncated)"));
+        assert!(detail.len() < COMMAND_OUTPUT_LIMIT + 100);
     }
 }

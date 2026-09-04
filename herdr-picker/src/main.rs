@@ -242,7 +242,9 @@ impl StepRuntime {
     }
 
     fn loading(&self) -> bool {
-        !self.received_snapshot && (self.provider.is_some() || self.pending_query.is_some())
+        self.error.is_none()
+            && !self.received_snapshot
+            && (self.provider.is_some() || self.pending_query.is_some())
     }
 
     fn notice_query_change(&mut self, previous_query: &str) {
@@ -298,6 +300,7 @@ impl StepRuntime {
                 self.fail_provider(error);
                 stop = true;
             }
+            process::ProviderEvent::Unavailable(error) => self.fail_provider(error),
             process::ProviderEvent::Exited { status, stderr } => {
                 if !status.success() {
                     self.fail_provider(if stderr.is_empty() {
@@ -305,7 +308,7 @@ impl StepRuntime {
                     } else {
                         format!("provider failed: {stderr}")
                     });
-                } else if !self.received_snapshot {
+                } else if !self.received_snapshot && self.error.is_none() {
                     self.fail_provider("provider exited before sending a snapshot".into());
                 }
                 stop = true;
@@ -829,6 +832,50 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("crashed"))
         );
+    }
+
+    #[test]
+    fn provider_error_stays_visible_until_recovery_without_stopping_the_source() {
+        let step = Step {
+            id: "source".into(),
+            title: "Source".into(),
+            source: Some(vec![
+                "sh".into(),
+                "-c".into(),
+                concat!(
+                    "read input; ",
+                    "printf '%s\\n' ",
+                    "'{\"error\":\"Hub offline; reconnecting\"}' ",
+                    "'{\"items\":[{\"id\":\"one\",\"title\":\"One\"}]}' ",
+                    "'{\"error\":\"Hub disconnected; reconnecting\"}' ",
+                    "'{\"items\":[]}'; sleep 30"
+                )
+                .into(),
+            ]),
+            search: SearchMode::Local,
+            items: Vec::new(),
+        };
+        let mut runtime = StepRuntime::start("test", &step, &BTreeMap::new(), Mode::Direct, None);
+        for (error, selected) in [
+            (Some("Hub offline; reconnecting"), None),
+            (None, Some("one")),
+            (Some("Hub disconnected; reconnecting"), None),
+            (None, None),
+        ] {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !runtime.poll_provider() {
+                assert!(Instant::now() < deadline, "provider message timed out");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+
+            assert_eq!(runtime.error.as_deref(), error);
+            assert_eq!(
+                runtime.picker.selected_item().map(|item| item.id.as_str()),
+                selected
+            );
+            assert!(!runtime.loading());
+            assert!(runtime.provider.is_some());
+        }
     }
 
     #[test]

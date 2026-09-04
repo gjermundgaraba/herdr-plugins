@@ -22,7 +22,7 @@ const STARTUP_POLL: Duration = Duration::from_millis(25);
 const QUEUE_CAPACITY: usize = 64;
 const MAX_IN_FLIGHT: usize = 64;
 
-pub(crate) fn run(resolve_herdr: impl FnOnce() -> Result<PathBuf>) -> Result<()> {
+pub fn run(resolve_herdr: impl FnOnce() -> Result<PathBuf>) -> Result<()> {
     let client = HubClient::new();
     let (stream, model) = subscribe_or_start(&client, resolve_herdr)?;
     let (events, incoming) = mpsc::sync_channel(QUEUE_CAPACITY);
@@ -35,7 +35,7 @@ pub(crate) fn run(resolve_herdr: impl FnOnce() -> Result<PathBuf>) -> Result<()>
     spawn_input(events.clone())?;
 
     let result = event_loop(&client, &events, &incoming, &outgoing);
-    let _ = outgoing.send(None);
+    drop(outgoing);
     let writer_result = writer
         .join()
         .map_err(|_| anyhow!("relay output writer panicked"))?;
@@ -117,7 +117,7 @@ fn event_loop(
     client: &HubClient,
     events: &SyncSender<Event>,
     incoming: &Receiver<Event>,
-    outgoing: &SyncSender<Option<ServerMessage>>,
+    outgoing: &SyncSender<ServerMessage>,
 ) -> Result<()> {
     let mut calls = 0_usize;
     let mut input_closed = false;
@@ -282,7 +282,7 @@ fn spawn_subscription(
 }
 
 fn spawn_output(
-    output: Receiver<Option<ServerMessage>>,
+    output: Receiver<ServerMessage>,
     events: SyncSender<Event>,
 ) -> Result<thread::JoinHandle<Result<()>>> {
     thread::Builder::new()
@@ -290,20 +290,10 @@ fn spawn_output(
         .spawn(move || -> Result<()> {
             let stdout = io::stdout();
             let mut writer = BufWriter::new(stdout.lock());
-            while let Ok(output) = output.recv() {
-                match output {
-                    Some(message) => {
-                        if let Err(error) = write_message(&mut writer, &message) {
-                            let _ = events.try_send(Event::OutputFailed(format!("{error:#}")));
-                            return Err(error);
-                        }
-                    }
-                    None => {
-                        return writer.flush().map_err(|error| {
-                            let _ = events.try_send(Event::OutputFailed(error.to_string()));
-                            error.into()
-                        });
-                    }
+            for message in output {
+                if let Err(error) = write_message(&mut writer, &message) {
+                    let _ = events.try_send(Event::OutputFailed(format!("{error:#}")));
+                    return Err(error);
                 }
             }
             Ok(())
@@ -311,9 +301,9 @@ fn spawn_output(
         .context("cannot start relay output writer")
 }
 
-fn send(outgoing: &SyncSender<Option<ServerMessage>>, message: ServerMessage) -> Result<()> {
+fn send(outgoing: &SyncSender<ServerMessage>, message: ServerMessage) -> Result<()> {
     outgoing
-        .send(Some(message))
+        .send(message)
         .map_err(|_| anyhow!("relay output writer stopped"))
 }
 

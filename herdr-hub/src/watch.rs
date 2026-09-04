@@ -31,7 +31,6 @@ pub(crate) struct Update {
 pub(crate) struct Watcher {
     pub(crate) generation: u64,
     active: Arc<AtomicBool>,
-    refresh: Arc<AtomicBool>,
     worker: thread::Thread,
     join: Option<JoinHandle<()>>,
 }
@@ -43,25 +42,21 @@ impl Watcher {
         updates: SyncSender<Event>,
     ) -> Result<Self> {
         let active = Arc::new(AtomicBool::new(true));
-        let refresh = Arc::new(AtomicBool::new(false));
         let worker_active = Arc::clone(&active);
-        let worker_refresh = Arc::clone(&refresh);
         let join = thread::Builder::new()
             .name(format!("herdr-hub-{}", session.name))
-            .spawn(move || watch(session, generation, updates, worker_active, worker_refresh))
+            .spawn(move || watch(session, generation, updates, worker_active))
             .context("cannot start session watcher")?;
         let worker = join.thread().clone();
         Ok(Self {
             generation,
             active,
-            refresh,
             worker,
             join: Some(join),
         })
     }
 
     pub(crate) fn wake(&self) {
-        self.refresh.store(true, Ordering::Release);
         self.worker.unpark();
     }
 }
@@ -81,7 +76,6 @@ fn watch(
     generation: u64,
     updates: SyncSender<Event>,
     active: Arc<AtomicBool>,
-    refresh: Arc<AtomicBool>,
 ) {
     let mut retry = SNAPSHOT_INTERVAL;
     let mut outage_started = Instant::now();
@@ -94,7 +88,6 @@ fn watch(
             generation,
             &updates,
             &active,
-            &refresh,
             &mut connected,
             &mut protocol,
         );
@@ -134,7 +127,6 @@ fn follow(
     generation: u64,
     updates: &SyncSender<Event>,
     active: &AtomicBool,
-    refresh: &AtomicBool,
     connected: &mut bool,
     protocol: &mut u32,
 ) -> Result<()> {
@@ -147,9 +139,6 @@ fn follow(
         *protocol = snapshot.protocol;
         validate_snapshot(&snapshot)?;
         let state = connected_state(session, snapshot);
-        if refresh.swap(false, Ordering::AcqRel) {
-            previous = None;
-        }
         publish_changed(updates, active, generation, &mut previous, state)?;
         *connected = true;
         thread::park_timeout(SNAPSHOT_INTERVAL);

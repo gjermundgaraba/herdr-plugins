@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
@@ -101,10 +101,9 @@ impl Server {
             .ok_or_else(|| anyhow!("hub socket disappeared after bind"))?;
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
-        let next_subscriber = Arc::new(AtomicU64::new(1));
         let accept_thread = thread::Builder::new()
             .name("herdr-hub-accept".into())
-            .spawn(move || accept_loop(listener, tx, thread_stop, next_subscriber))?;
+            .spawn(move || accept_loop(listener, tx, thread_stop))?;
         Ok(Self {
             subscribers: HashMap::new(),
             stop,
@@ -182,12 +181,8 @@ pub(crate) fn reply_call(
     let _ = stream.shutdown(Shutdown::Both);
 }
 
-fn accept_loop(
-    listener: UnixListener,
-    tx: SyncSender<Event>,
-    stop: Arc<AtomicBool>,
-    next_subscriber: Arc<AtomicU64>,
-) {
+fn accept_loop(listener: UnixListener, tx: SyncSender<Event>, stop: Arc<AtomicBool>) {
+    let mut next_subscriber = 1;
     while !stop.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _)) => {
@@ -196,7 +191,8 @@ fn accept_loop(
                     continue;
                 }
                 let tx = tx.clone();
-                let id = next_subscriber.fetch_add(1, Ordering::Relaxed);
+                let id = next_subscriber;
+                next_subscriber += 1;
                 let _ = thread::Builder::new()
                     .name("herdr-hub-connection".into())
                     .spawn(move || {

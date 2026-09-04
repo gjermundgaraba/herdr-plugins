@@ -57,10 +57,6 @@ enum WorkKind {
     },
 }
 
-fn require_agent(agent: Option<&AgentInfo>) -> Result<&AgentInfo> {
-    agent.ok_or_else(|| anyhow!("no focused Herdr agent"))
-}
-
 pub(super) fn agent_identity(
     agent: Option<&AgentInfo>,
 ) -> Option<(String, String, Option<String>)> {
@@ -74,8 +70,7 @@ pub(super) fn agent_identity(
 }
 
 /// Match Herdr's own prompt gate: only a blocked agent refuses text.
-fn ready_agent(agent: Option<&AgentInfo>) -> Result<&AgentInfo> {
-    let agent = require_agent(agent)?;
+fn ready_agent(agent: &AgentInfo) -> Result<&AgentInfo> {
     if agent.agent_status.as_str() == AgentStatus::BLOCKED {
         bail!("focused agent is blocked")
     }
@@ -178,10 +173,9 @@ fn script_command(
 fn execute_script(
     command: &str,
     args: &[String],
-    current: Option<&AgentInfo>,
+    current: &AgentInfo,
     lease: &DispatchLease<'_>,
 ) -> Result<()> {
-    let current = require_agent(current)?;
     lease.ensure()?;
     let mut child = script_command(
         command,
@@ -190,13 +184,12 @@ fn execute_script(
         lease.session,
         &current.pane_id,
     )?;
-    run_command_with_timeout(&mut child, COMMAND_TIMEOUT)?;
-    Ok(())
+    run_command_with_timeout(&mut child, COMMAND_TIMEOUT)
 }
 
 fn execute_action(
     action: &Action,
-    current: Option<&AgentInfo>,
+    current: &AgentInfo,
     call: &Caller<'_>,
     lease: &DispatchLease<'_>,
 ) -> Result<()> {
@@ -207,7 +200,6 @@ fn execute_action(
             send_prompt(call, prompt, submit.unwrap_or(true), current)?;
         }
         Action::Diff => {
-            let current = require_agent(current)?;
             lease.ensure()?;
             open_diff(call, current)?;
         }
@@ -231,16 +223,15 @@ fn execute_action(
             }
         }
         Action::Submit => {
-            let current = require_agent(current)?;
             lease.ensure()?;
             submit(call, current)?;
         }
         Action::Script { command, args } => execute_script(command, args, current, lease)?,
         Action::FocusPane { direction } => {
             let direction = direction.as_str();
-            let pane = require_agent(current)?.pane_id.clone();
+            let pane = &current.pane_id;
             lease.ensure()?;
-            focus_pane(call, &pane, direction)?;
+            focus_pane(call, pane, direction)?;
             log(format!(
                 "joystick focus {direction}: {}/{pane}",
                 lease.session.name
@@ -307,7 +298,7 @@ fn execute_work(
             let Some(action) = binding.resolve(current.agent.as_deref().unwrap_or("")) else {
                 return Ok(());
             };
-            execute_action(&action, Some(&current), call, &lease)
+            execute_action(&action, &current, call, &lease)
                 .with_context(|| format!("{source}: {}", action_name(&action)))?;
             log(format!(
                 "{source}: {} in {} for {} in {}",
@@ -728,22 +719,6 @@ printf '%s\n' --call "$@" >> "$HERDR_TEST_LOG"
     }
 
     #[test]
-    fn scripts_require_a_focused_agent() {
-        let routing_generation = AtomicU64::new(3);
-        let session = session("work");
-        let active_route = active_route(&session);
-        let lease = DispatchLease {
-            session: &session,
-            generation: 3,
-            routing_generation: &routing_generation,
-            active_route: &active_route,
-            stopping: &AtomicBool::new(false),
-        };
-        let error = execute_script("/usr/bin/true", &[], None, &lease).unwrap_err();
-        assert_eq!(error.to_string(), "no focused Herdr agent");
-    }
-
-    #[test]
     fn scripts_refuse_sessions_without_a_local_socket() {
         let session = Session {
             key: "remote/work".into(),
@@ -807,7 +782,7 @@ printf '%s\n' --call "$@" >> "$HERDR_TEST_LOG"
             stopping: &stopping,
         };
 
-        let error = execute_action(&Action::Submit, Some(&current), &caller, &lease).unwrap_err();
+        let error = execute_action(&Action::Submit, &current, &caller, &lease).unwrap_err();
 
         assert_eq!(error.to_string(), "Micro bridge is stopping");
         assert_eq!(calls.borrow().len(), 1, "submit RPC must not start");

@@ -1,9 +1,10 @@
 # herdr-picker-agents
 
 A live Herdr agent picker implemented as a focused Rust example for
-[`herdr-picker`](../herdr-picker). It streams agents from every session through
-the Herdr hub, orders them by attention, shows their session as a badge, and
-focuses the selected pane on its owning session after the popup closes.
+[`herdr-picker`](../herdr-picker). It streams agents from the active local
+session through the Herdr hub, orders them by attention, shows their session as
+a badge, and focuses the selected pane on its owning session after the popup closes.
+When there is no active local session, the picker is empty.
 
 For a shorter, one-shot Python example, see
 [`herdr-picker-scripts`](../herdr-picker-scripts).

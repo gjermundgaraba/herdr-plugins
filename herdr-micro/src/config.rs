@@ -395,7 +395,6 @@ fn valid_agent(agent: &str) -> bool {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd, Deserialize)]
 #[serde(rename_all = "lowercase")]
-// Declaration order is agent display priority, highest first.
 pub enum AgentStatus {
     Blocked,
     Done,
@@ -567,20 +566,6 @@ fn read_json(path: &Path) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn agent_status_declaration_order_is_display_priority() {
-        assert!(
-            [
-                AgentStatus::Blocked,
-                AgentStatus::Done,
-                AgentStatus::Working,
-                AgentStatus::Idle,
-                AgentStatus::Unknown,
-            ]
-            .is_sorted()
-        );
-    }
 
     #[test]
     fn controls_reject_unknown_fields_and_map_reversed_dial_labels() {
