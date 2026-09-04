@@ -14,6 +14,7 @@ fn agent_items(model: &Model) -> Vec<Item> {
     let mut agents = model
         .sessions
         .iter()
+        .filter(|session| model.active.as_deref() == Some(session.key.as_str()))
         .flat_map(|session| session.agents.iter().map(move |agent| (session, agent)))
         .collect::<Vec<_>>();
     agents.sort_by(|(_, a), (_, b)| attention_order(a, b));
@@ -176,9 +177,10 @@ mod tests {
     }
 
     fn model(sessions: Vec<SessionState>) -> Model {
+        let active = sessions.first().map(|session| session.key.clone());
         Model {
             version: 1,
-            active: None,
+            active,
             hosts: vec![HostState {
                 key: "local".into(),
                 connected: true,
@@ -255,7 +257,10 @@ mod tests {
         remote.tabs[0].tab_id = "shared-tab".into();
         remote.tabs[0].label = "remote tab".into();
 
-        let items = agent_items(&model(vec![local, remote]));
+        let items = [
+            agent_item(&local, &local.agents[0]),
+            agent_item(&remote, &remote.agents[0]),
+        ];
         assert_eq!(
             items
                 .iter()
@@ -288,7 +293,7 @@ mod tests {
     }
 
     #[test]
-    fn attention_order_is_global_across_sessions() {
+    fn agent_picker_only_includes_the_active_session() {
         let items = agent_items(&model(vec![
             session(
                 "local/default",
@@ -312,7 +317,7 @@ mod tests {
                 .iter()
                 .map(|item| item.value["pane_id"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            ["blocked-old", "done-new", "working-new"]
+            ["working-new"]
         );
     }
 
