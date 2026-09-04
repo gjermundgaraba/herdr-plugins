@@ -13,9 +13,8 @@ a root helper, or use `sudo`.
 
 - macOS and a Codex Micro; the current hardware baseline is stock firmware
   0.6.2
-- A Herdr build with `client_focused` in `session.snapshot`. Stock Herdr 0.8.2
-  uses socket protocol 20 but lacks this field and is incompatible; no
-  compatible public Herdr ref is currently obtainable.
+- A Herdr build with `client_focused` in `session.snapshot`
+- The `herdr-hub` plugin installed and its service running
 - Rust 1.89 or newer when building from source
 - An Apple Development code-signing identity when building from source
 - Work Louder Input for the one-time Layer 2 setup
@@ -29,14 +28,12 @@ The bridge uses an unsupported proprietary device protocol. Read the
 
 ## Install
 
-Public installation is currently blocked: stock Herdr 0.8.2 lacks the required
-`client_focused` snapshot field, and no compatible public Herdr ref is
-currently obtainable. The generic `herdr plugin install` recipe is therefore
-not currently usable.
-
-For a local Herdr build, focus the session's terminal, then run
-`herdr --session NAME api snapshot` with its session name. The output must
-include `"client_focused": true` or `"client_focused": false`.
+```sh
+herdr plugin install gjermundgaraba/herdr-plugins/herdr-micro
+herdr plugin enable gjermundgaraba.herdr-micro
+herdr plugin action invoke service-authorize \
+  --plugin gjermundgaraba.herdr-micro
+```
 
 `herdr-micro start`, including the plugin startup hook, installs or refreshes
 the per-user `dev.herdr.codex-micro` LaunchAgent automatically. The stable
@@ -163,22 +160,19 @@ boundaries.
 
 ## Routing and operation
 
-One Herdr client can route the Micro across default and named Herdr sessions.
-Each session reports whether its terminal window is focused through
-`session.snapshot`'s `client_focused`, so routing follows the window you are
-looking at without inspecting the terminal application. The target is
-revalidated before each action. `client_focused` may be absent until the
-terminal has reported focus, so check snapshots only after that focus report.
-The device service remains available when Herdr is absent, but only its
-reserved Handy action is local; gestures and all other actions need the Herdr
-client.
+The bridge subscribes to `herdr-hub` for one pushed model of default and named
+Herdr sessions. The hub publishes the active session from Herdr's
+`client_focused` snapshot field; the bridge revalidates that session and the
+captured target before each action. The device service remains available when
+the hub is absent, but only its reserved Handy action is local; gestures and
+all other actions need the hub.
 
 - Work Louder Input running or ChatGPT/Codex desktop frontmost: Herdr
   suppresses routing
 - Independently, the service enforces the gate by closing the physical device
 - Official writer inactive: the service reopens USB or BLE and replays state
-- A session's terminal window focused: Herdr selects Layer 2 and routes to
-  that session; other apps dispatch no Herdr action
+- Hub reports an active Herdr session: Herdr selects Layer 2 and routes to that
+  session; no active session means no Herdr action
 
 Useful actions:
 

@@ -11,7 +11,8 @@ stock Codex Micro firmware 0.6.2
      -> lifecycle, official-writer gate, replay, reserved Handy action
      -> owner-only, exact-version typed Unix socket
   -> herdr-micro daemon (optional policy client)
-     -> Herdr routing, gestures, actions, and lighting policy
+     -> pushed herdr-hub model and call passthrough
+     -> gestures, actions, and lighting policy
 ```
 
 The LaunchAgent runs without administrator privileges from
@@ -28,10 +29,11 @@ guarded keymap reads/writes. There is no generic raw device RPC and no path to
 the device that bypasses the service. The physical-device gate is
 service-owned.
 
-`herdr-micro` is a client of that service. It discovers Herdr sessions, follows
-which session's terminal window is focused, freezes and revalidates action
-targets, handles gestures, and computes lighting. Stopping Herdr does not stop
-the LaunchAgent.
+`herdr-micro` is a client of that service and of `herdr-hub`. The hub publishes
+the active Herdr session from `session.snapshot.client_focused`. The bridge
+freezes and revalidates action targets, handles gestures, and computes
+lighting. Stopping the hub blanks Herdr lighting and routing without stopping
+the device LaunchAgent.
 
 ## Device ownership
 
@@ -63,9 +65,10 @@ The service-owned device gate is:
 | ChatGPT/Codex desktop frontmost | Close the physical device |
 | Official writer inactive | Open USB or BLE and replay desired state |
 
-Separately, Herdr selects Layer 2 while a session's terminal window is
-focused and routes actions there. Other frontmost apps preserve the last
-applicable Herdr layer and dispatch no Herdr action.
+Separately, Herdr selects Layer 2 when the hub publishes an active Herdr
+session and routes actions there. When the hub publishes no active session,
+the bridge preserves the last applicable Herdr layer and dispatches no Herdr
+action.
 
 Layer 2 keeps `KV_OAI_AG00` through `KV_OAI_AG05` for six-way status lighting
 and native action codes for configured controls. `micro-setup` accepts only a
@@ -87,15 +90,17 @@ actuate both Button 5 and Button 6, so Button 6 is `null` by default.
 
 ## Herdr action scheduling
 
-The Herdr client polls every running session's stable `session.snapshot` API
-four times per second and routes to the session whose `client_focused` most
-recently became true. Built-in actions use direct socket requests after a
-fresh snapshot confirms the session is still focused and the captured agent
-identity. Script actions run from the plugin root after the same session,
-pane, agent, and routing generation are revalidated.
+One hub subscription supplies all session, agent, and active-session changes;
+the bridge does not poll Herdr. Built-in actions use the hub call passthrough.
+Before a queued binding runs, its captured session key must still match the
+hub's current active route, and `agent.get` must return the captured terminal,
+pane, and agent identity with
+`focused == true`; an Agent-key focus checks the captured identity without
+requiring it to already be focused.
 
-`client_focused` may be absent until the terminal has reported focus. Any
-snapshot compatibility check must therefore run after that focus report.
+Script actions run from the plugin root after the same session, pane, agent,
+and routing generation are revalidated. A script also requires a local session
+socket; remote hub sessions refuse script actions.
 
 Scripts receive `HERDR_SOCKET_PATH`, `HERDR_SESSION`, and `HERDR_PANE_ID`, and
 inherit `HERDR_BIN_PATH`. Output is bounded. One worker runs accepted scripts
@@ -106,7 +111,7 @@ in FIFO order, with a queue of 16 and a five-second deadline.
 | Component | Current boundary |
 |---|---|
 | Platform | macOS only |
-| Herdr | Requires `client_focused` in `session.snapshot`; stock 0.8.2 uses protocol 20 but lacks the field and is incompatible, and no compatible public ref is currently obtainable |
+| Herdr | A build with `session.snapshot.client_focused`, with `herdr-hub` running |
 | Build toolchain | Rust 1.89 or newer |
 | Codex Micro firmware | Stock 0.6.2 baseline; USB `device.status` physically confirmed |
 | Device transport | USB preferred; Bluetooth Low Energy supported |

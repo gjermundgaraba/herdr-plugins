@@ -1,0 +1,35 @@
+id = "gjermundgaraba.herdr-hub"
+name = "Herdr Hub"
+version = "0.2.0"
+min_herdr_version = "0.8.2"
+description = "One agent model for every Herdr dashboard"
+platforms = ["macos", "linux"]
+
+[[build]]
+command = ["cargo", "build", "--release", "--locked", "-p", "herdr-hub"]
+
+[[build]]
+command = ["mkdir", "-p", "bin"]
+
+[[build]]
+command = ["install", "-m", "750", "../target/release/herdr-hub", "bin/.herdr-hub.new"]
+
+[[build]]
+command = ["mv", "-f", "bin/.herdr-hub.new", "bin/herdr-hub"]
+
+[[startup]]
+command = ["bin/herdr-hub", "ensure"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["bin/herdr-hub", "notify", "event"]
+
+[[actions]]
+id = "status"
+title = "Show Herdr Hub status"
+command = ["bin/herdr-hub", "status"]
+
+[[actions]]
+id = "doctor"
+title = "Check Herdr Hub setup"
+command = ["bin/herdr-hub", "doctor"]

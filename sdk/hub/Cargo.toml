@@ -1,14 +1,17 @@
 [package]
-name = "herdr-picker-agents"
+name = "herdr-hub-client"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "Live Herdr agent example for herdr-picker"
+description = "Typed client for the Herdr agent hub"
 repository.workspace = true
 
 [dependencies]
-herdr-hub-client.workspace = true
-herdr-picker-sdk.workspace = true
+herdr-client.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

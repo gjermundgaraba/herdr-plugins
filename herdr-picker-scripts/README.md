@@ -58,15 +58,6 @@ These definitions intentionally use the same picker names as the Rust
 examples. Choose one implementation, or rename a copied definition when
 comparing both.
 
-### Build-specific unseen variant
-
-`agents-unseen.toml` focuses the selected agent and then marks the pane left
-behind as unseen. It is only for Herdr builds whose installed API schema
-exposes `pane.mark_unseen`; canonical upstream Herdr 0.8.2 does not expose that
-method. Its default source requires the `herdr-picker-agents` executable. The
-comment in `agents-unseen.toml` shows how to use the one-shot Python source
-instead.
-
 Add keybindings to `~/.config/herdr/config.toml` and reload with
 `herdr server reload-config`:
 

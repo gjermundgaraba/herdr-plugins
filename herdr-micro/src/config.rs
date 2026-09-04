@@ -652,6 +652,10 @@ mod tests {
         let mut stale = config_json();
         stale["controls"]["actionDeviceKeys"] = serde_json::json!({});
         assert!(parse_config(&stale).is_err());
+        let mut removed_scroll = config_json();
+        removed_scroll["controls"]["joystick"]["up"] =
+            serde_json::json!({"action":"scroll","direction":"up","percent":50});
+        assert!(parse_config(&removed_scroll).is_err());
         let mut extra = config_json();
         extra["controls"]["dial"]["extra"] = Value::Bool(true);
         assert!(parse_config(&extra).is_err());

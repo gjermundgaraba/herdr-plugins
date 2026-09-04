@@ -10,6 +10,6 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-herdr-client.workspace = true
+herdr-hub-client.workspace = true
 serde.workspace = true
 serde_json.workspace = true

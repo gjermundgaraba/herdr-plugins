@@ -4,6 +4,7 @@ Independent plugins and tools for [Herdr](https://herdr.dev/).
 
 | Package | Description |
 | --- | --- |
+| [herdr-hub](herdr-hub) | Shared agent model, active-session state, and action relay for every Herdr dashboard |
 | [herdr-picker](herdr-picker) | Standalone declarative fuzzy picker and workflow runner |
 | [herdr-picker-agents](herdr-picker-agents) | Live Herdr agent picker example in Rust |
 | [herdr-picker-workspaces](herdr-picker-workspaces) | Live Herdr workspace picker example in Rust |
@@ -26,6 +27,7 @@ Install only the plugin you want:
 herdr plugin install gjermundgaraba/herdr-plugins/equalize-splits
 herdr plugin install gjermundgaraba/herdr-plugins/fork-to-pane
 herdr plugin install gjermundgaraba/herdr-plugins/history
+herdr plugin install gjermundgaraba/herdr-plugins/herdr-hub
 herdr plugin install gjermundgaraba/herdr-plugins/herdr-micro
 herdr plugin install gjermundgaraba/herdr-plugins/space-meta
 ```
@@ -40,6 +42,7 @@ picker runs directly from `PATH`.
 herdr plugin link "$PWD/equalize-splits"
 herdr plugin link "$PWD/fork-to-pane"
 herdr plugin link "$PWD/history"
+herdr plugin link "$PWD/herdr-hub"
 herdr plugin link "$PWD/herdr-micro"
 herdr plugin link "$PWD/space-meta"
 ```
@@ -56,13 +59,29 @@ nix build .#herdr-picker
 result/bin/herdr-picker --version
 ```
 
-The other package names include `herdr-picker-agents`,
+The hub output is both a linkable plugin root and a CLI package:
+
+```sh
+nix profile install github:gjermundgaraba/herdr-plugins#herdr-hub
+herdr plugin link ~/.nix-profile/herdr-hub
+```
+
+The hub targets the production Herdr fork at commit `85ad1d77`. It reads the
+fork's `session.snapshot.client_focused` field in one canonical 250 ms loop and
+pushes active-session changes to every consumer; consumers do not poll Herdr or
+integrate with a terminal app directly.
+
+The other package names include `herdr-hub`, `herdr-picker-agents`,
 `herdr-picker-workspaces`, `equalize-splits`, `fork-to-pane`, `history`, and
 `space-meta`. The two picker examples are independent optional binary packages.
-Every package supports Linux and macOS. Plugin packages contain a complete,
-prebuilt plugin root, so linking them never invokes Cargo. The picker packages
-expose their executables under `bin/`. `herdr-micro` has no Nix package: its
-service binary must be codesigned with a local Apple Development identity.
+Every package builds on Linux and macOS, but the hub-backed live pickers require
+the macOS hub service; Linux supports the hub's remote hooks and relay, not a
+standalone local service. Plugin packages contain a complete, prebuilt plugin
+root, so linking them never invokes Cargo. The picker packages expose their
+executables under `bin/`; `herdr-hub` exposes both
+`herdr-hub/bin/herdr-hub` for plugin commands and `bin/herdr-hub` for `PATH`.
+`herdr-micro` has no Nix package: its service binary must be codesigned with a
+local Apple Development identity.
 
 For Home Manager, add the picker package to the profile:
 
@@ -87,10 +106,10 @@ on later activations, so there is no activation-time Rust compilation and no
 binary cache is required.
 
 Each package's filtered source contains its full local path-dependency closure.
-The picker and its Rust examples share `sdk/picker`; popup chrome lives in
-`sdk/ratatui`; Herdr clients use `sdk/rust`. Consequently, editing one plugin
-does not invalidate unrelated plugin outputs, while edits to a shared SDK
-invalidate packages that include it.
+The picker and its Rust examples share `sdk/picker` and `sdk/hub`; popup chrome
+lives in `sdk/ratatui`; plugin-environment clients use `sdk/rust`.
+Consequently, editing one plugin does not invalidate unrelated plugin outputs,
+while edits to a shared SDK invalidate packages that include it.
 
 Enter the repository development shell with the same pinned Rust toolchain using
 `nix develop`.
@@ -103,6 +122,9 @@ ClankerSnip. It intentionally does not own application state or event loops.
 
 [`sdk/picker`](sdk/picker) provides the picker wire types and shared live Herdr
 provider plumbing used by the independent agent and workspace examples.
+
+[`sdk/hub`](sdk/hub) provides the versioned hub protocol, streaming model
+client, action calls, and shared agent attention ordering.
 
 The reusable client under [`sdk/rust`](sdk/rust) also validates Herdr's plugin
 environment and supplies the repository file layout:

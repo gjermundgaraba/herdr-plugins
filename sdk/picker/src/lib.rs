@@ -5,16 +5,17 @@ use std::{
     fmt,
     io::{self, Write},
     process::ExitCode,
+    sync::mpsc,
     thread,
     time::Duration,
 };
 
-use anyhow::{Context, Result};
-use herdr_client::{
-    AgentStatus, Client, Error as ClientError, EventSubscription, SessionSnapshot, Subscription,
-};
+use anyhow::{Context, Result, bail};
+use herdr_hub_client::{AgentStatus, HubClient, Model, ServerMessage};
 use serde::{Deserialize, Serialize, de::IgnoredAny};
 use serde_json::{Value, json};
+
+const CALL_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -102,51 +103,29 @@ pub fn run(name: &str, result: Result<()>) -> ExitCode {
 }
 
 /// Read one picker context from stdin, then stream one item snapshot per
-/// session change while the picker stays open.
-pub fn serve(items: impl Fn(&SessionSnapshot) -> Vec<Item>) -> Result<()> {
+/// hub model change while the picker stays open.
+pub fn serve(items: impl Fn(&Model) -> Vec<Item>) -> Result<()> {
     let _: IgnoredAny = serde_json::from_reader(io::stdin()).context("invalid picker context")?;
-    let client = Client::from_env().context("cannot connect to Herdr")?;
-    let mut previous = None;
-    let mut publish = |snapshot: &SessionSnapshot| -> Result<()> {
-        let next = items(snapshot);
-        if previous.as_ref() != Some(&next) {
-            emit(&next)?;
-            previous = Some(next);
-        }
-        Ok(())
-    };
+    let (events_tx, events_rx) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        HubClient::new().run(move |event| {
+            events_tx
+                .send(event)
+                .expect("picker event receiver stopped");
+        })
+    });
 
-    'resubscribe: loop {
-        let (snapshot, mut events) = subscribe_events(&client)?;
-        let subscribed_panes = pane_ids(&snapshot);
-        publish(&snapshot)?;
-
-        while events
-            .next_event()
-            .context("cannot read Herdr events")?
-            .is_some()
-        {
-            while events.has_buffered_event() {
-                let _ = events.next_event().context("cannot read Herdr events")?;
-            }
-            let snapshot = client.snapshot().context("cannot refresh Herdr session")?;
-            publish(&snapshot)?;
-            if pane_ids(&snapshot) != subscribed_panes {
-                continue 'resubscribe;
-            }
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
+    consume(events_rx, items, emit)?;
+    bail!("hub event stream stopped")
 }
 
 /// Read the final picker context from stdin and call `method` with the
 /// `value_field` of the selected item as its `parameter`.
 pub fn submit(method: &str, value_field: &str, parameter: &str) -> Result<()> {
     let context: Value = serde_json::from_reader(io::stdin()).context("invalid picker context")?;
-    let value = selected_value(&context, value_field)?;
-    Client::from_env()
-        .context("cannot connect to Herdr")?
-        .call_value(method, &json!({ (parameter): value }))
+    let (session, value) = selected_value(&context, value_field)?;
+    HubClient::new()
+        .call(session, method, json!({ (parameter): value }), CALL_TIMEOUT)
         .with_context(|| format!("{method} failed"))?;
     Ok(())
 }
@@ -161,65 +140,51 @@ pub fn presentation(status: &AgentStatus) -> (&'static str, Tone, bool) {
     }
 }
 
-fn lifecycle_subscriptions() -> impl Iterator<Item = EventSubscription> {
-    const EVENTS: &[&str] = &[
-        "workspace.created",
-        "workspace.updated",
-        "workspace.renamed",
-        "workspace.moved",
-        "workspace.reordered",
-        "workspace.closed",
-        "worktree.created",
-        "worktree.opened",
-        "worktree.removed",
-        "tab.created",
-        "tab.closed",
-        "tab.renamed",
-        "tab.moved",
-        "pane.created",
-        "pane.closed",
-        "pane.updated",
-        "pane.moved",
-        "pane.exited",
-        "pane.agent_detected",
-    ];
-    EVENTS.iter().copied().map(EventSubscription::new)
-}
+fn consume(
+    events: impl IntoIterator<Item = herdr_hub_client::Result<ServerMessage>>,
+    items: impl Fn(&Model) -> Vec<Item>,
+    mut output: impl FnMut(&[Item]) -> Result<()>,
+) -> Result<()> {
+    let mut model = None;
+    let mut previous = None;
+    let mut outage = false;
 
-fn subscribe_events(client: &Client) -> Result<(SessionSnapshot, Subscription)> {
-    loop {
-        let before = client.snapshot().context("cannot load Herdr session")?;
-        let subscriptions = lifecycle_subscriptions()
-            .chain(before.panes.iter().map(|pane| {
-                EventSubscription::new("pane.agent_status_changed")
-                    .filter("pane_id", pane.pane_id.clone())
-            }))
-            .collect::<Vec<_>>();
-        let events = match client.subscribe(&subscriptions) {
-            Ok(events) => events,
-            Err(ClientError::Api(error)) if error.code == "pane_not_found" => {
-                thread::sleep(Duration::from_millis(10));
+    for event in events {
+        match event {
+            Ok(ServerMessage::Hello {
+                protocol: _,
+                model: replacement,
+            }) => {
+                model = Some(replacement);
+                outage = false;
+            }
+            Ok(message) => {
+                let Some(model) = model.as_mut() else {
+                    continue;
+                };
+                HubClient::apply(model, &message);
+            }
+            Err(_) => {
+                model = None;
+                if !outage {
+                    output(&[])?;
+                    previous = Some(Vec::new());
+                    outage = true;
+                }
                 continue;
             }
-            Err(error) => {
-                return Err(error).context("cannot subscribe to Herdr events");
-            }
+        }
+
+        let Some(model) = model.as_ref() else {
+            continue;
         };
-        let after = client.snapshot().context("cannot refresh Herdr session")?;
-        if pane_ids(&before) == pane_ids(&after) {
-            return Ok((after, events));
+        let next = items(model);
+        if previous.as_ref() != Some(&next) {
+            output(&next)?;
+            previous = Some(next);
         }
     }
-}
-
-fn pane_ids(snapshot: &SessionSnapshot) -> Vec<&str> {
-    let mut ids = snapshot
-        .panes
-        .iter()
-        .map(|pane| pane.pane_id.as_str())
-        .collect::<Vec<_>>();
-    ids.sort_unstable();
-    ids
+    Ok(())
 }
 
 fn emit(items: &[Item]) -> Result<()> {
@@ -232,21 +197,69 @@ fn emit(items: &[Item]) -> Result<()> {
         .context("cannot write provider message")
 }
 
-fn selected_value<'a>(context: &'a Value, value_field: &str) -> Result<&'a str> {
+fn selected_value<'a>(context: &'a Value, value_field: &str) -> Result<(&'a str, &'a str)> {
     let step = context["step"]
         .as_str()
         .context("picker context step is missing")?;
-    context["selections"][step]["value"][value_field]
+    let value = &context["selections"][step]["value"];
+    let session = value["session"]
         .as_str()
-        .with_context(|| format!("selections.{step}.value.{value_field} is missing"))
+        .with_context(|| format!("selections.{step}.value.session is missing"))?;
+    let selected = value[value_field]
+        .as_str()
+        .with_context(|| format!("selections.{step}.value.{value_field} is missing"))?;
+    Ok((session, selected))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn model(active: Option<&str>, version: u64) -> Model {
+        Model {
+            version,
+            active: active.map(str::to_owned),
+            hosts: Vec::new(),
+            sessions: Vec::new(),
+        }
+    }
+
+    fn active_item(model: &Model) -> Vec<Item> {
+        model
+            .active
+            .iter()
+            .map(|active| Item {
+                id: active.clone(),
+                title: active.clone(),
+                value: Value::Null,
+                ..Item::default()
+            })
+            .collect()
+    }
+
     #[test]
     fn submit_reads_the_final_compact_selection() {
+        let context = json!({
+            "step": "agent",
+            "selections": {
+                "agent": {
+                    "id": "w1:p1",
+                    "value": {
+                        "session": "local/default",
+                        "pane_id": "w1:p1"
+                    }
+                }
+            }
+        });
+
+        assert_eq!(
+            selected_value(&context, "pane_id").unwrap(),
+            ("local/default", "w1:p1")
+        );
+    }
+
+    #[test]
+    fn submit_requires_a_session() {
         let context = json!({
             "step": "agent",
             "selections": {
@@ -257,6 +270,65 @@ mod tests {
             }
         });
 
-        assert_eq!(selected_value(&context, "pane_id").unwrap(), "w1:p1");
+        assert_eq!(
+            selected_value(&context, "pane_id").unwrap_err().to_string(),
+            "selections.agent.value.session is missing"
+        );
+    }
+
+    #[test]
+    fn stream_applies_deltas_and_clears_once_per_outage() {
+        let events = [
+            Ok(ServerMessage::Hello {
+                protocol: herdr_hub_client::PROTOCOL,
+                model: model(Some("local/one"), 1),
+            }),
+            Ok(ServerMessage::Active {
+                version: 2,
+                key: Some("local/two".into()),
+            }),
+            Err(herdr_hub_client::Error::Disconnected),
+            Err(herdr_hub_client::Error::Disconnected),
+            Ok(ServerMessage::Active {
+                version: 3,
+                key: Some("ignored/without-hello".into()),
+            }),
+            Ok(ServerMessage::Hello {
+                protocol: herdr_hub_client::PROTOCOL,
+                model: model(Some("local/three"), 4),
+            }),
+        ];
+        let mut snapshots = Vec::new();
+
+        consume(events, active_item, |items| {
+            snapshots.push(items.iter().map(|item| item.id.clone()).collect::<Vec<_>>());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            snapshots,
+            [
+                vec!["local/one".to_owned()],
+                vec!["local/two".to_owned()],
+                Vec::new(),
+                vec!["local/three".to_owned()],
+            ]
+        );
+    }
+
+    #[test]
+    fn stream_propagates_output_failure() {
+        let error = consume(
+            [Ok(ServerMessage::Hello {
+                protocol: herdr_hub_client::PROTOCOL,
+                model: model(Some("local/one"), 1),
+            })],
+            active_item,
+            |_| anyhow::bail!("stdout closed"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "stdout closed");
     }
 }

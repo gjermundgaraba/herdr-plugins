@@ -9,6 +9,6 @@ description = "Live Herdr workspace example for herdr-picker"
 repository.workspace = true
 
 [dependencies]
-herdr-client.workspace = true
+herdr-hub-client.workspace = true
 herdr-picker-sdk.workspace = true
 serde_json.workspace = true

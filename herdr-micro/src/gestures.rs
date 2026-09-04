@@ -6,7 +6,7 @@ use std::{
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct GestureContext {
-    pub session: String,
+    pub session_key: String,
     pub generation: u64,
 }
 
@@ -193,9 +193,9 @@ mod tests {
     use super::*;
     use crate::config::Action;
 
-    fn context(session: &str, generation: u64) -> Option<GestureContext> {
+    fn context(session_key: &str, generation: u64) -> Option<GestureContext> {
         Some(GestureContext {
-            session: session.into(),
+            session_key: session_key.into(),
             generation,
         })
     }

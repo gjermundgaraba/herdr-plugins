@@ -5,6 +5,7 @@ use codex_micro::{
     InputMonitoringAccess,
     service::{Client as DeviceClient, ServiceStatus},
 };
+use herdr_hub_client::HubClient;
 use std::{
     env, fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Command, sync::mpsc,
     time::Duration,
@@ -13,7 +14,7 @@ use std::{
 use crate::{
     config::{config_path, load, requires_accessibility},
     control::request_status,
-    macos::{frontmost, post_event_access},
+    macos::post_event_access,
     setup::{PI_EXTENSION, plugin_root, service_executable},
 };
 
@@ -88,6 +89,20 @@ fn service_status() -> Result<ServiceStatus> {
 
 pub fn doctor() -> Report {
     let mut report = Report::default();
+    match HubClient::new().subscribe(Duration::from_millis(750)) {
+        Ok((_stream, model)) => {
+            let connected = model
+                .sessions
+                .iter()
+                .filter(|session| session.connected)
+                .count();
+            report.push(
+                Level::Ok,
+                format!("Herdr hub: connected; {connected} session(s) available"),
+            );
+        }
+        Err(error) => report.push(Level::Fail, format!("Herdr hub: {error}")),
+    }
     check(&mut report, "Codex Micro service executable", || {
         let path = service_executable()?;
         let metadata = fs::metadata(&path)?;
@@ -177,19 +192,9 @@ pub fn doctor() -> Report {
             Ok(()) => report.push(Level::Ok, "macOS event output"),
             Err(_) => report.push(
                 Level::Fail,
-                "macOS event output is denied; enable Accessibility for Herdr or its terminal host",
+                "macOS event output is denied; enable Accessibility for the process running Herdr",
             ),
         }
-    }
-    match frontmost() {
-        Ok(current) => report.push(
-            Level::Ok,
-            format!("Frontmost application: {}", current.app_name),
-        ),
-        Err(error) => report.push(
-            Level::Warn,
-            format!("Frontmost application could not be inspected: {error}"),
-        ),
     }
     match request_status(Duration::from_millis(750)) {
         Ok(status) => {

@@ -1,5 +1,5 @@
 use crate::config::{AgentStatus, Direction, Light, LightingConfig};
-use herdr_client::AgentInfo;
+use herdr_hub_client::{AgentInfo, attention_order, attention_rank};
 use std::collections::{HashMap, HashSet};
 
 pub const SLOT_COUNT: usize = 6;
@@ -19,14 +19,9 @@ fn status(agent: &AgentInfo) -> AgentStatus {
         _ => AgentStatus::Unknown,
     }
 }
-fn compare(a: &AgentInfo, b: &AgentInfo) -> std::cmp::Ordering {
-    status(a)
-        .cmp(&status(b))
-        .then_with(|| b.state_change_seq.cmp(&a.state_change_seq))
-}
 pub fn assign_slots(previous: &[Option<String>], agents: &[AgentInfo]) -> Vec<Option<String>> {
     let mut sorted: Vec<_> = agents.iter().collect();
-    sorted.sort_by(|a, b| compare(a, b));
+    sorted.sort_by(|a, b| attention_order(a, b));
     let by_id: HashMap<_, _> = agents
         .iter()
         .map(|agent| (agent.terminal_id.as_str(), agent))
@@ -51,10 +46,11 @@ pub fn assign_slots(previous: &[Option<String>], agents: &[AgentInfo]) -> Vec<Op
             continue;
         }
         let victim = (1..SLOT_COUNT).fold(0, |victim, index| {
-            if compare(
+            if attention_order(
                 by_id[slots[index].as_ref().unwrap().as_str()],
                 by_id[slots[victim].as_ref().unwrap().as_str()],
-            ) == std::cmp::Ordering::Greater
+            )
+            .is_gt()
             {
                 index
             } else {
@@ -62,7 +58,7 @@ pub fn assign_slots(previous: &[Option<String>], agents: &[AgentInfo]) -> Vec<Op
             }
         });
         let displaced = by_id[slots[victim].as_ref().unwrap().as_str()];
-        if status(candidate) >= status(displaced) {
+        if attention_rank(&candidate.agent_status) <= attention_rank(&displaced.agent_status) {
             break;
         }
         slotted.remove(&displaced.terminal_id);
@@ -103,7 +99,7 @@ pub fn aggregate_lighting(
         .iter()
         .flatten()
         .filter_map(|id| by_id.get(id.as_str()))
-        .min_by(|a, b| compare(a, b));
+        .min_by(|a, b| attention_order(a, b));
     let light = best.map(|a| config.light(status(a))).unwrap_or_default();
     ["ambient", "keys"]
         .into_iter()

@@ -50,9 +50,19 @@
       # (sourceRoots) and how the output is laid out. Platforms come from each
       # plugin's herdr-plugin.toml and binaries from the crate itself.
       pluginDefinitions = {
+        herdr-hub = {
+          sourceRoots = [
+            "herdr-hub"
+            "sdk/hub"
+            "sdk/rust"
+          ];
+          alsoBin = true;
+        };
+
         herdr-picker = {
           sourceRoots = [
             "herdr-picker"
+            "sdk/hub"
             "sdk/picker"
             "sdk/ratatui"
             "sdk/rust"
@@ -63,6 +73,7 @@
         herdr-picker-agents = {
           sourceRoots = [
             "herdr-picker-agents"
+            "sdk/hub"
             "sdk/picker"
             "sdk/rust"
           ];
@@ -73,6 +84,7 @@
         herdr-picker-workspaces = {
           sourceRoots = [
             "herdr-picker-workspaces"
+            "sdk/hub"
             "sdk/picker"
             "sdk/rust"
           ];
@@ -198,6 +210,12 @@
                 binary:
                 if definition.binOnly or false then
                   ''install -Dm755 "${cargoReleaseDir}/${binary}" "$out/bin/${binary}"''
+                else if definition.alsoBin or false then
+                  ''
+                    install -Dm755 "${cargoReleaseDir}/${binary}" "$out/${name}/bin/${binary}"
+                    mkdir -p "$out/bin"
+                    ln -s "../${name}/bin/${binary}" "$out/bin/${binary}"
+                  ''
                 else
                   ''install -Dm755 "${cargoReleaseDir}/${binary}" "$out/target/release/${binary}"''
               ) (binariesFor name crate);
