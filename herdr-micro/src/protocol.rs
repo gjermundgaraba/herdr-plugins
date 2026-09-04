@@ -21,7 +21,7 @@ fn status(agent: &AgentInfo) -> AgentStatus {
 }
 pub fn assign_slots(previous: &[Option<String>], agents: &[AgentInfo]) -> Vec<Option<String>> {
     let mut sorted: Vec<_> = agents.iter().collect();
-    sorted.sort_by(|a, b| attention_order(a, b));
+    sorted.sort_by(|a, b| attention_order(("", a), ("", b)));
     let by_id: HashMap<_, _> = agents
         .iter()
         .map(|agent| (agent.terminal_id.as_str(), agent))
@@ -47,8 +47,8 @@ pub fn assign_slots(previous: &[Option<String>], agents: &[AgentInfo]) -> Vec<Op
         }
         let victim = (1..SLOT_COUNT).fold(0, |victim, index| {
             if attention_order(
-                by_id[slots[index].as_ref().unwrap().as_str()],
-                by_id[slots[victim].as_ref().unwrap().as_str()],
+                ("", by_id[slots[index].as_ref().unwrap().as_str()]),
+                ("", by_id[slots[victim].as_ref().unwrap().as_str()]),
             )
             .is_gt()
             {
@@ -99,7 +99,7 @@ pub fn aggregate_lighting(
         .iter()
         .flatten()
         .filter_map(|id| by_id.get(id.as_str()))
-        .min_by(|a, b| attention_order(a, b));
+        .min_by(|a, b| attention_order(("", a), ("", b)));
     let light = best.map(|a| config.light(status(a))).unwrap_or_default();
     ["ambient", "keys"]
         .into_iter()

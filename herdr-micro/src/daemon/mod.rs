@@ -140,9 +140,7 @@ pub fn run_daemon() -> Result<()> {
     signal_hook::flag::register(SIGTERM, Arc::clone(&stopping))?;
     hub::spawn_updates({
         let runtime_tx = runtime_tx.clone();
-        move |update| {
-            let _ = runtime_tx.send(RuntimeEvent::Hub(Box::new(update)));
-        }
+        move |update| runtime_tx.send(RuntimeEvent::Hub(Box::new(update))).is_ok()
     });
     let mut state = State::new(config);
     let input_context = Arc::new(Mutex::new(Arc::new(InputContext::new(&state.config))));

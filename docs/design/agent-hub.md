@@ -5,13 +5,11 @@ upstream checkout at `v0.8.2`) and revised for the production Herdr fork at
 commit `85ad1d77`. That fork's `session.snapshot.client_focused` field is the
 authoritative active-session signal.
 
-Consumers today: `herdr-micro` (this repo), `clankerdeck`
-(`/Users/gg/ws/pers/clankerdeck`), the `sdk/picker` live agent list, and one more
-app coming. Goals: cut CPU spent on Herdr polling, share the Herdr-facing work,
-support several local sessions and remote hosts, show agents from all sessions
-(with "active session" still a first-class notion), and give every app the same
-view of the agent set. Backwards compatibility and churn are explicitly not
-concerns.
+Implemented consumers are `herdr-micro`, Clankerdeck, and the `sdk/picker` live
+agent and workspace lists. The hub cuts CPU spent on Herdr polling, shares the
+Herdr-facing work, supports several local sessions and remote hosts, shows
+agents from all sessions (with "active session" still a first-class notion),
+and gives every app the same view of the agent set.
 
 ## 1. What was measured
 
@@ -72,8 +70,8 @@ Read from `src/api/server.rs`, `src/api/subscriptions.rs`,
   dispatched to the App thread on every 100 ms tick when nothing new arrived
   (`ActiveAgentStatusChangedSubscription::poll_result`). One subscription per
   agent pane means 10 `pane.get`/s per agent, on the order of 7-9 % of a core
-  for 29 agents. This is what `sdk/picker` does today for every pane while the
-  picker is open. It is not a way to reduce server CPU.
+  for 29 agents. The pre-hub `sdk/picker` did this for every pane while the
+  picker was open. It was not a way to reduce server CPU.
 - **There is no unfiltered "any agent status changed" subscription.** A plain
   working→idle transition emits only `PaneAgentStatusChanged` into the hub, and
   no hub-based subscription kind exposes it.
@@ -104,9 +102,12 @@ Read from `src/api/server.rs`, `src/api/subscriptions.rs`,
 - **`herdr --remote` does not forward the API socket.** It bridges only the UI
   client socket over SSH (`src/remote/host_unix.rs`, `attach.rs`). Remote API
   access needs its own transport.
-- **Discovery:** `herdr session list --json` returns name, running flag, session
-  dir, and socket path. A plugin `[[startup]]` hook runs in every new session
-  server once its API is ready, which is a push signal for new sessions.
+- **Discovery:** `herdr session list --json` returns each session's name,
+  running/default flags, metadata-derived session directory, and socket path.
+  The hub derives the XDG-aware session root from the default session's
+  metadata and admits only the default and named-session layouts beneath that
+  root. A plugin `[[startup]]` hook runs in every new session server once its
+  API is ready, which triggers discovery reconciliation.
 
 ## 3. Design space and verdicts
 
@@ -136,18 +137,21 @@ Only one update path exists: `session.snapshot` is the truth. Lifecycle
 subscriptions and coalesced list refetches were an earlier design and were
 deleted when the fork's snapshot-only focus signal became authoritative.
 
-`state_change_seq` and `focused` come straight from `AgentInfo`, so slot
-ordering in both apps keeps working unchanged.
+`state_change_seq` and `focused` come straight from `AgentInfo`. Shared
+attention ordering compares status globally, then session key, then
+`state_change_seq` within that session, and finally terminal id. Sequence
+numbers from different Herdr sessions are unrelated and are never treated as
+global recency.
 
 ### 3.2 Where the logic lives
 
 | Option | Same view for all apps | Remote | Ops | Verdict |
 | --- | --- | --- | --- | --- |
 | Library only, each app embeds a watcher | Converges, never identical at an instant; N× refetches | Each app needs its own SSH per host | No new process | Reject as the deployment shape. |
-| Shared daemon (hub) that apps subscribe to | Identical versioned model | One SSH per host | One LaunchAgent, one socket, one protocol | **Recommended.** |
+| Shared daemon (hub) that apps subscribe to | Identical versioned model | One SSH per host | One LaunchAgent, one socket, one protocol | **Selected.** |
 | One app acts as hub for the others | Identical | One SSH | Asymmetric, fragile | Reject. |
 
-Build it as a library crate plus a thin daemon binary. The library owns
+The implementation uses a library crate plus a thin daemon binary. The library owns
 discovery, per-session watching (section 3.1), the multi-session model, and the
 remote relay client. The daemon binds the hub socket, runs the library, and
 serves clients. Apps are hub clients only; they stop linking `herdr-client` for
@@ -169,10 +173,12 @@ on = "pane.agent_status_changed"
 command = ["bin/herdr-hub", "notify", "event"]       # forwards HERDR_PLUGIN_EVENT_JSON
 ```
 
-`notify` connects to the hub socket, writes one line, exits 0 (also when the hub
-is not running). Herdr already knows the emitting session through
-`HERDR_SOCKET_PATH`. Startup notifications accelerate discovery; status
-notifications may wake the snapshot watcher before its next 250 ms deadline.
+`notify` connects to the hub socket, writes one line, and exits 0 (also when the
+hub is not running). Herdr supplies the emitting session through
+`HERDR_SOCKET_PATH`. Startup notifications accelerate reconciliation. Event
+notifications wake a watcher only when their socket path exactly matches an
+already admitted session; notifications cannot create sessions or infer names
+from paths.
 
 Discovery remains separate from state polling: `session list` runs at hub start
 and during periodic reconciliation, while the startup hook makes new sessions
@@ -209,14 +215,15 @@ Model shape:
     "workspaces": [ /* WorkspaceInfo values */ ],
     "tabs": [ /* TabInfo verbatim */ ],
     "agents": [ /* AgentInfo verbatim */ ],
-    "socket_path": "/tmp/herdr/herdr.sock",
+    "socket_path": "/Users/alice/.config/herdr/herdr.sock",
     "client_focused": true
   }]
 }
 ```
 
-Agent identity across the fleet is `(session key, terminal_id)`. Both apps'
-sticky slot logic keys on `terminal_id` already.
+Agent identity across the fleet is `(session key, terminal_id)`. Fleet-wide
+consumers keep that pair; herdr-micro keeps terminal ids only because its agent
+slice always belongs to one active session.
 
 Actions: the hub exposes a passthrough
 `{"type":"call","protocol":3,"id":7,"session":"workbox/agents","method":"pane.focus","params":{"pane_id":"w3:p1"}}`
@@ -225,8 +232,9 @@ and returns the raw result. Apps use it for every action, so local and remote
 sessions have one code path and apps never learn socket paths. The hub does not
 interpret actions.
 
-Shared presentation policy (attention ordering: status priority, then
-`state_change_seq`) goes into the client library so both apps sort identically.
+Shared presentation policy lives in the client library so all apps sort
+identically: status priority is global, then session key makes cross-session
+order deterministic, then `state_change_seq` orders agents within a session.
 Slot assignment and rendering stay in the apps.
 
 ### 3.4 Remote hosts
@@ -235,7 +243,7 @@ Slot assignment and rendering stay in the apps.
 | --- | --- | --- | --- |
 | `ssh host herdr api snapshot` per poll | No | No | Reject: a process and an SSH exec per poll. |
 | SSH Unix-socket forward per remote session socket (`-L local.sock:remote.sock`) | No | Socket subscriptions only; hooks fire on the remote host and cannot reach the local hub | Fallback only; would reintroduce `agent.list` polling for status. |
-| **`ssh host herdr-hub relay`**: the same binary runs the library remotely and speaks the hub protocol over stdio | Yes | Yes, everything | **Recommended.** |
+| **`ssh host herdr-hub relay`**: the same binary runs the library remotely and speaks the hub protocol over stdio | Yes | Yes, everything | **Selected.** |
 
 The local hub spawns one `ssh` per configured host (user SSH config, ControlMaster
 allowed), consumes `model`/`session` messages from the relay, prefixes session
@@ -244,6 +252,10 @@ relay connects to an already running hub on that host if one exists, else runs
 the library in-process for the life of the SSH session and binds the hub socket
 so that host's hooks reach it. Reconnect with backoff on SSH exit. This is the
 same shape Herdr uses for its own UI bridge (`run_remote_client_bridge`).
+
+The relay and remote version checks run SSH noninteractively with bounded SSH
+transport establishment. `doctor` also enforces a 10-second wall deadline, so
+an unavailable, interactive-only, or stalled target fails promptly.
 
 Requirement stated plainly: the binary and the hook plugin must be installed on
 the remote host, either from the Nix flake output or by building/linking the
@@ -275,19 +287,18 @@ herdr-hub (LaunchAgent) ── library: discover, snapshot, merge, active ──
   │ private socket, versioned model pushes, call passthrough
   ├── herdr-micro (lighting from active session, actions via call)
   ├── clankerdeck (slots across sessions, actions via call)
-  ├── picker live agents
-  └── next app
+  └── picker live agents and workspaces
 ```
 
 Expected steady state on the Herdr side: one hub-owned snapshot read every
 250 ms for each local session. A remote relay owns the equivalent loop for its
 host. Consumers do no direct Herdr polling; they receive versioned hub pushes.
-The paired post-cutover sample recorded in the implementation plan was 3.17%
-before and 3.37% after (+0.20 percentage points) on the default-session server.
+The paired post-cutover sample was 3.17% before and 3.37% after (+0.20
+percentage points) on the default-session server.
 
-## 5. Clean break: what each codebase loses
+## 5. Implemented clean break
 
-herdr-micro
+herdr-micro removed:
 
 - `herdr.rs`: `SessionWorker`, `follow_session`, `discover_sessions`,
   `run_command_with_timeout` and the process-spawning session discovery.
@@ -302,22 +313,27 @@ herdr-micro
   `agent.get` through the hub passthrough.
 - `docs/micro-bridge.md` "Herdr action scheduling" paragraph about 4 Hz polling.
 
-clankerdeck
+Clankerdeck removed:
 
 - `src/herdr.rs` entirely: hand-rolled RPC framing, `session_socket`,
   `HerdrClient::sessions` (process spawn), `snapshot`, `parse_snapshot_response`.
-- `snapshot_worker` and `SnapshotCommand` in `daemon.rs`; `action_worker`
-  becomes a thin caller of the hub passthrough.
-- `herdr.session` in config becomes a filter over hub session keys, or goes away
-  if slots span all sessions.
+- `snapshot_worker` and `SnapshotCommand` in `daemon.rs`; `action_worker` was
+  reduced to a thin caller of the hub passthrough.
+- The single-session `herdr.session` routing model; session filtering now uses
+  hub session keys while slots span all allowed sessions.
 
-sdk/picker
+sdk/picker removed:
 
 - `subscribe_events` with its per-pane `pane.agent_status_changed` fan-out.
 
-sdk/rust
+sdk/rust retained:
 
-- Keep `Client`, `Subscription`, types, `unix`, `ndjson`. Only the hub uses them.
+- Keep `Client`, `Subscription`, types, `unix`, `ndjson`. The hub uses them for
+  its Herdr-facing state path; migrated dashboard consumers use the Hub SDK.
+
+Hub clients use bounded writes and handshakes. A consumer can stop the
+reconnecting subscription loop from its callback when downstream delivery
+reports that its receiver has closed, without a background panic.
 
 No consumer or fallback polling remains in any app. The required hub-owned
 snapshot poll is the sole state path. If the hub is down, apps show offline and

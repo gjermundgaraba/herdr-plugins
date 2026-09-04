@@ -1,10 +1,9 @@
 use std::{
-    env,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Command,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,32 +36,7 @@ pub(crate) fn list_sessions(herdr: &Path) -> Result<Vec<LocalSession>> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    let home = env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .context("HOME is not set")?;
-    parse_sessions(&output.stdout, &home.join(".config/herdr"))
-}
-
-/// Maps only Herdr's default and named-session socket layouts.
-pub(crate) fn session_name(socket_path: &Path) -> Option<String> {
-    let home = env::var_os("HOME").filter(|value| !value.is_empty())?;
-    session_name_under(&PathBuf::from(home).join(".config/herdr"), socket_path)
-}
-
-fn session_name_under(root: &Path, socket_path: &Path) -> Option<String> {
-    if socket_path == root.join("herdr.sock") {
-        return Some("default".into());
-    }
-    if socket_path.file_name()? != "herdr.sock" {
-        return None;
-    }
-    let parent = socket_path.parent()?;
-    let name = parent.file_name()?.to_str()?;
-    if name.is_empty() || parent.parent()? != root.join("sessions") {
-        return None;
-    }
-    Some(name.into())
+    parse_sessions(&output.stdout)
 }
 
 #[derive(Deserialize)]
@@ -74,22 +48,48 @@ struct SessionList {
 struct ListedSession {
     name: String,
     running: bool,
+    default: bool,
+    session_dir: PathBuf,
     socket_path: PathBuf,
 }
 
-fn parse_sessions(bytes: &[u8], root: &Path) -> Result<Vec<LocalSession>> {
+fn parse_sessions(bytes: &[u8]) -> Result<Vec<LocalSession>> {
     let listed: SessionList =
         serde_json::from_slice(bytes).context("Herdr returned an invalid session list")?;
+    let mut defaults = listed.sessions.iter().filter(|session| session.default);
+    let default = defaults
+        .next()
+        .context("Herdr session list has no default session")?;
+    ensure!(
+        defaults.next().is_none(),
+        "Herdr session list has multiple default sessions"
+    );
+    ensure!(
+        default.name == "default"
+            && default.session_dir.is_absolute()
+            && default.socket_path == default.session_dir.join("herdr.sock"),
+        "Herdr returned an invalid default session layout"
+    );
+    let root = default.session_dir.clone();
+
     let mut sessions: Vec<_> = listed
         .sessions
         .into_iter()
         .filter(|session| session.running)
         .filter_map(|session| {
-            (session_name_under(root, &session.socket_path).as_deref() == Some(&session.name))
-                .then_some(LocalSession {
-                    name: session.name,
-                    socket_path: session.socket_path,
-                })
+            let expected_dir = if session.default {
+                root.clone()
+            } else if session.name != "default" && valid_name(&session.name) {
+                root.join("sessions").join(&session.name)
+            } else {
+                return None;
+            };
+            (session.session_dir == expected_dir
+                && session.socket_path == session.session_dir.join("herdr.sock"))
+            .then_some(LocalSession {
+                name: session.name,
+                socket_path: session.socket_path,
+            })
         })
         .collect();
     sessions.sort_by(|left, right| left.name.cmp(&right.name));
@@ -97,35 +97,34 @@ fn parse_sessions(bytes: &[u8], root: &Path) -> Result<Vec<LocalSession>> {
     Ok(sessions)
 }
 
+fn valid_name(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn recognizes_only_session_socket_layouts() {
-        let root = Path::new("/Users/test/.config/herdr");
-        assert_eq!(
-            session_name_under(root, Path::new("/Users/test/.config/herdr/herdr.sock")),
-            Some("default".into())
+    fn requires_one_valid_default_session() {
+        assert!(parse_sessions(br#"{"sessions":[]}"#).is_err());
+        assert!(
+            parse_sessions(
+                br#"{"sessions":[
+                    {"name":"default","running":true,"default":true,"session_dir":"relative","socket_path":"relative/herdr.sock"}
+                ]}"#
+            )
+            .is_err()
         );
-        assert_eq!(
-            session_name_under(
-                root,
-                Path::new("/Users/test/.config/herdr/sessions/work/herdr.sock")
-            ),
-            Some("work".into())
-        );
-        assert_eq!(
-            session_name_under(root, Path::new("/tmp/custom.sock")),
-            None
-        );
-        assert_eq!(
-            session_name_under(root, Path::new("/tmp/herdr/herdr.sock")),
-            None
-        );
-        assert_eq!(
-            session_name_under(root, Path::new("/Users/test/.config/other/work/herdr.sock")),
-            None
+        assert!(
+            parse_sessions(
+                br#"{"sessions":[
+                    {"name":"default","running":true,"default":true,"session_dir":"/xdg/herdr","socket_path":"/xdg/herdr/herdr.sock"},
+                    {"name":"other","running":true,"default":true,"session_dir":"/other","socket_path":"/other/herdr.sock"}
+                ]}"#
+            )
+            .is_err()
         );
     }
 
@@ -133,14 +132,14 @@ mod tests {
     fn session_list_keeps_running_standard_sessions() {
         let sessions = parse_sessions(
             br#"{"sessions":[
-                {"name":"work","running":true,"socket_path":"/Users/test/.config/herdr/sessions/work/herdr.sock"},
-                {"name":"default","running":true,"socket_path":"/Users/test/.config/herdr/herdr.sock"},
-                {"name":"stopped","running":false,"socket_path":"/Users/test/.config/herdr/sessions/stopped/herdr.sock"},
-                {"name":"custom","running":true,"socket_path":"/tmp/custom.sock"},
-                {"name":"suffix","running":true,"socket_path":"/tmp/herdr/herdr.sock"},
-                {"name":"wrong","running":true,"socket_path":"/Users/test/.config/herdr/sessions/other/herdr.sock"}
+                {"name":"work","running":true,"default":false,"session_dir":"/xdg/herdr/sessions/work","socket_path":"/xdg/herdr/sessions/work/herdr.sock"},
+                {"name":"default","running":true,"default":true,"session_dir":"/xdg/herdr","socket_path":"/xdg/herdr/herdr.sock"},
+                {"name":"stopped","running":false,"default":false,"session_dir":"/xdg/herdr/sessions/stopped","socket_path":"/xdg/herdr/sessions/stopped/herdr.sock"},
+                {"name":"custom","running":true,"default":false,"session_dir":"/tmp/custom","socket_path":"/tmp/custom/herdr.sock"},
+                {"name":"../escape","running":true,"default":false,"session_dir":"/xdg/herdr/escape","socket_path":"/xdg/herdr/escape/herdr.sock"},
+                {"name":"wrong","running":true,"default":false,"session_dir":"/xdg/herdr/sessions/other","socket_path":"/xdg/herdr/sessions/other/herdr.sock"},
+                {"name":"bad-socket","running":true,"default":false,"session_dir":"/xdg/herdr/sessions/bad-socket","socket_path":"/tmp/bad.sock"}
             ]}"#,
-            Path::new("/Users/test/.config/herdr"),
         )
         .unwrap();
         assert_eq!(
@@ -148,11 +147,11 @@ mod tests {
             [
                 LocalSession {
                     name: "default".into(),
-                    socket_path: "/Users/test/.config/herdr/herdr.sock".into(),
+                    socket_path: "/xdg/herdr/herdr.sock".into(),
                 },
                 LocalSession {
                     name: "work".into(),
-                    socket_path: "/Users/test/.config/herdr/sessions/work/herdr.sock".into(),
+                    socket_path: "/xdg/herdr/sessions/work/herdr.sock".into(),
                 }
             ]
         );

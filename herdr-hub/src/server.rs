@@ -203,11 +203,34 @@ fn accept_loop(
                         let _ = read_connection(stream, id, tx);
                     });
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(10));
+            Err(error) => {
+                if !retry_accept(error, &tx, &stop) {
+                    return;
+                }
             }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => return,
+        }
+    }
+}
+
+fn retry_accept(error: io::Error, tx: &SyncSender<Event>, stop: &AtomicBool) -> bool {
+    match error.kind() {
+        io::ErrorKind::WouldBlock => {
+            thread::sleep(Duration::from_millis(10));
+            true
+        }
+        io::ErrorKind::Interrupted => true,
+        _ => {
+            let mut event = Event::ServerFailed(error);
+            while !stop.load(Ordering::Acquire) {
+                match tx.try_send(event) {
+                    Ok(()) | Err(TrySendError::Disconnected(_)) => break,
+                    Err(TrySendError::Full(returned)) => {
+                        event = returned;
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            }
+            false
         }
     }
 }
@@ -674,5 +697,58 @@ mod tests {
         let mut reader = BufReader::new(client);
         assert!(next(&mut reader).is_none());
         cleanup(server, lock);
+    }
+
+    #[test]
+    fn unexpected_accept_errors_are_fatal_events() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let stop = AtomicBool::new(false);
+        assert!(retry_accept(
+            io::Error::from(io::ErrorKind::Interrupted),
+            &tx,
+            &stop,
+        ));
+        assert!(retry_accept(
+            io::Error::from(io::ErrorKind::WouldBlock),
+            &tx,
+            &stop,
+        ));
+        assert!(!retry_accept(
+            io::Error::other("listener failed"),
+            &tx,
+            &stop,
+        ));
+        let Event::ServerFailed(error) = rx.recv().unwrap() else {
+            panic!("expected fatal server event")
+        };
+        assert_eq!(error.to_string(), "listener failed");
+    }
+
+    #[test]
+    fn fatal_event_waits_for_space_but_not_during_teardown() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(Event::Shutdown).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let sender = thread::spawn(move || {
+            retry_accept(io::Error::other("listener failed"), &tx, &thread_stop)
+        });
+        assert!(matches!(rx.recv().unwrap(), Event::Shutdown));
+        let Event::ServerFailed(error) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else {
+            panic!("expected fatal server event")
+        };
+        assert_eq!(error.to_string(), "listener failed");
+        assert!(!sender.join().unwrap());
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(Event::Shutdown).unwrap();
+        stop.store(true, Ordering::Release);
+        assert!(!retry_accept(
+            io::Error::other("listener failed"),
+            &tx,
+            &stop,
+        ));
+        assert!(matches!(rx.recv().unwrap(), Event::Shutdown));
+        assert!(rx.try_recv().is_err());
     }
 }

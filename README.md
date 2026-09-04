@@ -21,7 +21,7 @@ Install the standalone picker on `PATH`:
 nix profile install github:gjermundgaraba/herdr-plugins#herdr-picker
 ```
 
-Install only the plugin you want:
+Install plugins as needed. When installing Micro, run the Hub line first:
 
 ```sh
 herdr plugin install gjermundgaraba/herdr-plugins/equalize-splits
@@ -32,22 +32,30 @@ herdr plugin install gjermundgaraba/herdr-plugins/herdr-micro
 herdr plugin install gjermundgaraba/herdr-plugins/space-meta
 ```
 
+Herdr Micro depends on Herdr Hub. Install Hub first and verify its service as
+described in the [Hub setup](herdr-hub/README.md#setup), then continue with the
+[Micro installation](herdr-micro/README.md#install).
+
 For local development:
 
 Build each plugin using its README before linking it. `herdr plugin link` only
 registers the working tree; it does not run manifest `[[build]]` commands. The
-picker runs directly from `PATH`.
+picker runs directly from `PATH`. Hub and Micro also require the staging and
+service steps in their package READMEs.
 
 ```sh
 herdr plugin link "$PWD/equalize-splits"
 herdr plugin link "$PWD/fork-to-pane"
 herdr plugin link "$PWD/history"
-herdr plugin link "$PWD/herdr-hub"
-herdr plugin link "$PWD/herdr-micro"
 herdr plugin link "$PWD/space-meta"
 ```
 
-Each plugin directory above is independent and has its own `herdr-plugin.toml`.
+Use the [Hub local-development sequence](herdr-hub/README.md#local-development)
+and [Micro local-development sequence](herdr-micro/README.md#local-development)
+for those service-backed plugins.
+
+Each plugin directory above has its own `herdr-plugin.toml`; Herdr 0.8.2 does
+not install cross-plugin dependencies.
 
 ## Nix
 
@@ -59,12 +67,8 @@ nix build .#herdr-picker
 result/bin/herdr-picker --version
 ```
 
-The hub output is both a linkable plugin root and a CLI package:
-
-```sh
-nix profile install github:gjermundgaraba/herdr-plugins#herdr-hub
-herdr plugin link ~/.nix-profile/herdr-hub
-```
+The hub output is both a linkable plugin root and a CLI package; follow the
+[Hub setup](herdr-hub/README.md#setup) to install and start it.
 
 The hub targets the production Herdr fork at commit `85ad1d77`. It reads the
 fork's `session.snapshot.client_focused` field in one canonical 250 ms loop and

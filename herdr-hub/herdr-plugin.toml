@@ -25,6 +25,12 @@ on = "pane.agent_status_changed"
 command = ["bin/herdr-hub", "notify", "event"]
 
 [[actions]]
+id = "install-service"
+title = "Install Herdr Hub service"
+platforms = ["macos"]
+command = ["bin/herdr-hub", "install-service"]
+
+[[actions]]
 id = "status"
 title = "Show Herdr Hub status"
 command = ["bin/herdr-hub", "status"]

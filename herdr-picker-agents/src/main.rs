@@ -17,7 +17,9 @@ fn agent_items(model: &Model) -> Vec<Item> {
         .filter(|session| model.active.as_deref() == Some(session.key.as_str()))
         .flat_map(|session| session.agents.iter().map(move |agent| (session, agent)))
         .collect::<Vec<_>>();
-    agents.sort_by(|(_, a), (_, b)| attention_order(a, b));
+    agents.sort_by(|(a_session, a), (b_session, b)| {
+        attention_order((&a_session.key, a), (&b_session.key, b))
+    });
 
     agents
         .into_iter()
@@ -299,14 +301,18 @@ mod tests {
                 "local/default",
                 "local",
                 "default",
-                vec![agent("working-new", "working", 99)],
+                vec![
+                    agent("blocked-local-old", "blocked", 1),
+                    agent("blocked-local-new", "blocked", 2),
+                    agent("working-new", "working", 99),
+                ],
             ),
             session(
                 "studio/default",
                 "studio",
                 "default",
                 vec![
-                    agent("blocked-old", "blocked", 1),
+                    agent("blocked-remote-new", "blocked", 10_000),
                     agent("done-new", "done", 200),
                 ],
             ),
@@ -317,7 +323,7 @@ mod tests {
                 .iter()
                 .map(|item| item.value["pane_id"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            ["working-new"]
+            ["blocked-local-new", "blocked-local-old", "working-new"]
         );
     }
 

@@ -11,16 +11,9 @@ For a shorter, one-shot Python example, see
 ## Prerequisite
 
 The live provider needs the macOS [`herdr-hub`](../herdr-hub) service. From
-this checkout, build and start it once using its manifest commands:
-
-```sh
-cargo build --release --locked -p herdr-hub
-mkdir -p herdr-hub/bin
-install -m 750 target/release/herdr-hub herdr-hub/bin/.herdr-hub.new
-mv -f herdr-hub/bin/.herdr-hub.new herdr-hub/bin/herdr-hub
-herdr plugin link herdr-hub
-herdr-hub/bin/herdr-hub install-service
-```
+this checkout, follow the Hub README's
+[local-development setup](../herdr-hub/README.md#local-development). For a
+normal installation, follow its [Setup](../herdr-hub/README.md#setup).
 
 There is no standalone Linux hub service, so this live picker is not available
 as a local Linux setup.
@@ -49,15 +42,15 @@ cp herdr-picker-agents/examples/agents.toml \
 With Nix:
 
 ```sh
-nix profile install github:gjermundgaraba/herdr-plugins#herdr-hub
-herdr plugin link ~/.nix-profile/herdr-hub
-herdr-hub install-service
 nix profile install github:gjermundgaraba/herdr-plugins#herdr-picker
 nix profile install github:gjermundgaraba/herdr-plugins#herdr-picker-agents
 mkdir -p ~/.config/herdr-picker/pickers
 cp ~/.nix-profile/share/herdr-picker/examples/agents.toml \
   ~/.config/herdr-picker/pickers/
 ```
+
+Install the Hub using its [Nix instructions](../herdr-hub/README.md#setup)
+before running the live provider.
 
 Add a direct popup keybinding:
 

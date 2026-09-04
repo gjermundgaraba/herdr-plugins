@@ -2,8 +2,9 @@ use std::{
     collections::HashMap,
     ffi::OsString,
     io::{self, BufReader, Read, Write},
+    os::unix::process::CommandExt,
     os::unix::{io::AsRawFd, net::UnixStream},
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Child, ChildStdin, Command, Output, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -27,8 +28,7 @@ const MAX_IN_FLIGHT: usize = 64;
 const MIN_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const EVENT_RETRY: Duration = Duration::from_millis(10);
-const COUNTER_BITS: u32 = 32;
-const MAX_EPOCH: u64 = u32::MAX as u64;
+const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 pub(crate) enum Event {
@@ -214,8 +214,15 @@ pub(crate) fn check_version(host: &HostConfig) -> Result<String> {
 }
 
 fn check_version_with_program(host: &HostConfig, program: &std::ffi::OsStr) -> Result<String> {
-    let output = version_command(program, host)
-        .output()
+    check_version_with_program_and_timeout(host, program, VERSION_TIMEOUT)
+}
+
+fn check_version_with_program_and_timeout(
+    host: &HostConfig,
+    program: &std::ffi::OsStr,
+    timeout: Duration,
+) -> Result<String> {
+    let output = run_version_command(version_command(program, host), timeout)
         .with_context(|| format!("check herdr-hub on remote host {:?}", host.key))?;
     if !output.status.success() {
         bail!(
@@ -239,8 +246,77 @@ fn check_version_with_program(host: &HostConfig, program: &std::ffi::OsStr) -> R
 
 fn version_command(program: &std::ffi::OsStr, host: &HostConfig) -> Command {
     let mut command = Command::new(program);
+    add_ssh_connect_options(&mut command);
     command.args([host.ssh.as_str(), "herdr-hub", "--version"]);
     command
+}
+
+fn run_version_command(mut command: Command, timeout: Duration) -> Result<Output> {
+    let program = command.get_program().to_string_lossy().into_owned();
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to run {program}"))?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        BufReader::new(stdout)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes)
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        BufReader::new(stderr)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes)
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child
+            .try_wait()
+            .with_context(|| format!("wait for {program}"))
+        {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                stop_child(&mut child);
+                break Err(anyhow!(
+                    "{program} timed out after {}s",
+                    timeout.as_secs_f64()
+                ));
+            }
+            Err(error) => {
+                stop_child(&mut child);
+                break Err(error);
+            }
+        }
+    };
+    if status.is_ok() {
+        terminate_process_group(&child);
+    }
+    let stdout = join_reader(stdout_reader, "stdout", &program)?;
+    let stderr = join_reader(stderr_reader, "stderr", &program)?;
+    Ok(Output {
+        status: status?,
+        stdout,
+        stderr,
+    })
+}
+
+fn join_reader(
+    reader: JoinHandle<io::Result<Vec<u8>>>,
+    stream: &str,
+    program: &str,
+) -> Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| anyhow!("{stream} reader for {program} panicked"))?
+        .with_context(|| format!("read {stream} from {program}"))
 }
 
 struct HostWorker {
@@ -513,7 +589,7 @@ impl Connection<'_> {
         while self.in_flight.len() < MAX_IN_FLIGHT {
             match self.commands.try_recv() {
                 Ok(call) if call.epoch == self.epoch => {
-                    let id = wire_id(self.epoch, self.next_counter)?;
+                    let id = self.next_counter;
                     self.next_counter = self
                         .next_counter
                         .checked_add(1)
@@ -704,16 +780,6 @@ fn relay_session_key(host: &str, key: &str) -> Result<String> {
     Ok(format!("local/{name}"))
 }
 
-fn wire_id(epoch: u64, counter: u64) -> Result<u64> {
-    if epoch == 0 || epoch > MAX_EPOCH {
-        bail!("relay connection epoch {epoch} cannot be encoded")
-    }
-    if counter == 0 || counter > u32::MAX as u64 {
-        bail!("relay call counter {counter} cannot be encoded")
-    }
-    Ok((epoch << COUNTER_BITS) | counter)
-}
-
 fn next_backoff(current: Duration) -> Duration {
     current.saturating_mul(2).min(MAX_BACKOFF)
 }
@@ -878,15 +944,15 @@ fn spawn_relay(ssh_program: &std::ffi::OsStr, host: &HostConfig) -> Result<Child
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
+        .process_group(0)
         .spawn()
         .with_context(|| format!("spawn relay for remote host {:?}", host.key))
 }
 
 fn relay_command(ssh_program: &std::ffi::OsStr, host: &HostConfig) -> Command {
     let mut command = Command::new(ssh_program);
+    add_ssh_connect_options(&mut command);
     command.args([
-        "-o",
-        "BatchMode=yes",
         "-o",
         "ServerAliveInterval=15",
         host.ssh.as_str(),
@@ -894,6 +960,17 @@ fn relay_command(ssh_program: &std::ffi::OsStr, host: &HostConfig) -> Command {
         "relay",
     ]);
     command
+}
+
+fn add_ssh_connect_options(command: &mut Command) {
+    command.args([
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=5",
+        "-o",
+        "ConnectionAttempts=1",
+    ]);
 }
 
 fn encode_message(message: &impl Serialize) -> Result<Vec<u8>> {
@@ -906,11 +983,16 @@ fn encode_message(message: &impl Serialize) -> Result<Vec<u8>> {
 }
 
 fn stop_child(child: &mut Child) {
-    match child.try_wait() {
-        Ok(Some(_)) => {}
-        Ok(None) | Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
+    terminate_process_group(child);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn terminate_process_group(child: &Child) {
+    if let Ok(process_group) = i32::try_from(child.id()) {
+        // SAFETY: relay and version-check children start their own process groups.
+        unsafe {
+            libc::kill(-process_group, libc::SIGKILL);
         }
     }
 }
@@ -957,6 +1039,10 @@ mod tests {
                 "-o",
                 "BatchMode=yes",
                 "-o",
+                "ConnectTimeout=5",
+                "-o",
+                "ConnectionAttempts=1",
+                "-o",
                 "ServerAliveInterval=15",
                 "ssh-target",
                 "herdr-hub",
@@ -967,7 +1053,17 @@ mod tests {
         assert_eq!(command.get_program(), "ssh");
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
-            ["ssh-target", "herdr-hub", "--version"]
+            [
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=5",
+                "-o",
+                "ConnectionAttempts=1",
+                "ssh-target",
+                "herdr-hub",
+                "--version",
+            ]
         );
     }
 
@@ -996,6 +1092,75 @@ mod tests {
     }
 
     #[test]
+    fn version_check_timeout_kills_and_reaps_the_process_group() {
+        let directory = temp_directory("version-timeout");
+        std::fs::create_dir_all(&directory).unwrap();
+        let script = directory.join("fake-ssh");
+        let marker = directory.join("descendant-survived");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n(sleep 0.2; touch '{}') &\nexec sleep 30\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        make_executable(&script);
+
+        let started = Instant::now();
+        let error = check_version_with_program_and_timeout(
+            &host(),
+            script.as_os_str(),
+            Duration::from_millis(20),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            !marker.exists(),
+            "version-check descendant survived timeout"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn successful_version_check_kills_pipe_holding_descendants() {
+        let directory = temp_directory("version-descendant");
+        std::fs::create_dir_all(&directory).unwrap();
+        let script = directory.join("fake-ssh");
+        let marker = directory.join("descendant-survived");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n(sleep 0.2; touch '{}') &\nexec printf 'herdr-hub {}\\n'\n",
+                marker.display(),
+                env!("CARGO_PKG_VERSION")
+            ),
+        )
+        .unwrap();
+        make_executable(&script);
+
+        let started = Instant::now();
+        assert_eq!(
+            check_version_with_program_and_timeout(
+                &host(),
+                script.as_os_str(),
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+            format!("herdr-hub {}", env!("CARGO_PKG_VERSION"))
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            !marker.exists(),
+            "version-check descendant survived successful leader exit"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn session_rewrite_is_strict_and_clears_remote_focus() {
         let (_, rewritten) =
             rewrite_session("workbox", session("local/default", "local", "default")).unwrap();
@@ -1016,12 +1181,7 @@ mod tests {
     }
 
     #[test]
-    fn call_ids_include_epoch_and_backoff_caps_at_thirty_seconds() {
-        assert_eq!(wire_id(1, 1).unwrap(), (1_u64 << 32) | 1);
-        assert_ne!(wire_id(1, 7).unwrap(), wire_id(2, 7).unwrap());
-        assert!(wire_id(0, 1).is_err());
-        assert!(wire_id(1, 0).is_err());
-
+    fn backoff_caps_at_thirty_seconds() {
         let mut backoff = MIN_BACKOFF;
         let mut seconds = Vec::new();
         for _ in 0..7 {
@@ -1095,7 +1255,7 @@ mod tests {
             key: "local/agents".into(),
         };
         let reply = ServerMessage::Reply {
-            id: wire_id(1, 1).unwrap(),
+            id: 1,
             result: json!({"focused": true}),
         };
         let source = format!(
@@ -1184,14 +1344,14 @@ mod tests {
 
         assert_eq!(
             std::fs::read_to_string(args_path).unwrap().trim(),
-            "-o BatchMode=yes -o ServerAliveInterval=15 ssh-target herdr-hub relay"
+            "-o BatchMode=yes -o ConnectTimeout=5 -o ConnectionAttempts=1 -o ServerAliveInterval=15 ssh-target herdr-hub relay"
         );
         let call: ClientMessage =
             serde_json::from_str(&std::fs::read_to_string(call_path).unwrap()).unwrap();
         assert!(matches!(
             call,
             ClientMessage::Call { id, session, .. }
-                if id == wire_id(1, 1).unwrap() && session == "local/default"
+                if id == 1 && session == "local/default"
         ));
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -1394,7 +1554,7 @@ mod tests {
         let replies = (1..=MAX_IN_FLIGHT as u64)
             .map(|counter| {
                 serde_json::to_string(&ServerMessage::Reply {
-                    id: wire_id(1, counter).unwrap(),
+                    id: counter,
                     result: json!({"counter": counter}),
                 })
                 .unwrap()
@@ -1403,7 +1563,7 @@ mod tests {
             .join("\n");
         let final_counter = MAX_IN_FLIGHT as u64 + 1;
         let final_reply = serde_json::to_string(&ServerMessage::Reply {
-            id: wire_id(1, final_counter).unwrap(),
+            id: final_counter,
             result: json!({"counter": final_counter}),
         })
         .unwrap();
@@ -1486,11 +1646,11 @@ mod tests {
             session: session("local/marker", "local", "marker"),
         };
         let reply_one = ServerMessage::Reply {
-            id: wire_id(1, 1).unwrap(),
+            id: 1,
             result: json!({"call": 1}),
         };
         let reply_two = ServerMessage::Reply {
-            id: wire_id(1, 2).unwrap(),
+            id: 2,
             result: json!({"call": 2}),
         };
         std::fs::write(

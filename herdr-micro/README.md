@@ -28,12 +28,25 @@ The bridge uses an unsupported proprietary device protocol. Read the
 
 ## Install
 
+Install the required Hub first:
+
+```sh
+herdr plugin install gjermundgaraba/herdr-plugins/herdr-hub
+```
+
+In Herdr, run **Install Herdr Hub service**. When its action log reports
+success, run **Check Herdr Hub setup**. Then install and authorize Micro:
+
 ```sh
 herdr plugin install gjermundgaraba/herdr-plugins/herdr-micro
 herdr plugin enable gjermundgaraba.herdr-micro
 herdr plugin action invoke service-authorize \
   --plugin gjermundgaraba.herdr-micro
 ```
+
+For a Hub source checkout, follow its
+[local-development setup](../herdr-hub/README.md#local-development). Remote
+hosts have separate [Hub instructions](../herdr-hub/README.md#remote-hosts).
 
 `herdr-micro start`, including the plugin startup hook, installs or refreshes
 the per-user `dev.herdr.codex-micro` LaunchAgent automatically. The stable
@@ -50,7 +63,7 @@ The build signs the service as `dev.herdr.codex-micro`, so one Input Monitoring
 grant survives later builds signed by the same Apple Development identity.
 Changing the signing identity requires one new grant.
 
-For local development:
+### Local development
 
 ```sh
 git clone https://github.com/gjermundgaraba/herdr-plugins.git

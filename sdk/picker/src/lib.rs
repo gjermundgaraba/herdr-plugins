@@ -107,13 +107,7 @@ pub fn run(name: &str, result: Result<()>) -> ExitCode {
 pub fn serve(items: impl Fn(&Model) -> Vec<Item>) -> Result<()> {
     let _: IgnoredAny = serde_json::from_reader(io::stdin()).context("invalid picker context")?;
     let (events_tx, events_rx) = mpsc::sync_channel(1);
-    thread::spawn(move || {
-        HubClient::new().run(move |event| {
-            events_tx
-                .send(event)
-                .expect("picker event receiver stopped");
-        })
-    });
+    thread::spawn(move || HubClient::new().run(move |event| events_tx.send(event).is_ok()));
 
     consume(events_rx, items, emit)?;
     bail!("hub event stream stopped")

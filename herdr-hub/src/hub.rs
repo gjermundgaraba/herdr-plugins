@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use herdr_client::Client;
 use herdr_hub_client::{HostState, ServerMessage, SessionState};
 use serde_json::Value;
@@ -32,6 +32,7 @@ const REMOTE_EVENT_QUEUE: usize = 128;
 
 pub(crate) enum Event {
     Server(Request),
+    ServerFailed(std::io::Error),
     Watch(Update),
     Remote(remote::Event),
     CallFinished {
@@ -98,14 +99,7 @@ fn event_loop(
                 params,
             })) => match core.route(&session) {
                 Some(Route::Local(socket_path)) => {
-                    start_call(
-                        core.tx.clone(),
-                        stream,
-                        id,
-                        Some(socket_path),
-                        method,
-                        params,
-                    );
+                    start_call(core.tx.clone(), stream, id, socket_path, method, params);
                 }
                 Some(Route::Remote { host, epoch }) => {
                     let token = core.track_remote_call(host.clone(), epoch, stream, id);
@@ -119,9 +113,7 @@ fn event_loop(
             },
             Ok(Event::Server(Request::Notify { socket_path, event })) => {
                 if event.is_some() {
-                    if let Err(error) = core.notify(socket_path) {
-                        server::log_error(&format!("notification failed: {error:#}"));
-                    }
+                    core.notify(&socket_path);
                 } else {
                     reconcile_at = Instant::now() + RECONCILE_INTERVAL;
                     reconcile_and_broadcast(herdr, core, server);
@@ -129,6 +121,9 @@ fn event_loop(
             }
             Ok(Event::CallFinished { stream, id, reply }) => {
                 server::reply_call(stream, id, reply);
+            }
+            Ok(Event::ServerFailed(error)) => {
+                return Err(anyhow!(error).context("Herdr Hub listener failed"));
             }
             Ok(Event::Shutdown) => return Ok(()),
             Err(RecvTimeoutError::Timeout) => {
@@ -183,14 +178,10 @@ fn start_call(
     tx: SyncSender<Event>,
     stream: UnixStream,
     id: u64,
-    socket_path: Option<PathBuf>,
+    socket_path: PathBuf,
     method: String,
     params: Value,
 ) {
-    let Some(socket_path) = socket_path else {
-        server::reply_call(stream, id, Err("unknown session".into()));
-        return;
-    };
     thread::spawn(move || {
         let reply = Client::new(socket_path)
             .with_timeout(CALL_TIMEOUT)
@@ -304,24 +295,16 @@ impl Core {
         Ok(messages)
     }
 
-    fn notify(&mut self, socket_path: PathBuf) -> Result<()> {
-        if !socket_path.is_absolute() {
-            return Ok(());
-        }
-        let Some(name) = discover::session_name(&socket_path) else {
-            return Ok(());
+    fn notify(&mut self, socket_path: &Path) {
+        let Some(entry) = self
+            .watchers
+            .values_mut()
+            .find(|entry| entry.session.socket_path == socket_path)
+        else {
+            return;
         };
-        let session = LocalSession { name, socket_path };
-        let key = session.key();
-        if let Some(entry) = self.watchers.get_mut(&key) {
-            if entry.session.socket_path == session.socket_path {
-                entry.listed = true;
-                entry.watcher.wake();
-            }
-        } else {
-            self.add(session)?;
-        }
-        Ok(())
+        entry.listed = true;
+        entry.watcher.wake();
     }
 
     fn apply(&mut self, update: Update) -> Vec<ServerMessage> {
@@ -578,6 +561,7 @@ impl Core {
             .map(|entry| entry.session.socket_path.clone())
     }
 
+    #[cfg(test)]
     fn add(&mut self, session: LocalSession) -> Result<()> {
         let key = session.key();
         let entry = self.watcher_entry(session)?;
@@ -947,9 +931,24 @@ mod tests {
     fn custom_notification_path_is_ignored() {
         let (tx, _rx) = mpsc::sync_channel(64);
         let mut core = Core::new(tx);
-        core.notify("/tmp/custom.sock".into()).unwrap();
-        core.notify("/tmp/herdr/herdr.sock".into()).unwrap();
+        core.notify(Path::new("/tmp/custom.sock"));
+        core.notify(Path::new("/tmp/herdr/herdr.sock"));
         assert!(core.watchers.is_empty());
+    }
+
+    #[test]
+    fn notifications_wake_only_an_admitted_exact_socket() {
+        let (tx, _rx) = mpsc::sync_channel(64);
+        let mut core = Core::new(tx);
+        core.add(session("work")).unwrap();
+        core.watchers.get_mut("local/work").unwrap().listed = false;
+
+        core.notify(Path::new("/tmp/herdr/sessions/other/herdr.sock"));
+        assert_eq!(core.watchers.len(), 1);
+        assert!(!core.watchers["local/work"].listed);
+
+        core.notify(Path::new("/tmp/herdr/sessions/work/herdr.sock"));
+        assert!(core.watchers["local/work"].listed);
     }
 
     #[test]
@@ -983,7 +982,7 @@ mod tests {
             tx,
             reply_stream,
             17,
-            Some(path.clone()),
+            path.clone(),
             "pane.focus".into(),
             json!({"pane_id": "w1:p1"}),
         );

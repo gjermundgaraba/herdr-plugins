@@ -11,6 +11,6 @@ pub(crate) struct Session {
 
 pub(crate) type Update = herdr_hub_client::Result<ServerMessage>;
 
-pub(crate) fn spawn_updates(on_update: impl FnMut(Update) + Send + 'static) {
+pub(crate) fn spawn_updates(on_update: impl FnMut(Update) -> bool + Send + 'static) {
     thread::spawn(move || HubClient::new().run(on_update));
 }

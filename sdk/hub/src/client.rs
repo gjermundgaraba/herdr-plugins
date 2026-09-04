@@ -1,10 +1,7 @@
 use std::{
     fmt,
     io::{self, BufReader, Write},
-    os::{
-        fd::{AsFd, AsRawFd, BorrowedFd},
-        unix::net::UnixStream,
-    },
+    os::{fd::AsRawFd, unix::net::UnixStream},
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
     thread,
@@ -101,7 +98,33 @@ impl HubClient {
     }
 
     pub fn subscribe(&self, timeout: Duration) -> Result<(Stream, Model)> {
-        self.subscribe_at(timeout)
+        let mut socket = self.connect(timeout)?;
+        write_message(
+            &mut socket,
+            &ClientMessage::Subscribe { protocol: PROTOCOL },
+        )?;
+        let mut reader = BufReader::new(socket);
+        let mut pending = Vec::new();
+        let model = match read_message_with_timeout(&mut reader, &mut pending, timeout)? {
+            Some(ServerMessage::Hello { protocol, model }) if protocol == PROTOCOL => model,
+            Some(ServerMessage::Hello { protocol, .. }) => {
+                return Err(Error::Protocol {
+                    expected: PROTOCOL,
+                    actual: protocol,
+                });
+            }
+            Some(ServerMessage::Error { error }) => return Err(Error::Server(error)),
+            Some(_) => return Err(Error::UnexpectedMessage("hello")),
+            None => return Err(Error::Disconnected),
+        };
+        Ok((
+            Stream {
+                reader,
+                pending,
+                ended: false,
+            },
+            model,
+        ))
     }
 
     pub fn call(
@@ -189,7 +212,7 @@ impl HubClient {
         }
     }
 
-    pub fn run(&self, mut on_message: impl FnMut(Result<ServerMessage>)) -> ! {
+    pub fn run(&self, mut on_message: impl FnMut(Result<ServerMessage>) -> bool) {
         let mut backoff = MIN_RECONNECT_BACKOFF;
         let mut outage_reported = false;
         loop {
@@ -197,13 +220,19 @@ impl HubClient {
                 Ok((mut stream, model)) => {
                     backoff = MIN_RECONNECT_BACKOFF;
                     outage_reported = false;
-                    on_message(Ok(ServerMessage::Hello {
+                    if !on_message(Ok(ServerMessage::Hello {
                         protocol: PROTOCOL,
                         model,
-                    }));
+                    })) {
+                        return;
+                    }
                     loop {
                         match stream.next() {
-                            Ok(Some(message)) => on_message(Ok(message)),
+                            Ok(Some(message)) => {
+                                if !on_message(Ok(message)) {
+                                    return;
+                                }
+                            }
                             Ok(None) => break Error::Disconnected,
                             Err(error) => break error,
                         }
@@ -212,42 +241,14 @@ impl HubClient {
                 Err(error) => error,
             };
             if !outage_reported {
-                on_message(Err(error));
+                if !on_message(Err(error)) {
+                    return;
+                }
                 outage_reported = true;
             }
             thread::sleep(backoff);
             backoff = backoff.saturating_mul(2).min(MAX_RECONNECT_BACKOFF);
         }
-    }
-
-    fn subscribe_at(&self, timeout: Duration) -> Result<(Stream, Model)> {
-        let mut socket = self.connect(timeout)?;
-        write_message(
-            &mut socket,
-            &ClientMessage::Subscribe { protocol: PROTOCOL },
-        )?;
-        let mut reader = BufReader::new(socket);
-        let mut pending = Vec::new();
-        let model = match read_message_with_timeout(&mut reader, &mut pending, timeout)? {
-            Some(ServerMessage::Hello { protocol, model }) if protocol == PROTOCOL => model,
-            Some(ServerMessage::Hello { protocol, .. }) => {
-                return Err(Error::Protocol {
-                    expected: PROTOCOL,
-                    actual: protocol,
-                });
-            }
-            Some(ServerMessage::Error { error }) => return Err(Error::Server(error)),
-            Some(_) => return Err(Error::UnexpectedMessage("hello")),
-            None => return Err(Error::Disconnected),
-        };
-        Ok((
-            Stream {
-                reader,
-                pending,
-                ended: false,
-            },
-            model,
-        ))
     }
 
     fn connect(&self, timeout: Duration) -> Result<UnixStream> {
@@ -294,10 +295,6 @@ impl Stream {
             }
             Err(error) => Err(error),
         }
-    }
-
-    pub fn as_fd(&self) -> BorrowedFd<'_> {
-        self.reader.get_ref().as_fd()
     }
 }
 
@@ -360,7 +357,6 @@ fn read_message_with_timeout(
 mod tests {
     use std::{
         io::{BufRead, BufReader, Write},
-        os::fd::AsRawFd,
         os::unix::net::UnixListener,
         sync::atomic::{AtomicU64, Ordering},
     };
@@ -447,7 +443,6 @@ mod tests {
             .subscribe(Duration::from_secs(1))
             .unwrap();
         assert_eq!(initial.version, 3);
-        assert!(stream.as_fd().as_raw_fd() >= 0);
         assert_eq!(
             stream.next().unwrap(),
             Some(ServerMessage::Active {
@@ -455,6 +450,39 @@ mod tests {
                 key: Some("local/default".into()),
             })
         );
+        server.join().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn run_stops_when_callback_returns_false() {
+        let path = test_socket("run-stop");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(socket.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            writeln!(
+                socket,
+                "{}",
+                serde_json::to_string(&ServerMessage::Hello {
+                    protocol: PROTOCOL,
+                    model: model(1),
+                })
+                .unwrap()
+            )
+            .unwrap();
+        });
+
+        let mut messages = 0;
+        HubClient::at(&path).run(|_| {
+            messages += 1;
+            false
+        });
+
+        assert_eq!(messages, 1);
         server.join().unwrap();
         std::fs::remove_file(path).unwrap();
     }

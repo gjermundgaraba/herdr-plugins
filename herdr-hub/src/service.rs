@@ -161,10 +161,13 @@ mod macos {
             fs::{MetadataExt, OpenOptionsExt},
             io::AsRawFd,
         },
-        process::{Command, Output},
+        process::{Child, Command, Output, Stdio},
         thread,
         time::{Duration, Instant},
     };
+
+    const BOOTOUT_TIMEOUT: Duration = Duration::from_secs(15);
+    const WAIT_INTERVAL: Duration = Duration::from_millis(50);
 
     pub(crate) fn install() -> Result<()> {
         require_user()?;
@@ -176,12 +179,14 @@ mod macos {
         let paths = paths()?;
         let herdr = resolve_herdr()?;
         prepare_directories(&paths)?;
-        remove_obsolete_source_fingerprints(&paths)?;
         install_executable(
             &env::current_exe().context("resolve running herdr-hub")?,
             &paths,
         )?;
-        install_plist(&render_plist(&paths, &herdr), &paths)?;
+        install_plist(
+            &render_plist(&paths, &herdr, env::var_os("XDG_CONFIG_HOME"))?,
+            &paths,
+        )?;
         bootout()?;
         bootstrap(&paths.plist)?;
         Ok(())
@@ -193,7 +198,7 @@ mod macos {
         let paths = paths()?;
         let source = env::current_exe().context("resolve running herdr-hub")?;
         let herdr = resolve_herdr()?;
-        let expected_plist = render_plist(&paths, &herdr);
+        let expected_plist = render_plist(&paths, &herdr, env::var_os("XDG_CONFIG_HOME"))?;
         let current = files_match(&source, &paths.executable)?
             && fs::read(&paths.plist).is_ok_and(|bytes| bytes == expected_plist.as_bytes());
         if !current || !loaded_from(&paths.executable)? {
@@ -208,7 +213,6 @@ mod macos {
         let _lock = LifecycleLock::acquire()?;
         let paths = paths()?;
         bootout()?;
-        remove_obsolete_source_fingerprints(&paths)?;
         for path in [
             &paths.plist_new,
             &paths.plist,
@@ -219,22 +223,11 @@ mod macos {
         }
         match fs::remove_dir(&paths.application_dir) {
             Ok(()) => {}
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
-                ) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(error)
                     .with_context(|| format!("remove {}", paths.application_dir.display()));
             }
-        }
-        Ok(())
-    }
-
-    fn remove_obsolete_source_fingerprints(paths: &Paths) -> Result<()> {
-        for name in ["source-fingerprint.new", "source-fingerprint"] {
-            remove_file(&paths.application_dir.join(name))?;
         }
         Ok(())
     }
@@ -304,8 +297,25 @@ mod macos {
         Ok(installed == source)
     }
 
-    pub(super) fn render_plist(paths: &Paths, herdr: &Path) -> String {
-        format!(
+    pub(super) fn render_plist(
+        paths: &Paths,
+        herdr: &Path,
+        xdg_config_home: Option<std::ffi::OsString>,
+    ) -> Result<String> {
+        let xdg_config_home = xdg_config_home.filter(|value| !value.is_empty());
+        if xdg_config_home
+            .as_ref()
+            .is_some_and(|value| !Path::new(value).is_absolute())
+        {
+            bail!("XDG_CONFIG_HOME must be an absolute path")
+        }
+        let xdg_environment = xdg_config_home.map_or_else(String::new, |path| {
+            format!(
+                "    <key>XDG_CONFIG_HOME</key>\n    <string>{}</string>\n",
+                xml_escape(Path::new(&path))
+            )
+        });
+        Ok(format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -321,6 +331,7 @@ mod macos {
   <dict>
     <key>HERDR_BIN_PATH</key>
     <string>{}</string>
+{}
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -335,9 +346,10 @@ mod macos {
 "#,
             xml_escape(&paths.executable),
             xml_escape(herdr),
+            xdg_environment,
             xml_escape(&paths.stdout),
             xml_escape(&paths.stderr),
-        )
+        ))
     }
 
     fn xml_escape(path: &Path) -> String {
@@ -359,15 +371,46 @@ mod macos {
     }
 
     fn bootout() -> Result<()> {
-        let output = Command::new("/bin/launchctl")
+        let child = Command::new("/bin/launchctl")
             .args(["bootout", "--wait", &service_target()])
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .context("stop Herdr Hub LaunchAgent")?;
+        let output = wait_for_bootout(child, BOOTOUT_TIMEOUT)?;
         if output.status.success() || not_loaded(&output) {
             Ok(())
         } else {
             command_error("stop Herdr Hub LaunchAgent", output)
         }
+    }
+
+    fn wait_for_bootout(mut child: Child, timeout: Duration) -> Result<Output> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error).context("wait for Herdr Hub LaunchAgent to stop");
+                }
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!(
+                    "launchctl bootout timed out after {}s",
+                    timeout.as_secs_f64()
+                )
+            }
+            thread::sleep(WAIT_INTERVAL);
+        }
+        let output = child
+            .wait_with_output()
+            .context("collect launchctl bootout output")?;
+        Ok(output)
     }
 
     fn bootstrap(plist: &Path) -> Result<()> {
@@ -497,33 +540,19 @@ mod macos {
         }
 
         #[test]
-        fn obsolete_source_fingerprints_are_removed() {
-            let directory = std::env::temp_dir().join(format!(
-                "herdr-hub-service-test-{}-{}",
-                std::process::id(),
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            let paths = paths_from_home(&directory).unwrap();
-            fs::create_dir_all(&paths.application_dir).unwrap();
-            for name in ["source-fingerprint", "source-fingerprint.new"] {
-                fs::write(paths.application_dir.join(name), b"obsolete").unwrap();
-            }
+        fn bootout_timeout_kills_and_reaps_promptly() {
+            let child = Command::new("/bin/sh")
+                .args(["-c", "exec sleep 5"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let started = Instant::now();
 
-            remove_obsolete_source_fingerprints(&paths).unwrap();
-            remove_obsolete_source_fingerprints(&paths).unwrap();
+            let error = wait_for_bootout(child, Duration::from_millis(10)).unwrap_err();
 
-            assert!(!paths.application_dir.join("source-fingerprint").exists());
-            assert!(
-                !paths
-                    .application_dir
-                    .join("source-fingerprint.new")
-                    .exists()
-            );
-            fs::remove_dir(&paths.application_dir).unwrap();
-            fs::remove_dir_all(directory).unwrap();
+            assert!(error.to_string().contains("timed out after 0.01s"));
+            assert!(started.elapsed() < Duration::from_secs(1));
         }
     }
 }
@@ -553,13 +582,33 @@ mod tests {
     #[test]
     fn plist_has_the_service_contract() {
         let paths = paths_from_home(Path::new("/Users/a&b")).unwrap();
-        let plist = macos::render_plist(&paths, Path::new("/opt/herdr"));
+        let plist = macos::render_plist(
+            &paths,
+            Path::new("/opt/herdr"),
+            Some("/Users/a&b/.config".into()),
+        )
+        .unwrap();
         assert!(plist.contains("<string>dev.herdr.hub</string>"));
         assert!(plist.contains("<string>serve</string>"));
         assert!(plist.contains("<key>HERDR_BIN_PATH</key>"));
         assert!(plist.contains("<string>/opt/herdr</string>"));
+        assert!(plist.contains("<key>XDG_CONFIG_HOME</key>"));
+        assert!(plist.contains("<string>/Users/a&amp;b/.config</string>"));
         assert!(plist.contains("/Users/a&amp;b/Library/Application Support"));
         assert!(plist.contains("<key>RunAtLoad</key>\n  <true/>"));
         assert!(plist.contains("<key>KeepAlive</key>\n  <true/>"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn plist_omits_empty_xdg_config_home_and_rejects_relative_paths() {
+        let paths = paths_from_home(Path::new("/Users/test")).unwrap();
+        for value in [None, Some("".into())] {
+            let plist = macos::render_plist(&paths, Path::new("/opt/herdr"), value).unwrap();
+            assert!(!plist.contains("XDG_CONFIG_HOME"));
+        }
+        assert!(
+            macos::render_plist(&paths, Path::new("/opt/herdr"), Some("relative".into())).is_err()
+        );
     }
 }
