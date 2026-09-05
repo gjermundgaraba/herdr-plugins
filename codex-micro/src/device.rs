@@ -9,12 +9,8 @@
 use std::{
     collections::HashMap,
     ffi::{CStr, c_void},
-    fs::{File, OpenOptions},
-    io,
-    os::unix::{
-        fs::{MetadataExt, OpenOptionsExt},
-        io::AsRawFd,
-    },
+    fs::{File, OpenOptions, TryLockError},
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::Path,
     ptr::NonNull,
     sync::{
@@ -305,7 +301,7 @@ fn await_reply<T>(
         .map_err(|error| anyhow!(error))
 }
 
-/// Dropping the owned file closes its descriptor, which releases the flock.
+/// Dropping the owned file closes its descriptor, which releases the lock.
 struct DeviceLock(#[allow(dead_code)] File);
 
 impl DeviceLock {
@@ -332,13 +328,12 @@ impl DeviceLock {
         {
             bail!("unsafe Codex Micro device lock {}", path.display())
         }
-        // SAFETY: flock only operates on this live file descriptor.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
                 bail!("another process owns the Codex Micro")
             }
-            return Err(error.into());
+            Err(TryLockError::Error(error)) => return Err(error.into()),
         }
         Ok(Self(file))
     }

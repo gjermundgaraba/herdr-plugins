@@ -155,12 +155,9 @@ fn paths_from_home(home: &Path) -> Result<Paths> {
 mod macos {
     use super::*;
     use std::{
-        fs::{File, OpenOptions},
+        fs::{File, OpenOptions, TryLockError},
         io,
-        os::unix::{
-            fs::{MetadataExt, OpenOptionsExt},
-            io::AsRawFd,
-        },
+        os::unix::fs::{MetadataExt, OpenOptionsExt},
         process::{Child, Command, Output, Stdio},
         thread,
         time::{Duration, Instant},
@@ -485,13 +482,12 @@ mod macos {
             }
             let deadline = Instant::now() + Duration::from_secs(15);
             loop {
-                // SAFETY: file owns a live descriptor and LOCK_NB prevents blocking.
-                if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                    return Ok(Self(file));
-                }
-                let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::WouldBlock {
-                    return Err(error).context("lock Herdr Hub lifecycle");
+                match file.try_lock() {
+                    Ok(()) => return Ok(Self(file)),
+                    Err(TryLockError::WouldBlock) => {}
+                    Err(TryLockError::Error(error)) => {
+                        return Err(error).context("lock Herdr Hub lifecycle");
+                    }
                 }
                 if Instant::now() >= deadline {
                     bail!("another Herdr Hub lifecycle command is running")

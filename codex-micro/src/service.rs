@@ -4,7 +4,7 @@ use std::{
     cell::Cell,
     collections::{BTreeMap, HashMap},
     ffi::c_int,
-    fs::{self, File, OpenOptions},
+    fs::{self, File, OpenOptions, TryLockError},
     io::{self, BufRead, BufReader, Read, Write},
     os::unix::{
         fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -1234,7 +1234,7 @@ fn service_lock_path(uid: libc::uid_t) -> PathBuf {
     PathBuf::from(format!("/tmp/dev.codex-micro-{uid}.service.lock"))
 }
 
-/// Dropping the owned file closes its descriptor, which releases the flock.
+/// Dropping the owned file closes its descriptor, which releases the lock.
 struct ServiceLock(#[allow(dead_code)] File);
 
 impl ServiceLock {
@@ -1255,13 +1255,14 @@ impl ServiceLock {
         {
             bail!("unsafe Codex Micro service lock {}", path.display())
         }
-        // SAFETY: file owns a valid descriptor and LOCK_NB makes this nonblocking.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::WouldBlock {
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
                 bail!("Codex Micro service is already running")
             }
-            return Err(error).with_context(|| format!("lock service {}", path.display()));
+            Err(TryLockError::Error(error)) => {
+                return Err(error).with_context(|| format!("lock service {}", path.display()));
+            }
         }
         Ok(Self(file))
     }

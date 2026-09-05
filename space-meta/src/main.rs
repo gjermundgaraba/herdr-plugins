@@ -8,6 +8,7 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use herdr_client::{Client, Environment, SessionSnapshot, WorkspaceInfo, socket_scope_dir};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(2);
@@ -434,10 +435,14 @@ struct PrCache {
     dirty: bool,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct PrCacheEntry {
+    // Require both keys while allowing null values.
+    #[serde(deserialize_with = "Option::deserialize")]
     branch: Option<String>,
+    #[serde(deserialize_with = "Option::deserialize")]
     number: Option<String>,
+    #[serde(rename = "at")]
     stamped_at: u64,
 }
 
@@ -451,30 +456,11 @@ impl PrCache {
             && let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(&contents)
         {
             for (key, value) in map {
-                let Some(entry) = value.as_object() else {
-                    continue;
-                };
-                let branch = match entry.get("branch") {
-                    Some(Value::String(branch)) => Some(branch.clone()),
-                    Some(Value::Null) => None,
-                    _ => continue,
-                };
-                let number = match entry.get("number") {
-                    Some(Value::String(number)) => Some(number.clone()),
-                    Some(Value::Null) => None,
-                    _ => continue,
-                };
-                let Some(stamped_at) = entry.get("at").and_then(Value::as_u64) else {
-                    continue;
-                };
-                cache.entries.insert(
-                    key,
-                    PrCacheEntry {
-                        branch,
-                        number,
-                        stamped_at,
-                    },
-                );
+                if value.is_object()
+                    && let Ok(entry) = serde_json::from_value(value)
+                {
+                    cache.entries.insert(key, entry);
+                }
             }
         }
         cache
@@ -524,18 +510,7 @@ impl PrCache {
         if !self.dirty {
             return Ok(());
         }
-        let mut map = serde_json::Map::new();
-        for (key, entry) in &self.entries {
-            map.insert(
-                key.clone(),
-                json!({
-                    "branch": entry.branch,
-                    "number": entry.number,
-                    "at": entry.stamped_at,
-                }),
-            );
-        }
-        let contents = serde_json::to_vec(&Value::Object(map))
+        let contents = serde_json::to_vec(&self.entries)
             .map_err(|error| format!("serialize PR cache: {error}"))?;
         let temporary = path.with_extension("json.tmp");
         let mut options = File::options();
@@ -846,7 +821,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_ignores_valid_json_entries_with_incomplete_shapes() {
+    fn cache_ignores_valid_json_entries_with_invalid_shapes() {
         let path = temporary_path("malformed-cache.json");
         fs::write(
             &path,
@@ -855,7 +830,20 @@ mod tests {
                 "/none": {"branch": null, "number": null, "at": 0},
                 "/missing-branch": {"number": "1", "at": 1},
                 "/missing-number": {"branch": "main", "at": 1},
-                "/missing-at": {"branch": "main", "number": null}
+                "/missing-at": {"branch": "main", "number": null},
+                "/array": ["main", "12", 1],
+                "/null": null,
+                "/string": "main",
+                "/integer": 1,
+                "/boolean": true,
+                "/wrong-branch": {"branch": 1, "number": null, "at": 0},
+                "/wrong-number": {"branch": null, "number": 12, "at": 0},
+                "/null-at": {"branch": null, "number": null, "at": null},
+                "/string-at": {"branch": null, "number": null, "at": "1"},
+                "/negative-at": {"branch": null, "number": null, "at": -1},
+                "/float-at": {"branch": null, "number": null, "at": 1.0},
+                "/overflow-at": {"branch": null, "number": null, "at": 18446744073709551616},
+                "/max-at": {"branch": null, "number": null, "at": 18446744073709551615}
             }"#,
         )
         .unwrap();
@@ -863,7 +851,9 @@ mod tests {
         let mut cache = PrCache::load(&path);
         fs::remove_file(path).unwrap();
 
-        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.entries.len(), 3);
+        assert!(!cache.dirty);
+        assert_eq!(cache.entries["/max-at"].stamped_at, u64::MAX);
         assert_eq!(
             cache.entries["/ok"],
             PrCacheEntry {

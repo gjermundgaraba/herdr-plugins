@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     env,
-    fs::{self, File, OpenOptions},
+    fs::{self, File, OpenOptions, TryLockError},
     io::{self, BufReader, Write},
     net::Shutdown,
     os::unix::{
@@ -421,13 +421,12 @@ fn acquire_lock(path: &Path) -> Result<File> {
     {
         bail!("unsafe hub lock {}", path.display())
     }
-    // SAFETY: file owns a live descriptor and LOCK_NB prevents blocking.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::WouldBlock {
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => {
             bail!("Herdr Hub is already running")
         }
-        return Err(error).context("lock Herdr Hub");
+        Err(TryLockError::Error(error)) => return Err(error).context("lock Herdr Hub"),
     }
     Ok(file)
 }
@@ -522,6 +521,18 @@ mod tests {
     fn cleanup(server: Server, lock: PathBuf) {
         drop(server);
         fs::remove_file(lock).unwrap();
+    }
+
+    #[test]
+    fn second_server_cannot_replace_the_live_socket() {
+        let (server, _rx, socket, lock) = server("lock");
+        let (tx, _other_rx) = mpsc::sync_channel(64);
+        assert!(matches!(
+            Server::start_at(tx, socket.clone(), lock.clone()),
+            Err(error) if error.to_string() == "Herdr Hub is already running"
+        ));
+        assert!(socket.exists());
+        cleanup(server, lock);
     }
 
     #[test]

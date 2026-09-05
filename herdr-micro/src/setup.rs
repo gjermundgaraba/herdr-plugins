@@ -8,7 +8,7 @@ use std::{
     ffi::OsString,
     fs::{self, OpenOptions},
     io::{Read, Write},
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Command,
     sync::mpsc,
@@ -583,21 +583,13 @@ pub fn install_pi_effort(source: &Path, target: &Path, timestamp: u128) -> Resul
     } else {
         None
     };
-    let name = target
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| anyhow!("Pi extension target has no file name"))?;
-    let temporary = parent.join(format!(".{name}.tmp-{}-{timestamp}", std::process::id()));
-    let written = (|| -> Result<()> {
-        write_new_file(&temporary, 0o644, &bundled)?;
-        fs::rename(&temporary, target)?;
-        fs::File::open(parent)?.sync_all()?;
-        Ok(())
-    })();
-    if written.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    written?;
+    let mut temporary = tempfile::Builder::new()
+        .permissions(fs::Permissions::from_mode(0o644))
+        .tempfile_in(parent)?;
+    temporary.write_all(&bundled)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(target).map_err(|error| error.error)?;
+    fs::File::open(parent)?.sync_all()?;
     Ok(PiInstall {
         target: target.into(),
         backup,
@@ -905,6 +897,11 @@ mod tests {
         let changed = install_pi_effort(&source, &target, 12).unwrap();
         assert_eq!(fs::read(changed.backup.unwrap()).unwrap(), b"one");
         assert_eq!(fs::read(&target).unwrap(), b"two");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o133,
+            0
+        );
+        assert_eq!(fs::read_dir(target.parent().unwrap()).unwrap().count(), 2);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -925,20 +922,18 @@ mod tests {
     }
 
     #[test]
-    fn pi_install_failure_leaves_live_extension_unchanged() {
+    fn pi_install_backup_collision_preserves_live_extension_and_backup() {
         let root = temp("pi-failure");
         let source = root.join("source.js");
         let target = root.join("extension.ts");
         fs::write(&source, b"new").unwrap();
         fs::write(&target, b"old").unwrap();
-        fs::write(
-            root.join(format!(".extension.ts.tmp-{}-10", std::process::id())),
-            b"occupied",
-        )
-        .unwrap();
+        let backup = root.join("extension.ts.bak-10");
+        fs::write(&backup, b"previous backup").unwrap();
         assert!(install_pi_effort(&source, &target, 10).is_err());
         assert_eq!(fs::read(&target).unwrap(), b"old");
-        assert_eq!(fs::read(root.join("extension.ts.bak-10")).unwrap(), b"old");
+        assert_eq!(fs::read(&backup).unwrap(), b"previous backup");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 3);
         fs::remove_dir_all(root).unwrap();
     }
 }

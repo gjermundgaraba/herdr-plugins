@@ -3,21 +3,21 @@
 use std::{
     env,
     ffi::{CStr, OsStr},
-    fs::{self, File, OpenOptions},
+    fs::{self, File, OpenOptions, TryLockError},
     io::{self, Read, Write},
     os::unix::{
         ffi::OsStrExt,
         fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
-        io::AsRawFd,
     },
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::mpsc,
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
+use tempfile::NamedTempFile;
 
 use crate::{
     InputMonitoringAccess,
@@ -57,20 +57,20 @@ pub fn install() -> Result<ServiceStatus> {
         !managed_file_matches(&paths.executable, &executable, uid, EXECUTABLE_MODE)?;
     let plist_changed = !managed_file_matches(&paths.plist, &plist, uid, PLIST_MODE)?;
 
-    let mut staged_executable = executable_changed
-        .then(|| StagedFile::new(&paths.executable, &executable, EXECUTABLE_MODE))
+    let staged_executable = executable_changed
+        .then(|| stage_file(&paths.executable, &executable, EXECUTABLE_MODE))
         .transpose()?;
-    let mut staged_plist = plist_changed
-        .then(|| StagedFile::new(&paths.plist, &plist, PLIST_MODE))
+    let staged_plist = plist_changed
+        .then(|| stage_file(&paths.plist, &plist, PLIST_MODE))
         .transpose()?;
 
     if executable_changed || plist_changed {
         bootout()?;
-        if let Some(staged) = staged_executable.as_mut() {
-            staged.commit()?;
+        if let Some(staged) = staged_executable {
+            commit_file(staged, &paths.executable)?;
         }
-        if let Some(staged) = staged_plist.as_mut() {
-            staged.commit()?;
+        if let Some(staged) = staged_plist {
+            commit_file(staged, &paths.plist)?;
         }
     }
 
@@ -258,7 +258,7 @@ fn require_user() -> Result<()> {
     Ok(())
 }
 
-/// Dropping the owned file closes its descriptor, which releases the flock.
+/// Dropping the owned file closes its descriptor, which releases the lock.
 struct LifecycleLock(#[allow(dead_code)] File);
 
 impl LifecycleLock {
@@ -285,13 +285,12 @@ impl LifecycleLock {
         }
         let deadline = Instant::now() + timeout;
         loop {
-            // SAFETY: file owns a live descriptor and LOCK_NB prevents an unbounded syscall.
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                return Ok(Self(file));
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::WouldBlock {
-                return Err(error).context("lock Codex Micro lifecycle");
+            match file.try_lock() {
+                Ok(()) => return Ok(Self(file)),
+                Err(TryLockError::WouldBlock) => {}
+                Err(TryLockError::Error(error)) => {
+                    return Err(error).context("lock Codex Micro lifecycle");
+                }
             }
             if Instant::now() >= deadline {
                 bail!("another Codex Micro lifecycle command is running")
@@ -425,62 +424,25 @@ fn read_regular_file(path: &Path) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-struct StagedFile {
-    temporary: PathBuf,
-    target: PathBuf,
-    committed: bool,
+fn stage_file(target: &Path, bytes: &[u8], mode: u32) -> Result<NamedTempFile> {
+    let parent = target.parent().context("install target has no parent")?;
+    let mut file =
+        NamedTempFile::new_in(parent).with_context(|| format!("stage {}", target.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("write staged {}", target.display()))?;
+    file.as_file()
+        .set_permissions(fs::Permissions::from_mode(mode))?;
+    file.as_file()
+        .sync_all()
+        .with_context(|| format!("sync staged {}", target.display()))?;
+    Ok(file)
 }
 
-impl StagedFile {
-    fn new(target: &Path, bytes: &[u8], mode: u32) -> Result<Self> {
-        let parent = target.parent().context("install target has no parent")?;
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let temporary = parent.join(format!(".codex-micro-{}-{nonce}.tmp", std::process::id()));
-        let result = (|| {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(mode)
-                .open(&temporary)
-                .with_context(|| format!("create {}", temporary.display()))?;
-            file.write_all(bytes)
-                .with_context(|| format!("write {}", temporary.display()))?;
-            file.set_permissions(fs::Permissions::from_mode(mode))?;
-            file.sync_all()
-                .with_context(|| format!("sync {}", temporary.display()))?;
-            Ok(Self {
-                temporary: temporary.clone(),
-                target: target.to_owned(),
-                committed: false,
-            })
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result
-    }
-
-    fn commit(&mut self) -> Result<()> {
-        fs::rename(&self.temporary, &self.target)
-            .with_context(|| format!("install {}", self.target.display()))?;
-        self.committed = true;
-        sync_dir(
-            self.target
-                .parent()
-                .context("install target has no parent")?,
-        )
-    }
-}
-
-impl Drop for StagedFile {
-    fn drop(&mut self) {
-        if !self.committed {
-            let _ = fs::remove_file(&self.temporary);
-        }
-    }
+fn commit_file(file: NamedTempFile, target: &Path) -> Result<()> {
+    file.persist(target)
+        .map_err(|error| error.error)
+        .with_context(|| format!("install {}", target.display()))?;
+    sync_dir(target.parent().context("install target has no parent")?)
 }
 
 fn wait_for_status() -> Result<ServiceStatus> {
@@ -615,6 +577,7 @@ fn sync_dir(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_dir(name: &str) -> PathBuf {
         let nonce = SystemTime::now()
@@ -713,6 +676,52 @@ mod tests {
         fs::remove_file(home.join("Library")).unwrap();
         fs::remove_dir(home).unwrap();
         fs::remove_dir(redirected).unwrap();
+    }
+
+    #[test]
+    fn staged_files_preserve_live_contents_until_commit() {
+        let dir = test_dir("staging");
+        let executable = dir.join("executable");
+        let plist = dir.join("plist");
+        fs::write(&executable, b"old executable").unwrap();
+        fs::write(&plist, b"old plist").unwrap();
+        let staged_executable =
+            stage_file(&executable, b"new executable", EXECUTABLE_MODE).unwrap();
+        let staged_plist = stage_file(&plist, b"new plist", PLIST_MODE).unwrap();
+        assert_eq!(fs::read(&executable).unwrap(), b"old executable");
+        assert_eq!(fs::read(&plist).unwrap(), b"old plist");
+
+        commit_file(staged_executable, &executable).unwrap();
+        commit_file(staged_plist, &plist).unwrap();
+        assert!(
+            managed_file_matches(
+                &executable,
+                b"new executable",
+                effective_uid(),
+                EXECUTABLE_MODE
+            )
+            .unwrap()
+        );
+        assert!(managed_file_matches(&plist, b"new plist", effective_uid(), PLIST_MODE).unwrap());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_commit_and_abandoned_staging_leave_no_temporary_files() {
+        let dir = test_dir("staging-failure");
+        let target = dir.join("target");
+        fs::create_dir(&target).unwrap();
+        let existing = target.join("existing");
+        fs::write(&existing, b"keep").unwrap();
+        let staged = stage_file(&target, b"replacement", EXECUTABLE_MODE).unwrap();
+        let abandoned = stage_file(&dir.join("plist"), b"plist", PLIST_MODE).unwrap();
+        let error = commit_file(staged, &target).unwrap_err();
+        assert!(error.to_string().contains("install"));
+        drop(abandoned);
+        assert_eq!(fs::read(&existing).unwrap(), b"keep");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
