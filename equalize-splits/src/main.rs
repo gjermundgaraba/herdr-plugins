@@ -170,12 +170,14 @@ fn load_pane_tabs(path: &Path) -> Result<HashMap<String, String>> {
 }
 
 fn save_pane_tabs(path: &Path, pane_tabs: &HashMap<String, String>) -> Result<()> {
-    let temporary = path.with_extension("json.tmp");
-    let contents = serde_json::to_vec(pane_tabs).context("serialize pane-to-tab cache")?;
-    fs::write(&temporary, contents).context("write pane-to-tab cache")?;
-    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))
-        .context("chmod pane-to-tab cache")?;
-    fs::rename(&temporary, path).context("save pane-to-tab cache")
+    let parent = path
+        .parent()
+        .context("pane-to-tab cache path has no parent")?;
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(parent).context("open pane-to-tab cache temporary file")?;
+    serde_json::to_writer(&mut temporary, pane_tabs).context("write pane-to-tab cache")?;
+    temporary.persist(path).context("save pane-to-tab cache")?;
+    Ok(())
 }
 
 /// Equalize the connected same-direction region around a freshly created pane.
@@ -303,6 +305,26 @@ mod tests {
     use herdr_client::{LayoutDescription, LayoutPane, LayoutSplit};
 
     use super::*;
+
+    #[test]
+    fn cache_save_replaces_the_file_with_private_permissions() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pane-tabs.json");
+        let old_path = directory.path().join("old-cache.json");
+        fs::write(&path, b"old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::hard_link(&path, &old_path).unwrap();
+        let pane_tabs = HashMap::from([("pane-a".into(), "tab-a".into())]);
+
+        save_pane_tabs(&path, &pane_tabs).unwrap();
+
+        assert_eq!(load_pane_tabs(&path).unwrap(), pane_tabs);
+        assert_eq!(fs::read(&old_path).unwrap(), b"old");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 
     fn pane(id: &str) -> LayoutNode {
         LayoutNode::Pane(LayoutPane {

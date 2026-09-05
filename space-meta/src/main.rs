@@ -1,7 +1,6 @@
 // Space Meta: publishes composite, PR-aware workspace tokens for the spaces sidebar.
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -510,20 +509,15 @@ impl PrCache {
         if !self.dirty {
             return Ok(());
         }
-        let contents = serde_json::to_vec(&self.entries)
-            .map_err(|error| format!("serialize PR cache: {error}"))?;
-        let temporary = path.with_extension("json.tmp");
-        let mut options = File::options();
-        options.create(true).truncate(true).write(true).mode(0o600);
-        let mut file = options
-            .open(&temporary)
+        let parent = path.parent().ok_or("PR cache path has no parent")?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)
             .map_err(|error| format!("open PR cache temporary file: {error}"))?;
-        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))
-            .map_err(|error| format!("chmod PR cache temporary file: {error}"))?;
-        file.write_all(&contents)
+        serde_json::to_writer(&mut temporary, &self.entries)
             .map_err(|error| format!("write PR cache: {error}"))?;
-        drop(file);
-        fs::rename(&temporary, path).map_err(|error| format!("save PR cache: {error}"))
+        temporary
+            .persist(path)
+            .map_err(|error| format!("save PR cache: {error}"))?;
+        Ok(())
     }
 
     fn pr_number(&mut self, cwd: &Path, branch: &str, refresh: bool) -> Option<String> {
@@ -878,7 +872,7 @@ mod tests {
         let path = temporary_path("private-cache.json");
         fs::write(&path, b"old").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        let cache = PrCache {
+        let mut cache = PrCache {
             entries: HashMap::from([(
                 "/repo".into(),
                 PrCacheEntry {
@@ -887,9 +881,12 @@ mod tests {
                     stamped_at: 1,
                 },
             )]),
-            dirty: true,
+            dirty: false,
         };
 
+        cache.save(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"old");
+        cache.dirty = true;
         cache.save(&path).unwrap();
 
         assert_eq!(

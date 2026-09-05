@@ -1,7 +1,7 @@
 use herdr_ratatui::{SearchLine, key_hints, theme};
 use ratatui::{
     Frame,
-    layout::Rect,
+    layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     symbols,
     text::{Line, Span},
@@ -30,6 +30,7 @@ pub struct Screen<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct Rects {
     pub header: Rect,
+    pub header_separator: Rect,
     pub body: Rect,
     pub detail_separator: Rect,
     pub detail: Rect,
@@ -37,32 +38,29 @@ pub struct Rects {
 }
 
 pub fn rects(area: Rect) -> Rects {
+    let [
+        header,
+        header_separator,
+        body,
+        detail_separator,
+        detail,
+        footer,
+    ] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(area);
     Rects {
-        header: Rect::new(area.x, area.y, area.width, area.height.min(1)),
-        body: Rect::new(
-            area.x,
-            area.y.saturating_add(2),
-            area.width,
-            area.height.saturating_sub(5),
-        ),
-        detail_separator: Rect::new(
-            area.x,
-            area.y.saturating_add(area.height.saturating_sub(3)),
-            area.width,
-            area.height.min(1),
-        ),
-        detail: Rect::new(
-            area.x,
-            area.y.saturating_add(area.height.saturating_sub(2)),
-            area.width,
-            area.height.min(1),
-        ),
-        footer: Rect::new(
-            area.x,
-            area.y.saturating_add(area.height.saturating_sub(1)),
-            area.width,
-            area.height.min(1),
-        ),
+        header,
+        header_separator,
+        body,
+        detail_separator,
+        detail,
+        footer,
     }
 }
 
@@ -75,7 +73,7 @@ pub fn render(picker: &mut Picker, mode: Mode, screen: &Screen<'_>, frame: &mut 
     render_header(picker, mode, screen, frame, rects.header);
     frame.render_widget(
         Fill::new(symbols::line::HORIZONTAL).style(theme::muted()),
-        Rect::new(area.x, area.y + 1, area.width, 1),
+        rects.header_separator,
     );
     render_rows(
         picker,
@@ -466,9 +464,61 @@ mod tests {
     }
 
     #[test]
-    fn detail_separator_has_its_own_row() {
-        let rects = rects(Rect::new(0, 0, 80, 20));
-        assert_eq!(rects.detail_separator.y + 1, rects.detail.y);
+    fn layout_preserves_normal_geometry_and_bounds_tiny_areas() {
+        for height in 0..=20 {
+            let area = Rect::new(3, 7, 80, height);
+            let rects = rects(area);
+            let sections = [
+                rects.header,
+                rects.header_separator,
+                rects.body,
+                rects.detail_separator,
+                rects.detail,
+                rects.footer,
+            ];
+            let mut bottom = area.y;
+            for section in sections {
+                assert_eq!(section.x, area.x);
+                assert_eq!(section.width, area.width);
+                assert_eq!(section.y, bottom);
+                assert!(section.bottom() <= area.bottom());
+                bottom = section.bottom();
+            }
+            assert_eq!(bottom, area.bottom());
+            if height >= 5 {
+                assert_eq!(
+                    sections.map(|section| section.height),
+                    [1, 1, height - 5, 1, 1, 1]
+                );
+            } else {
+                assert_eq!(rects.body.height, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn mouse_targets_follow_the_offset_layout() {
+        let picker = Picker::new(vec![Item::default(), Item::default()], true);
+        let rects = rects(Rect::new(3, 7, 20, 8));
+        assert_eq!(crate::row_at(&picker, rects.body, 3, rects.body.y), Some(0));
+        assert_eq!(
+            crate::row_at(&picker, rects.body, 3, rects.body.y + 1),
+            Some(0)
+        );
+        assert_eq!(
+            crate::row_at(&picker, rects.body, 3, rects.body.y + 2),
+            None
+        );
+        assert_eq!(
+            crate::row_at(&picker, rects.body, 3, rects.header_separator.y),
+            None
+        );
+        assert_eq!(
+            crate::row_at(&picker, rects.body, 3, rects.detail_separator.y),
+            None
+        );
+        let button = back_button_rect(rects.footer, 1);
+        assert_eq!(button, Rect::new(16, 14, 7, 1));
     }
 
     #[test]

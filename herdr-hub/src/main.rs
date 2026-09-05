@@ -18,8 +18,10 @@ const PLUGIN_ID: &str = "gjermundgaraba.herdr-hub";
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn main() -> ExitCode {
-    let serving = env::args().nth(1).as_deref() == Some("serve");
-    match run() {
+    let args: Vec<_> = env::args().skip(1).collect();
+    let args: Vec<_> = args.iter().map(String::as_str).collect();
+    let serving = args.first() == Some(&"serve");
+    match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("herdr-hub: {error:#}");
@@ -31,60 +33,33 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<()> {
-    let mut args = env::args().skip(1);
-    let Some(command) = args.next() else {
-        return usage();
-    };
-    match command.as_str() {
-        "serve" => {
-            no_more_args(args)?;
-            serve()
-        }
-        "status" => {
-            no_more_args(args)?;
-            status()
-        }
-        "doctor" => {
-            no_more_args(args)?;
-            doctor()
-        }
-        "notify" => {
-            let kind = args
-                .next()
-                .ok_or_else(|| anyhow!("notify expects startup or event"))?;
-            no_more_args(args)?;
-            notify::command(&kind)
-        }
-        "ensure" => {
-            no_more_args(args)?;
-            service::ensure()
-        }
-        "install-service" => {
-            no_more_args(args)?;
-            service::install()
-        }
-        "uninstall-service" => {
-            no_more_args(args)?;
-            service::uninstall()
-        }
-        "dump" => {
-            no_more_args(args)?;
-            dump()
-        }
-        "relay" => {
-            no_more_args(args)?;
-            herdr_hub::run_relay(service::resolve_herdr)
-        }
-        "--version" | "-V" => {
-            no_more_args(args)?;
+fn run(args: &[&str]) -> Result<()> {
+    match args {
+        ["serve"] => serve(),
+        ["status"] => status(),
+        ["doctor"] => doctor(),
+        ["notify", kind] => notify::command(kind),
+        ["notify"] => bail!("notify expects startup or event"),
+        ["ensure"] => service::ensure(),
+        ["install-service"] => service::install(),
+        ["uninstall-service"] => service::uninstall(),
+        ["dump"] => dump(),
+        ["relay"] => herdr_hub::run_relay(service::resolve_herdr),
+        ["--version" | "-V"] => {
             println!("herdr-hub {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        "--help" | "-h" => {
+        ["--help" | "-h", ..] => {
             print_usage();
             Ok(())
         }
+        ["notify", _, extra, ..]
+        | [
+            "serve" | "status" | "doctor" | "ensure" | "install-service" | "uninstall-service"
+            | "dump" | "relay" | "--version" | "-V",
+            extra,
+            ..,
+        ] => bail!("unexpected argument: {extra}"),
         _ => usage(),
     }
 }
@@ -194,13 +169,6 @@ fn require_enabled_plugin(value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn no_more_args(mut args: impl Iterator<Item = String>) -> Result<()> {
-    if let Some(argument) = args.next() {
-        bail!("unexpected argument: {argument}")
-    }
-    Ok(())
-}
-
 fn usage<T>() -> Result<T> {
     print_usage();
     bail!("missing or unknown command")
@@ -225,6 +193,49 @@ fn log_error(message: &str) {
 mod tests {
     use super::*;
     use herdr_hub_client::HostState;
+
+    #[test]
+    fn invalid_arguments_are_rejected_before_dispatch() {
+        for command in [
+            "serve",
+            "status",
+            "doctor",
+            "ensure",
+            "install-service",
+            "uninstall-service",
+            "dump",
+            "relay",
+            "--version",
+            "-V",
+        ] {
+            assert_eq!(
+                run(&[command, "extra", "more"]).unwrap_err().to_string(),
+                "unexpected argument: extra"
+            );
+        }
+        assert_eq!(
+            run(&["notify", "event", "extra"]).unwrap_err().to_string(),
+            "unexpected argument: extra"
+        );
+        assert_eq!(
+            run(&["notify"]).unwrap_err().to_string(),
+            "notify expects startup or event"
+        );
+        for args in [&[][..], &["unknown"][..], &["unknown", "extra"][..]] {
+            assert_eq!(
+                run(args).unwrap_err().to_string(),
+                "missing or unknown command"
+            );
+        }
+        for args in [
+            &["--help", "extra"][..],
+            &["-h"][..],
+            &["--version"][..],
+            &["-V"][..],
+        ] {
+            assert!(run(args).is_ok());
+        }
+    }
 
     fn model_with_hosts(hosts: Vec<HostState>) -> Model {
         Model {

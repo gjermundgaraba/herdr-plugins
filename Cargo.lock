@@ -85,6 +85,7 @@ dependencies = [
  "objc2-io-kit",
  "serde",
  "serde_json",
+ "signal-hook 0.4.4",
  "tempfile",
 ]
 
@@ -318,6 +319,7 @@ dependencies = [
  "anyhow",
  "herdr-client",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -441,6 +443,7 @@ dependencies = [
  "herdr-client",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

@@ -3,7 +3,6 @@
 use std::{
     cell::Cell,
     collections::{BTreeMap, HashMap},
-    ffi::c_int,
     fs::{self, File, OpenOptions, TryLockError},
     io::{self, BufRead, BufReader, Read, Write},
     os::unix::{
@@ -13,7 +12,6 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    ptr,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -27,6 +25,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+use signal_hook::consts::SIGTERM;
 
 use crate::{
     DeviceEvent, DeviceInfo, ExternalOwner, InputMonitoringAccess,
@@ -49,11 +48,6 @@ const RETRY_DELAY: Duration = Duration::from_secs(1);
 const OWNER_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const EVENT_QUEUE_SIZE: usize = 256;
 const SLOT_COUNT: usize = 6;
-static SHUTDOWN: AtomicBool = AtomicBool::new(false);
-
-extern "C" fn request_shutdown(_signal: c_int) {
-    SHUTDOWN.store(true, Ordering::Release);
-}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -949,15 +943,16 @@ pub fn run() -> Result<()> {
     if uid == 0 {
         bail!("Codex Micro service refuses to run as root")
     }
-    SHUTDOWN.store(false, Ordering::Release);
-    install_sigterm_handler()?;
+    let shutdown = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(SIGTERM, Arc::clone(&shutdown))
+        .context("install SIGTERM handler")?;
     let _service_lock = ServiceLock::acquire(&service_lock_path(uid))?;
     let path = socket_path();
     let (listener, _cleanup) = bind_socket(&path)?;
-    run_listener(listener, uid)
+    run_listener(listener, uid, &shutdown)
 }
 
-fn run_listener(listener: UnixListener, uid: libc::uid_t) -> Result<()> {
+fn run_listener(listener: UnixListener, uid: libc::uid_t, shutdown: &AtomicBool) -> Result<()> {
     listener.set_nonblocking(true)?;
     let next_client = AtomicU64::new(1);
     let (service_tx, service_rx) = mpsc::channel();
@@ -965,7 +960,7 @@ fn run_listener(listener: UnixListener, uid: libc::uid_t) -> Result<()> {
     let (handy_tx, handy_shutdown, handy_worker) = spawn_handy_worker()?;
     let mut state = ServiceState::new(device_event_tx, handy_tx, external_owner());
     let mut next_owner_poll = Instant::now() + OWNER_POLL_INTERVAL;
-    while !SHUTDOWN.load(Ordering::Acquire) {
+    while !shutdown.load(Ordering::Acquire) {
         if Instant::now() >= next_owner_poll {
             state.refresh_external_owner(external_owner());
             next_owner_poll = Instant::now() + OWNER_POLL_INTERVAL;
@@ -1065,19 +1060,6 @@ fn toggle_handy() -> Result<()> {
         }
         thread::sleep(Duration::from_millis(25));
     }
-}
-
-fn install_sigterm_handler() -> Result<()> {
-    // SAFETY: zero initializes sigaction, its mask is initialized before use,
-    // and the handler only stores an atomic flag.
-    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-    action.sa_sigaction = request_shutdown as *const () as libc::sighandler_t;
-    if unsafe { libc::sigemptyset(&mut action.sa_mask) } != 0
-        || unsafe { libc::sigaction(libc::SIGTERM, &action, ptr::null_mut()) } != 0
-    {
-        return Err(io::Error::last_os_error()).context("install SIGTERM handler");
-    }
-    Ok(())
 }
 
 fn serve_connection(
