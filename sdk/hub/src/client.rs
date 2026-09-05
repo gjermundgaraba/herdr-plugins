@@ -1,5 +1,4 @@
 use std::{
-    fmt,
     io::{self, BufReader, Write},
     os::{fd::AsRawFd, unix::net::UnixStream},
     path::PathBuf,
@@ -20,63 +19,22 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
-    Io(io::Error),
-    Json(serde_json::Error),
+    #[error("{0}")]
+    Io(#[from] io::Error),
+    #[error("{0}")]
+    Json(#[from] serde_json::Error),
+    #[error("hub protocol {actual} does not match client protocol {expected}")]
     Protocol { expected: u32, actual: u32 },
+    #[error("{0}")]
     Server(String),
+    #[error("unexpected hub message; expected {0}")]
     UnexpectedMessage(&'static str),
+    #[error("hub reply id {actual} does not match request id {expected}")]
     MismatchedReply { expected: u64, actual: u64 },
+    #[error("hub disconnected")]
     Disconnected,
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io(error) => write!(f, "{error}"),
-            Self::Json(error) => write!(f, "{error}"),
-            Self::Protocol { expected, actual } => {
-                write!(
-                    f,
-                    "hub protocol {actual} does not match client protocol {expected}"
-                )
-            }
-            Self::Server(error) => write!(f, "{error}"),
-            Self::UnexpectedMessage(expected) => {
-                write!(f, "unexpected hub message; expected {expected}")
-            }
-            Self::MismatchedReply { expected, actual } => {
-                write!(
-                    f,
-                    "hub reply id {actual} does not match request id {expected}"
-                )
-            }
-            Self::Disconnected => f.write_str("hub disconnected"),
-        }
-    }
-}
-
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(error) => Some(error),
-            Self::Json(error) => Some(error),
-            _ => None,
-        }
-    }
-}
-
-impl From<io::Error> for Error {
-    fn from(error: io::Error) -> Self {
-        Self::Io(error)
-    }
-}
-
-impl From<serde_json::Error> for Error {
-    fn from(error: serde_json::Error) -> Self {
-        Self::Json(error)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -365,6 +323,13 @@ mod tests {
     use crate::{HostState, SessionState};
 
     static NEXT_SOCKET: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn io_errors_keep_their_message_and_source() {
+        let error = Error::from(io::Error::other("connection failed"));
+        assert_eq!(error.to_string(), "connection failed");
+        assert!(std::error::Error::source(&error).unwrap().is::<io::Error>());
+    }
 
     fn test_socket(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(

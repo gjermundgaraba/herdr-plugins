@@ -1,5 +1,4 @@
 use std::cell::Cell;
-use std::fmt;
 use std::io::{self, BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::os::fd::{AsFd, BorrowedFd};
@@ -218,67 +217,31 @@ impl Subscription {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, thiserror::Error)]
+#[error("{code}: {message}")]
 pub struct ApiError {
     pub code: String,
     pub message: String,
 }
 
-impl fmt::Display for ApiError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.code, self.message)
-    }
-}
-
-impl std::error::Error for ApiError {}
-
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("HERDR_SOCKET_PATH is not set")]
     MissingSocketPath,
-    Io(io::Error),
-    Json(serde_json::Error),
-    Api(ApiError),
+    #[error("{0}")]
+    Io(#[from] io::Error),
+    #[error("{0}")]
+    Json(#[source] serde_json::Error),
+    #[error("{0}")]
+    Api(#[source] ApiError),
+    #[error("Herdr closed the socket without a response")]
     EmptyResponse,
+    #[error("Herdr response has neither result nor error")]
     MissingResult,
+    #[error("Herdr response id {actual:?} does not match {expected:?}")]
     MismatchedResponseId { expected: String, actual: String },
+    #[error("unexpected Herdr result type {0:?}")]
     UnexpectedResult(String),
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MissingSocketPath => f.write_str("HERDR_SOCKET_PATH is not set"),
-            Self::Io(error) => write!(f, "{error}"),
-            Self::Json(error) => write!(f, "{error}"),
-            Self::Api(error) => write!(f, "{error}"),
-            Self::EmptyResponse => f.write_str("Herdr closed the socket without a response"),
-            Self::MissingResult => f.write_str("Herdr response has neither result nor error"),
-            Self::MismatchedResponseId { expected, actual } => {
-                write!(
-                    f,
-                    "Herdr response id {actual:?} does not match {expected:?}"
-                )
-            }
-            Self::UnexpectedResult(kind) => write!(f, "unexpected Herdr result type {kind:?}"),
-        }
-    }
-}
-
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(error) => Some(error),
-            Self::Json(error) => Some(error),
-            Self::Api(error) => Some(error),
-            _ => None,
-        }
-    }
-}
-
-impl From<io::Error> for Error {
-    fn from(error: io::Error) -> Self {
-        Self::Io(error)
-    }
 }
 
 #[derive(Serialize)]
@@ -389,6 +352,8 @@ mod tests {
         let line = br#"{"id":"x","error":{"code":"not_found","message":"pane not found"}}
 "#;
         let error = read_response::<Value, _>(&mut &line[..], "x").expect_err("error response");
+        assert_eq!(error.to_string(), "not_found: pane not found");
+        assert!(std::error::Error::source(&error).unwrap().is::<ApiError>());
         match error {
             Error::Api(error) => assert_eq!(error.code, "not_found"),
             other => panic!("unexpected error: {other}"),

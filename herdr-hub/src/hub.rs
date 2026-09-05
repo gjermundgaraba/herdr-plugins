@@ -497,16 +497,9 @@ impl Core {
     }
 
     fn fail_remote_calls(&mut self, host: &str, error: &str) -> Vec<RemoteReply> {
-        let tokens = self
-            .pending_remote
-            .iter()
-            .filter(|(_, pending)| pending.host == host)
-            .map(|(token, _)| *token)
-            .collect::<Vec<_>>();
-        tokens
-            .into_iter()
-            .filter_map(|token| self.pending_remote.remove(&token))
-            .map(|pending| RemoteReply {
+        self.pending_remote
+            .extract_if(|_, pending| pending.host == host)
+            .map(|(_, pending)| RemoteReply {
                 stream: pending.stream,
                 id: pending.id,
                 result: Err(error.into()),
@@ -878,6 +871,30 @@ mod tests {
         assert!(core.model.get().hosts.iter().any(|host| {
             host.key == "workbox" && !host.connected && host.error.as_deref() == Some("ssh lost")
         }));
+    }
+
+    #[test]
+    fn failing_remote_calls_removes_all_calls_for_only_that_host() {
+        let (tx, _rx) = mpsc::sync_channel(64);
+        let mut core = Core::new(tx);
+        for (host, id) in [("workbox", 1), ("other", 2), ("workbox", 3)] {
+            let (stream, _peer) = UnixStream::pair().unwrap();
+            core.track_remote_call(host.into(), 1, stream, id);
+        }
+
+        let mut replies = core.fail_remote_calls("workbox", "ssh lost");
+        replies.sort_by_key(|reply| reply.id);
+        assert_eq!(
+            replies
+                .iter()
+                .map(|reply| (reply.id, reply.result.clone()))
+                .collect::<Vec<_>>(),
+            vec![(1, Err("ssh lost".into())), (3, Err("ssh lost".into()))]
+        );
+        assert_eq!(core.pending_remote.len(), 1);
+        let remaining = core.pending_remote.values().next().unwrap();
+        assert_eq!(remaining.host, "other");
+        assert_eq!(remaining.id, 2);
     }
 
     #[test]

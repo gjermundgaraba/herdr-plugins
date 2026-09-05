@@ -136,22 +136,13 @@ fn socket_path_bytes(path: &Path) -> Vec<u8> {
         .collect()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PluginEnvironmentError {
+    #[error("plugin must run under Herdr (HERDR_ENV=1)")]
     NotInHerdr,
+    #[error("{0} is not set")]
     Missing(&'static str),
 }
-
-impl fmt::Display for PluginEnvironmentError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotInHerdr => f.write_str("plugin must run under Herdr (HERDR_ENV=1)"),
-            Self::Missing(variable) => write!(f, "{variable} is not set"),
-        }
-    }
-}
-
-impl std::error::Error for PluginEnvironmentError {}
 
 fn required<'a, T>(
     value: &'a Option<T>,
@@ -227,26 +218,11 @@ fn make_private(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("{variable} contains invalid JSON: {source}")]
 pub struct EnvironmentError {
     pub variable: &'static str,
     pub source: serde_json::Error,
-}
-
-impl fmt::Display for EnvironmentError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{} contains invalid JSON: {}",
-            self.variable, self.source
-        )
-    }
-}
-
-impl std::error::Error for EnvironmentError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
 }
 
 fn string_var(name: &str) -> Option<String> {

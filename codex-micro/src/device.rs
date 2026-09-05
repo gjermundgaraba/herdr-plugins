@@ -584,13 +584,11 @@ impl Owner {
             }
         }
         let now = Instant::now();
-        let expired: Vec<_> = self
+        for (id, pending) in self
             .pending
-            .iter()
-            .filter_map(|(&id, pending)| (pending.deadline <= now).then_some(id))
-            .collect();
-        for id in expired {
-            self.fail_pending(id, format!("request {id} timed out"));
+            .extract_if(|_, pending| pending.deadline <= now)
+        {
+            let _ = pending.reply.send(Err(format!("request {id} timed out")));
         }
         write_status
     }

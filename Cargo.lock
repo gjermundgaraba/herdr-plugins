@@ -307,6 +307,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "thiserror",
  "toml",
 ]
 
@@ -360,6 +361,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "thiserror",
 ]
 
 [[package]]
