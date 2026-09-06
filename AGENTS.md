@@ -2,7 +2,7 @@
 
 This is a repo with herdr plugins.
 
-Before working on these plugins, read the [Herdr agent guide](https://herdr.dev/agent-guide.md).
+For changes to plugin manifests, actions, or Herdr APIs, consult the relevant sections of the [Herdr agent guide](https://herdr.dev/agent-guide.md).
 
 ## general instructions
 

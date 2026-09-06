@@ -134,10 +134,16 @@ fn get_agent(call: &Caller<'_>, pane_id: &str) -> Result<AgentInfo> {
 fn revalidate_binding(
     call: &Caller<'_>,
     target: &Option<(String, String, Option<String>)>,
-) -> Option<AgentInfo> {
-    let (_, pane_id, _) = target.as_ref()?;
-    let agent = get_agent(call, pane_id).ok()?;
-    (agent.focused && agent_identity(Some(&agent)).as_ref() == target.as_ref()).then_some(agent)
+) -> Result<Option<AgentInfo>> {
+    let Some((_, pane_id, _)) = target.as_ref() else {
+        return Ok(None);
+    };
+    let agent = get_agent(call, pane_id)
+        .with_context(|| format!("agent.get failed while revalidating pane {pane_id}"))?;
+    Ok(
+        (agent.focused && agent_identity(Some(&agent)).as_ref() == target.as_ref())
+            .then_some(agent),
+    )
 }
 
 fn script_command(
@@ -291,7 +297,9 @@ fn execute_work(
             log(format!("{source}: focused {}/{pane_id}", session.name));
         }
         WorkKind::Binding { binding, target } => {
-            let Some(current) = revalidate_binding(call, &target) else {
+            let Some(current) = revalidate_binding(call, &target)
+                .with_context(|| format!("{source}: binding revalidation in {}", session.name))?
+            else {
                 log(format!("{source} ignored: focused pane changed"));
                 return Ok(());
             };
@@ -745,18 +753,39 @@ printf '%s\n' --call "$@" >> "$HERDR_TEST_LOG"
         };
 
         assert_eq!(
-            revalidate_binding(&caller, &target).map(|agent| agent.pane_id),
+            revalidate_binding(&caller, &target)
+                .unwrap()
+                .map(|agent| agent.pane_id),
             Some("pane".into())
         );
         reply.borrow_mut().focused = false;
-        assert!(revalidate_binding(&caller, &target).is_none());
+        assert!(revalidate_binding(&caller, &target).unwrap().is_none());
         reply.borrow_mut().focused = true;
         reply.borrow_mut().terminal_id = "replacement".into();
-        assert!(revalidate_binding(&caller, &target).is_none());
+        assert!(revalidate_binding(&caller, &target).unwrap().is_none());
         assert_eq!(
             calls.borrow()[0],
             ("agent.get".into(), json!({"target":"pane"}))
         );
+    }
+
+    #[test]
+    fn binding_revalidation_preserves_rpc_errors() {
+        let expected = agent("terminal", "pane", "codex");
+        let target = agent_identity(Some(&expected));
+        let caller = |method: &str, params: Value| -> Result<Value> {
+            assert_eq!(method, "agent.get");
+            assert_eq!(params, json!({"target":"pane"}));
+            bail!("Hub request timed out")
+        };
+
+        let error = revalidate_binding(&caller, &target).unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "agent.get failed while revalidating pane pane: Hub request timed out"
+        );
+        // Missing captured focus still rejects the binding without issuing an RPC.
+        assert!(revalidate_binding(&caller, &None).unwrap().is_none());
     }
 
     #[test]
@@ -770,7 +799,7 @@ printf '%s\n' --call "$@" >> "$HERDR_TEST_LOG"
             stopping.store(true, Ordering::Release);
             Ok(json!({"type":"agent_info", "agent": expected}))
         };
-        let current = revalidate_binding(&caller, &target).unwrap();
+        let current = revalidate_binding(&caller, &target).unwrap().unwrap();
         let routing_generation = AtomicU64::new(3);
         let session = session("work");
         let active_route = active_route(&session);

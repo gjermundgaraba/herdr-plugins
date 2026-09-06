@@ -23,12 +23,15 @@ use std::{
 };
 
 use anyhow::{Result, anyhow, bail};
-use objc2_core_foundation::{CFDictionary, CFNumber, CFRunLoop, CFString, kCFRunLoopDefaultMode};
+use objc2_core_foundation::{
+    CFDictionary, CFNumber, CFRetained, CFRunLoop, CFRunLoopSource, CFRunLoopSourceContext,
+    CFString, kCFRunLoopDefaultMode,
+};
 use objc2_io_kit::{
     IOHIDAccessType, IOHIDCheckAccess, IOHIDDevice, IOHIDManager, IOHIDReportType,
     IOHIDRequestAccess, IOHIDRequestType, IOOptionBits, IOReturn, kIOHIDLocationIDKey,
     kIOHIDProductIDKey, kIOHIDSerialNumberKey, kIOHIDTransportKey, kIOHIDVendorIDKey,
-    kIOReturnSuccess,
+    kIOReturnNotPermitted, kIOReturnSuccess,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -133,8 +136,68 @@ struct Pending {
     reply: SyncSender<std::result::Result<Value, String>>,
 }
 
+/// A version-zero source makes channel notifications survive the race between
+/// checking a channel and entering the run loop. Wake-up alone does not do that.
+struct RunLoopWake {
+    run_loop: CFRetained<CFRunLoop>,
+    source: CFRetained<CFRunLoopSource>,
+}
+
+// SAFETY: CoreFoundation supports signaling sources and waking run loops from
+// other threads. Both objects are retained and the source has no context data.
+// Registration and invalidation remain on the owner thread.
+unsafe impl Send for RunLoopWake {}
+unsafe impl Sync for RunLoopWake {}
+
+impl RunLoopWake {
+    fn new() -> Result<Arc<Self>> {
+        let run_loop =
+            CFRunLoop::current().ok_or_else(|| anyhow!("no Core Foundation run loop"))?;
+        let mut context = CFRunLoopSourceContext {
+            version: 0,
+            info: std::ptr::null_mut(),
+            retain: None,
+            release: None,
+            copyDescription: None,
+            equal: None,
+            hash: None,
+            schedule: None,
+            cancel: None,
+            perform: Some(channel_wake_callback),
+        };
+        // SAFETY: CF copies this version-zero context; its callback accesses no
+        // borrowed data. A null allocator selects the default CF allocator.
+        let source = unsafe { CFRunLoopSource::new(None, 0, &mut context) }
+            .ok_or_else(|| anyhow!("could not create HID owner wake source"))?;
+        // SAFETY: CoreFoundation supplies this mode for the process lifetime.
+        run_loop.add_source(Some(&source), unsafe { kCFRunLoopDefaultMode });
+        Ok(Arc::new(Self { run_loop, source }))
+    }
+
+    fn notify(&self) {
+        self.source.signal();
+        self.run_loop.wake_up();
+    }
+}
+
+// The channels own their payloads. Handling this source simply returns control
+// from run_in_mode(return_after_source_handled=true) so the owner drains them.
+unsafe extern "C-unwind" fn channel_wake_callback(_context: *mut c_void) {}
+
+struct RunLoopWakeRegistration(Arc<RunLoopWake>);
+
+impl Drop for RunLoopWakeRegistration {
+    fn drop(&mut self) {
+        // Invalidating removes the source from its run loop even on an open
+        // failure or panic. Late writer notifications retain inert CF objects,
+        // never a pointer into the dropped owner or its callback context.
+        self.0.source.invalidate();
+    }
+}
+
 pub struct MicroDevice {
     command_tx: Sender<Command>,
+    wake: Arc<OnceLock<Arc<RunLoopWake>>>,
     next_request_id: AtomicU64,
     closed: Arc<AtomicBool>,
     terminal_error: Arc<OnceLock<String>>,
@@ -152,6 +215,8 @@ impl MicroDevice {
         let lock = DeviceLock::acquire()?;
         let (command_tx, command_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let wake = Arc::new(OnceLock::new());
+        let owner_wake = Arc::clone(&wake);
         let closed = Arc::new(AtomicBool::new(false));
         let terminal_error = Arc::new(OnceLock::new());
         let owner_closed = Arc::clone(&closed);
@@ -170,6 +235,7 @@ impl MicroDevice {
                         ready_tx,
                         owner_closed,
                         owner_terminal_error,
+                        owner_wake,
                     )
                 }));
                 let result = match result {
@@ -191,6 +257,7 @@ impl MicroDevice {
             Ok(Ok(info)) => Ok((
                 Self {
                     command_tx,
+                    wake,
                     next_request_id: AtomicU64::new(1),
                     closed,
                     terminal_error,
@@ -205,6 +272,9 @@ impl MicroDevice {
             }
             Err(_) => {
                 let _ = command_tx.send(Command::Close);
+                if let Some(wake) = wake.get() {
+                    wake.notify();
+                }
                 let _ = owner.join();
                 Err(anyhow!("Codex Micro not found or unavailable"))
             }
@@ -223,6 +293,7 @@ impl MicroDevice {
                 reply: reply_tx,
             })
             .map_err(|_| self.disconnected_error())?;
+        self.notify_owner();
         await_reply(
             reply_rx,
             DEFAULT_REQUEST_TIMEOUT + RESPONSE_SLACK,
@@ -245,6 +316,7 @@ impl MicroDevice {
                 reply: reply_tx,
             })
             .map_err(|_| self.disconnected_error())?;
+        self.notify_owner();
         await_reply(
             reply_rx,
             DEFAULT_REQUEST_TIMEOUT + RESPONSE_SLACK,
@@ -256,6 +328,7 @@ impl MicroDevice {
     pub fn close(&mut self) -> Result<()> {
         if !self.closed.swap(true, Ordering::AcqRel) {
             let _ = self.command_tx.send(Command::Close);
+            self.notify_owner();
         }
         let joined = match self.owner.take().map(JoinHandle::join) {
             Some(Ok(result)) => result,
@@ -271,6 +344,12 @@ impl MicroDevice {
             return Err(self.disconnected_error());
         }
         Ok(())
+    }
+
+    fn notify_owner(&self) {
+        if let Some(wake) = self.wake.get() {
+            wake.notify();
+        }
     }
 
     fn disconnected_error(&self) -> anyhow::Error {
@@ -351,13 +430,18 @@ fn owner_main(
     ready_tx: SyncSender<std::result::Result<DeviceInfo, String>>,
     closed: Arc<AtomicBool>,
     terminal_error: Arc<OnceLock<String>>,
+    shared_wake: Arc<OnceLock<Arc<RunLoopWake>>>,
 ) -> Result<()> {
     let result = (|| {
+        let wake = RunLoopWake::new()?;
+        let _registration = RunLoopWakeRegistration(Arc::clone(&wake));
+        let _ = shared_wake.set(Arc::clone(&wake));
         let (mut owner, info) = Owner::open(
             Arc::new(Mutex::new(command_rx)),
             event_tx,
             closed,
             terminal_error,
+            wake,
         )?;
         if ready_tx.send(Ok(info)).is_err() {
             owner.teardown(true);
@@ -398,6 +482,7 @@ impl Owner {
         event_tx: Sender<DeviceEvent>,
         closed: Arc<AtomicBool>,
         terminal_error: Arc<OnceLock<String>>,
+        wake: Arc<RunLoopWake>,
     ) -> Result<(Self, DeviceInfo)> {
         let manager = IOHIDManager::new(None, 0 as IOOptionBits);
         let vendor_key = cf_string(kIOHIDVendorIDKey);
@@ -411,8 +496,9 @@ impl Owner {
         // SAFETY: Both keys and values are the documented IOKit CF types and
         // `matching` remains retained until IOKit has copied its criteria.
         unsafe { manager.set_device_matching(Some(matching.as_opaque())) };
-        if manager.open(0) != kIOReturnSuccess {
-            bail!("Codex Micro not found or unavailable")
+        let status = manager.open(0);
+        if status != kIOReturnSuccess {
+            bail!(hid_error("IOHIDManagerOpen", status))
         }
 
         let candidates = choose_devices(&manager)?;
@@ -425,6 +511,7 @@ impl Owner {
                 event_tx.clone(),
                 Arc::clone(&closed),
                 Arc::clone(&terminal_error),
+                Arc::clone(&wake),
             ) {
                 Ok(mut owner) => match owner.handshake() {
                     Ok(info) => {
@@ -451,6 +538,7 @@ impl Owner {
         event_tx: Sender<DeviceEvent>,
         closed: Arc<AtomicBool>,
         terminal_error: Arc<OnceLock<String>>,
+        wake: Arc<RunLoopWake>,
     ) -> Result<Self> {
         let DeviceCandidate {
             device, transport, ..
@@ -460,8 +548,9 @@ impl Owner {
         // kCFRunLoopDefaultMode is supplied by CoreFoundation for the process lifetime.
         let run_loop_mode = unsafe { kCFRunLoopDefaultMode }
             .ok_or_else(|| anyhow!("no Core Foundation default run loop mode"))?;
-        if device.open(0) != kIOReturnSuccess {
-            bail!("Codex Micro is unavailable")
+        let status = device.open(0);
+        if status != kIOReturnSuccess {
+            bail!(hid_error("IOHIDDeviceOpen", status))
         }
         let (callback_tx, callback_rx) = mpsc::channel();
         let (writer_tx, writer_rx) = mpsc::channel();
@@ -469,7 +558,7 @@ impl Owner {
         let writer_callback_tx = callback_tx.clone();
         thread::Builder::new()
             .name("codex-micro-hid-writer".into())
-            .spawn(move || writer_main(writer_device, writer_rx, writer_callback_tx))?;
+            .spawn(move || writer_main(writer_device, writer_rx, writer_callback_tx, wake))?;
         let context = Box::new(CallbackContext { callback_tx });
         let mut input_buffer = Box::new([0; REPORT_SIZE]);
         let buffer = NonNull::from(input_buffer.as_mut()).cast::<u8>();
@@ -526,7 +615,9 @@ impl Owner {
 
     fn run(&mut self) -> Result<()> {
         loop {
-            self.pump();
+            // Drain ready callbacks without sleeping before already-queued
+            // commands: source signals can coalesce several commands into one.
+            self.pump_for(Duration::ZERO);
             if self.closed.load(Ordering::Acquire) {
                 break;
             }
@@ -558,7 +649,7 @@ impl Owner {
                 }) => {
                     let _ = self.start_request(id, method, params, deadline, reply);
                 }
-                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Empty) => self.pump(),
             }
         }
         let terminal_error = self.terminal_error.get().cloned();
@@ -567,12 +658,15 @@ impl Owner {
     }
 
     fn pump(&mut self) {
-        // Running a short turn lets CoreFoundation dispatch HID callbacks while
-        // still giving channel commands and request timeouts predictable latency.
+        // HID callbacks and channel notifications interrupt this bounded wait.
         let _ = self.pump_for(Duration::from_millis(10));
     }
 
     fn pump_for(&mut self, duration: Duration) -> Option<IOReturn> {
+        let now = Instant::now();
+        let duration = self.pending.values().fold(duration, |duration, pending| {
+            duration.min(pending.deadline.saturating_duration_since(now))
+        });
         let _ = CFRunLoop::run_in_mode(Some(self.run_loop_mode), duration.as_secs_f64(), true);
         let mut write_status = None;
         while let Ok(event) = self.callback_rx.try_recv() {
@@ -644,7 +738,7 @@ impl Owner {
                     self.disconnect(error.into());
                     bail!(error)
                 };
-                if let Some(status) = self.pump_for(remaining.min(Duration::from_millis(10))) {
+                if let Some(status) = self.pump_for(remaining) {
                     break status;
                 }
                 if self.closed.load(Ordering::Acquire) {
@@ -665,7 +759,7 @@ impl Owner {
                 )
             }
             if status != kIOReturnSuccess {
-                let error = format!("IOHIDDeviceSetReport failed: 0x{:08X}", status as u32);
+                let error = hid_error("IOHIDDeviceSetReport", status);
                 self.disconnect(error.clone());
                 bail!(error)
             }
@@ -787,10 +881,9 @@ unsafe extern "C-unwind" fn input_report_callback(
     // SAFETY: IOKit keeps the registered context alive for this callback.
     let context = unsafe { &*(context.cast::<CallbackContext>()) };
     if result != kIOReturnSuccess {
-        let _ = context.callback_tx.send(CallbackEvent::Failed(format!(
-            "input report failed: 0x{:08X}",
-            result as u32
-        )));
+        let _ = context
+            .callback_tx
+            .send(CallbackEvent::Failed(hid_error("input report", result)));
         return;
     }
     if report_type != IOHIDReportType::Input || report_id != REPORT_ID as u32 || length <= 0 {
@@ -822,7 +915,12 @@ struct WriterDevice(objc2_core_foundation::CFRetained<IOHIDDevice>);
 // described above.
 unsafe impl Send for WriterDevice {}
 
-fn writer_main(device: WriterDevice, jobs: Receiver<Vec<u8>>, callback_tx: Sender<CallbackEvent>) {
+fn writer_main(
+    device: WriterDevice,
+    jobs: Receiver<Vec<u8>>,
+    callback_tx: Sender<CallbackEvent>,
+    wake: Arc<RunLoopWake>,
+) {
     while let Ok(wire) = jobs.recv() {
         let pointer = NonNull::from(wire.as_slice()).cast::<u8>();
         // SAFETY: `wire` outlives this synchronous call and its length is exact.
@@ -840,6 +938,18 @@ fn writer_main(device: WriterDevice, jobs: Receiver<Vec<u8>>, callback_tx: Sende
         {
             return;
         }
+        wake.notify();
+    }
+}
+
+fn hid_error(operation: &str, status: IOReturn) -> String {
+    if status as u32 == kIOReturnNotPermitted {
+        format!(
+            "{operation} failed: keyboard access denied by macOS (Secure Input or console access restrictions may be active): 0x{:08X}",
+            status as u32
+        )
+    } else {
+        format!("{operation} failed: 0x{:08X}", status as u32)
     }
 }
 
@@ -995,6 +1105,41 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn channel_wake_survives_notification_before_run_loop_waits() {
+        let wake = RunLoopWake::new().unwrap();
+        let registration = RunLoopWakeRegistration(Arc::clone(&wake));
+        wake.notify();
+        assert_eq!(
+            CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, 1.0, true),
+            objc2_core_foundation::CFRunLoopRunResult::HandledSource
+        );
+        // The notification is consumed once, so it cannot cause a busy loop.
+        assert_eq!(
+            CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, 0.0, true),
+            objc2_core_foundation::CFRunLoopRunResult::TimedOut
+        );
+        drop(registration);
+        assert!(!wake.source.is_valid());
+        // A writer can finish after owner teardown, with its own retain.
+        thread::spawn(move || wake.notify()).join().unwrap();
+    }
+
+    #[test]
+    fn channel_wake_interrupts_run_loop_from_another_thread() {
+        let wake = RunLoopWake::new().unwrap();
+        let _registration = RunLoopWakeRegistration(Arc::clone(&wake));
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            wake.notify();
+        });
+        assert_eq!(
+            CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, 2.0, true),
+            objc2_core_foundation::CFRunLoopRunResult::HandledSource
+        );
+        writer.join().unwrap();
+    }
+
+    #[test]
     fn usb_omits_only_the_report_id() {
         let mut report = [0; REPORT_SIZE];
         report[0] = REPORT_ID;
@@ -1066,6 +1211,7 @@ mod tests {
         let owner_joined = Arc::clone(&joined);
         let mut device = MicroDevice {
             command_tx,
+            wake: Arc::new(OnceLock::new()),
             next_request_id: AtomicU64::new(1),
             closed: Arc::new(AtomicBool::new(true)),
             terminal_error: Arc::new(OnceLock::new()),

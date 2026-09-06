@@ -1,33 +1,25 @@
 //! Bridge state and its reconciliation with the hub's active session and the
 //! HID device.
 
-use anyhow::Result;
 use codex_micro::{
-    DeviceEvent, ExternalOwner, external_owner,
-    service::{Client as DeviceClient, Lighting, ServiceStatus},
+    ExternalOwner, external_owner,
+    service::{Lighting, ServiceStatus},
 };
 use herdr_hub_client::{AgentInfo, HubClient, Model, ServerMessage, SessionState};
 use serde_json::{Value, json};
-use std::{
-    collections::HashSet,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::Sender,
-    },
-    time::{Duration, Instant},
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use crate::{
-    actions::{HERDR_LAYER, layer_identity},
+    actions::HERDR_LAYER,
     config::{Config, Controls, enabled_buttons},
     hub::{self, Session},
     protocol::{SLOT_COUNT, aggregate_lighting, assign_slots, slot_lighting},
 };
 
-use super::{DAEMON_PROTOCOL_VERSION, dispatch::agent_identity, log, log_changed};
-
-const DEVICE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+use super::{DAEMON_PROTOCOL_VERSION, device, dispatch::agent_identity, log, log_changed};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct ActiveRoute {
@@ -48,11 +40,6 @@ pub(super) struct State {
     pub(super) last_device_error: String,
     pub(super) last_herdr_error: String,
     pub(super) last_controls_error: String,
-    pub(super) last_lighting_error: String,
-    pub(super) last_lighting: String,
-    pub(super) last_sent_layer: Option<usize>,
-    pub(super) managed_aggregate_zones: HashSet<String>,
-    pub(super) next_device_open: Option<Instant>,
 }
 
 impl State {
@@ -71,11 +58,6 @@ impl State {
             last_device_error: String::new(),
             last_herdr_error: String::new(),
             last_controls_error: String::new(),
-            last_lighting_error: String::new(),
-            last_lighting: String::new(),
-            last_sent_layer: None,
-            managed_aggregate_zones: HashSet::new(),
-            next_device_open: None,
         }
     }
 
@@ -150,17 +132,7 @@ impl InputContext {
     }
 }
 
-fn device_failure(state: &mut State, context: &str, error: String) {
-    state.device_state = "unavailable".into();
-    log_changed(&mut state.last_device_error, error, &format!("{context}: "));
-}
-
-fn device_disconnected(state: &mut State, error: String) {
-    device_failure(state, "device disconnected", error);
-    state.next_device_open = Some(Instant::now());
-}
-
-fn apply_service_status(state: &mut State, status: &ServiceStatus) -> bool {
+pub(super) fn apply_service_status(state: &mut State, status: &ServiceStatus) -> bool {
     let next_state = if status.device.is_some() {
         "connected"
     } else {
@@ -173,87 +145,18 @@ fn apply_service_status(state: &mut State, status: &ServiceStatus) -> bool {
     changed
 }
 
-pub(super) fn refresh_device_status(device: &DeviceClient, state: &mut State) -> bool {
-    match device.status() {
-        Ok(status) => {
-            let changed = apply_service_status(state, &status);
-            if changed && let Some(error) = status.last_error {
-                log(format!("device unavailable: {error}"));
-            }
-            changed
-        }
-        Err(error) => {
-            let previous_state = state.device_state.clone();
-            let previous_error = state.last_device_error.clone();
-            device_failure(state, "device status failed", error.to_string());
-            state.device_state != previous_state || state.last_device_error != previous_error
-        }
+/// Compute desired output from light-affecting state only. The device worker
+/// compares this value, so title, token, and revision changes never resend LEDs.
+pub(super) fn device_output(state: &State) -> device::Output {
+    device::Output {
+        layer: state.active_layer,
+        lighting: Lighting {
+            slots: slot_lighting(&state.slots, &state.agents, &state.config.lighting),
+            aggregate: aggregate_lighting(&state.slots, &state.agents, &state.config.lighting)
+                .into_iter()
+                .collect(),
+        },
     }
-}
-
-pub(super) fn send_lighting(device: &DeviceClient, state: &mut State) -> Result<()> {
-    let slots = slot_lighting(&state.slots, &state.agents, &state.config.lighting);
-    let mut aggregate = aggregate_lighting(&state.slots, &state.agents, &state.config.lighting);
-    let next_zones: HashSet<_> = aggregate.keys().cloned().collect();
-    for zone in &state.managed_aggregate_zones {
-        if !next_zones.contains(zone) {
-            aggregate.insert(zone.clone(), crate::config::Light::default());
-        }
-    }
-    let lighting = Lighting {
-        aggregate: aggregate.into_iter().collect(),
-        slots,
-    };
-    let signature = serde_json::to_string(&lighting)?;
-    if signature == state.last_lighting {
-        return Ok(());
-    }
-    device.set_lighting(lighting)?;
-    state.managed_aggregate_zones = next_zones;
-    state.last_lighting = signature;
-    Ok(())
-}
-
-pub(super) fn shutdown_device(device: &mut Option<DeviceClient>, state: &mut State) {
-    let Some(mut client) = device.take() else {
-        return;
-    };
-    // Cache blank lighting before close leaves the standalone service running.
-    if let Err(error) = client.set_lighting(Lighting {
-        aggregate: state
-            .managed_aggregate_zones
-            .iter()
-            .map(|zone| (zone.clone(), crate::config::Light::default()))
-            .collect(),
-        ..Lighting::default()
-    }) {
-        log(format!("device lighting blank failed: {error:#}"));
-    }
-    if let Err(error) = client.set_focused_app(layer_identity(1)) {
-        log(format!("safe layer selection failed: {error:#}"));
-    }
-    if let Err(error) = client.close() {
-        log(format!("device service client close failed: {error:#}"));
-    }
-    state.last_sent_layer = None;
-    state.last_lighting.clear();
-    state.managed_aggregate_zones.clear();
-}
-
-fn select_layer(
-    device: Option<&DeviceClient>,
-    state: &mut State,
-    layer: Option<usize>,
-) -> Result<()> {
-    let Some(layer) = layer else { return Ok(()) };
-    state.active_layer = Some(layer);
-    let Some(device) = device else { return Ok(()) };
-    if state.last_sent_layer != Some(layer) {
-        device.set_focused_app(layer_identity(layer))?;
-        state.last_sent_layer = Some(layer);
-        log(format!("layer {layer} selected"));
-    }
-    Ok(())
 }
 
 fn empty_model() -> Model {
@@ -294,64 +197,25 @@ fn sync_active_route(state: &State) {
         .unwrap_or_else(|error| error.into_inner()) = active_route(&state.model);
 }
 
-fn clear_agents(state: &mut State) -> bool {
-    let changed = !state.agents.is_empty() || state.slots.iter().any(Option::is_some);
-    state.agents.clear();
-    state.slots.fill(None);
-    changed
-}
-
-pub(super) fn reconcile_active(
-    state: &mut State,
-    device: Option<&DeviceClient>,
-    stopping: &AtomicBool,
-) -> Result<()> {
+pub(super) fn reconcile_active(state: &mut State, stopping: &AtomicBool) {
     let Some(session) = active_session(&state.model) else {
         state.revoke_routing();
-        if clear_agents(state) {
-            state.last_lighting.clear();
-            if !stopping.load(Ordering::Acquire)
-                && let Some(device) = device
-            {
-                send_lighting(device, state)?;
-            }
-        }
-        return Ok(());
+        state.agents.clear();
+        state.slots.fill(None);
+        return;
     };
 
-    let agents = session.agents.clone();
-    let slots = assign_slots(&state.slots, &agents);
-    let lighting_changed = state.agents != agents || state.slots != slots;
-    state.agents = agents;
-    state.slots = slots;
-
+    state.slots = assign_slots(&state.slots, &session.agents);
+    state.agents.clone_from(&session.agents);
     if state.owner.is_some() || stopping.load(Ordering::Acquire) {
         state.revoke_routing();
     } else {
-        select_layer(device, state, Some(HERDR_LAYER))?;
-        if stopping.load(Ordering::Acquire) {
-            state.revoke_routing();
-        } else {
-            state.routing_ready = true;
-        }
+        state.active_layer = Some(HERDR_LAYER);
+        state.routing_ready = true;
     }
-    if lighting_changed {
-        state.last_lighting.clear();
-        if !stopping.load(Ordering::Acquire)
-            && let Some(device) = device
-        {
-            send_lighting(device, state)?;
-        }
-    }
-    Ok(())
 }
 
-pub(super) fn apply_hub_update(
-    state: &mut State,
-    update: hub::Update,
-    device: Option<&DeviceClient>,
-    stopping: &AtomicBool,
-) -> Result<()> {
+pub(super) fn apply_hub_update(state: &mut State, update: hub::Update, stopping: &AtomicBool) {
     let published_route = Arc::clone(&state.active_route);
     let mut published_route = published_route
         .lock()
@@ -387,7 +251,7 @@ pub(super) fn apply_hub_update(
     if connected {
         state.last_herdr_error.clear();
     }
-    reconcile_active(state, device, stopping)
+    reconcile_active(state, stopping)
 }
 
 pub(super) fn refresh_owner(state: &mut State) -> bool {
@@ -399,74 +263,11 @@ pub(super) fn refresh_owner(state: &mut State) -> bool {
             state.revoke_routing();
         } else {
             log("device owner cleared");
-            state.next_device_open = None;
         }
         true
     } else {
         false
     }
-}
-
-pub(super) fn open_device(
-    device: &mut Option<DeviceClient>,
-    event_tx: &Sender<DeviceEvent>,
-    state: &mut State,
-    stopping: &AtomicBool,
-) -> Result<bool> {
-    if stopping.load(Ordering::Acquire)
-        || state.owner.is_some()
-        || device.is_some()
-        || state
-            .next_device_open
-            .is_some_and(|deadline| Instant::now() < deadline)
-    {
-        return Ok(false);
-    }
-    state.next_device_open = None;
-    let opened =
-        DeviceClient::connect(event_tx.clone()).and_then(|mut client| match client.acquire() {
-            Ok(info) => Ok((client, info)),
-            Err(error) => {
-                let _ = client.close();
-                Err(error)
-            }
-        });
-    match opened {
-        Ok((mut opened, info)) => {
-            // A stop during connect/acquire would only make the fresh device
-            // more shutdown work; release it instead of replaying state.
-            if stopping.load(Ordering::Acquire) {
-                let _ = opened.close();
-                return Ok(false);
-            }
-            *device = Some(opened);
-            state.device_state = "connected".into();
-            state.last_device_error.clear();
-            state.last_lighting.clear();
-            state.last_sent_layer = None;
-            log(format!(
-                "device connected: transport={:?}, firmware={}",
-                info.transport, info.firmware
-            ));
-            select_layer(device.as_ref(), state, state.active_layer)?;
-            if !stopping.load(Ordering::Acquire)
-                && let Some(device) = device.as_ref()
-            {
-                send_lighting(device, state)?;
-            }
-        }
-        Err(error) => {
-            state.next_device_open = Some(Instant::now() + DEVICE_RETRY_INTERVAL);
-            let message = error.to_string();
-            state.device_state = "unavailable".into();
-            log_changed(
-                &mut state.last_device_error,
-                message,
-                "device open failed: ",
-            );
-        }
-    }
-    Ok(true)
 }
 
 pub(super) fn publish(status: &Arc<Mutex<Value>>, state: &State) {
@@ -503,22 +304,10 @@ pub(super) fn update_input_context(context: &Mutex<Arc<InputContext>>, state: &S
     });
 }
 
-pub(super) fn handle_input_disconnect(
-    state: &mut State,
-    device: &mut Option<DeviceClient>,
-    error: String,
-) -> bool {
-    if device.is_none() {
-        return false;
-    }
-    device_disconnected(state, error);
+pub(super) fn handle_input_disconnect(state: &mut State, error: String) {
+    state.device_state = "unavailable".into();
+    log_changed(&mut state.last_device_error, error, "device disconnected: ");
     state.revoke_routing();
-    state.last_lighting.clear();
-    state.last_sent_layer = None;
-    if let Some(mut client) = device.take() {
-        let _ = client.close();
-    }
-    true
 }
 
 pub(super) fn apply_config_load(
@@ -540,7 +329,6 @@ pub(super) fn apply_config_load(
             let config_changed = state.config != next;
             if config_changed {
                 state.config = next;
-                state.last_lighting.clear();
             }
             config_changed
         }
@@ -618,7 +406,7 @@ mod tests {
         let stopping = AtomicBool::new(false);
         let mut active = model(vec![agent("terminal", "pane", "codex")]);
         active.sessions[0].client_focused = None;
-        apply_hub_update(&mut state, hello(active), None, &stopping).unwrap();
+        apply_hub_update(&mut state, hello(active), &stopping);
         assert!(state.routing_ready);
         assert_eq!(state.agents.len(), 1);
         assert_eq!(state.slots[0].as_deref(), Some("terminal"));
@@ -636,6 +424,47 @@ mod tests {
     }
 
     #[test]
+    fn title_churn_updates_context_without_changing_lights_or_routing() {
+        let stopping = AtomicBool::new(false);
+        let mut state = State::new(Config::default());
+        let mut current = agent("terminal", "pane", "codex");
+        apply_hub_update(&mut state, hello(model(vec![current.clone()])), &stopping);
+        let output = device_output(&state);
+        let generation = state.routing_generation();
+        let context = Mutex::new(Arc::new(InputContext::new(&state.config)));
+
+        for revision in 2..102 {
+            current.terminal_title = Some(format!("working {revision}"));
+            current.revision = revision;
+            apply_hub_update(
+                &mut state,
+                Ok(ServerMessage::Session {
+                    version: revision,
+                    session: session("local/work", vec![current.clone()]),
+                }),
+                &stopping,
+            );
+            update_input_context(&context, &state);
+            assert_eq!(device_output(&state), output);
+            assert_eq!(state.routing_generation(), generation);
+            assert_eq!(
+                context
+                    .lock()
+                    .unwrap()
+                    .target
+                    .as_ref()
+                    .unwrap()
+                    .terminal_title,
+                current.terminal_title
+            );
+        }
+
+        current.agent_status = "working".into();
+        apply_hub_update(&mut state, hello(model(vec![current])), &stopping);
+        assert_ne!(device_output(&state), output);
+    }
+
+    #[test]
     fn active_and_focused_agent_changes_invalidate_captured_routes() {
         let stopping = AtomicBool::new(false);
         let mut initial = model(vec![agent("work-agent", "work-pane", "codex")]);
@@ -644,7 +473,7 @@ mod tests {
             vec![agent("personal-agent", "personal-pane", "claude")],
         ));
         let mut state = State::new(Config::default());
-        apply_hub_update(&mut state, hello(initial), None, &stopping).unwrap();
+        apply_hub_update(&mut state, hello(initial), &stopping);
         let first_generation = state.routing_generation();
 
         apply_hub_update(
@@ -653,10 +482,8 @@ mod tests {
                 version: 5,
                 key: Some("local/personal".into()),
             }),
-            None,
             &stopping,
-        )
-        .unwrap();
+        );
         assert!(state.routing_ready);
         assert_ne!(state.routing_generation(), first_generation);
         assert_eq!(state.agents[0].pane_id, "personal-pane");
@@ -671,10 +498,8 @@ mod tests {
                     vec![agent("new-agent", "new-pane", "claude")],
                 ),
             }),
-            None,
             &stopping,
-        )
-        .unwrap();
+        );
         assert_ne!(state.routing_generation(), agent_generation);
         assert_eq!(state.agents[0].pane_id, "new-pane");
     }
@@ -686,10 +511,8 @@ mod tests {
         apply_hub_update(
             &mut state,
             hello(model(vec![agent("terminal", "pane", "codex")])),
-            None,
             &stopping,
-        )
-        .unwrap();
+        );
         let ready_generation = state.routing_generation();
 
         let mut disconnected = session("local/work", vec![agent("terminal", "pane", "codex")]);
@@ -700,10 +523,8 @@ mod tests {
                 version: 5,
                 session: disconnected,
             }),
-            None,
             &stopping,
-        )
-        .unwrap();
+        );
         assert!(!state.routing_ready);
         assert!(state.agents.is_empty());
         assert!(state.slots.iter().all(Option::is_none));
@@ -715,10 +536,8 @@ mod tests {
                 version: 6,
                 session: session("local/work", vec![agent("terminal", "pane", "codex")]),
             }),
-            None,
             &stopping,
-        )
-        .unwrap();
+        );
         assert!(state.routing_ready);
         let restored_generation = state.routing_generation();
 
@@ -728,10 +547,8 @@ mod tests {
                 version: 7,
                 key: None,
             }),
-            None,
             &stopping,
-        )
-        .unwrap();
+        );
         assert!(!state.routing_ready);
         assert!(state.agents.is_empty());
         assert_ne!(state.routing_generation(), restored_generation);
@@ -745,13 +562,11 @@ mod tests {
         apply_hub_update(
             &mut state,
             hello(model(vec![agent("terminal", "pane", "codex")])),
-            None,
             &stopping,
-        )
-        .unwrap();
+        );
         let generation = state.routing_generation();
 
-        apply_hub_update(&mut state, Err(HubError::Disconnected), None, &stopping).unwrap();
+        apply_hub_update(&mut state, Err(HubError::Disconnected), &stopping);
 
         assert!(state.model.sessions.is_empty());
         assert!(state.model.active.is_none());
@@ -766,7 +581,7 @@ mod tests {
     fn status_matches_the_control_contract() {
         let mut state = State::new(Config::default());
         let stopping = AtomicBool::new(false);
-        apply_hub_update(&mut state, hello(model(Vec::new())), None, &stopping).unwrap();
+        apply_hub_update(&mut state, hello(model(Vec::new())), &stopping);
         let status = state.status();
         assert_eq!(status["session"], "work");
         assert_eq!(status["routing"], "ready");
@@ -784,24 +599,11 @@ mod tests {
         state.model = model(vec![agent("terminal", "pane", "codex")]);
         sync_active_route(&state);
         state.owner = Some(ExternalOwner::Input);
-        reconcile_active(&mut state, None, &stopping).unwrap();
+        reconcile_active(&mut state, &stopping);
         assert!(!state.routing_ready);
         state.owner = None;
-        reconcile_active(&mut state, None, &stopping).unwrap();
+        reconcile_active(&mut state, &stopping);
         assert!(state.routing_ready);
-    }
-
-    #[test]
-    fn unexpected_disconnect_requests_immediate_service_reconnect() {
-        let mut state = State::new(Config::default());
-        let before = Instant::now();
-        device_disconnected(&mut state, "service lost".into());
-        assert!(
-            state
-                .next_device_open
-                .is_some_and(|deadline| deadline >= before)
-        );
-        assert_eq!(state.last_device_error, "service lost");
     }
 
     #[test]

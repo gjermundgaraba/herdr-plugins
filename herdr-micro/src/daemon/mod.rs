@@ -3,6 +3,7 @@
 //! The event loop and logging live in this module, input dispatch in
 //! `dispatch`, and Herdr/device state reconciliation in `reconcile`.
 
+mod device;
 mod dispatch;
 mod reconcile;
 
@@ -27,43 +28,48 @@ use crate::{
 };
 use dispatch::{action_worker, input_worker};
 use reconcile::{
-    InputContext, State, apply_config_load, apply_hub_update, handle_input_disconnect, open_device,
-    publish, reconcile_active, refresh_device_status, refresh_owner, send_lighting,
-    shutdown_device, update_input_context,
+    InputContext, State, apply_config_load, apply_hub_update, apply_service_status, device_output,
+    handle_input_disconnect, publish, reconcile_active, refresh_owner, update_input_context,
 };
 
 const CONFIG_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const OWNER_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 const WORK_QUEUE_CAPACITY: usize = 16;
-pub const DAEMON_PROTOCOL_VERSION: u32 = 9;
+pub const DAEMON_PROTOCOL_VERSION: u32 = 10;
 
 static LOG_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-pub(super) enum RuntimeEvent {
+enum RuntimeEvent {
     Hub(Box<hub::Update>),
     InputDisconnected(String),
+    Device(device::Update),
 }
 
-fn apply_runtime_event(
-    event: RuntimeEvent,
-    state: &mut State,
-    device: &mut Option<codex_micro::service::Client>,
-    stopping: &AtomicBool,
-) -> bool {
+fn apply_runtime_event(event: RuntimeEvent, state: &mut State, stopping: &AtomicBool) {
     match event {
-        RuntimeEvent::Hub(update) => {
-            if let Err(error) = apply_hub_update(state, *update, device.as_ref(), stopping) {
-                state.revoke_routing();
-                log(format!("Herdr hub update failed: {error:#}"));
-            }
-            true
-        }
+        RuntimeEvent::Hub(update) => apply_hub_update(state, *update, stopping),
         RuntimeEvent::InputDisconnected(error) => {
-            let changed = handle_input_disconnect(state, device, error);
-            if changed && let Err(error) = reconcile_active(state, None, stopping) {
-                log(format!("refresh failed: {error:#}"));
+            handle_input_disconnect(state, error);
+            reconcile_active(state, stopping);
+        }
+        RuntimeEvent::Device(device::Update::Status(status)) => {
+            if apply_service_status(state, &status) {
+                if let Some(error) = &status.last_error {
+                    log(format!("device unavailable: {error}"));
+                } else if let Some(info) = &status.device {
+                    log(format!(
+                        "device connected: transport={:?}, firmware={}",
+                        info.transport, info.firmware
+                    ));
+                }
             }
-            changed
+        }
+        RuntimeEvent::Device(device::Update::Error(error)) => {
+            log_changed(
+                &mut state.last_device_error,
+                error,
+                "device update failed: ",
+            );
         }
     }
 }
@@ -142,6 +148,16 @@ pub fn run_daemon() -> Result<()> {
         let runtime_tx = runtime_tx.clone();
         move |update| runtime_tx.send(RuntimeEvent::Hub(Box::new(update))).is_ok()
     });
+    let device = device::Worker::spawn(
+        device_tx.clone(),
+        {
+            let runtime_tx = runtime_tx.clone();
+            move |update| {
+                let _ = runtime_tx.send(RuntimeEvent::Device(update));
+            }
+        },
+        Arc::clone(&stopping),
+    )?;
     let mut state = State::new(config);
     let input_context = Arc::new(Mutex::new(Arc::new(InputContext::new(&state.config))));
     let worker = thread::spawn({
@@ -174,7 +190,6 @@ pub fn run_daemon() -> Result<()> {
         let _ = control_result_tx.send(server.run_with_shutdown(&shutdown_rx));
     });
     let mut control_error = None;
-    let mut device = None;
     let mut config_due = Instant::now();
     let mut owner_due = Instant::now();
     log("bridge started");
@@ -200,89 +215,42 @@ pub fn run_daemon() -> Result<()> {
         if stopping.load(Ordering::Acquire) {
             continue;
         }
-        let mut changed = false;
         let now = Instant::now();
         if now >= owner_due {
             owner_due = now + OWNER_REFRESH_INTERVAL;
-            let owner_changed = refresh_owner(&mut state);
-            changed |= owner_changed;
-            if owner_changed {
-                let input_generation = state.routing_generation();
-                let input_ready = state.routing_ready;
-                if let Err(error) = reconcile_active(&mut state, device.as_ref(), &stopping) {
-                    state.revoke_routing();
-                    changed = true;
-                    log(format!("refresh failed: {error:#}"));
-                }
-                changed |= input_generation != state.routing_generation()
-                    || input_ready != state.routing_ready;
-            }
-            if state.owner.is_none() && !stopping.load(Ordering::Acquire) {
-                match open_device(&mut device, &device_tx, &mut state, &stopping) {
-                    Ok(device_changed) => changed |= device_changed,
-                    Err(error) => {
-                        changed = true;
-                        log(format!("refresh failed: {error:#}"));
-                    }
-                }
-            }
+            refresh_owner(&mut state);
         }
         if now >= config_due {
             config_due = now + CONFIG_REFRESH_INTERVAL;
-            changed |= apply_config_load(&mut state, load(&config_path), startup_enabled_buttons);
-            let input_generation = state.routing_generation();
-            let input_ready = state.routing_ready;
-            if !stopping.load(Ordering::Acquire)
-                && let Err(error) = reconcile_active(&mut state, device.as_ref(), &stopping)
-            {
-                state.revoke_routing();
-                changed = true;
-                log(format!("refresh failed: {error:#}"));
-            }
-            changed |= input_generation != state.routing_generation()
-                || input_ready != state.routing_ready;
-            // A stop between device calls must not start another slow cluster.
-            if !stopping.load(Ordering::Acquire)
-                && let Some(device) = device.as_ref()
-            {
-                changed |= refresh_device_status(device, &mut state);
-                if !stopping.load(Ordering::Acquire) {
-                    match send_lighting(device, &mut state) {
-                        Ok(()) => state.last_lighting_error.clear(),
-                        Err(error) => {
-                            let error = format!("{error:#}");
-                            log_changed(
-                                &mut state.last_lighting_error,
-                                error,
-                                "lighting update failed: ",
-                            );
-                        }
-                    }
-                }
-            }
+            apply_config_load(&mut state, load(&config_path), startup_enabled_buttons);
         }
-        if changed {
-            update_input_context(&input_context, &state);
-            publish(&status, &state);
-        }
+        reconcile_active(&mut state, &stopping);
+        update_input_context(&input_context, &state);
+        publish(&status, &state);
+        device.set_output(device_output(&state));
+
         let deadline = config_due.min(owner_due);
         match runtime_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
             Ok(event) => {
-                if !stopping.load(Ordering::Acquire)
-                    && apply_runtime_event(event, &mut state, &mut device, &stopping)
-                {
-                    update_input_context(&input_context, &state);
-                    publish(&status, &state);
+                // Apply transitions in order so even a focus round-trip revokes
+                // captured actions. Publish only the final output in this batch.
+                // Bound each batch to keep owner/config checks responsive.
+                for event in std::iter::once(event).chain(runtime_rx.try_iter().take(255)) {
+                    if stopping.load(Ordering::Acquire) {
+                        break;
+                    }
+                    apply_runtime_event(event, &mut state, &stopping);
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
+
     log("stopping");
     state.revoke_routing();
     stopping.store(true, Ordering::Release);
-    shutdown_device(&mut device, &mut state);
+    device.shutdown();
     drop(device_tx);
     let _ = input.join();
     publish(&status, &state);
@@ -299,6 +267,21 @@ pub fn run_daemon() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lighting_failure_does_not_revoke_a_herdr_route() {
+        let mut state = State::new(crate::config::Config::default());
+        state.routing_ready = true;
+        let generation = state.routing_generation();
+        apply_runtime_event(
+            RuntimeEvent::Device(device::Update::Error("keyboard access denied".into())),
+            &mut state,
+            &AtomicBool::new(false),
+        );
+        assert!(state.routing_ready);
+        assert_eq!(state.routing_generation(), generation);
+        assert_eq!(state.last_device_error, "keyboard access denied");
+    }
 
     #[test]
     fn timestamps_are_utc_iso_8601() {

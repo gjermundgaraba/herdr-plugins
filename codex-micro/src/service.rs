@@ -170,6 +170,12 @@ pub struct Client {
 }
 
 impl Client {
+    /// Whether the service connection has ended. A physical-device outage does
+    /// not close this connection; the service owns reconnecting the hardware.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
     pub fn connect(event_tx: Sender<DeviceEvent>) -> Result<Self> {
         Self::connect_at(&socket_path(), event_tx)
     }

@@ -82,9 +82,12 @@ device service and must remain `null` in Herdr's `config.json`. On press, the
 service consumes the event and runs Handy's `--toggle-transcription` command
 directly.
 
-This path has no F19 mapping and emits no CGEvent. It therefore remains
-available without a running Herdr session and while Secure Input blocks
-synthetic keyboard events. The other buttons, dial, joystick, gestures,
+This path has no F19 mapping and emits no CGEvent. It remains available
+without a running Herdr session and does not depend on permission to synthesize
+keyboard events. macOS can still temporarily deny access to the physical HID
+keyboard during Secure Input or console ownership changes; this affects every
+device button, including Handy. The service reports the access denial and
+retries automatically. The other buttons, dial, joystick, gestures,
 routing, and lighting policy remain Herdr-side. The stock wide keycap can
 actuate both Button 5 and Button 6, so Button 6 is `null` by default.
 
@@ -92,6 +95,10 @@ actuate both Button 5 and Button 6, so Button 6 is `null` by default.
 
 One hub subscription supplies all session, agent, and active-session changes;
 the bridge does not poll Herdr. Built-in actions use the hub call passthrough.
+Routing updates never wait for device I/O. A separate worker retains only the
+latest desired layer and lighting, compares actual light values, and writes
+only changes. Terminal-title animations and other agent metadata do not resend
+lights. Device errors are reported separately from Herdr routing failures.
 Before a queued binding runs, its captured session key must still match the
 hub's current active route, and `agent.get` must return the captured terminal,
 pane, and agent identity with
