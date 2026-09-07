@@ -1,114 +1,80 @@
-import { afterEach, beforeEach, expect, mock, spyOn, test } from 'bun:test'
-import type { PluginAPI } from '@ampcode/plugin'
+import { afterEach, beforeEach, expect, mock, test } from 'bun:test'
+import type { PluginAPI, PluginCommandContext } from '@ampcode/plugin'
 import plugin from './amp-plugin'
 
 const id = 'T-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
-const other = 'T-11111111-2222-4333-8444-555555555555'
 const environment = { HERDR_ENV: '1', HERDR_PANE_ID: 'w1:p1', HERDR_BIN_PATH: '/path with spaces/herdr', HERDR_SOCKET_PATH: '/tmp/herdr.sock' }
+const installed = { plugin_id: 'gjermundgaraba.herdr-fork-to-pane', enabled: true, plugin_root: '/plugins with spaces/fork-to-pane' }
 let saved: Record<string, string | undefined>
-let dispose: (() => Promise<void>) | undefined
-let heartbeat: () => void
-const interval = { unref() {} }
-const flush = () => new Promise<void>(resolve => setImmediate(resolve))
 
 beforeEach(() => {
 	saved = Object.fromEntries(Object.keys(environment).map(key => [key, process.env[key]]))
 	Object.assign(process.env, environment)
-	dispose = undefined
-	spyOn(globalThis, 'setInterval').mockImplementation(((callback: () => void, delay: number) => {
-		expect(delay).toBe(10000)
-		heartbeat = callback
-		return interval
-	}) as typeof setInterval)
-	spyOn(globalThis, 'clearInterval').mockImplementation(() => {})
 })
 
-afterEach(async () => {
-	await dispose?.()
-	mock.restore()
+afterEach(() => {
 	for (const [key, value] of Object.entries(saved)) {
 		if (value === undefined) delete process.env[key]
 		else process.env[key] = value
 	}
 })
 
-function setup(initial: string | null = id, remote = false) {
-	let changed: (thread: { id: string } | null) => void
-	const unsubscribe = mock(() => {})
-	const activeThread = {
-		current: initial === null ? null : { id: initial },
-		subscribe(callback: typeof changed) { changed = callback; return { unsubscribe } },
-	}
-	const on = mock(() => { throw new Error('Must not register prompt hooks') })
-	const log = mock(() => {})
-	const run = mock(async (_file: string, _args: string[], _options: unknown) => ({ stdout: '{}' }))
-	plugin({ activeThread, on, logger: { log }, system: { executor: { kind: remote ? 'remote' : 'local' } }, onDispose(callback: typeof dispose) { dispose = callback } } as unknown as PluginAPI, run)
-	return { run, log, on, unsubscribe, switch(value: string | null) {
-		activeThread.current = value === null ? null : { id: value }
-		changed(activeThread.current)
+function setup(remote = false) {
+	let handler: (ctx: PluginCommandContext) => void | Promise<void>
+	const registerCommand = mock((_id: string, _options: unknown, callback: typeof handler) => { handler = callback })
+	const run = mock(async (_file: string, _args: string[], _options: unknown) => ({ stdout: JSON.stringify({ result: { plugins: [installed] } }) }))
+	const notify = mock(async (_message: string) => {})
+	// No thread subscriptions, lifecycle hooks, or prompt APIs are provided.
+	plugin({ registerCommand, system: { executor: { kind: remote ? 'remote' : 'local' } } } as unknown as PluginAPI, run)
+	return { run, notify, registerCommand, invoke(threadID: string | null = id) {
+		return handler({ thread: threadID === null ? undefined : { id: threadID }, ui: { notify } } as PluginCommandContext)
 	} }
 }
 
-test.each(Object.keys(environment))('no-op without %s', async key => {
+test.each(Object.keys(environment))('no command outside Herdr: missing %s', key => {
 	delete process.env[key]
+	expect(setup().registerCommand).not.toHaveBeenCalled()
+})
+
+test('no command on remote executors', () => {
+	expect(setup(true).registerCommand).not.toHaveBeenCalled()
+})
+
+test('one-shot command uses invocation thread and the installed executable', async () => {
 	const h = setup()
-	await flush()
 	expect(h.run).not.toHaveBeenCalled()
+	expect(h.registerCommand.mock.calls[0][0]).toBe('branch-to-pane')
+	await h.invoke()
+	expect(h.run).toHaveBeenNthCalledWith(1, environment.HERDR_BIN_PATH,
+		['plugin', 'list', '--plugin', installed.plugin_id, '--json'], { encoding: 'utf8', timeout: 5000 })
+	expect(h.run).toHaveBeenNthCalledWith(2, `${installed.plugin_root}/bin/herdr-fork-to-pane`,
+		['--amp-thread', id], { encoding: 'utf8', timeout: 45000 })
+	const other = 'T-11111111-2222-4333-8444-555555555555'
+	await h.invoke(other)
+	expect(h.run.mock.calls[3][1]).toEqual(['--amp-thread', other])
+	expect(h.notify).not.toHaveBeenCalled()
 })
 
-test('no-op on remote executors', async () => {
-	const h = setup(id, true)
-	await flush()
+test('requires an existing thread', async () => {
+	const h = setup()
+	await h.invoke(null)
 	expect(h.run).not.toHaveBeenCalled()
+	expect(h.notify.mock.calls[0][0]).toContain('Open an existing Amp thread')
 })
 
-test('reports active identity, changes and null without any prompt hook', async () => {
+test.each([{ plugins: [] }, { plugins: [{ ...installed, enabled: false }] }])('requires an enabled installation %j', async ({ plugins }) => {
 	const h = setup()
-	await flush()
-	expect(h.run).toHaveBeenLastCalledWith(environment.HERDR_BIN_PATH, [
-		'pane', 'report-metadata', 'w1:p1', '--source', 'plugin:fork-to-pane:amp',
-		'--token', `amp_thread_id=${id}`, '--ttl-ms', '30000',
-	], { encoding: 'utf8', timeout: 1000 })
-	h.switch(other)
-	await flush()
-	expect(h.run.mock.calls.at(-1)![1]).toContain(`amp_thread_id=${other}`)
-	h.switch(null)
-	await flush()
-	expect(h.run.mock.calls.at(-1)![1]).toContain('--clear-token')
-	expect(h.on).not.toHaveBeenCalled()
-})
-
-test.each([null, 'invalid', `${id}\n`])('clears invalid or missing identity %j', async value => {
-	const h = setup(value)
-	await flush()
-	expect(h.run.mock.calls.at(-1)![1]).toContain('--clear-token')
-})
-
-test('refreshes identity and stops reporting on disposal', async () => {
-	const h = setup()
-	await flush()
-	heartbeat()
-	await flush()
-	expect(h.run).toHaveBeenCalledTimes(2)
-	await dispose!()
-	dispose = undefined
-	expect(h.unsubscribe).toHaveBeenCalled()
-	expect(clearInterval).toHaveBeenCalledWith(interval)
-	expect(h.run.mock.calls.at(-1)![1]).toContain('--clear-token')
-	expect(h.run).toHaveBeenCalledTimes(3)
-})
-
-test('skips superseded queued reports and recovers from CLI errors', async () => {
-	const h = setup()
-	h.switch(other)
-	await flush()
+	h.run.mockResolvedValueOnce({ stdout: JSON.stringify({ result: { plugins } }) })
+	await h.invoke()
 	expect(h.run).toHaveBeenCalledTimes(1)
-	expect(h.run.mock.calls[0][1]).toContain(`amp_thread_id=${other}`)
-	h.run.mockRejectedValueOnce(new Error('offline'))
-	heartbeat()
-	await flush()
-	expect(h.log).toHaveBeenCalled()
-	heartbeat()
-	await flush()
-	expect(h.run).toHaveBeenCalledTimes(3)
+	expect(h.notify.mock.calls[0][0]).toContain('Install and enable')
+})
+
+test('reports launch failure without retrying', async () => {
+	const h = setup()
+	h.run.mockResolvedValueOnce({ stdout: JSON.stringify({ result: { plugins: [installed] } }) })
+	h.run.mockRejectedValueOnce(new Error('launch outcome unknown'))
+	await h.invoke()
+	expect(h.run).toHaveBeenCalledTimes(2)
+	expect(h.notify.mock.calls[0][0]).toContain('launch outcome unknown')
 })

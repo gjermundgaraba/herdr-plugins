@@ -998,7 +998,7 @@ fn terminate_process_group(child: &Child) {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use herdr_hub_client::{HostState, Model};
     use serde_json::json;
@@ -1091,9 +1091,8 @@ mod tests {
 
     #[test]
     fn version_check_requires_exact_successful_output() {
-        let directory = temp_directory("version");
-        std::fs::create_dir_all(&directory).unwrap();
-        let script = directory.join("fake-ssh");
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("fake-ssh");
         std::fs::write(
             &script,
             format!(
@@ -1110,15 +1109,14 @@ mod tests {
 
         std::fs::write(&script, "#!/bin/sh\nprintf 'herdr-hub wrong\\n'\n").unwrap();
         assert!(check_version_with_program(&host(), script.as_os_str()).is_err());
-        std::fs::remove_dir_all(directory).unwrap();
+        directory.close().unwrap();
     }
 
     #[test]
     fn version_check_timeout_kills_and_reaps_the_process_group() {
-        let directory = temp_directory("version-timeout");
-        std::fs::create_dir_all(&directory).unwrap();
-        let script = directory.join("fake-ssh");
-        let marker = directory.join("descendant-survived");
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("fake-ssh");
+        let marker = directory.path().join("descendant-survived");
         std::fs::write(
             &script,
             format!(
@@ -1143,15 +1141,14 @@ mod tests {
             !marker.exists(),
             "version-check descendant survived timeout"
         );
-        std::fs::remove_dir_all(directory).unwrap();
+        directory.close().unwrap();
     }
 
     #[test]
     fn successful_version_check_kills_pipe_holding_descendants() {
-        let directory = temp_directory("version-descendant");
-        std::fs::create_dir_all(&directory).unwrap();
-        let script = directory.join("fake-ssh");
-        let pid_path = directory.join("descendant-pid");
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("fake-ssh");
+        let pid_path = directory.path().join("descendant-pid");
         std::fs::write(
             &script,
             format!(
@@ -1188,7 +1185,7 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
-        std::fs::remove_dir_all(directory).unwrap();
+        directory.close().unwrap();
     }
 
     #[test]
@@ -1252,11 +1249,10 @@ mod tests {
 
     #[test]
     fn supervisor_filters_stream_and_maps_call_reply() {
-        let directory = temp_directory("transport");
-        std::fs::create_dir_all(&directory).unwrap();
-        let script = directory.join("fake-ssh");
-        let args_path = directory.join("args");
-        let call_path = directory.join("call");
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("fake-ssh");
+        let args_path = directory.path().join("args");
+        let call_path = directory.path().join("call");
         let hello = ServerMessage::Hello {
             protocol: PROTOCOL,
             model: Model {
@@ -1381,14 +1377,13 @@ mod tests {
             ClientMessage::Call { id, session, .. }
                 if id == 1 && session == "local/default"
         ));
-        std::fs::remove_dir_all(directory).unwrap();
+        directory.close().unwrap();
     }
 
     #[test]
     fn disconnect_fails_an_in_flight_call() {
-        let directory = temp_directory("disconnect");
-        std::fs::create_dir_all(&directory).unwrap();
-        let script = directory.join("fake-ssh");
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("fake-ssh");
         let hello = ServerMessage::Hello {
             protocol: PROTOCOL,
             model: Model {
@@ -1434,14 +1429,13 @@ mod tests {
             Event::Disconnected { epoch: 1, .. }
         ));
         drop(supervisor);
-        std::fs::remove_dir_all(directory).unwrap();
+        directory.close().unwrap();
     }
 
     #[test]
     fn shutdown_interrupts_a_backpressured_relay_write() {
-        let directory = temp_directory("backpressure");
-        std::fs::create_dir_all(&directory).unwrap();
-        let script = directory.join("fake-ssh");
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("fake-ssh");
         let hello = ServerMessage::Hello {
             protocol: PROTOCOL,
             model: Model {
@@ -1494,14 +1488,13 @@ mod tests {
             "backpressured supervisor shutdown took {:?}",
             started.elapsed()
         );
-        std::fs::remove_dir_all(directory).unwrap();
+        directory.close().unwrap();
     }
 
     #[test]
     fn unanswered_calls_remain_bounded() {
-        let directory = temp_directory("unanswered");
-        std::fs::create_dir_all(&directory).unwrap();
-        let script = directory.join("fake-ssh");
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("fake-ssh");
         let hello = ServerMessage::Hello {
             protocol: PROTOCOL,
             model: Model {
@@ -1547,16 +1540,15 @@ mod tests {
         assert!(rejected > 0);
 
         drop(supervisor);
-        std::fs::remove_dir_all(directory).unwrap();
+        directory.close().unwrap();
     }
 
     #[test]
     fn reply_burst_skips_abandoned_calls_and_releases_live_calls_without_an_extra_wake() {
-        let directory = temp_directory("reply-burst");
-        std::fs::create_dir_all(&directory).unwrap();
-        let script = directory.join("fake-ssh");
-        let release = directory.join("release");
-        let forwarded = directory.join("forwarded");
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("fake-ssh");
+        let release = directory.path().join("release");
+        let forwarded = directory.path().join("forwarded");
         let hello = ServerMessage::Hello {
             protocol: PROTOCOL,
             model: Model {
@@ -1666,14 +1658,13 @@ mod tests {
         );
 
         drop(supervisor);
-        std::fs::remove_dir_all(directory).unwrap();
+        directory.close().unwrap();
     }
 
     #[test]
     fn backpressured_write_drains_relay_output_and_recovers() {
-        let directory = temp_directory("full-duplex");
-        std::fs::create_dir_all(&directory).unwrap();
-        let script = directory.join("fake-ssh");
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("fake-ssh");
         let hello = ServerMessage::Hello {
             protocol: PROTOCOL,
             model: Model {
@@ -1746,16 +1737,7 @@ mod tests {
         assert_eq!(replies[&41], json!({"call": 1}));
         assert_eq!(replies[&42], json!({"call": 2}));
         drop(supervisor);
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    fn temp_directory(name: &str) -> PathBuf {
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        std::env::temp_dir().join(format!(
-            "herdr-hub-remote-{name}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ))
+        directory.close().unwrap();
     }
 
     fn make_executable(path: &Path) {

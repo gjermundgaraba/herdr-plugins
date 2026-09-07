@@ -33,7 +33,8 @@ herdr plugin install gjermundgaraba/herdr-plugins/fork-to-pane
 Restart OpenCode after installing its integration. Its native session reference
 becomes available after a session-bearing event.
 
-Invoke **Fork agent into right pane** from the action menu or bind it in
+For Pi, Codex, Claude Code, and OpenCode, invoke **Fork agent into right pane**
+from the Herdr action menu or bind it in
 `~/.config/herdr/config.toml`:
 
 ```toml
@@ -65,15 +66,22 @@ Copy from the installed Herdr plugin's directory or this checkout. Amp's plugin
 loader rejects symlinks. To update the companion, copy the new version over this
 same file rather than installing a second copy. Reload Amp plugins or restart Amp
 after installing or updating.
-Requires an Amp CLI with `activeThread` and `onDispose` plugin APIs.
 
-The companion runs only inside Herdr. It tracks the active thread (including
-thread switches) through a short-lived `amp_thread_id` pane token; it does not
-take over agent lifecycle state. Open an existing Amp thread before invoking the
-fork action. The action waits for Amp's input to be ready, pastes the reference
-without pressing Enter, then focuses the new pane. If startup or paste fails,
-the pane stays open and an error is reported rather than retrying the paste.
-The companion does not intercept or modify user messages.
+Open an existing thread and run **Herdr: Branch into right pane** from Amp's
+command palette. This is an Amp command, not the Herdr fork action above.
+For an Amp-specific shortcut, find the command's full ID with `amp config keymap`
+after loading the companion, then bind it using `amp.keymap` in Amp settings.
+
+The companion runs only inside Herdr. On invocation it passes `ctx.thread.id`
+directly to the installed plugin's executable as `--amp-thread T-…`. It locates
+the executable through `herdr plugin list`; there are no background reports,
+pane tokens, timers, or prompt hooks. Requires Amp's `registerCommand` API with
+the current thread in the command context.
+
+The executable waits for Amp's input to be ready, pastes the reference without
+pressing Enter, then focuses the new pane. If startup or paste fails, the pane
+stays open when launch may have occurred, and an error is reported rather than
+retrying the paste. The companion does not intercept or modify user messages.
 
 ## Warp limitation
 

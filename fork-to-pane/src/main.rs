@@ -36,6 +36,8 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<()> {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    let amp_parent = amp_argument(&arguments)?;
     let environment = Environment::load()?;
     let source_pane_id = environment
         .pane_id
@@ -45,13 +47,9 @@ fn run() -> Result<()> {
     let source = client
         .current_pane(Some(source_pane_id))
         .context("read focused pane")?;
-    let amp_parent = if source.agent.as_deref() == Some("amp") {
-        Some(amp_thread_id(
-            source.tokens.get("amp_thread_id").map(String::as_str),
-        )?)
-    } else {
-        None
-    };
+    if amp_parent.is_none() && source.agent.as_deref() == Some("amp") {
+        bail!("Use Amp's Herdr: Branch into right pane command to branch an Amp thread");
+    }
     let (kind, args) = if amp_parent.is_some() {
         ("amp", vec![])
     } else {
@@ -160,10 +158,15 @@ fn start_was_rejected(error: &Error) -> bool {
     matches!(error, Error::Api(_))
 }
 
-fn amp_thread_id(value: Option<&str>) -> Result<&str> {
-    let value = value.context(
-        "no active Amp thread reference; install fork-to-pane/amp-plugin.ts in ~/.config/amp/plugins/, reload Amp plugins, and open a thread",
-    )?;
+fn amp_argument(args: &[String]) -> Result<Option<&str>> {
+    match args {
+        [] => Ok(None),
+        [flag, value] if flag == "--amp-thread" => amp_thread_id(value).map(Some),
+        _ => bail!("usage: herdr-fork-to-pane [--amp-thread T-<uuid>]"),
+    }
+}
+
+fn amp_thread_id(value: &str) -> Result<&str> {
     if value.len() != 38
         || !value.starts_with("T-")
         || !value[2..].bytes().enumerate().all(|(index, byte)| {
@@ -174,7 +177,7 @@ fn amp_thread_id(value: Option<&str>) -> Result<&str> {
             }
         })
     {
-        bail!("Amp companion reported an invalid thread ID");
+        bail!("invalid Amp thread ID");
     }
     Ok(value)
 }
@@ -367,22 +370,23 @@ mod tests {
     }
 
     #[test]
-    fn amp_requires_a_valid_companion_thread_id() {
+    fn amp_requires_an_explicit_valid_thread_id() {
         let id = "T-12345678-1234-1234-1234-123456789abc";
-        assert_eq!(amp_thread_id(Some(id)).unwrap(), id);
-        assert!(
-            amp_thread_id(None)
-                .unwrap_err()
-                .to_string()
-                .contains("amp-plugin.ts")
+        assert_eq!(amp_argument(&[]).unwrap(), None);
+        assert_eq!(
+            amp_argument(&["--amp-thread".into(), id.into()]).unwrap(),
+            Some(id)
         );
+        assert!(amp_argument(&["--amp-thread".into()]).is_err());
+        assert!(amp_argument(&["--unknown".into(), id.into()]).is_err());
+        assert!(amp_argument(&["--amp-thread".into(), id.into(), "extra".into()]).is_err());
         for invalid in [
             "",
             "T-not-a-uuid",
             "--continue",
             "T-12345678-1234-1234-1234-123456789abz",
         ] {
-            assert!(amp_thread_id(Some(invalid)).is_err());
+            assert!(amp_argument(&["--amp-thread".into(), invalid.into()]).is_err());
         }
     }
 

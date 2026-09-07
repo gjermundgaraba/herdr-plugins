@@ -17,3 +17,6 @@ serde.workspace = true
 serde_json.workspace = true
 signal-hook = "0.4.4"
 toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

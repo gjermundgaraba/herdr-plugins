@@ -368,16 +368,16 @@ mod unix_tests {
 
     use super::*;
 
-    fn socket_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("herdr-client-{name}-{}.sock", std::process::id()))
+    fn socket_path() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        (dir, path)
     }
 
     fn subscription_server(
-        name: &str,
         send: impl FnOnce(&mut UnixStream) + Send + 'static,
-    ) -> (PathBuf, thread::JoinHandle<()>) {
-        let path = socket_path(name);
-        let _ = std::fs::remove_file(&path);
+    ) -> (tempfile::TempDir, PathBuf, thread::JoinHandle<()>) {
+        let (dir, path) = socket_path();
         let listener = UnixListener::bind(&path).expect("bind test socket");
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept request");
@@ -402,13 +402,12 @@ mod unix_tests {
             .expect("write ack");
             send(&mut stream);
         });
-        (path, server)
+        (dir, path, server)
     }
 
     #[test]
     fn raw_calls_round_trip_over_ndjson() {
-        let path = socket_path("ping");
-        let _ = std::fs::remove_file(&path);
+        let (dir, path) = socket_path();
         let listener = UnixListener::bind(&path).expect("bind test socket");
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept request");
@@ -437,12 +436,12 @@ mod unix_tests {
         assert_eq!(ping["version"], "0.8.0");
         assert_eq!(ping["protocol"], 19);
         server.join().expect("server thread");
-        let _ = std::fs::remove_file(path);
+        dir.close().unwrap();
     }
 
     #[test]
     fn subscriptions_keep_reading_after_the_ack() {
-        let (path, server) = subscription_server("subscribe", |stream| {
+        let (dir, path, server) = subscription_server(|stream| {
             writeln!(
                 stream,
                 "{}",
@@ -464,12 +463,12 @@ mod unix_tests {
         assert_eq!(event.event, "pane_focused");
         assert_eq!(event.data["pane_id"], "w1:p1");
         server.join().expect("server thread");
-        let _ = std::fs::remove_file(path);
+        dir.close().unwrap();
     }
 
     #[test]
     fn subscription_timeout_preserves_a_partial_event() {
-        let (path, server) = subscription_server("subscription-timeout", |stream| {
+        let (dir, path, server) = subscription_server(|stream| {
             stream
                 .write_all(b"{\"event\":\"pane_focused\",\"data\":{\"type\":\"pane_focused\",\"pane_id\":\"w1:p1\",\"label\":\"\xc3")
                 .expect("write partial event");
@@ -499,12 +498,12 @@ mod unix_tests {
         assert_eq!(event.data["pane_id"], "w1:p1");
         assert_eq!(event.data["label"], "é");
         server.join().expect("server thread");
-        let _ = std::fs::remove_file(path);
+        dir.close().unwrap();
     }
 
     #[test]
     fn malformed_subscription_event_does_not_poison_the_next_line() {
-        let (path, server) = subscription_server("subscription-malformed", |stream| {
+        let (dir, path, server) = subscription_server(|stream| {
             writeln!(stream, "not json").expect("write malformed event");
             writeln!(
                 stream,
@@ -530,12 +529,12 @@ mod unix_tests {
             "w1:p1"
         );
         server.join().expect("server thread");
-        let _ = std::fs::remove_file(path);
+        dir.close().unwrap();
     }
 
     #[test]
     fn subscription_rejects_an_incomplete_frame_at_eof() {
-        let (path, server) = subscription_server("subscription-incomplete", |stream| {
+        let (dir, path, server) = subscription_server(|stream| {
             stream
                 .write_all(br#"{"event":"pane_focused""#)
                 .expect("write partial event");
@@ -550,12 +549,12 @@ mod unix_tests {
         ));
         assert!(subscription.next_event().expect("read EOF").is_none());
         server.join().expect("server thread");
-        let _ = std::fs::remove_file(path);
+        dir.close().unwrap();
     }
 
     #[test]
     fn subscription_enforces_frame_boundaries() {
-        let (path, server) = subscription_server("subscription-frame-boundaries", |stream| {
+        let (dir, path, server) = subscription_server(|stream| {
             let mut event = br#"{"event":"pane_focused","data":{"type":"pane_focused","pane_id":"w1:p1","padding":""#
                 .to_vec();
             let suffix = b"\"}}\n";
@@ -599,6 +598,6 @@ mod unix_tests {
             "subscription should remain ended after oversized frame"
         );
         server.join().expect("server thread");
-        let _ = std::fs::remove_file(path);
+        dir.close().unwrap();
     }
 }

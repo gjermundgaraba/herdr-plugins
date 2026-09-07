@@ -507,23 +507,13 @@ mod macos {
 
     #[cfg(test)]
     mod tests {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
         use super::*;
 
         #[test]
         fn executable_comparison_detects_rebuilt_input() {
-            let directory = std::env::temp_dir().join(format!(
-                "herdr-hub-service-test-{}-{}",
-                std::process::id(),
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            fs::create_dir(&directory).unwrap();
-            let source = directory.join("source");
-            let installed = directory.join("installed");
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("source");
+            let installed = directory.path().join("installed");
             fs::write(&source, b"first build").unwrap();
 
             assert!(!files_match(&source, &installed).unwrap());
@@ -532,7 +522,7 @@ mod macos {
 
             fs::write(&source, b"second build").unwrap();
             assert!(!files_match(&source, &installed).unwrap());
-            fs::remove_dir_all(directory).unwrap();
+            directory.close().unwrap();
         }
 
         #[test]

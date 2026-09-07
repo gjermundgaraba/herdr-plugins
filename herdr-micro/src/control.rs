@@ -3,7 +3,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::fs::{self, Permissions};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -314,37 +314,74 @@ fn handle_connection(
 
 fn read_line(stream: &mut UnixStream) -> Result<Vec<u8>> {
     let mut line = Vec::new();
-    let mut byte = [0_u8; 1];
-    loop {
-        match stream.read(&mut byte) {
-            Ok(0) => bail!("connection closed before newline"),
-            Ok(_) if byte[0] == b'\n' => return Ok(line),
-            Ok(_) if line.len() < MAX_LINE_BYTES => line.push(byte[0]),
-            Ok(_) => bail!("request exceeds {MAX_LINE_BYTES} bytes"),
-            Err(error) => return Err(error.into()),
-        }
+    // Connections carry one message; read-ahead cannot consume a later request.
+    // The payload limit excludes its newline.
+    BufReader::new(stream)
+        .take((MAX_LINE_BYTES + 1) as u64)
+        .read_until(b'\n', &mut line)?;
+    if line.last() == Some(&b'\n') {
+        line.pop();
+        return Ok(line);
     }
+    if line.len() > MAX_LINE_BYTES {
+        bail!("request exceeds {MAX_LINE_BYTES} bytes");
+    }
+    bail!("connection closed before newline")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::mpsc;
-    use std::{
-        env,
-        sync::atomic::{AtomicUsize, Ordering},
-    };
 
-    fn temp_dir(name: &str) -> PathBuf {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        // Short prefix: socket paths must stay under the 104-byte SUN_LEN.
-        let dir = env::temp_dir().join(format!(
-            "hm-ctl-{name}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
+    #[test]
+    fn control_lines_preserve_payload_limit_and_require_newline() {
+        let read = |bytes: Vec<u8>| {
+            let (mut reader, mut writer) = UnixStream::pair().unwrap();
+            let sender = thread::spawn(move || {
+                let _ = writer.write_all(&bytes);
+            });
+            let result = read_line(&mut reader);
+            drop(reader);
+            sender.join().unwrap();
+            result
+        };
+
+        for length in [0, 1, MAX_LINE_BYTES - 1, MAX_LINE_BYTES] {
+            let payload = vec![b'x'; length];
+            let mut bytes = payload.clone();
+            bytes.extend_from_slice(b"\nignored");
+            assert_eq!(read(bytes).unwrap(), payload);
+            assert_eq!(
+                read(payload).unwrap_err().to_string(),
+                "connection closed before newline"
+            );
+        }
+
+        for newline in [false, true] {
+            let mut bytes = vec![b'x'; MAX_LINE_BYTES + 1];
+            if newline {
+                bytes.push(b'\n');
+            }
+            assert_eq!(
+                read(bytes).unwrap_err().to_string(),
+                format!("request exceeds {MAX_LINE_BYTES} bytes")
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_control_line_propagates_socket_timeout() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        writer.write_all(b"partial").unwrap();
+        let error = read_line(&mut reader).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            ErrorKind::TimedOut | ErrorKind::WouldBlock
         ));
-        fs::create_dir_all(&dir).unwrap();
-        dir
     }
 
     fn start_test_server(
@@ -367,8 +404,8 @@ mod tests {
 
     #[test]
     fn rust_client_and_server() {
-        let dir = temp_dir("rust");
-        let path = dir.join(SOCKET_NAME);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SOCKET_NAME);
         let (server, shutdown, runner) =
             start_test_server(path.clone(), Arc::new(AtomicBool::new(false)));
         assert_eq!(
@@ -379,13 +416,13 @@ mod tests {
         shutdown.send(()).unwrap();
         drop(server);
         runner.join().unwrap();
-        fs::remove_dir_all(dir).unwrap();
+        dir.close().unwrap();
     }
 
     #[test]
     fn client_accepts_newline_json_server() {
-        let dir = temp_dir("protocol-server");
-        let path = dir.join(SOCKET_NAME);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SOCKET_NAME);
         let listener = UnixListener::bind(&path).unwrap();
         let thread = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -397,14 +434,13 @@ mod tests {
             json!({ "fixture": true })
         );
         thread.join().unwrap();
-        fs::remove_file(&path).unwrap();
-        fs::remove_dir_all(dir).unwrap();
+        dir.close().unwrap();
     }
 
     #[test]
     fn newline_json_client_reaches_server() {
-        let dir = temp_dir("protocol-client");
-        let path = dir.join(SOCKET_NAME);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SOCKET_NAME);
         let (server, shutdown, runner) =
             start_test_server(path.clone(), Arc::new(AtomicBool::new(false)));
         let mut client = UnixStream::connect(&path).unwrap();
@@ -417,13 +453,13 @@ mod tests {
         shutdown.send(()).unwrap();
         drop(server);
         runner.join().unwrap();
-        fs::remove_dir_all(dir).unwrap();
+        dir.close().unwrap();
     }
 
     #[test]
     fn malformed_and_unknown_requests_return_errors() {
-        let dir = temp_dir("errors");
-        let path = dir.join(SOCKET_NAME);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SOCKET_NAME);
         let (server, shutdown, runner) =
             start_test_server(path.clone(), Arc::new(AtomicBool::new(false)));
         for (request, expected) in [
@@ -447,13 +483,13 @@ mod tests {
         shutdown.send(()).unwrap();
         drop(server);
         runner.join().unwrap();
-        fs::remove_dir_all(dir).unwrap();
+        dir.close().unwrap();
     }
 
     #[test]
     fn duplicate_start_detects_live_daemon() {
-        let dir = temp_dir("duplicate");
-        let path = dir.join(SOCKET_NAME);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SOCKET_NAME);
         let (server, shutdown, runner) =
             start_test_server(path.clone(), Arc::new(AtomicBool::new(false)));
         let error = match listen_for_control_at(
@@ -469,13 +505,13 @@ mod tests {
         shutdown.send(()).unwrap();
         drop(server);
         runner.join().unwrap();
-        fs::remove_dir_all(dir).unwrap();
+        dir.close().unwrap();
     }
 
     #[test]
     fn stale_socket_is_replaced_without_touching_a_new_one() {
-        let dir = temp_dir("stale");
-        let path = dir.join(SOCKET_NAME);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SOCKET_NAME);
         drop(UnixListener::bind(&path).unwrap());
         let stale = identity(&path).unwrap().unwrap();
         let server = listen_for_control_at(
@@ -487,13 +523,13 @@ mod tests {
         assert_ne!(identity(&path).unwrap().unwrap(), stale);
         drop(server);
         assert!(!path.exists());
-        fs::remove_dir_all(dir).unwrap();
+        dir.close().unwrap();
     }
 
     #[test]
     fn socket_is_owner_only_and_stop_sets_shared_flag() {
-        let dir = temp_dir("stop");
-        let path = dir.join(SOCKET_NAME);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SOCKET_NAME);
         let stopping = Arc::new(AtomicBool::new(false));
         let (server, shutdown, runner) = start_test_server(path.clone(), Arc::clone(&stopping));
         assert_eq!(
@@ -508,13 +544,13 @@ mod tests {
         shutdown.send(()).unwrap();
         runner.join().unwrap();
         drop(server);
-        fs::remove_dir_all(dir).unwrap();
+        dir.close().unwrap();
     }
 
     #[test]
     fn stopping_server_refuses_status() {
-        let dir = temp_dir("stopping-status");
-        let path = dir.join(SOCKET_NAME);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SOCKET_NAME);
         let (server, shutdown, runner) =
             start_test_server(path.clone(), Arc::new(AtomicBool::new(false)));
         // The flag is set before the stop response is written, so the next
@@ -527,13 +563,13 @@ mod tests {
         shutdown.send(()).unwrap();
         drop(server);
         runner.join().unwrap();
-        fs::remove_dir_all(dir).unwrap();
+        dir.close().unwrap();
     }
 
     #[test]
     fn daemon_side_flag_refuses_status() {
-        let dir = temp_dir("daemon-stopping");
-        let path = dir.join(SOCKET_NAME);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SOCKET_NAME);
         let stopping = Arc::new(AtomicBool::new(false));
         let (server, shutdown, runner) = start_test_server(path.clone(), Arc::clone(&stopping));
         // A signal sets the daemon's flag without any stop
@@ -546,13 +582,13 @@ mod tests {
         shutdown.send(()).unwrap();
         drop(server);
         runner.join().unwrap();
-        fs::remove_dir_all(dir).unwrap();
+        dir.close().unwrap();
     }
 
     #[test]
     fn stopping_daemon_is_replaced_without_stop_request() {
-        let dir = temp_dir("stopping-start");
-        let path = dir.join(SOCKET_NAME);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SOCKET_NAME);
         let old_listener = UnixListener::bind(&path).unwrap();
         let old_path = path.clone();
         let old_runner = thread::spawn(move || {
@@ -571,7 +607,7 @@ mod tests {
         let launch_path = path.clone();
         let status = start_daemon_versioned_at(
             &path,
-            &dir.join("micro.log"),
+            &dir.path().join("micro.log"),
             "0.9.0",
             1,
             move || {
@@ -590,14 +626,13 @@ mod tests {
         assert_eq!(status["version"], "0.9.0");
         ready_rx.recv().unwrap().join().unwrap();
         old_runner.join().unwrap();
-        fs::remove_file(&path).unwrap();
-        fs::remove_dir_all(dir).unwrap();
+        dir.close().unwrap();
     }
 
     #[test]
     fn version_mismatch_stops_and_relaunches() {
-        let dir = temp_dir("versioned-start");
-        let path = dir.join(SOCKET_NAME);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SOCKET_NAME);
         let old_listener = UnixListener::bind(&path).unwrap();
         let old_path = path.clone();
         let old_runner = thread::spawn(move || {
@@ -621,7 +656,7 @@ mod tests {
         let launched_by_start = Arc::clone(&launched);
         let status = start_daemon_versioned_at(
             &path,
-            &dir.join("micro.log"),
+            &dir.path().join("micro.log"),
             "0.9.0",
             1,
             move || {
@@ -645,7 +680,6 @@ mod tests {
         assert_eq!(status["version"], "0.9.0");
         ready_rx.recv().unwrap().join().unwrap();
         old_runner.join().unwrap();
-        fs::remove_file(&path).unwrap();
-        fs::remove_dir_all(dir).unwrap();
+        dir.close().unwrap();
     }
 }

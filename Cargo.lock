@@ -308,6 +308,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "toml",
 ]
@@ -352,6 +353,7 @@ dependencies = [
  "serde",
  "serde_json",
  "signal-hook 0.4.4",
+ "tempfile",
  "toml",
 ]
 
@@ -363,6 +365,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
 ]
 

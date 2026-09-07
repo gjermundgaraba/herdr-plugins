@@ -455,34 +455,18 @@ fn socket_identity(path: &Path) -> Result<Option<SocketIdentity>> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io::BufReader,
-        sync::atomic::AtomicUsize,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::io::BufReader;
 
     use herdr_hub_client::HostState;
     use serde_json::json;
 
     use super::*;
 
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-
-    fn paths(name: &str) -> (PathBuf, PathBuf) {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let stem = format!(
-            "herdr-hub-{name}-{}-{nonce}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        );
-        let directory = std::env::temp_dir();
-        (
-            directory.join(format!("{stem}.sock")),
-            directory.join(format!("{stem}.lock")),
-        )
+    fn paths() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("s.sock");
+        let lock = directory.path().join("s.lock");
+        (directory, socket, lock)
     }
 
     fn model(version: u64) -> Model {
@@ -511,33 +495,35 @@ mod tests {
             .map(|frame| serde_json::from_slice(&frame).unwrap())
     }
 
-    fn server(name: &str) -> (Server, mpsc::Receiver<Event>, PathBuf, PathBuf) {
-        let (socket, lock) = paths(name);
+    fn server() -> (tempfile::TempDir, Server, mpsc::Receiver<Event>, PathBuf) {
+        let (directory, socket, lock) = paths();
         let (tx, rx) = mpsc::sync_channel(64);
         let server = Server::start_at(tx, socket.clone(), lock.clone()).unwrap();
-        (server, rx, socket, lock)
+        (directory, server, rx, socket)
     }
 
-    fn cleanup(server: Server, lock: PathBuf) {
+    fn cleanup(server: Server, directory: tempfile::TempDir) {
         drop(server);
-        fs::remove_file(lock).unwrap();
+        fs::remove_file(directory.path().join("s.lock")).unwrap();
+        directory.close().unwrap();
     }
 
     #[test]
     fn second_server_cannot_replace_the_live_socket() {
-        let (server, _rx, socket, lock) = server("lock");
+        let (directory, server, _rx, socket) = server();
+        let lock = directory.path().join("s.lock");
         let (tx, _other_rx) = mpsc::sync_channel(64);
         assert!(matches!(
             Server::start_at(tx, socket.clone(), lock.clone()),
             Err(error) if error.to_string() == "Herdr Hub is already running"
         ));
         assert!(socket.exists());
-        cleanup(server, lock);
+        cleanup(server, directory);
     }
 
     #[test]
     fn subscribe_gets_atomic_hello_then_versioned_updates() {
-        let (mut server, rx, socket, lock) = server("subscribe");
+        let (directory, mut server, rx, socket) = server();
         assert_eq!(
             fs::metadata(&socket).unwrap().permissions().mode() & 0o777,
             0o600
@@ -574,12 +560,12 @@ mod tests {
             next(&mut reader),
             Some(ServerMessage::Host { version: 9, .. })
         ));
-        cleanup(server, lock);
+        cleanup(server, directory);
     }
 
     #[test]
     fn call_connection_receives_only_its_reply() {
-        let (mut server, rx, socket, lock) = server("call");
+        let (directory, mut server, rx, socket) = server();
         let client = connect(
             &socket,
             &ClientMessage::Call {
@@ -606,12 +592,12 @@ mod tests {
             Some(ServerMessage::Reply { id: 41, .. })
         ));
         assert!(next(&mut reader).is_none());
-        cleanup(server, lock);
+        cleanup(server, directory);
     }
 
     #[test]
     fn a_second_subscriber_message_closes_the_fixed_role() {
-        let (mut server, rx, socket, lock) = server("role");
+        let (directory, mut server, rx, socket) = server();
         let mut client = connect(&socket, &ClientMessage::Subscribe { protocol: PROTOCOL });
         let Event::Server(Request::Subscribe { id, stream }) =
             rx.recv_timeout(Duration::from_secs(1)).unwrap()
@@ -630,12 +616,12 @@ mod tests {
         )
         .unwrap();
         assert!(next(&mut reader).is_none());
-        cleanup(server, lock);
+        cleanup(server, directory);
     }
 
     #[test]
     fn subscriber_eof_removes_it_without_waiting_for_a_broadcast() {
-        let (mut server, rx, socket, lock) = server("eof");
+        let (directory, mut server, rx, socket) = server();
         let client = connect(&socket, &ClientMessage::Subscribe { protocol: PROTOCOL });
         let Event::Server(Request::Subscribe { id, stream }) =
             rx.recv_timeout(Duration::from_secs(1)).unwrap()
@@ -658,12 +644,12 @@ mod tests {
         assert_eq!(closed, id);
         server.remove_subscriber(closed);
         assert!(server.subscribers.is_empty());
-        cleanup(server, lock);
+        cleanup(server, directory);
     }
 
     #[test]
     fn full_subscriber_queue_disconnects_instead_of_dropping_an_update() {
-        let (mut server, _rx, _socket, lock) = server("slow");
+        let (directory, mut server, _rx, _socket) = server();
         let (outgoing, _receiver) = mpsc::sync_channel(1);
         outgoing
             .send(ServerMessage::Active {
@@ -680,12 +666,12 @@ mod tests {
             key: None,
         });
         assert!(server.subscribers.is_empty());
-        cleanup(server, lock);
+        cleanup(server, directory);
     }
 
     #[test]
     fn notify_is_forwarded_without_a_reply() {
-        let (server, rx, socket, lock) = server("notify");
+        let (directory, server, rx, socket) = server();
         let client = connect(
             &socket,
             &ClientMessage::Notify {
@@ -703,7 +689,7 @@ mod tests {
         assert!(event.is_some());
         let mut reader = BufReader::new(client);
         assert!(next(&mut reader).is_none());
-        cleanup(server, lock);
+        cleanup(server, directory);
     }
 
     #[test]

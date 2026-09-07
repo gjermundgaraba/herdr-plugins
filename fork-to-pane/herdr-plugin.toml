@@ -20,6 +20,6 @@ command = ["mv", "-f", "bin/.herdr-fork-to-pane.new", "bin/herdr-fork-to-pane"]
 [[actions]]
 id = "fork"
 title = "Fork agent into right pane"
-description = "Fork the focused session, or branch Amp with a reference to its active thread"
+description = "Fork Pi, Codex, Claude Code, or OpenCode; for Amp use its Herdr: Branch into right pane command"
 contexts = ["pane"]
 command = ["bin/herdr-fork-to-pane"]

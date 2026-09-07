@@ -615,14 +615,6 @@ mod tests {
             .collect()
     }
 
-    fn temporary_path(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("space-meta-{name}-{}-{nonce}", std::process::id()))
-    }
-
     #[test]
     fn display_order_preserves_plain_workspace_order() {
         let snapshot = snapshot(vec![
@@ -676,7 +668,8 @@ mod tests {
 
     #[test]
     fn pending_refreshes_are_coalesced_without_removing_other_files() {
-        let run_dir = temporary_path("pending");
+        let temporary = tempfile::tempdir().unwrap();
+        let run_dir = temporary.path().join("pending");
         fs::create_dir(&run_dir).unwrap();
         fs::write(run_dir.join("space-meta.pending-one"), b"").unwrap();
         fs::write(run_dir.join("space-meta.pending-two"), b"").unwrap();
@@ -687,7 +680,7 @@ mod tests {
         assert!(!has_pending(&run_dir).unwrap());
         assert!(run_dir.join("space-meta.lock").exists());
 
-        fs::remove_dir_all(run_dir).unwrap();
+        temporary.close().unwrap();
     }
 
     #[test]
@@ -749,7 +742,8 @@ mod tests {
 
     #[test]
     fn git_branch_detects_an_unborn_symbolic_head() {
-        let repository = temporary_path("unborn");
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("unborn");
         let init = Command::new("git")
             .args(["init", "--quiet"])
             .arg(&repository)
@@ -766,7 +760,7 @@ mod tests {
 
         assert_eq!(git_branch(&repository).as_deref(), Some("nascent"));
 
-        fs::remove_dir_all(repository).unwrap();
+        temporary.close().unwrap();
     }
 
     #[test]
@@ -816,7 +810,8 @@ mod tests {
 
     #[test]
     fn cache_ignores_valid_json_entries_with_invalid_shapes() {
-        let path = temporary_path("malformed-cache.json");
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("malformed-cache.json");
         fs::write(
             &path,
             br#"{
@@ -865,11 +860,13 @@ mod tests {
             }
         );
         assert_eq!(cache.branch(Path::new("/none"), false), (None, false));
+        temporary.close().unwrap();
     }
 
     #[test]
     fn cache_save_replaces_the_file_with_private_permissions() {
-        let path = temporary_path("private-cache.json");
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("private-cache.json");
         fs::write(&path, b"old").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         let mut cache = PrCache {
@@ -899,6 +896,6 @@ mod tests {
                 "/repo": {"branch": "main", "number": "12", "at": 1}
             })
         );
-        fs::remove_file(path).unwrap();
+        temporary.close().unwrap();
     }
 }

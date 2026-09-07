@@ -316,13 +316,10 @@ mod tests {
     use std::{
         io::{BufRead, BufReader, Write},
         os::unix::net::UnixListener,
-        sync::atomic::{AtomicU64, Ordering},
     };
 
     use super::*;
     use crate::{HostState, SessionState};
-
-    static NEXT_SOCKET: AtomicU64 = AtomicU64::new(1);
 
     #[test]
     fn io_errors_keep_their_message_and_source() {
@@ -331,12 +328,10 @@ mod tests {
         assert!(std::error::Error::source(&error).unwrap().is::<io::Error>());
     }
 
-    fn test_socket(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "herdr-hub-client-{name}-{}-{}.sock",
-            std::process::id(),
-            NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
-        ))
+    fn test_socket() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        (dir, path)
     }
 
     fn model(version: u64) -> Model {
@@ -370,7 +365,7 @@ mod tests {
 
     #[test]
     fn subscribe_requires_hello_and_streams_updates() {
-        let path = test_socket("subscribe");
+        let (dir, path) = test_socket();
         let listener = UnixListener::bind(&path).unwrap();
         let server = thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
@@ -416,12 +411,12 @@ mod tests {
             })
         );
         server.join().unwrap();
-        std::fs::remove_file(path).unwrap();
+        dir.close().unwrap();
     }
 
     #[test]
     fn run_stops_when_callback_returns_false() {
-        let path = test_socket("run-stop");
+        let (dir, path) = test_socket();
         let listener = UnixListener::bind(&path).unwrap();
         let server = thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
@@ -449,12 +444,12 @@ mod tests {
 
         assert_eq!(messages, 1);
         server.join().unwrap();
-        std::fs::remove_file(path).unwrap();
+        dir.close().unwrap();
     }
 
     #[test]
     fn call_uses_a_dedicated_one_reply_connection() {
-        let path = test_socket("call");
+        let (dir, path) = test_socket();
         let listener = UnixListener::bind(&path).unwrap();
         let server = thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
@@ -498,7 +493,7 @@ mod tests {
             .unwrap();
         assert_eq!(result, serde_json::json!({ "focused": true }));
         server.join().unwrap();
-        std::fs::remove_file(path).unwrap();
+        dir.close().unwrap();
     }
 
     #[test]
