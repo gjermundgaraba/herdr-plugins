@@ -16,8 +16,13 @@ herdr plugin install gjermundgaraba/herdr-plugins/history
 
 Or for local development:
 
+Run these commands from the repository root:
+
 ```sh
-cargo build --release --locked
+cargo build --release --locked -p herdr-history
+mkdir -p history/bin
+install -m 750 target/release/herdr-history history/bin/.herdr-history.new
+mv -f history/bin/.herdr-history.new history/bin/herdr-history
 herdr plugin link /path/to/herdr-plugins/history
 ```
 
@@ -86,13 +91,16 @@ retires on its own. Every retirement is logged with its reason.
 
 ```sh
 cargo test -p herdr-history                                  # pure history logic
-cargo build --release --locked -p herdr-history              # linked executable
+cargo build --release --locked -p herdr-history
+mkdir -p history/bin
+install -m 750 target/release/herdr-history history/bin/.herdr-history.new
+mv -f history/bin/.herdr-history.new history/bin/herdr-history
 herdr plugin action invoke gjermundgaraba.herdr-history.activate  # optional: swap now
 herdr plugin log list --plugin gjermundgaraba.herdr-history  # per-invocation logs
 ```
 
-Rebuilding is the whole workflow: the next action swaps the daemon to the new
-binary automatically. `activate` forces the swap immediately; it retires a
+Build and stage the executable as above: the next action swaps the daemon to
+the new binary automatically. `activate` forces the swap immediately; it retires a
 daemon built from different bytes and leaves an identical one alone. A bare
 workspace build (`cargo build --release` at the repo root) unifies features
 differently and produces a different binary than `-p herdr-history`, which

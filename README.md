@@ -10,7 +10,7 @@ Independent plugins and tools for [Herdr](https://herdr.dev/).
 | [herdr-picker-workspaces](herdr-picker-workspaces) | Live Herdr workspace picker example in Rust |
 | [herdr-picker-scripts](herdr-picker-scripts) | One-shot agent, workspace, and pane-moving examples in Python |
 | [equalize-splits](equalize-splits) | Automatically equalize pane sizes after splitting |
-| [fork-to-pane](fork-to-pane) | Fork the focused Pi, Codex, or Claude Code session into a new pane |
+| [fork-to-pane](fork-to-pane) | Fork Pi, Codex, Claude Code, or OpenCode into a new pane; branch Amp with a thread reference |
 | [history](history) | Vim-style back/forward focus history |
 | [space-meta](space-meta) | Space numbers and PR badges in the spaces sidebar |
 | [herdr-micro](herdr-micro) | Control Herdr from a Work Louder Codex Micro |
@@ -40,7 +40,9 @@ For local development:
 
 Build each plugin using its README before linking it. `herdr plugin link` only
 registers the working tree; it does not run manifest `[[build]]` commands. The
-picker runs directly from `PATH`. Hub and Micro also require the staging and
+picker runs directly from `PATH`. Each plugin runs its installed copy under
+its own `bin/`; Cargo `target/` is only needed while building and staging.
+Hub and Micro also require the staging and
 service steps in their package READMEs.
 
 ```sh

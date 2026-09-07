@@ -6,13 +6,10 @@ For changes to plugin manifests, actions, or Herdr APIs, consult the relevant se
 
 ## general instructions
 
-- Before reporting a plugin source change done, rebuild any generated executable it affects
-using the applicable manifest `[[build]]` command(s). Tests and debug builds may not update the artifact used by a locally linked plugin.
-- Plugins with a long-running daemon (currently `history`) swap in a rebuilt
-executable automatically on the next action; in-memory daemon state (focus
-history) resets when the binary actually changed. To verify a change
-immediately instead of waiting for the next keypress, invoke any action after
-rebuilding, e.g. `herdr plugin action invoke gjermundgaraba.herdr-history.activate`.
+- Before reporting a plugin source change done, run all applicable manifest `[[build]]` commands in order from that plugin's directory, including the install and atomic replacement steps. Tests and bare `cargo build` do not update the installed executable used by a locally linked plugin. `herdr plugin link` only registers the plugin; it does not build or install its executable.
+- Runtime commands must use the plugin's independent `bin/` copy, never a binary or symlink into `target/`. Keep Cargo artifacts separate from installed executables so build-cache cleanup cannot break plugins. Follow the package README for the build and install sequence.
+- The `history` daemon automatically swaps to an updated installed executable on the next action, resetting focus history if the binary bytes changed. To swap immediately after building and installing, invoke `herdr plugin action invoke gjermundgaraba.herdr-history.activate`. Installing identical bytes does not restart it.
+- For other daemons and installed services, follow the plugin’s lifecycle documentation: `herdr-hub/README.md` for Hub and `herdr-micro/docs/micro-bridge.md` for Micro. Hub’s installed service copy can be refreshed after rebuilding with `herdr-hub/bin/herdr-hub install-service`.
 - Never suggest "upstreaming a change to herdr itself". If we can't do something in an extension today, we can't do it today. Just plainly say that if this is the case.
 
 

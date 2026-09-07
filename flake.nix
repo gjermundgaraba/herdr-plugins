@@ -210,14 +210,14 @@
                 binary:
                 if definition.binOnly or false then
                   ''install -Dm755 "${cargoReleaseDir}/${binary}" "$out/bin/${binary}"''
-                else if definition.alsoBin or false then
+                else
                   ''
                     install -Dm755 "${cargoReleaseDir}/${binary}" "$out/${name}/bin/${binary}"
-                    mkdir -p "$out/bin"
-                    ln -s "../${name}/bin/${binary}" "$out/bin/${binary}"
+                    ${lib.optionalString (definition.alsoBin or false) ''
+                      mkdir -p "$out/bin"
+                      ln -s "../${name}/bin/${binary}" "$out/bin/${binary}"
+                    ''}
                   ''
-                else
-                  ''install -Dm755 "${cargoReleaseDir}/${binary}" "$out/target/release/${binary}"''
               ) (binariesFor name crate);
               installExampleFiles = lib.concatMapStringsSep "\n" (
                 file:
@@ -245,6 +245,9 @@
 
                 ${lib.optionalString (!(definition.binOnly or false)) ''
                   install -Dm444 "${name}/herdr-plugin.toml" "$out/${name}/herdr-plugin.toml"
+                ''}
+                ${lib.optionalString (name == "fork-to-pane") ''
+                  install -Dm444 "${name}/amp-plugin.ts" "$out/${name}/amp-plugin.ts"
                 ''}
                 ${installBinaries}
                 ${installExampleFiles}

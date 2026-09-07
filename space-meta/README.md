@@ -47,8 +47,13 @@ herdr plugin install gjermundgaraba/herdr-plugins/space-meta
 
 ## Local development
 
+Run these commands from the repository root:
+
 ```sh
-cargo build --release --locked
+cargo build --release --locked -p herdr-space-meta
+mkdir -p space-meta/bin
+install -m 750 target/release/herdr-space-meta space-meta/bin/.herdr-space-meta.new
+mv -f space-meta/bin/.herdr-space-meta.new space-meta/bin/herdr-space-meta
 herdr plugin link "$PWD/space-meta"
 herdr plugin action invoke gjermundgaraba.herdr-space-meta.refresh
 ```

@@ -22,7 +22,10 @@ For local development:
 
 ```sh
 cd /path/to/herdr-plugins/equalize-splits
-cargo build --release --locked
+cargo build --release --locked -p herdr-equalize-splits
+mkdir -p bin
+install -m 750 ../target/release/herdr-equalize-splits bin/.herdr-equalize-splits.new
+mv -f bin/.herdr-equalize-splits.new bin/herdr-equalize-splits
 herdr plugin link "$PWD"
 ```
 

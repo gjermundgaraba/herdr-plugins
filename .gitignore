@@ -4,3 +4,7 @@
 __pycache__/
 /herdr-micro/bin/
 /herdr-hub/bin/
+/history/bin/
+/equalize-splits/bin/
+/fork-to-pane/bin/
+/space-meta/bin/

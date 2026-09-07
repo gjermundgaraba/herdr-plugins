@@ -6,52 +6,61 @@ description = "Space numbers and PR badges in the spaces sidebar"
 platforms = ["macos", "linux"]
 
 [[build]]
-command = ["cargo", "build", "--release", "--locked"]
+command = ["cargo", "build", "--release", "--locked", "-p", "herdr-space-meta"]
+
+[[build]]
+command = ["mkdir", "-p", "bin"]
+
+[[build]]
+command = ["install", "-m", "750", "../target/release/herdr-space-meta", "bin/.herdr-space-meta.new"]
+
+[[build]]
+command = ["mv", "-f", "bin/.herdr-space-meta.new", "bin/herdr-space-meta"]
 
 [[startup]]
-command = ["../target/release/herdr-space-meta"]
+command = ["bin/herdr-space-meta"]
 
 [[actions]]
 id = "refresh"
 title = "Refresh space numbers and PR badges"
-command = ["../target/release/herdr-space-meta"]
+command = ["bin/herdr-space-meta"]
 
 [[events]]
 on = "workspace.created"
-command = ["../target/release/herdr-space-meta"]
+command = ["bin/herdr-space-meta"]
 
 [[events]]
 on = "workspace.updated"
-command = ["../target/release/herdr-space-meta"]
+command = ["bin/herdr-space-meta"]
 
 [[events]]
 on = "workspace.renamed"
-command = ["../target/release/herdr-space-meta"]
+command = ["bin/herdr-space-meta"]
 
 [[events]]
 on = "workspace.closed"
-command = ["../target/release/herdr-space-meta"]
+command = ["bin/herdr-space-meta"]
 
 [[events]]
 on = "workspace.moved"
-command = ["../target/release/herdr-space-meta"]
+command = ["bin/herdr-space-meta"]
 
 [[events]]
 on = "workspace.reordered"
-command = ["../target/release/herdr-space-meta"]
+command = ["bin/herdr-space-meta"]
 
 [[events]]
 on = "workspace.focused"
-command = ["../target/release/herdr-space-meta"]
+command = ["bin/herdr-space-meta"]
 
 [[events]]
 on = "worktree.created"
-command = ["../target/release/herdr-space-meta"]
+command = ["bin/herdr-space-meta"]
 
 [[events]]
 on = "worktree.opened"
-command = ["../target/release/herdr-space-meta"]
+command = ["bin/herdr-space-meta"]
 
 [[events]]
 on = "worktree.removed"
-command = ["../target/release/herdr-space-meta"]
+command = ["bin/herdr-space-meta"]
