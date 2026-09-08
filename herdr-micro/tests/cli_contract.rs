@@ -1,29 +1,17 @@
 use std::{
-    env, fs,
+    fs,
     io::{BufRead, BufReader, Write},
     os::unix::fs::PermissionsExt,
     os::unix::net::{UnixListener, UnixStream},
     os::unix::process::CommandExt,
-    path::{Path, PathBuf},
+    path::Path,
     process::{Command, Output},
-    sync::atomic::{AtomicUsize, Ordering},
     thread,
 };
 
 use herdr_micro::daemon::DAEMON_PROTOCOL_VERSION;
 
 const BIN: &str = env!("CARGO_BIN_EXE_herdr-micro");
-
-fn temp_dir(name: &str) -> PathBuf {
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let path = env::temp_dir().join(format!(
-        "herdr-micro-cli-{name}-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    fs::create_dir_all(&path).unwrap();
-    path
-}
 
 fn command(args: &[&str]) -> Command {
     let mut command = Command::new(BIN);
@@ -65,7 +53,11 @@ fn missing_and_invalid_cli_are_useful_errors() {
 
 #[test]
 fn status_stop_and_start_use_the_newline_json_socket_without_spawning() {
-    let dir = temp_dir("socket");
+    let directory = tempfile::Builder::new()
+        .prefix("hm-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let dir = directory.path();
     let state = dir.join("state");
     let run = state.join("run");
     fs::create_dir_all(&run).unwrap();
@@ -113,7 +105,7 @@ fn status_stop_and_start_use_the_newline_json_socket_without_spawning() {
             ),
         ),
     ] {
-        let result = plugin_command(&args, &dir, &state).output().unwrap();
+        let result = plugin_command(&args, dir, &state).output().unwrap();
         assert!(
             result.status.success(),
             "{}",
@@ -126,13 +118,15 @@ fn status_stop_and_start_use_the_newline_json_socket_without_spawning() {
         fs::read_to_string(state.join("service-command")).unwrap(),
         "install\n"
     );
-
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn setup_pi_effort_uses_plugin_root_outside_the_repository() {
-    let dir = temp_dir("pi-effort");
+    let directory = tempfile::Builder::new()
+        .prefix("hm-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let dir = directory.path();
     let root = dir.join("plugin");
     let source = root.join("integrations/pi/herdr-effort.js");
     fs::create_dir_all(source.parent().unwrap()).unwrap();
@@ -166,6 +160,4 @@ fn setup_pi_effort_uses_plugin_root_outside_the_repository() {
         0o600
     );
     assert!(String::from_utf8_lossy(&install.stdout).contains("Installed Pi effort extension:"));
-
-    fs::remove_dir_all(dir).unwrap();
 }

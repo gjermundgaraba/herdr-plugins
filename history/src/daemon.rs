@@ -83,10 +83,10 @@ pub(crate) fn run_daemon() -> Result<()> {
     let mut executable_missing_since: Option<Instant> = None;
 
     loop {
-        // Existence only, deliberately not identity: rebuilds recreate this
-        // path (identity churns on every no-op build), while an uninstall
-        // leaves it gone with no future client to retire this daemon. The
-        // grace period rides out cargo's unlink-then-relink window.
+        // Existence only: an uninstall leaves this path gone with no future
+        // client to retire the daemon. Managed upgrades temporarily move the
+        // entire checkout, so allow their replacement/rollback window even
+        // though binary installation itself uses an atomic rename.
         if fs::symlink_metadata(&executable).is_err() {
             let missing_since = *executable_missing_since.get_or_insert_with(Instant::now);
             if missing_since.elapsed() >= EXEC_MISSING_GRACE {

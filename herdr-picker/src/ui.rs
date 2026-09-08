@@ -208,7 +208,7 @@ fn render_row(item: &Item, selected: bool, spinner_frame: usize, frame: &mut Fra
     };
     let badge = (!item.badge.is_empty()).then(|| format!(" {} ", item.badge));
     let indicator = if item.spinning {
-        ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][spinner_frame % 10]
+        ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][spinner_frame]
     } else {
         &item.indicator
     };

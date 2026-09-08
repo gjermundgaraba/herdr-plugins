@@ -35,7 +35,8 @@ use reconcile::{
 const CONFIG_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const OWNER_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 const WORK_QUEUE_CAPACITY: usize = 16;
-pub const DAEMON_PROTOCOL_VERSION: u32 = 10;
+// Replacing the lighting IPC contract requires replacing a running policy client too.
+pub const DAEMON_PROTOCOL_VERSION: u32 = 11;
 
 static LOG_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -71,6 +72,23 @@ fn apply_runtime_event(event: RuntimeEvent, state: &mut State, stopping: &Atomic
                 "device update failed: ",
             );
         }
+    }
+}
+
+fn apply_runtime_batch(
+    events: impl IntoIterator<Item = RuntimeEvent>,
+    state: &mut State,
+    stopping: &AtomicBool,
+    dirty: &mut bool,
+) {
+    *dirty = true;
+    // Apply transitions in order so even a focus round-trip revokes captured
+    // actions. Bound the batch to keep owner/config checks responsive.
+    for event in events.into_iter().take(256) {
+        if stopping.load(Ordering::Acquire) {
+            break;
+        }
+        apply_runtime_event(event, state, stopping);
     }
 }
 
@@ -129,6 +147,23 @@ fn civil_from_days(days: u64) -> (u64, u64, u64) {
     };
     let year = year_of_era + era * 400 + u64::from(month <= 2);
     (year, month, day)
+}
+
+/// Publish derived state once after a change, preserving the idle owner poll.
+fn reconcile_dirty(
+    dirty: &mut bool,
+    state: &mut State,
+    stopping: &AtomicBool,
+    input_context: &Mutex<Arc<InputContext>>,
+    status: &Arc<Mutex<serde_json::Value>>,
+) -> Option<device::Output> {
+    if !std::mem::take(dirty) {
+        return None;
+    }
+    reconcile_active(state, stopping);
+    update_input_context(input_context, state);
+    publish(status, state);
+    Some(device_output(state))
 }
 
 /// Run the bridge in the foreground.  `main`/the start action owns process
@@ -192,6 +227,7 @@ pub fn run_daemon() -> Result<()> {
     let mut control_error = None;
     let mut config_due = Instant::now();
     let mut owner_due = Instant::now();
+    let mut dirty = true;
     log("bridge started");
     while !stopping.load(Ordering::Acquire) {
         match control_result_rx.try_recv() {
@@ -218,29 +254,27 @@ pub fn run_daemon() -> Result<()> {
         let now = Instant::now();
         if now >= owner_due {
             owner_due = now + OWNER_REFRESH_INTERVAL;
-            refresh_owner(&mut state);
+            dirty |= refresh_owner(&mut state);
         }
         if now >= config_due {
             config_due = now + CONFIG_REFRESH_INTERVAL;
-            apply_config_load(&mut state, load(&config_path), startup_enabled_buttons);
+            dirty |= apply_config_load(&mut state, load(&config_path), startup_enabled_buttons);
         }
-        reconcile_active(&mut state, &stopping);
-        update_input_context(&input_context, &state);
-        publish(&status, &state);
-        device.set_output(device_output(&state));
+        if let Some(output) =
+            reconcile_dirty(&mut dirty, &mut state, &stopping, &input_context, &status)
+        {
+            device.set_output(output);
+        }
 
         let deadline = config_due.min(owner_due);
         match runtime_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
             Ok(event) => {
-                // Apply transitions in order so even a focus round-trip revokes
-                // captured actions. Publish only the final output in this batch.
-                // Bound each batch to keep owner/config checks responsive.
-                for event in std::iter::once(event).chain(runtime_rx.try_iter().take(255)) {
-                    if stopping.load(Ordering::Acquire) {
-                        break;
-                    }
-                    apply_runtime_event(event, &mut state, &stopping);
-                }
+                apply_runtime_batch(
+                    std::iter::once(event).chain(runtime_rx.try_iter()),
+                    &mut state,
+                    &stopping,
+                    &mut dirty,
+                );
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
@@ -248,7 +282,7 @@ pub fn run_daemon() -> Result<()> {
     }
 
     log("stopping");
-    state.revoke_routing();
+    state.invalidate_routing();
     stopping.store(true, Ordering::Release);
     device.shutdown();
     drop(device_tx);
@@ -267,6 +301,99 @@ pub fn run_daemon() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dirty_publication_covers_startup_errors_owner_changes_and_shutdown() {
+        let config = crate::config::Config::default();
+        let mut state = State::new(config.clone());
+        let context = Mutex::new(Arc::new(InputContext::new(&config)));
+        let status = Arc::new(Mutex::new(serde_json::Value::Null));
+        let stopping = AtomicBool::new(false);
+        let mut dirty = true;
+        assert!(reconcile_dirty(&mut dirty, &mut state, &stopping, &context, &status).is_some());
+        assert_eq!(*status.lock().unwrap(), state.status());
+        let initial_context = Arc::clone(&context.lock().unwrap());
+        for _ in 0..20 {
+            assert!(
+                reconcile_dirty(&mut dirty, &mut state, &stopping, &context, &status).is_none()
+            );
+            assert!(Arc::ptr_eq(&initial_context, &context.lock().unwrap()));
+        }
+
+        apply_runtime_batch(
+            [RuntimeEvent::Device(device::Update::Error(
+                "write failed".into(),
+            ))],
+            &mut state,
+            &stopping,
+            &mut dirty,
+        );
+        assert!(reconcile_dirty(&mut dirty, &mut state, &stopping, &context, &status).is_some());
+        assert_eq!(status.lock().unwrap()["deviceError"], "write failed");
+
+        for owner in [Some(codex_micro::ExternalOwner::Input), None] {
+            state.owner = owner;
+            dirty = true;
+            assert!(
+                reconcile_dirty(&mut dirty, &mut state, &stopping, &context, &status).is_some()
+            );
+            assert_eq!(
+                status.lock().unwrap()["device"] == "yielded",
+                owner.is_some()
+            );
+        }
+        state.routing_ready = true;
+        state.invalidate_routing();
+        stopping.store(true, Ordering::Release);
+        publish(&status, &state);
+        assert_ne!(status.lock().unwrap()["routing"], "ready");
+    }
+
+    #[test]
+    fn runtime_batches_preserve_focus_round_trips_and_bound_work() {
+        use herdr_hub_client::{Model, ServerMessage, SessionState};
+        let config = crate::config::Config::default();
+        let mut state = State::new(config);
+        let stopping = AtomicBool::new(false);
+        let session = |name: &str| SessionState {
+            key: name.into(),
+            host: "local".into(),
+            name: name.into(),
+            connected: true,
+            error: None,
+            protocol: 20,
+            workspaces: vec![],
+            tabs: vec![],
+            agents: vec![],
+            socket_path: Some(format!("/tmp/{name}.sock").into()),
+            client_focused: Some(true),
+        };
+        let event = |active: &str| {
+            RuntimeEvent::Hub(Box::new(Ok(ServerMessage::Hello {
+                protocol: herdr_hub_client::PROTOCOL,
+                model: Model {
+                    version: 4,
+                    active: Some(active.into()),
+                    hosts: vec![],
+                    sessions: vec![session("a"), session("b")],
+                },
+            })))
+        };
+        apply_runtime_event(event("a"), &mut state, &stopping);
+        let generation = state.routing_generation();
+        let mut dirty = false;
+        apply_runtime_batch([event("b"), event("a")], &mut state, &stopping, &mut dirty);
+        assert!(dirty);
+        assert_eq!(state.model.active.as_deref(), Some("a"));
+        assert!(state.routing_generation() > generation);
+        let mut received = 0;
+        let events = std::iter::from_fn(|| {
+            received += 1;
+            Some(RuntimeEvent::Device(device::Update::Error(String::new())))
+        });
+        apply_runtime_batch(events, &mut state, &stopping, &mut dirty);
+        assert_eq!(received, 256);
+    }
 
     #[test]
     fn lighting_failure_does_not_revoke_a_herdr_route() {

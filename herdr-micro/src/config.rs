@@ -7,7 +7,7 @@ use std::{
 };
 
 #[cfg(test)]
-use std::{env, os::unix::fs::PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(tag = "action", rename_all = "kebab-case", deny_unknown_fields)]
@@ -732,9 +732,8 @@ mod tests {
 
     #[test]
     fn loading_is_pure_and_provisioning_creates_private_defaults() {
-        let root = env::temp_dir().join(format!("herdr-micro-config-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let path = root.join("config.json");
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
         assert!(load(&path).is_err());
         assert!(!path.exists());
         provision(&path).unwrap();
@@ -749,6 +748,5 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o644
         );
-        fs::remove_dir_all(root).unwrap();
     }
 }

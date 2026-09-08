@@ -15,6 +15,15 @@ stock Codex Micro firmware 0.6.2
      -> gestures, actions, and lighting policy
 ```
 
+The complete lighting boundary keeps policy separate from device recovery:
+
+```mermaid
+flowchart LR
+    P["Herdr policy: colors, enablement, layers"] --> W["Independent worker: latest output, retries, send cache"]
+    W -->|"replace_lighting: ambient + keys + six slots"| S["Device service: serialize, retain accepted state, recover, blank"]
+    S --> G["Official-owner gate"] --> D["USB / BLE Micro"]
+```
+
 The LaunchAgent runs without administrator privileges from
 `~/Library/Application Support/dev.herdr.codex-micro/codex-micro`. It owns the
 device connection, the official-writer gate, and reconnects. It closes the
@@ -23,7 +32,7 @@ frontmost, then reopens and replays the latest state when that gate clears. USB
 wins when USB and Bluetooth Low Energy are both available.
 
 The local socket is mode `0600`, verifies the peer's effective UID, requires an
-exact protocol version, bounds frames, and permits one device controller. Its
+exact protocol version (2), bounds frames, and permits one device controller. Its
 operations are typed: status, controller lifecycle, focused app, lighting, and
 guarded keymap reads/writes. There is no generic raw device RPC and no path to
 the device that bypasses the service. The physical-device gate is
@@ -99,6 +108,24 @@ Routing updates never wait for device I/O. A separate worker retains only the
 latest desired layer and lighting, compares actual light values, and writes
 only changes. Terminal-title animations and other agent metadata do not resend
 lights. Device errors are reported separately from Herdr routing failures.
+Lighting uses `Client::replace_lighting` with a complete snapshot: `ambient`,
+`keys`, and exactly six slots. Every replacement writes both aggregate zones
+and all slots; disabled aggregates and `Lighting::default()` explicitly turn
+lights off. Success means the service accepted the snapshot: connected device
+writes completed under the transport contract, or an offline snapshot was
+retained for replay. It does not promise visible hardware read-back.
+
+A failed write can have partial physical effects. The service retains its last
+accepted snapshot and replays it after reconnect, or blanks all lights if none
+was accepted. Official-owner checks remain between writes and gate recovery.
+The first controller acquisition after service restart establishes native
+Layer 1 and complete blank lighting, including when a status check already
+opened the device. Status queries alone do not reset lighting. Controller
+disconnect restores Layer 1 and blanks every supported surface. The worker
+invalidates its send cache before a lighting attempt so a lost IPC reply cannot
+prevent a later replacement. Version 1 clients and services are rejected;
+update both binaries together using the start flow above.
+
 Before a queued binding runs, its captured session key must still match the
 hub's current active route, and `agent.get` must return the captured terminal,
 pane, and agent identity with

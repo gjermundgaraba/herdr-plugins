@@ -3,6 +3,7 @@
 mod device;
 mod keymap;
 pub mod lifecycle;
+mod lock;
 mod owner;
 pub mod service;
 mod wire;

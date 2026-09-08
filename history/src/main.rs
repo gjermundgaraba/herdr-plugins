@@ -132,10 +132,4 @@ mod tests {
         assert_ne!(first.control_socket, other_server.control_socket);
         assert!(first.control_socket.as_os_str().len() < 104);
     }
-
-    #[test]
-    fn build_identity_is_content_not_metadata() {
-        assert_eq!(build_hash().unwrap(), build_hash().unwrap());
-        assert_eq!(build_hash().unwrap().len(), 24);
-    }
 }

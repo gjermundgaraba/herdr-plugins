@@ -271,18 +271,8 @@ impl LifecycleLock {
     }
 
     fn acquire_at(path: &Path, timeout: Duration) -> Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)
+        let file = crate::lock::open_checked_lock_file(path, effective_uid())
             .with_context(|| format!("open lifecycle lock {}", path.display()))?;
-        let metadata = file.metadata()?;
-        if !managed_metadata_matches(&metadata, effective_uid(), 0o600) {
-            bail!("unsafe Codex Micro lifecycle lock {}", path.display())
-        }
         let deadline = Instant::now() + timeout;
         loop {
             match file.try_lock() {
@@ -577,34 +567,6 @@ fn sync_dir(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn test_dir(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = env::temp_dir().join(format!(
-            "codex-micro-lifecycle-{name}-{}-{nonce}",
-            std::process::id()
-        ));
-        fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
-        path
-    }
-
-    fn test_home_dir(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = home_dir(effective_uid()).unwrap().join(format!(
-            ".codex-micro-lifecycle-{name}-{}-{nonce}",
-            std::process::id()
-        ));
-        fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
-        path
-    }
-
     #[test]
     fn derives_exact_paths() {
         let paths = paths_from_home(Path::new("/Users/test")).unwrap();
@@ -636,7 +598,8 @@ mod tests {
 
     #[test]
     fn managed_file_equality_requires_mode_and_single_link() {
-        let dir = test_dir("file");
+        let dir_guard = tempfile::tempdir().unwrap();
+        let dir = dir_guard.path();
         let path = dir.join("managed");
         let link = dir.join("link");
         fs::write(&path, b"same").unwrap();
@@ -649,38 +612,36 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         fs::hard_link(&path, &link).unwrap();
         assert!(!managed_file_matches(&path, b"same", effective_uid(), 0o600).unwrap());
-
-        fs::remove_file(link).unwrap();
-        fs::remove_file(path).unwrap();
-        fs::remove_dir(dir).unwrap();
     }
 
     #[test]
     fn managed_parent_rejects_group_or_world_writes() {
-        let dir = test_dir("dir");
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o722)).unwrap();
-        assert!(ensure_dir(&dir, false).is_err());
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::remove_dir(dir).unwrap();
+        let dir_guard = tempfile::tempdir().unwrap();
+        let dir = dir_guard.path();
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o722)).unwrap();
+        assert!(ensure_dir(dir, false).is_err());
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]
     fn managed_parent_rejects_symlinked_ancestor() {
-        let home = test_home_dir("symlink");
-        let redirected = test_dir("redirect");
-        std::os::unix::fs::symlink(&redirected, home.join("Library")).unwrap();
-        let paths = paths_from_home(&home).unwrap();
+        let home_guard = tempfile::Builder::new()
+            .prefix(".codex-micro-test-")
+            .tempdir_in(home_dir(effective_uid()).unwrap())
+            .unwrap();
+        let home = home_guard.path();
+        let redirected_guard = tempfile::tempdir().unwrap();
+        let redirected = redirected_guard.path();
+        std::os::unix::fs::symlink(redirected, home.join("Library")).unwrap();
+        let paths = paths_from_home(home).unwrap();
 
         assert!(ensure_managed_dirs(&paths).is_err());
-
-        fs::remove_file(home.join("Library")).unwrap();
-        fs::remove_dir(home).unwrap();
-        fs::remove_dir(redirected).unwrap();
     }
 
     #[test]
     fn staged_files_preserve_live_contents_until_commit() {
-        let dir = test_dir("staging");
+        let dir_guard = tempfile::tempdir().unwrap();
+        let dir = dir_guard.path();
         let executable = dir.join("executable");
         let plist = dir.join("plist");
         fs::write(&executable, b"old executable").unwrap();
@@ -703,13 +664,13 @@ mod tests {
             .unwrap()
         );
         assert!(managed_file_matches(&plist, b"new plist", effective_uid(), PLIST_MODE).unwrap());
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
-        fs::remove_dir_all(dir).unwrap();
+        assert_eq!(fs::read_dir(dir).unwrap().count(), 2);
     }
 
     #[test]
     fn failed_commit_and_abandoned_staging_leave_no_temporary_files() {
-        let dir = test_dir("staging-failure");
+        let dir_guard = tempfile::tempdir().unwrap();
+        let dir = dir_guard.path();
         let target = dir.join("target");
         fs::create_dir(&target).unwrap();
         let existing = target.join("existing");
@@ -720,19 +681,17 @@ mod tests {
         assert!(error.to_string().contains("install"));
         drop(abandoned);
         assert_eq!(fs::read(&existing).unwrap(), b"keep");
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
-        fs::remove_dir_all(dir).unwrap();
+        assert_eq!(fs::read_dir(dir).unwrap().count(), 1);
     }
 
     #[test]
     fn lifecycle_lock_serializes_mutations() {
-        let dir = test_dir("lock");
+        let dir_guard = tempfile::tempdir().unwrap();
+        let dir = dir_guard.path();
         let path = dir.join("lifecycle.lock");
         let first = LifecycleLock::acquire_at(&path, Duration::ZERO).unwrap();
         assert!(LifecycleLock::acquire_at(&path, Duration::ZERO).is_err());
         drop(first);
         LifecycleLock::acquire_at(&path, Duration::ZERO).unwrap();
-        fs::remove_file(path).unwrap();
-        fs::remove_dir(dir).unwrap();
     }
 }

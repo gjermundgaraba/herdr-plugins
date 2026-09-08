@@ -616,21 +616,10 @@ pub(super) fn input_worker(
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, fs, os::unix::fs::PermissionsExt, path::PathBuf, sync::mpsc};
+    use std::{cell::RefCell, fs, os::unix::fs::PermissionsExt, sync::mpsc};
 
     use super::*;
     use crate::config::Config;
-
-    fn temp_dir(name: &str) -> PathBuf {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "herdr-micro-{name}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&path).unwrap();
-        path
-    }
 
     fn agent(terminal: &str, pane: &str, kind: &str) -> AgentInfo {
         serde_json::from_value(json!({
@@ -664,7 +653,8 @@ mod tests {
 
     #[test]
     fn script_context_drives_the_bundled_adapter() {
-        let dir = temp_dir("script-context");
+        let directory = tempfile::tempdir().unwrap();
+        let dir = directory.path();
         let fake_herdr = dir.join("herdr");
         let calls = dir.join("calls");
         let environment = dir.join("environment");
@@ -723,7 +713,6 @@ printf '%s\n' --call "$@" >> "$HERDR_TEST_LOG"
             fs::read_to_string(&calls).unwrap(),
             "--call\npane\nsend-text\nw9:p4\n/effort\n--call\npane\nsend-keys\nw9:p4\nenter\n--call\npane\nsend-keys\nw9:p4\nleft\n--call\npane\nsend-keys\nw9:p4\nenter\n"
         );
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

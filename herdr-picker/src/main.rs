@@ -193,7 +193,7 @@ impl StepRuntime {
     fn start(
         name: &str,
         step: &Step,
-        selections: &BTreeMap<String, Item>,
+        selections: &BTreeMap<String, Selection>,
         mode: Mode,
         restored: Option<Picker>,
     ) -> Self {
@@ -262,7 +262,7 @@ impl StepRuntime {
         now: Instant,
         name: &str,
         step: &Step,
-        selections: &BTreeMap<String, Item>,
+        selections: &BTreeMap<String, Selection>,
     ) -> bool {
         if self.pending_query.is_none_or(|deadline| deadline > now) {
             return false;
@@ -398,7 +398,7 @@ fn run_tui(
                 );
             }
             ScreenOutcome::Select { item, query } => {
-                selections.insert(step.id.clone(), *item);
+                selections.insert(step.id.clone(), item);
                 if step_index + 1 == workflow.steps.len() {
                     return Ok(Some(command_input(name, step, &selections, &query)));
                 }
@@ -419,7 +419,7 @@ fn run_tui(
 fn command_input(
     workflow: &str,
     step: &Step,
-    selections: &BTreeMap<String, Item>,
+    selections: &BTreeMap<String, Selection>,
     query: &str,
 ) -> Value {
     let selections = selections
@@ -434,8 +434,22 @@ fn command_input(
     })
 }
 
+struct Selection {
+    id: String,
+    value: Value,
+}
+
+impl From<&Item> for Selection {
+    fn from(item: &Item) -> Self {
+        Self {
+            id: item.id.clone(),
+            value: item.value.clone(),
+        }
+    }
+}
+
 enum ScreenOutcome {
-    Select { item: Box<Item>, query: String },
+    Select { item: Selection, query: String },
     Back,
     Cancel,
 }
@@ -445,7 +459,7 @@ fn run_screen(
     name: &str,
     workflow: &Workflow,
     step_index: usize,
-    selections: &BTreeMap<String, Item>,
+    selections: &BTreeMap<String, Selection>,
     runtime: &mut StepRuntime,
 ) -> Result<ScreenOutcome> {
     let step = &workflow.steps[step_index];
@@ -512,7 +526,7 @@ fn run_screen(
                             runtime.picker.selected = index;
                             if let Some(item) = runtime.picker.selected_item() {
                                 return Ok(ScreenOutcome::Select {
-                                    item: Box::new(item.clone()),
+                                    item: Selection::from(item),
                                     query: runtime.picker.query.clone(),
                                 });
                             }
@@ -538,13 +552,10 @@ fn handle_key(picker: &mut Picker, mode: &mut Mode, key: KeyEvent) -> Option<Scr
         (KeyCode::Esc, _) => return Some(ScreenOutcome::Back),
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Some(ScreenOutcome::Cancel),
         (KeyCode::Enter, _) => {
-            return picker
-                .selected_item()
-                .cloned()
-                .map(|item| ScreenOutcome::Select {
-                    item: Box::new(item),
-                    query: picker.query.clone(),
-                });
+            return picker.selected_item().map(|item| ScreenOutcome::Select {
+                item: Selection::from(item),
+                query: picker.query.clone(),
+            });
         }
         (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
             picker.move_selection(-1)
@@ -702,14 +713,18 @@ mod tests {
         let mut selections = BTreeMap::new();
         let mut selected = item("opus");
         selected.subtitle = "presentation".into();
-        selections.insert("model".into(), selected);
+        selected.value = json!({"nested": [null, {"number": 42, "flag": true}]});
+        selections.insert("model".into(), Selection::from(&selected));
         let input = command_input("new-agent", &step, &selections, "cl");
 
         assert_eq!(input["workflow"], "new-agent");
         assert_eq!(input["step"], "harness");
         assert_eq!(input["query"], "cl");
         assert_eq!(input["selections"]["model"]["id"], "opus");
-        assert!(input["selections"]["model"].get("subtitle").is_none());
+        assert_eq!(
+            input["selections"]["model"],
+            json!({"id": "opus", "value": selected.value})
+        );
     }
 
     #[test]

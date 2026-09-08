@@ -148,11 +148,8 @@ mod tests {
         assert!(error.to_string().contains("timed out"));
         assert!(started.elapsed() < Duration::from_secs(2));
 
-        let marker = std::env::temp_dir().join(format!(
-            "herdr-micro-command-descendant-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&marker);
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("descendant");
         run_command_with_timeout(
             Command::new("/bin/sh")
                 .args(["-c", "(sleep 0.2; : > \"$HERDR_TEST_MARKER\") &"])

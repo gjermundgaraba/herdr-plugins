@@ -9,12 +9,11 @@
 use std::{
     collections::HashMap,
     ffi::{CStr, c_void},
-    fs::{File, OpenOptions, TryLockError},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    fs::{File, TryLockError},
     path::Path,
     ptr::NonNull,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender, SyncSender, TryRecvError},
     },
@@ -22,7 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use objc2_core_foundation::{
     CFDictionary, CFNumber, CFRetained, CFRunLoop, CFRunLoopSource, CFRunLoopSourceContext,
     CFString, kCFRunLoopDefaultMode,
@@ -391,22 +390,8 @@ impl DeviceLock {
     }
 
     fn acquire_at(path: &Path) -> Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file()
-            || metadata.uid() != unsafe { libc::getuid() }
-            || metadata.nlink() != 1
-            || metadata.mode() & 0o7777 != 0o600
-        {
-            bail!("unsafe Codex Micro device lock {}", path.display())
-        }
+        let file = crate::lock::open_checked_lock_file(path, unsafe { libc::getuid() })
+            .with_context(|| format!("open Codex Micro device lock {}", path.display()))?;
         match file.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
@@ -436,13 +421,7 @@ fn owner_main(
         let wake = RunLoopWake::new()?;
         let _registration = RunLoopWakeRegistration(Arc::clone(&wake));
         let _ = shared_wake.set(Arc::clone(&wake));
-        let (mut owner, info) = Owner::open(
-            Arc::new(Mutex::new(command_rx)),
-            event_tx,
-            closed,
-            terminal_error,
-            wake,
-        )?;
+        let (mut owner, info) = Owner::open(&command_rx, event_tx, closed, terminal_error, wake)?;
         if ready_tx.send(Ok(info)).is_err() {
             owner.teardown(true);
             bail!("opener dropped")
@@ -455,7 +434,7 @@ fn owner_main(
     result
 }
 
-struct Owner {
+struct Owner<'a> {
     manager: objc2_core_foundation::CFRetained<IOHIDManager>,
     device: objc2_core_foundation::CFRetained<IOHIDDevice>,
     transport: Transport,
@@ -466,7 +445,7 @@ struct Owner {
     context: Box<CallbackContext>,
     callback_rx: Receiver<CallbackEvent>,
     writer_tx: Sender<Vec<u8>>,
-    command_rx: Arc<Mutex<Receiver<Command>>>,
+    command_rx: &'a Receiver<Command>,
     event_tx: Sender<DeviceEvent>,
     reassembler: Reassembler,
     pending: HashMap<u64, Pending>,
@@ -476,9 +455,9 @@ struct Owner {
     torn_down: bool,
 }
 
-impl Owner {
+impl<'a> Owner<'a> {
     fn open(
-        command_rx: Arc<Mutex<Receiver<Command>>>,
+        command_rx: &'a Receiver<Command>,
         event_tx: Sender<DeviceEvent>,
         closed: Arc<AtomicBool>,
         terminal_error: Arc<OnceLock<String>>,
@@ -507,7 +486,7 @@ impl Owner {
             match Self::open_candidate(
                 manager.clone(),
                 candidate,
-                Arc::clone(&command_rx),
+                command_rx,
                 event_tx.clone(),
                 Arc::clone(&closed),
                 Arc::clone(&terminal_error),
@@ -534,7 +513,7 @@ impl Owner {
     fn open_candidate(
         manager: objc2_core_foundation::CFRetained<IOHIDManager>,
         candidate: DeviceCandidate,
-        command_rx: Arc<Mutex<Receiver<Command>>>,
+        command_rx: &'a Receiver<Command>,
         event_tx: Sender<DeviceEvent>,
         closed: Arc<AtomicBool>,
         terminal_error: Arc<OnceLock<String>>,
@@ -621,10 +600,7 @@ impl Owner {
             if self.closed.load(Ordering::Acquire) {
                 break;
             }
-            let command = match self.command_rx.lock() {
-                Ok(receiver) => receiver.try_recv(),
-                Err(_) => break,
-            };
+            let command = self.command_rx.try_recv();
             match command {
                 Ok(Command::Close) | Err(TryRecvError::Disconnected) => break,
                 Ok(Command::Send {
@@ -725,7 +701,7 @@ impl Owner {
             }
             if self
                 .writer_tx
-                .send(output_wire(&report, self.transport)?)
+                .send(output_wire(&report, self.transport))
                 .is_err()
             {
                 let error = "device writer stopped";
@@ -817,9 +793,7 @@ impl Owner {
         };
         self.closed.store(true, Ordering::Release);
         self.fail_all(&error);
-        if let Ok(receiver) = self.command_rx.lock() {
-            fail_queued(&receiver, &error);
-        }
+        fail_queued(self.command_rx, &error);
     }
 
     fn teardown(&mut self, close_manager: bool) {
@@ -834,9 +808,7 @@ impl Owner {
             .unwrap_or("device disconnected")
             .to_owned();
         self.fail_all(&error);
-        if let Ok(receiver) = self.command_rx.lock() {
-            fail_queued(&receiver, &error);
-        }
+        fail_queued(self.command_rx, &error);
         // SAFETY: This is the same owner thread that registered and scheduled
         // the callbacks. Clearing them precedes unscheduling, close, and drop.
         let context_ptr = &*self.context as *const CallbackContext as *mut c_void;
@@ -860,7 +832,7 @@ impl Owner {
     }
 }
 
-impl Drop for Owner {
+impl Drop for Owner<'_> {
     fn drop(&mut self) {
         self.teardown(true);
     }
@@ -1037,15 +1009,12 @@ fn cf_string(value: &CStr) -> objc2_core_foundation::CFRetained<CFString> {
     CFString::from_str(value.to_str().expect("IOKit keys are UTF-8"))
 }
 
-fn output_wire(report: &[u8; REPORT_SIZE], transport: Transport) -> Result<Vec<u8>> {
-    if report[0] != REPORT_ID {
-        bail!("invalid Micro report ID")
-    }
-    Ok(if transport == Transport::Usb {
+fn output_wire(report: &[u8; REPORT_SIZE], transport: Transport) -> Vec<u8> {
+    if transport == Transport::Usb {
         report[1..].to_vec()
     } else {
         report.to_vec()
-    })
+    }
 }
 
 fn device_info(transport: Transport, status: &Value) -> Result<DeviceInfo> {
@@ -1144,13 +1113,11 @@ mod tests {
         let mut report = [0; REPORT_SIZE];
         report[0] = REPORT_ID;
         report[1] = 2;
-        let usb = output_wire(&report, Transport::Usb).unwrap();
+        let usb = output_wire(&report, Transport::Usb);
         assert_eq!(usb.len(), 63);
         assert_eq!(usb[0], 2);
         assert_eq!(
-            output_wire(&report, Transport::BluetoothLowEnergy)
-                .unwrap()
-                .len(),
+            output_wire(&report, Transport::BluetoothLowEnergy).len(),
             64
         );
     }
@@ -1186,8 +1153,8 @@ mod tests {
     fn lock_excludes_another_micro_owner() {
         use std::os::unix::fs::PermissionsExt;
 
-        let path =
-            std::env::temp_dir().join(format!("codex-micro-lock-test-{}", std::process::id()));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("device.lock");
         let first = DeviceLock::acquire_at(&path).unwrap();
         assert!(DeviceLock::acquire_at(&path).is_err());
         drop(first);
@@ -1198,14 +1165,12 @@ mod tests {
         let link = path.with_extension("link");
         std::fs::hard_link(&path, &link).unwrap();
         assert!(DeviceLock::acquire_at(&path).is_err());
-        std::fs::remove_file(link).unwrap();
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn close_joins_an_owner_after_removal() {
-        let path =
-            std::env::temp_dir().join(format!("codex-micro-close-test-{}", std::process::id()));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("device.lock");
         let (command_tx, _command_rx) = mpsc::channel();
         let joined = Arc::new(AtomicBool::new(false));
         let owner_joined = Arc::clone(&joined);
@@ -1226,7 +1191,6 @@ mod tests {
         assert!(joined.load(Ordering::Acquire));
         assert!(device.owner.is_none());
         assert!(device.lock.is_none());
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -18,7 +18,11 @@ pub struct Picker {
 
 impl Picker {
     pub fn new(items: Vec<Item>, local_search: bool) -> Self {
-        let haystacks = items.iter().map(haystack).collect();
+        let haystacks = if local_search {
+            items.iter().map(haystack).collect()
+        } else {
+            Vec::new()
+        };
         let mut picker = Self {
             items,
             query: String::new(),
@@ -57,11 +61,10 @@ impl Picker {
 
     pub fn refilter(&mut self) {
         let query = self.query.trim();
-        let mut matches = Vec::new();
-
-        if query.is_empty() || !self.local_search {
-            matches.extend((0..self.items.len()).map(|index| (index, 0)));
+        self.filtered = if query.is_empty() || !self.local_search {
+            (0..self.items.len()).collect()
         } else {
+            let mut matches = Vec::new();
             let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
             for index in 0..self.items.len() {
                 if let Some(score) =
@@ -77,9 +80,8 @@ impl Picker {
                         .cmp(&self.items[*right_index].title)
                 })
             });
-        }
-
-        self.filtered = matches.into_iter().map(|(index, _)| index).collect();
+            matches.into_iter().map(|(index, _)| index).collect()
+        };
         self.selected = 0;
         self.scroll = 0;
     }
@@ -116,7 +118,9 @@ impl Picker {
     }
 
     fn rebuild(&mut self, selected: Option<(String, usize)>) {
-        self.haystacks = self.items.iter().map(haystack).collect();
+        if self.local_search {
+            self.haystacks = self.items.iter().map(haystack).collect();
+        }
         self.refilter();
         if let Some((selected_id, selected_row)) = selected
             && let Some(index) = self

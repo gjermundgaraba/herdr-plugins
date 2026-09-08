@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::OsString,
     io::{self, BufReader, Read, Write},
     os::unix::process::CommandExt,
@@ -423,8 +423,7 @@ impl HostWorker {
             stdin,
             incoming,
             imported: HashMap::new(),
-            in_flight: HashMap::new(),
-            next_counter: 1,
+            in_flight: HashSet::new(),
             connected: false,
         };
         let result = connection.run();
@@ -463,8 +462,7 @@ struct Connection<'a> {
     stdin: ChildStdin,
     incoming: Receiver<Incoming>,
     imported: HashMap<String, String>,
-    in_flight: HashMap<u64, u64>,
-    next_counter: u64,
+    in_flight: HashSet<u64>,
     connected: bool,
 }
 
@@ -557,12 +555,8 @@ impl Connection<'_> {
         while self.in_flight.len() < MAX_IN_FLIGHT {
             match self.commands.try_recv() {
                 Ok(call) if call.epoch == self.epoch => {
-                    let id = self.next_counter;
-                    self.next_counter = self
-                        .next_counter
-                        .checked_add(1)
-                        .ok_or_else(|| anyhow!("relay call counter overflowed"))?;
-                    self.in_flight.insert(id, call.token);
+                    let id = call.token;
+                    self.in_flight.insert(id);
                     if !self.write_message(
                         &ClientMessage::Call {
                             protocol: PROTOCOL,
@@ -662,16 +656,15 @@ impl Connection<'_> {
     }
 
     fn finish_call(&mut self, id: u64, result: std::result::Result<Value, String>) -> Result<()> {
-        let token = self
-            .in_flight
-            .remove(&id)
-            .ok_or_else(|| anyhow!("relay replied with unknown call id {id}"))?;
-        self.reply(self.epoch, token, result)
+        if !self.in_flight.remove(&id) {
+            bail!("relay replied with unknown call id {id}")
+        }
+        self.reply(self.epoch, id, result)
     }
 
     fn fail_in_flight(&mut self, error: &str) {
         let calls = std::mem::take(&mut self.in_flight);
-        for (_, token) in calls {
+        for token in calls {
             let _ = self.reply(self.epoch, token, Err(error.into()));
         }
     }
@@ -914,11 +907,7 @@ fn set_nonblocking(fd: std::os::fd::RawFd) -> io::Result<()> {
 }
 
 fn wake(wake_tx: &UnixStream) {
-    match (&*wake_tx).write(&[1]) {
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-        Err(_) => {}
-    }
+    let _ = (&*wake_tx).write(&[1]);
 }
 
 fn send_event(events: &SyncSender<Event>, stop: &AtomicBool, mut event: Event) -> bool {
@@ -1282,7 +1271,7 @@ mod tests {
             key: "local/agents".into(),
         };
         let reply = ServerMessage::Reply {
-            id: 1,
+            id: 91,
             result: json!({"focused": true}),
         };
         let source = format!(
@@ -1375,7 +1364,7 @@ mod tests {
         assert!(matches!(
             call,
             ClientMessage::Call { id, session, .. }
-                if id == 1 && session == "local/default"
+                if id == 91 && session == "local/default"
         ));
         directory.close().unwrap();
     }
@@ -1430,6 +1419,57 @@ mod tests {
         ));
         drop(supervisor);
         directory.close().unwrap();
+    }
+
+    #[test]
+    fn unknown_and_duplicate_reply_tokens_disconnect_the_relay() {
+        for duplicate in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let script = directory.path().join("fake-ssh");
+            let hello = ServerMessage::Hello {
+                protocol: PROTOCOL,
+                model: Model {
+                    version: 1,
+                    active: None,
+                    hosts: Vec::new(),
+                    sessions: vec![session("local/default", "local", "default")],
+                },
+            };
+            let reply = serde_json::to_string(&ServerMessage::Reply {
+                id: if duplicate { 91 } else { 92 },
+                result: json!({}),
+            })
+            .unwrap();
+            std::fs::write(&script, format!(
+                "#!/bin/sh\nprintf '%s\\n' '{}'\nIFS= read -r call\nprintf '%s\\n' '{}'\nprintf '%s\\n' '{}'\nexec /bin/sleep 30\n",
+                serde_json::to_string(&hello).unwrap(), reply, reply,
+            )).unwrap();
+            make_executable(&script);
+            let (events_tx, events) = mpsc::sync_channel(16);
+            let supervisor =
+                Supervisor::spawn_with_program(vec![host()], events_tx, script.into_os_string())
+                    .unwrap();
+            assert!(matches!(
+                events.recv_timeout(TEST_TIMEOUT).unwrap(),
+                Event::Connected { .. }
+            ));
+            let (caller, _peer) = UnixStream::pair().unwrap();
+            supervisor
+                .call("workbox", call(91, "pane.focus", json!({}), &caller))
+                .unwrap();
+            let Event::Reply { token, result, .. } = events.recv_timeout(TEST_TIMEOUT).unwrap()
+            else {
+                panic!("expected call completion")
+            };
+            assert_eq!(token, 91);
+            assert_eq!(result.is_ok(), duplicate);
+            let Event::Disconnected { error, .. } = events.recv_timeout(TEST_TIMEOUT).unwrap()
+            else {
+                panic!("expected fatal relay disconnect")
+            };
+            assert!(error.contains("unknown call id"), "{error}");
+            drop(supervisor);
+        }
     }
 
     #[test]
@@ -1679,11 +1719,11 @@ mod tests {
             session: session("local/marker", "local", "marker"),
         };
         let reply_one = ServerMessage::Reply {
-            id: 1,
+            id: 41,
             result: json!({"call": 1}),
         };
         let reply_two = ServerMessage::Reply {
-            id: 2,
+            id: 73,
             result: json!({"call": 2}),
         };
         std::fs::write(
@@ -1718,7 +1758,7 @@ mod tests {
         supervisor
             .call(
                 "workbox",
-                call(42, "second", Value::String("x".repeat(256 * 1024)), &caller),
+                call(73, "second", Value::String("x".repeat(256 * 1024)), &caller),
             )
             .unwrap();
 
@@ -1735,7 +1775,7 @@ mod tests {
             }
         }
         assert_eq!(replies[&41], json!({"call": 1}));
-        assert_eq!(replies[&42], json!({"call": 2}));
+        assert_eq!(replies[&73], json!({"call": 2}));
         drop(supervisor);
         directory.close().unwrap();
     }

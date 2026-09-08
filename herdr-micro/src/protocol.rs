@@ -1,4 +1,5 @@
 use crate::config::{AgentStatus, Direction, Light, LightingConfig};
+use codex_micro::service::Lighting;
 use herdr_hub_client::{AgentInfo, attention_order, attention_rank};
 use std::collections::{HashMap, HashSet};
 
@@ -67,33 +68,31 @@ pub fn assign_slots(previous: &[Option<String>], agents: &[AgentInfo]) -> Vec<Op
     }
     slots
 }
-pub fn slot_lighting(
+fn slot_lighting(
     slots: &[Option<String>],
-    agents: &[AgentInfo],
+    by_id: &HashMap<&str, &AgentInfo>,
     config: &LightingConfig,
-) -> Vec<Light> {
-    let by_id: HashMap<_, _> = agents.iter().map(|a| (a.terminal_id.as_str(), a)).collect();
-    slots
-        .iter()
-        .map(|slot| {
-            slot.as_ref()
-                .and_then(|id| by_id.get(id.as_str()))
-                .map(|a| {
-                    let mut l = config.light(status(a));
-                    if a.focused {
-                        l.b = l.b.max(config.focused_brightness);
-                    }
-                    l
-                })
-                .unwrap_or_default()
-        })
-        .collect()
+) -> [Light; SLOT_COUNT] {
+    std::array::from_fn(|index| {
+        slots
+            .get(index)
+            .and_then(Option::as_ref)
+            .and_then(|id| by_id.get(id.as_str()))
+            .map(|a| {
+                let mut l = config.light(status(a));
+                if a.focused {
+                    l.b = l.b.max(config.focused_brightness);
+                }
+                l
+            })
+            .unwrap_or_default()
+    })
 }
-pub fn aggregate_lighting(
+pub fn lighting(
     slots: &[Option<String>],
     agents: &[AgentInfo],
     config: &LightingConfig,
-) -> HashMap<String, Light> {
+) -> Lighting {
     let by_id: HashMap<_, _> = agents.iter().map(|a| (a.terminal_id.as_str(), a)).collect();
     let best = slots
         .iter()
@@ -101,14 +100,15 @@ pub fn aggregate_lighting(
         .filter_map(|id| by_id.get(id.as_str()))
         .min_by(|a, b| attention_order(("", a), ("", b)));
     let light = best.map(|a| config.light(status(a))).unwrap_or_default();
-    ["ambient", "keys"]
-        .into_iter()
-        .filter(|zone| match *zone {
-            "ambient" => config.ambient,
-            _ => config.keys,
-        })
-        .map(|zone| (zone.to_owned(), light))
-        .collect()
+    Lighting {
+        ambient: if config.ambient {
+            light
+        } else {
+            Light::default()
+        },
+        keys: if config.keys { light } else { Light::default() },
+        slots: slot_lighting(slots, &by_id, config),
+    }
 }
 pub fn joystick_event(
     angle: f64,
@@ -180,13 +180,32 @@ mod tests {
         focused_idle.b = focused_idle.b.max(config.focused_brightness);
         let empty = Light::default();
         assert_eq!(
-            slot_lighting(&slots, &agents, &config),
+            lighting(&slots, &agents, &config).slots.as_slice(),
             [config.light(AgentStatus::Working), focused_idle]
                 .into_iter()
                 .chain(std::iter::repeat_n(empty, SLOT_COUNT - 2))
                 .collect::<Vec<_>>()
         );
     }
+    #[test]
+    fn disabling_aggregates_produces_explicit_off_in_complete_snapshot() {
+        let agents = [agent("working", "working", false)];
+        let slots = assign_slots(&[], &agents);
+        let mut config = Config::default().lighting;
+        config.ambient = true;
+        config.keys = true;
+        let lit = lighting(&slots, &agents, &config);
+        assert_ne!(lit.ambient, Light::default());
+        assert_ne!(lit.keys, Light::default());
+        config.ambient = false;
+        config.keys = false;
+        let disabled = lighting(&slots, &agents, &config);
+        assert_eq!(disabled.ambient, Light::default());
+        assert_eq!(disabled.keys, Light::default());
+        assert_eq!(disabled.slots, lit.slots);
+        assert_eq!(lighting(&[], &agents, &config), Lighting::default());
+    }
+
     #[test]
     fn joystick_changes_direction_at_an_angular_boundary() {
         let first = joystick_event(0.124, 0.9, None, 0.75, 0.3);

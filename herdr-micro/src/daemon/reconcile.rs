@@ -1,10 +1,7 @@
 //! Bridge state and its reconciliation with the hub's active session and the
 //! HID device.
 
-use codex_micro::{
-    ExternalOwner, external_owner,
-    service::{Lighting, ServiceStatus},
-};
+use codex_micro::{ExternalOwner, external_owner, service::ServiceStatus};
 use herdr_hub_client::{AgentInfo, HubClient, Model, ServerMessage, SessionState};
 use serde_json::{Value, json};
 use std::sync::{
@@ -16,7 +13,7 @@ use crate::{
     actions::HERDR_LAYER,
     config::{Config, Controls, enabled_buttons},
     hub::{self, Session},
-    protocol::{SLOT_COUNT, aggregate_lighting, assign_slots, slot_lighting},
+    protocol::{SLOT_COUNT, assign_slots, lighting},
 };
 
 use super::{DAEMON_PROTOCOL_VERSION, device, dispatch::agent_identity, log, log_changed};
@@ -84,10 +81,6 @@ impl State {
         })
     }
 
-    pub(super) fn revoke_routing(&mut self) {
-        self.invalidate_routing();
-    }
-
     pub(super) fn invalidate_routing(&mut self) {
         if self.routing_ready {
             self.routing_ready = false;
@@ -150,12 +143,7 @@ pub(super) fn apply_service_status(state: &mut State, status: &ServiceStatus) ->
 pub(super) fn device_output(state: &State) -> device::Output {
     device::Output {
         layer: state.active_layer,
-        lighting: Lighting {
-            slots: slot_lighting(&state.slots, &state.agents, &state.config.lighting),
-            aggregate: aggregate_lighting(&state.slots, &state.agents, &state.config.lighting)
-                .into_iter()
-                .collect(),
-        },
+        lighting: lighting(&state.slots, &state.agents, &state.config.lighting),
     }
 }
 
@@ -199,7 +187,7 @@ fn sync_active_route(state: &State) {
 
 pub(super) fn reconcile_active(state: &mut State, stopping: &AtomicBool) {
     let Some(session) = active_session(&state.model) else {
-        state.revoke_routing();
+        state.invalidate_routing();
         state.agents.clear();
         state.slots.fill(None);
         return;
@@ -208,7 +196,7 @@ pub(super) fn reconcile_active(state: &mut State, stopping: &AtomicBool) {
     state.slots = assign_slots(&state.slots, &session.agents);
     state.agents.clone_from(&session.agents);
     if state.owner.is_some() || stopping.load(Ordering::Acquire) {
-        state.revoke_routing();
+        state.invalidate_routing();
     } else {
         state.active_layer = Some(HERDR_LAYER);
         state.routing_ready = true;
@@ -260,7 +248,7 @@ pub(super) fn refresh_owner(state: &mut State) -> bool {
         state.owner = owner;
         if let Some(owner) = state.owner {
             log(format!("device owned by {owner}"));
-            state.revoke_routing();
+            state.invalidate_routing();
         } else {
             log("device owner cleared");
         }
@@ -307,7 +295,7 @@ pub(super) fn update_input_context(context: &Mutex<Arc<InputContext>>, state: &S
 pub(super) fn handle_input_disconnect(state: &mut State, error: String) {
     state.device_state = "unavailable".into();
     log_changed(&mut state.last_device_error, error, "device disconnected: ");
-    state.revoke_routing();
+    state.invalidate_routing();
 }
 
 pub(super) fn apply_config_load(

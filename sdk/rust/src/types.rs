@@ -37,15 +37,11 @@ impl From<&str> for AgentStatus {
 pub struct SessionSnapshot {
     pub version: String,
     pub protocol: u32,
-    #[serde(default)]
     pub focused_workspace_id: Option<String>,
-    #[serde(default)]
     pub focused_tab_id: Option<String>,
-    #[serde(default)]
     pub focused_pane_id: Option<String>,
     /// Whether the session's attached terminal window reports focus; absent
     /// until the terminal reports focus once.
-    #[serde(default)]
     pub client_focused: Option<bool>,
     pub workspaces: Vec<WorkspaceInfo>,
     pub tabs: Vec<TabInfo>,
@@ -66,7 +62,6 @@ pub struct WorkspaceInfo {
     pub agent_status: AgentStatus,
     #[serde(default)]
     pub tokens: HashMap<String, String>,
-    #[serde(default)]
     pub worktree: Option<WorkspaceWorktreeInfo>,
 }
 
@@ -105,30 +100,20 @@ pub struct PaneInfo {
     pub workspace_id: String,
     pub tab_id: String,
     pub focused: bool,
-    #[serde(default)]
     pub cwd: Option<String>,
-    #[serde(default)]
     pub foreground_cwd: Option<String>,
-    #[serde(default)]
     pub label: Option<String>,
-    #[serde(default)]
     pub agent: Option<String>,
-    #[serde(default)]
     pub title: Option<String>,
-    #[serde(default)]
     pub terminal_title: Option<String>,
-    #[serde(default)]
     pub terminal_title_stripped: Option<String>,
-    #[serde(default)]
     pub display_agent: Option<String>,
     pub agent_status: AgentStatus,
     #[serde(default)]
     pub state_labels: HashMap<String, String>,
     #[serde(default)]
     pub tokens: HashMap<String, String>,
-    #[serde(default)]
     pub agent_session: Option<AgentSessionInfo>,
-    #[serde(default)]
     pub scroll: Option<PaneScrollInfo>,
     pub revision: u64,
 }
@@ -143,17 +128,11 @@ pub struct PaneScrollInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentInfo {
     pub terminal_id: String,
-    #[serde(default)]
     pub name: Option<String>,
-    #[serde(default)]
     pub agent: Option<String>,
-    #[serde(default)]
     pub title: Option<String>,
-    #[serde(default)]
     pub terminal_title: Option<String>,
-    #[serde(default)]
     pub terminal_title_stripped: Option<String>,
-    #[serde(default)]
     pub display_agent: Option<String>,
     pub agent_status: AgentStatus,
     #[serde(default)]
@@ -162,7 +141,6 @@ pub struct AgentInfo {
     pub state_labels: HashMap<String, String>,
     #[serde(default)]
     pub tokens: HashMap<String, String>,
-    #[serde(default)]
     pub agent_session: Option<AgentSessionInfo>,
     pub workspace_id: String,
     pub tab_id: String,
@@ -174,9 +152,7 @@ pub struct AgentInfo {
     pub interactive_ready: bool,
     #[serde(default)]
     pub state_change_seq: u64,
-    #[serde(default)]
     pub cwd: Option<String>,
-    #[serde(default)]
     pub foreground_cwd: Option<String>,
     pub revision: u64,
 }
@@ -188,7 +164,7 @@ pub struct AgentStartParams {
     pub pane_id: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
 }
 
@@ -236,11 +212,11 @@ pub enum LayoutNode {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct LayoutPane {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pane_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command: Vec<String>,
@@ -265,14 +241,14 @@ pub enum SplitDirection {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PaneSplitParams {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub target_pane_id: Option<String>,
     pub direction: SplitDirection,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ratio: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(default)]
     pub focus: bool,
@@ -291,17 +267,17 @@ pub struct LayoutDescription {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct LayoutExportParams {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tab_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pane_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct LayoutSetSplitRatioParams {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tab_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pane_id: Option<String>,
     /// Split to resize: `false` descends into `first`, `true` into `second`.
     pub path: Vec<bool>,

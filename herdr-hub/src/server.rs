@@ -69,7 +69,7 @@ pub(crate) enum Request {
 }
 
 struct Subscriber {
-    outgoing: SyncSender<ServerMessage>,
+    outgoing: SyncSender<Arc<[u8]>>,
     shutdown: UnixStream,
 }
 
@@ -122,9 +122,15 @@ impl Server {
     ) -> Result<()> {
         let shutdown = stream.try_clone()?;
         let (outgoing, receiver) = mpsc::sync_channel(SUBSCRIBER_QUEUE);
-        let hello = ServerMessage::Hello {
+        let hello = match encode_message(&ServerMessage::Hello {
             protocol: PROTOCOL,
             model: model.clone(),
+        }) {
+            Ok(frame) => frame,
+            Err(error) => {
+                let _ = stream.shutdown(Shutdown::Both);
+                return Err(error);
+            }
         };
         thread::Builder::new()
             .name("herdr-hub-subscriber".into())
@@ -141,8 +147,18 @@ impl Server {
     }
 
     pub(crate) fn broadcast(&mut self, message: &ServerMessage) {
+        let frame = match encode_message(message) {
+            Ok(frame) => frame,
+            Err(error) => {
+                log_error(&format!("encode subscriber broadcast: {error:#}"));
+                for (_, subscriber) in self.subscribers.drain() {
+                    let _ = subscriber.shutdown.shutdown(Shutdown::Both);
+                }
+                return;
+            }
+        };
         self.subscribers.retain(|_, subscriber| {
-            match subscriber.outgoing.try_send(message.clone()) {
+            match subscriber.outgoing.try_send(Arc::clone(&frame)) {
                 Ok(()) => true,
                 Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
                     let _ = subscriber.shutdown.shutdown(Shutdown::Both);
@@ -307,15 +323,17 @@ fn read_connection(
 
 fn subscriber_writer(
     mut stream: UnixStream,
-    hello: ServerMessage,
-    outgoing: mpsc::Receiver<ServerMessage>,
+    hello: Arc<[u8]>,
+    outgoing: mpsc::Receiver<Arc<[u8]>>,
 ) {
-    if write_message(&mut stream, &hello).is_err() {
+    if stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT)).is_err()
+        || stream.write_all(&hello).is_err()
+    {
         let _ = stream.shutdown(Shutdown::Both);
         return;
     }
     while let Ok(message) = outgoing.recv() {
-        if write_message(&mut stream, &message).is_err() {
+        if stream.write_all(&message).is_err() {
             let _ = stream.shutdown(Shutdown::Both);
             return;
         }
@@ -357,12 +375,18 @@ fn read_handshake<T: serde::de::DeserializeOwned>(
 }
 
 fn write_message(stream: &mut impl Write, message: &impl Serialize) -> Result<()> {
+    stream
+        .write_all(&encode_message(message)?)
+        .context("write Herdr Hub message")
+}
+
+fn encode_message(message: &impl Serialize) -> Result<Arc<[u8]>> {
     let mut bytes = serde_json::to_vec(message)?;
     if bytes.len() + 1 > ndjson::MAX_FRAME_BYTES {
         bail!("Herdr Hub message exceeds 1 MiB")
     }
     bytes.push(b'\n');
-    stream.write_all(&bytes).context("write Herdr Hub message")
+    Ok(bytes.into())
 }
 
 fn bind_socket(path: &Path) -> Result<UnixListener> {
@@ -536,10 +560,6 @@ mod tests {
         };
         server.add_subscriber(id, stream, &model(7)).unwrap();
         let mut reader = BufReader::new(client);
-        assert!(matches!(
-            next(&mut reader),
-            Some(ServerMessage::Hello { model, .. }) if model.version == 7
-        ));
         server.broadcast(&ServerMessage::Active {
             version: 8,
             key: Some("local/default".into()),
@@ -554,12 +574,85 @@ mod tests {
         });
         assert!(matches!(
             next(&mut reader),
+            Some(ServerMessage::Hello { model, .. }) if model.version == 7
+        ));
+        assert!(matches!(
+            next(&mut reader),
             Some(ServerMessage::Active { version: 8, .. })
         ));
         assert!(matches!(
             next(&mut reader),
             Some(ServerMessage::Host { version: 9, .. })
         ));
+        cleanup(server, directory);
+    }
+
+    #[test]
+    fn broadcasts_share_identical_ordered_frames() {
+        let (directory, mut server, _rx, _socket) = server();
+        let mut receivers = Vec::new();
+        let mut peers = Vec::new();
+        for id in 1..=2 {
+            let (outgoing, receiver) = mpsc::sync_channel(SUBSCRIBER_QUEUE);
+            let (shutdown, peer) = UnixStream::pair().unwrap();
+            server
+                .subscribers
+                .insert(id, Subscriber { outgoing, shutdown });
+            receivers.push(receiver);
+            peers.push(peer);
+        }
+        for version in 1..=3 {
+            server.broadcast(&ServerMessage::Active { version, key: None });
+        }
+        for version in 1..=3 {
+            let left = receivers[0].recv().unwrap();
+            let right = receivers[1].recv().unwrap();
+            assert!(Arc::ptr_eq(&left, &right));
+            assert_eq!(left.last(), Some(&b'\n'));
+            assert!(
+                matches!(serde_json::from_slice::<ServerMessage>(&left).unwrap(),
+                ServerMessage::Active { version: actual, .. } if actual == version)
+            );
+        }
+        cleanup(server, directory);
+    }
+
+    #[test]
+    fn oversize_broadcast_disconnects_every_recipient_and_hello_fails_closed() {
+        use std::io::Read;
+        let (directory, mut server, _rx, _socket) = server();
+        let mut peers = Vec::new();
+        let mut receivers = Vec::new();
+        for id in 1..=2 {
+            let (outgoing, receiver) = mpsc::sync_channel(SUBSCRIBER_QUEUE);
+            let (shutdown, peer) = UnixStream::pair().unwrap();
+            server
+                .subscribers
+                .insert(id, Subscriber { outgoing, shutdown });
+            receivers.push(receiver);
+            peers.push(peer);
+        }
+        let oversized = "x".repeat(ndjson::MAX_FRAME_BYTES);
+        server.broadcast(&ServerMessage::Active {
+            version: 1,
+            key: Some(oversized.clone()),
+        });
+        assert!(server.subscribers.is_empty());
+        for mut peer in peers {
+            assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+        }
+        for receiver in receivers {
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(mpsc::TryRecvError::Disconnected)
+            ));
+        }
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let mut oversized_model = model(0);
+        oversized_model.active = Some(oversized);
+        assert!(server.add_subscriber(3, stream, &oversized_model).is_err());
+        assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+        assert!(server.subscribers.is_empty());
         cleanup(server, directory);
     }
 
@@ -650,13 +743,12 @@ mod tests {
     #[test]
     fn full_subscriber_queue_disconnects_instead_of_dropping_an_update() {
         let (directory, mut server, _rx, _socket) = server();
-        let (outgoing, _receiver) = mpsc::sync_channel(1);
-        outgoing
-            .send(ServerMessage::Active {
-                version: 1,
-                key: None,
-            })
-            .unwrap();
+        let (outgoing, _receiver) = mpsc::sync_channel(SUBSCRIBER_QUEUE);
+        for version in 0..SUBSCRIBER_QUEUE as u64 {
+            outgoing
+                .send(encode_message(&ServerMessage::Active { version, key: None }).unwrap())
+                .unwrap();
+        }
         let (shutdown, _peer) = UnixStream::pair().unwrap();
         server
             .subscribers

@@ -257,28 +257,31 @@ fn display_order(snapshot: &SessionSnapshot) -> Vec<DisplayEntry<'_>> {
                 .push(index);
         }
     }
-    let grouped_keys: std::collections::HashSet<&str> = members_by_key
+    let grouped_parents: HashMap<&str, usize> = members_by_key
         .iter()
-        .filter(|(_, members)| {
-            members.len() >= 2
-                && members.iter().any(|index| {
+        .filter(|(_, members)| members.len() >= 2)
+        .filter_map(|(key, members)| {
+            members
+                .iter()
+                .copied()
+                .find(|index| {
                     snapshot.workspaces[*index]
                         .worktree
                         .as_ref()
                         .is_some_and(|worktree| !worktree.is_linked_worktree)
                 })
+                .map(|parent| (*key, parent))
         })
-        .map(|(key, _)| *key)
         .collect();
 
     let mut emitted_groups = std::collections::HashSet::<&str>::new();
     let mut ordered = Vec::with_capacity(snapshot.workspaces.len());
-    for (index, workspace) in snapshot.workspaces.iter().enumerate() {
-        let Some(key) = workspace
+    for workspace in &snapshot.workspaces {
+        let Some((key, parent)) = workspace
             .worktree
             .as_ref()
-            .map(|worktree| &worktree.repo_key)
-            .filter(|key| grouped_keys.contains(key.as_str()))
+            .map(|worktree| worktree.repo_key.as_str())
+            .and_then(|key| grouped_parents.get(key).map(|&parent| (key, parent)))
         else {
             ordered.push(DisplayEntry {
                 workspace,
@@ -286,20 +289,10 @@ fn display_order(snapshot: &SessionSnapshot) -> Vec<DisplayEntry<'_>> {
             });
             continue;
         };
-        if !emitted_groups.insert(key.as_str()) {
+        if !emitted_groups.insert(key) {
             continue;
         }
-        let members = &members_by_key[key.as_str()];
-        let parent = members
-            .iter()
-            .copied()
-            .find(|member| {
-                snapshot.workspaces[*member]
-                    .worktree
-                    .as_ref()
-                    .is_some_and(|worktree| !worktree.is_linked_worktree)
-            })
-            .unwrap_or(index);
+        let members = &members_by_key[key];
         ordered.push(DisplayEntry {
             workspace: &snapshot.workspaces[parent],
             grouped_child: false,

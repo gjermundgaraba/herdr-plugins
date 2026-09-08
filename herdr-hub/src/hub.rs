@@ -333,13 +333,11 @@ impl Core {
             self.watchers.remove(&update.key);
             return self.remove_session(&update.key);
         }
-        let previous = self.model.session(&update.key).cloned();
-        let initial = previous.as_ref().is_none_or(|session| !session.connected);
+        let previous = self.model.session(&update.key);
+        let initial = previous.is_none_or(|session| !session.connected);
         let gained_focus = update.state.connected
             && update.state.client_focused == Some(true)
-            && previous
-                .as_ref()
-                .is_none_or(|session| session.client_focused != Some(true));
+            && previous.is_none_or(|session| session.client_focused != Some(true));
         let lost_active = self.model.get().active.as_deref() == Some(update.key.as_str())
             && (!update.state.connected || update.state.client_focused != Some(true));
         let mut messages = Vec::new();

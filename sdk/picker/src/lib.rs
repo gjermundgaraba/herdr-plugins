@@ -5,8 +5,6 @@ use std::{
     fmt,
     io::{self, Write},
     process::ExitCode,
-    sync::mpsc,
-    thread,
     time::Duration,
 };
 
@@ -113,11 +111,7 @@ pub fn run(name: &str, result: Result<()>) -> ExitCode {
 /// hub model change while the picker stays open.
 pub fn serve(items: impl Fn(&Model) -> Vec<Item>) -> Result<()> {
     let _: IgnoredAny = serde_json::from_reader(io::stdin()).context("invalid picker context")?;
-    let (events_tx, events_rx) = mpsc::sync_channel(1);
-    thread::spawn(move || HubClient::new().run(move |event| events_tx.send(event).is_ok()));
-
-    consume(events_rx, items, emit)?;
-    bail!("hub event stream stopped")
+    run_events(|callback| HubClient::new().run(callback), items, emit)
 }
 
 /// Read the final picker context from stdin and call `method` with the
@@ -141,48 +135,65 @@ pub fn presentation(status: &AgentStatus) -> (&'static str, Tone, bool) {
     }
 }
 
-fn consume(
-    events: impl IntoIterator<Item = herdr_hub_client::Result<ServerMessage>>,
+fn run_events(
+    run: impl FnOnce(&mut dyn FnMut(herdr_hub_client::Result<ServerMessage>) -> bool),
     items: impl Fn(&Model) -> Vec<Item>,
     mut output: impl FnMut(ProviderMessage<&[Item]>) -> Result<()>,
 ) -> Result<()> {
-    let mut model = None;
-    let mut previous = None;
-
-    for event in events {
-        match event {
-            Ok(ServerMessage::Hello {
-                protocol: _,
-                model: replacement,
-            }) => {
-                model = Some(replacement);
+    let mut state = StreamState::default();
+    let mut output_error = None;
+    run(
+        &mut |event| match state.handle(event, &items, &mut output) {
+            Ok(()) => true,
+            Err(error) => {
+                output_error = Some(error);
+                false
             }
+        },
+    );
+    if let Some(error) = output_error {
+        return Err(error);
+    }
+    bail!("hub event stream stopped")
+}
+
+#[derive(Default)]
+struct StreamState {
+    model: Option<Model>,
+    previous: Option<Vec<Item>>,
+}
+
+impl StreamState {
+    fn handle(
+        &mut self,
+        event: herdr_hub_client::Result<ServerMessage>,
+        items: &impl Fn(&Model) -> Vec<Item>,
+        output: &mut impl FnMut(ProviderMessage<&[Item]>) -> Result<()>,
+    ) -> Result<()> {
+        let model = match event {
+            Ok(ServerMessage::Hello { model, .. }) => self.model.insert(model),
             Ok(message) => {
-                let Some(model) = model.as_mut() else {
-                    continue;
+                let Some(model) = self.model.as_mut() else {
+                    return Ok(());
                 };
                 HubClient::apply(model, &message);
+                model
             }
             Err(error) => {
-                model = None;
-                previous = None;
-                output(ProviderMessage::Error {
+                self.model = None;
+                self.previous = None;
+                return output(ProviderMessage::Error {
                     error: format!("Herdr hub unavailable: {error}. Reconnecting…"),
-                })?;
-                continue;
+                });
             }
-        }
-
-        let Some(model) = model.as_ref() else {
-            continue;
         };
         let next = items(model);
-        if previous.as_ref() != Some(&next) {
+        if self.previous.as_ref() != Some(&next) {
             output(ProviderMessage::Snapshot(Snapshot { items: &next }))?;
-            previous = Some(next);
+            self.previous = Some(next);
         }
+        Ok(())
     }
-    Ok(())
 }
 
 fn emit(message: ProviderMessage<&[Item]>) -> Result<()> {
@@ -211,6 +222,24 @@ fn selected_value<'a>(context: &'a Value, value_field: &str) -> Result<(&'a str,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn consume(
+        events: impl IntoIterator<Item = herdr_hub_client::Result<ServerMessage>>,
+        items: impl Fn(&Model) -> Vec<Item>,
+        output: impl FnMut(ProviderMessage<&[Item]>) -> Result<()>,
+    ) -> Result<()> {
+        run_events(
+            |callback| {
+                for event in events {
+                    if !callback(event) {
+                        break;
+                    }
+                }
+            },
+            items,
+            output,
+        )
+    }
 
     fn model(active: Option<&str>, version: u64) -> Model {
         Model {
@@ -300,7 +329,7 @@ mod tests {
             messages.push(serde_json::to_value(message)?);
             Ok(())
         })
-        .unwrap();
+        .unwrap_err();
 
         assert_eq!(
             messages,
@@ -311,6 +340,71 @@ mod tests {
                 json!({ "items": [] }),
             ]
         );
+    }
+
+    #[test]
+    fn unchanged_items_are_suppressed_but_recovery_republishes() {
+        let hello = || {
+            Ok(ServerMessage::Hello {
+                protocol: herdr_hub_client::PROTOCOL,
+                model: model(Some("local/one"), 1),
+            })
+        };
+        let mut messages = Vec::new();
+        let error = consume(
+            [
+                hello(),
+                Ok(ServerMessage::Active {
+                    version: 2,
+                    key: Some("local/one".into()),
+                }),
+                hello(),
+                Err(herdr_hub_client::Error::Disconnected),
+                hello(),
+            ],
+            active_item,
+            |message| {
+                messages.push(serde_json::to_value(message)?);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "hub event stream stopped");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0], messages[2]);
+        assert!(messages[1].get("error").is_some());
+    }
+
+    #[test]
+    fn callback_stops_immediately_and_returns_original_output_error() {
+        for outage in [false, true] {
+            let mut calls = 0;
+            let error = run_events(
+                |callback| {
+                    let event = if outage {
+                        Err(herdr_hub_client::Error::Disconnected)
+                    } else {
+                        Ok(ServerMessage::Hello {
+                            protocol: herdr_hub_client::PROTOCOL,
+                            model: model(None, 1),
+                        })
+                    };
+                    assert!(!callback(event));
+                },
+                active_item,
+                |_| {
+                    calls += 1;
+                    Err(io::Error::new(io::ErrorKind::BrokenPipe, "original output error").into())
+                },
+            )
+            .unwrap_err();
+            assert_eq!(calls, 1);
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+            assert_eq!(error.to_string(), "original output error");
+        }
     }
 
     #[test]

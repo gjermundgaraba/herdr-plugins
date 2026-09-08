@@ -17,7 +17,7 @@ use std::{
 
 use crate::{
     actions::{HERDR_LAYER, layer_identity},
-    config::{Config, Controls, config_path, load, provision},
+    config::{Controls, config_path, load, provision},
     control::{backup_dir, request_status},
 };
 
@@ -151,11 +151,6 @@ fn blank_layout() -> Value {
             ]
         }
     })
-}
-
-/// Copies the compatible Layer 1 layout into blank or previously managed Layer 2.
-pub fn configure_micro(keymap: &mut Value) -> Result<()> {
-    configure_keymap(keymap, &Config::default().controls)
 }
 
 fn configure_keymap(keymap: &mut Value, controls: &Controls) -> Result<()> {
@@ -608,13 +603,7 @@ pub fn setup_pi_effort() -> Result<PiInstall> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn temp(name: &str) -> PathBuf {
-        let path = env::temp_dir().join(format!("herdr-micro-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).unwrap();
-        path
-    }
+    use crate::config::Config;
 
     fn blank_layer() -> Value {
         json!({
@@ -708,7 +697,7 @@ mod tests {
                 blank_layer()
             ] }]
         });
-        configure_micro(&mut keymap).unwrap();
+        configure_keymap(&mut keymap, &Config::default().controls).unwrap();
         assert_eq!(
             keymap.pointer("/profiles/0/layers/0/linkedAppId"),
             Some(&json!(0))
@@ -738,13 +727,13 @@ mod tests {
             Some(&json!("KV_OAI_ACT10"))
         );
         let configured = keymap.clone();
-        configure_micro(&mut keymap).unwrap();
+        configure_keymap(&mut keymap, &Config::default().controls).unwrap();
         assert_eq!(keymap, configured);
         *keymap
             .pointer_mut("/profiles/0/layers/1/layout/keymap/0/0")
             .unwrap() = json!("KC_F13");
         assert!(
-            configure_micro(&mut keymap)
+            configure_keymap(&mut keymap, &Config::default().controls)
                 .unwrap_err()
                 .to_string()
                 .contains("must use KV_OAI_AG00")
@@ -776,7 +765,7 @@ mod tests {
                 ]}
             ]
         });
-        configure_micro(&mut keymap).unwrap();
+        configure_keymap(&mut keymap, &Config::default().controls).unwrap();
         assert_eq!(keymap["activeProfileId"], json!(0));
         assert_eq!(
             keymap.pointer("/profiles/0/layers/1/layout/keymap/0/0"),
@@ -816,7 +805,7 @@ mod tests {
             ] }]
         });
         assert!(
-            configure_micro(&mut keymap)
+            configure_keymap(&mut keymap, &Config::default().controls)
                 .unwrap_err()
                 .to_string()
                 .contains("not blank or managed")
@@ -840,7 +829,9 @@ mod tests {
                 ] }]
             });
             assert_eq!(
-                configure_micro(&mut keymap).unwrap_err().to_string(),
+                configure_keymap(&mut keymap, &Config::default().controls)
+                    .unwrap_err()
+                    .to_string(),
                 "Layer 2 is not blank or managed; refusing to overwrite it"
             );
         }
@@ -861,7 +852,9 @@ mod tests {
             ] }]
         });
         assert_eq!(
-            configure_micro(&mut keymap).unwrap_err().to_string(),
+            configure_keymap(&mut keymap, &Config::default().controls)
+                .unwrap_err()
+                .to_string(),
             "Layer 1 Agent slot 6 must use KV_OAI_AG05"
         );
     }
@@ -878,14 +871,17 @@ mod tests {
         });
 
         assert_eq!(
-            configure_micro(&mut keymap).unwrap_err().to_string(),
+            configure_keymap(&mut keymap, &Config::default().controls)
+                .unwrap_err()
+                .to_string(),
             "Layer 1 encoder slot /encoders/0/0 must use KV_OAI_ENC_CC"
         );
     }
 
     #[test]
     fn installs_pi_extension_once_and_backs_up_changes() {
-        let root = temp("pi-install");
+        let root_guard = tempfile::tempdir().unwrap();
+        let root = root_guard.path();
         let source = root.join("source.js");
         let target = root.join("nested/extension.ts");
         fs::write(&source, b"one").unwrap();
@@ -902,14 +898,14 @@ mod tests {
             0
         );
         assert_eq!(fs::read_dir(target.parent().unwrap()).unwrap().count(), 2);
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn pi_install_refuses_symlinks_without_touching_their_target() {
         use std::os::unix::fs::symlink;
 
-        let root = temp("pi-symlink");
+        let root_guard = tempfile::tempdir().unwrap();
+        let root = root_guard.path();
         let source = root.join("source.js");
         let outside = root.join("outside.ts");
         let target = root.join("extension.ts");
@@ -918,12 +914,12 @@ mod tests {
         symlink(&outside, &target).unwrap();
         assert!(install_pi_effort(&source, &target, 10).is_err());
         assert_eq!(fs::read(&outside).unwrap(), b"old");
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn pi_install_backup_collision_preserves_live_extension_and_backup() {
-        let root = temp("pi-failure");
+        let root_guard = tempfile::tempdir().unwrap();
+        let root = root_guard.path();
         let source = root.join("source.js");
         let target = root.join("extension.ts");
         fs::write(&source, b"new").unwrap();
@@ -933,7 +929,6 @@ mod tests {
         assert!(install_pi_effort(&source, &target, 10).is_err());
         assert_eq!(fs::read(&target).unwrap(), b"old");
         assert_eq!(fs::read(&backup).unwrap(), b"previous backup");
-        assert_eq!(fs::read_dir(&root).unwrap().count(), 3);
-        fs::remove_dir_all(root).unwrap();
+        assert_eq!(fs::read_dir(root).unwrap().count(), 3);
     }
 }

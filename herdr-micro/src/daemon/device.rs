@@ -1,7 +1,6 @@
 //! Device-service calls run here, independently of input and Herdr routing.
 
 use std::{
-    collections::BTreeSet,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -14,7 +13,7 @@ use std::{
 use anyhow::{Context, Result};
 use codex_micro::{
     DeviceEvent,
-    service::{Client as DeviceClient, Light, Lighting, ServiceStatus, layer_identity},
+    service::{Client as DeviceClient, Lighting, ServiceStatus, layer_identity},
 };
 
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
@@ -103,8 +102,6 @@ impl Worker {
 struct Sent {
     layer: Option<usize>,
     lighting: Option<Lighting>,
-    // Includes attempted writes: a failed lighting call may have partly applied.
-    all_zones: BTreeSet<String>,
 }
 
 impl Sent {
@@ -121,7 +118,7 @@ fn send_pending(
     sent: &mut Sent,
     stopping: &AtomicBool,
     mut set_layer: impl FnMut(usize) -> Result<()>,
-    mut set_lighting: impl FnMut(Lighting) -> Result<()>,
+    mut replace_lighting: impl FnMut(Lighting) -> Result<()>,
 ) -> Result<()> {
     if stopping.load(Ordering::Acquire) {
         return Ok(());
@@ -145,15 +142,10 @@ fn send_pending(
         return Ok(());
     }
     if sent.lighting.as_ref() != Some(&output.lighting) {
-        let mut lighting = output.lighting.clone();
-        for zone in &sent.all_zones {
-            lighting.aggregate.entry(zone.clone()).or_default();
-        }
-        sent.all_zones.extend(lighting.aggregate.keys().cloned());
-        // A failure may already have changed aggregate lighting. Even returning
-        // to the last successful desired output must send its zone clears.
+        // The service may accept this snapshot but lose its reply. Returning
+        // to the previous desired output must still send a replacement.
         sent.lighting = None;
-        set_lighting(lighting)?;
+        replace_lighting(output.lighting.clone())?;
         sent.lighting = Some(output.lighting);
     }
     Ok(())
@@ -240,7 +232,7 @@ fn run(
                     &mut sent,
                     &stopping,
                     |layer| device.set_focused_app(layer_identity(layer)),
-                    |lighting| device.set_lighting(lighting),
+                    |lighting| device.replace_lighting(lighting),
                 ) {
                     Ok(()) => last_error.clear(),
                     Err(error) => {
@@ -300,15 +292,7 @@ fn run(
     }
     if let Some(mut device) = client {
         if acquired {
-            let blank = Lighting {
-                aggregate: sent
-                    .all_zones
-                    .into_iter()
-                    .map(|zone| (zone, Light::default()))
-                    .collect(),
-                ..Lighting::default()
-            };
-            if let Err(error) = device.set_lighting(blank) {
+            if let Err(error) = device.replace_lighting(Lighting::default()) {
                 report_error(
                     &mut on_update,
                     &mut last_error,
@@ -370,20 +354,21 @@ fn report_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_micro::service::Light;
 
     fn output(layer: usize, zone: &str) -> Output {
         Output {
             layer: Some(layer),
             lighting: Lighting {
-                aggregate: [(
-                    zone.into(),
-                    Light {
-                        c: 0x123456,
-                        b: 0.5,
-                        ..Light::default()
+                ambient: Light {
+                    c: match zone {
+                        "old" => 1,
+                        "intermediate" => 2,
+                        _ => 3,
                     },
-                )]
-                .into(),
+                    b: 0.5,
+                    ..Light::default()
+                },
                 ..Lighting::default()
             },
         }
@@ -447,32 +432,54 @@ mod tests {
     }
 
     #[test]
-    fn omitted_zones_are_cleared_even_when_intermediate_output_is_coalesced() {
+    fn accepted_lighting_with_lost_reply_is_replaced_when_desired_reverts() {
         let desired = Desired::default();
         let mut sent = Sent::default();
         let stopping = AtomicBool::new(false);
+        let mut accepted = Lighting::default();
         desired.replace(output(1, "old"));
-        send_pending(&desired, &mut sent, &stopping, |_| Ok(()), |_| Ok(())).unwrap();
-        desired.replace(output(1, "intermediate"));
+        send_pending(
+            &desired,
+            &mut sent,
+            &stopping,
+            |_| Ok(()),
+            |lighting| {
+                accepted = lighting;
+                Ok(())
+            },
+        )
+        .unwrap();
+
         desired.replace(output(1, "latest"));
-        let mut lights = Vec::new();
+        assert!(
+            send_pending(
+                &desired,
+                &mut sent,
+                &stopping,
+                |_| panic!("layer was already sent"),
+                |lighting| {
+                    accepted = lighting;
+                    anyhow::bail!("service accepted replacement, IPC reply lost")
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(accepted, output(1, "latest").lighting);
+        assert!(sent.lighting.is_none());
+
+        desired.replace(output(1, "old"));
         send_pending(
             &desired,
             &mut sent,
             &stopping,
             |_| panic!("layer was already sent"),
             |lighting| {
-                lights.push(lighting);
+                accepted = lighting;
                 Ok(())
             },
         )
         .unwrap();
-        assert_eq!(lights[0].aggregate["old"], Light::default());
-        assert!(!lights[0].aggregate.contains_key("intermediate"));
-        assert_eq!(
-            sent.all_zones,
-            BTreeSet::from(["old".into(), "latest".into()])
-        );
+        assert_eq!(accepted, output(1, "old").lighting);
         send_pending(
             &desired,
             &mut sent,
@@ -483,44 +490,6 @@ mod tests {
         .unwrap();
     }
 
-    #[test]
-    fn partially_failed_lighting_is_cleared_when_returning_to_previous_output() {
-        let desired = Desired::default();
-        let mut sent = Sent::default();
-        let stopping = AtomicBool::new(false);
-        desired.replace(output(1, "old"));
-        send_pending(&desired, &mut sent, &stopping, |_| Ok(()), |_| Ok(())).unwrap();
-
-        desired.replace(output(1, "partially-enabled"));
-        let result = send_pending(
-            &desired,
-            &mut sent,
-            &stopping,
-            |_| panic!("layer was already sent"),
-            |lighting| {
-                assert_eq!(lighting.aggregate["partially-enabled"].c, 0x123456);
-                anyhow::bail!("aggregate write applied, slot write failed")
-            },
-        );
-        assert!(result.is_err());
-
-        desired.replace(output(1, "old"));
-        let mut lights = Vec::new();
-        send_pending(
-            &desired,
-            &mut sent,
-            &stopping,
-            |_| panic!("layer was already sent"),
-            |lighting| {
-                lights.push(lighting);
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert_eq!(lights.len(), 1);
-        assert_eq!(lights[0].aggregate["partially-enabled"], Light::default());
-        assert_eq!(lights[0].aggregate["old"].c, 0x123456);
-    }
     #[test]
     fn unchanged_healthy_status_is_republished_once_after_an_error() {
         let status = ServiceStatus {
