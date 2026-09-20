@@ -1,13 +1,13 @@
 # herdr-deck
 
-Lean native Stream Deck daemon for macOS, with a Herdr agent dashboard. It owns the configured devices directly over HID; it does not use Elgato plugins or profiles.
+Native Stream Deck daemon for macOS with a Herdr agent dashboard. It owns the configured devices directly over HID and does not use Elgato plugins or profiles.
 
 Configured and physically verified here:
 
 - Stream Deck + `A00WA4411LI67S`: eight sticky Herdr agent keys, four dials, and touch strip.
 - Stream Deck Pedal `A00YA4272193CD`: system-wide F19, Enter, and F19.
 
-The CLI enumerates the models recognized by `elgato-streamdeck`; the daemon intentionally manages Plus and Pedal, the two devices whose rendering and input paths are tested here.
+The CLI enumerates every model `elgato-streamdeck` recognizes. The daemon manages only Plus and Pedal, the two devices whose rendering and input paths are tested here.
 
 ## Safe takeover
 
@@ -85,9 +85,9 @@ display as `fn+f19`. Supported keys are `enter` and `f19`:
 ```
 
 These actions require Accessibility access for
-`~/Library/Application Support/dev.herdr.deck/bin/herdr-deck` in System Settings →
-Privacy & Security → Accessibility. The `system-enter` action is also accepted
-as a shortcut for `system-key` with `key: "enter"`.
+`~/Library/Application Support/dev.herdr.deck/bin/herdr-deck`, granted under
+Privacy & Security in System Settings. The `system-enter` action is also
+accepted as a shortcut for `system-key` with `key: "enter"`.
 
 Replacing the executable can invalidate its Accessibility authorization even
 while the switch remains on. If the daemon startup log reports access is not
@@ -129,9 +129,9 @@ cargo build --release --locked -p herdr-deck
 ../target/release/herdr-deck install-service
 ```
 
-`install-service` validates the configuration, atomically copies the executable to `~/Library/Application Support/dev.herdr.deck/bin/herdr-deck`, and starts or restarts the launchd service using that installed copy. The service also uses a stable working directory outside the checkout, so clearing Cargo build artifacts does not affect it. To upgrade, rebuild and run `install-service` again. `uninstall-service` removes the launchd service and leaves the installed binary and configuration in place.
+`install-service` validates the configuration, atomically copies the executable to `~/Library/Application Support/dev.herdr.deck/bin/herdr-deck`, and starts or restarts the launchd service using that installed copy. It takes an optional plist path and an optional config path as its two arguments. The service logs to `~/Library/Logs/dev.herdr.deck/daemon.log`. The service also uses a stable working directory outside the checkout, so clearing Cargo build artifacts does not affect it. To upgrade, rebuild and run `install-service` again. `uninstall-service` removes the launchd service and leaves the installed binary and configuration in place.
 
-Then disable **Elgato Stream Deck → Open automatically at login**. Keep the app installed until the launchd service survives a login and device reconnect; it can then be removed without affecting Herdr Deck.
+Then turn off "Open automatically at login" in the Elgato Stream Deck app. Keep the app installed until the launchd service survives a login and a device reconnect; after that it can be removed without affecting Herdr Deck.
 
 ## Rendering
 

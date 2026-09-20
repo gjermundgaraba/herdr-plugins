@@ -28,7 +28,7 @@ herdr-hub doctor
 Use **Show Herdr Hub status** for a compact summary. A source or Nix install
 also exposes `herdr-hub dump` to print the complete model once.
 
-Hub protocol **6** carries `hello`, `session`, `session_removed`, and `host`
+Hub protocol 6 carries `hello`, `session`, `session_removed`, and `host`
 updates, plus session-scoped `call` replies. It does not discover frontend
 sockets, route client input, or activate endpoints. Rebuild Hub SDK consumers
 and local/remote Hub binaries together when updating.

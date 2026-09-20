@@ -257,7 +257,7 @@ pub fn doctor() -> Report {
         Ok(output) if output.status.success() => report.push(Level::Ok, "Hunk diff integration"),
         _ => report.push(
             Level::Warn,
-            "Hunk is not installed; the diff button is unavailable",
+            "Hunk is not installed; the diff popup pane is unavailable",
         ),
     }
     report

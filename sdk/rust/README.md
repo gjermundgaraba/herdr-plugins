@@ -60,9 +60,10 @@ let log = plugin.logs_dir().join("plugin.log");
 next open after the active file reaches its size limit. The final write can
 cross that limit.
 
-`Client::subscribe` uses Herdr 0.8.0's retained lifecycle-event stream. The
-stable API has no snapshot cursor or server-generation token, so consumers
-must tolerate replayed events and refresh state after reconnecting.
+`Client::subscribe` opens a live lifecycle-event stream. Since Herdr 0.9.0 a
+subscription starts when the request is accepted and does not replay retained
+events, and the stable API has no snapshot cursor or server-generation token,
+so consumers must refresh state after reconnecting.
 
 Validated against the [Herdr fork build](../../README.md#herdr-build)
 (0.9.1, socket protocol 22).

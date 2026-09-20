@@ -3,8 +3,8 @@
 Hub owns the shared session inventory, not TUI presentation. Navigation,
 history, and the unread hold are native TUI client actions; Herdr owns
 selection, navigation completion, and choice dialogs. Micro and local tools
-connect directly to the per-TUI frontend socket. Hub neither discovers
-frontends nor chooses a focused client, routes client input, or activates
+connect directly to the per-TUI frontend socket. Hub does not discover
+frontends, choose a focused client, route client input, or activate
 endpoints.
 
 ## State ownership
@@ -78,6 +78,7 @@ On Linux relay mode can own the in-process Hub; plugin notifications remain
 supported. Build/install the plugin's independent `bin/` executable before
 linking. Updating an installed service is a separate, explicit operation.
 
-The Hub SDK retains shared attention ordering for inventory consumers. Slot
-assignment and rendering remain consumer policy. No Hub model fact claims which
-TUI is focused or where a user's next keystroke will go.
+The Hub SDK exposes only the protocol, the model, and the streaming client.
+Attention ordering, slot assignment, and rendering are consumer policy. No Hub
+model fact claims which TUI is focused or where a user's next keystroke will
+go.

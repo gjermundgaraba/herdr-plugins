@@ -57,7 +57,7 @@ presets; attribution is in `THIRD_PARTY_NOTICES.md`.
 
 Animation time is wall-clock: `render_key` receives `now` in seconds since the
 epoch and derives the frame from it, so every key and every reconnect stays in
-phase. Two rates are involved and they are different things:
+phase. Two different rates are involved:
 
 - **Frame-table fps** (`animation()` in `render.rs`): the rate at which time
   is quantised into frames, which fixes how many unique images a loop has.
@@ -73,7 +73,7 @@ phase. Two rates are involved and they are different things:
 
 The delivery rates were set by measuring on the device with eight animated
 keys: idle went to 5 fps first, working and done were later lowered to 15 and
-10, while the frame tables stayed at 20 so the cached loops did not change.
+10, while their frame tables stayed at 20 so the cached loops did not change.
 
 ## Loop shapes
 
@@ -134,7 +134,7 @@ period, whether or not a link joins them.
 
 ## Where the numbers come from
 
-The engine ships base profiles plus per-size presets, and `resolvePreset(mode,
+The engine ships base profiles plus per-size presets, and `resolvePreset(state,
 64)` combines them with three rules: paired counts (`lanes`, `segs`) scale by
 `sqrt(count)`, flat counts (`nodeN`, `ghostN`, `signals`) scale by `count`,
 radii (`rBase`, `rDepth`, `nodeR`, `nodeRDepth`) scale by `size`. The Rust

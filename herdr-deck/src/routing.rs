@@ -188,7 +188,6 @@ pub struct DisplayModel {
 #[derive(Clone, Debug)]
 pub struct SessionState {
     pub key: String,
-    pub host: String,
     pub name: String,
     pub connected: bool,
     pub workspaces: Vec<WorkspaceInfo>,
@@ -206,7 +205,6 @@ pub fn project_model(raw: &Model) -> DisplayModel {
                     let snapshot = endpoint.snapshot.as_ref()?;
                     Some(SessionState {
                         key: endpoint.endpoint_id.clone(),
-                        host: "local".into(),
                         name: endpoint.label.clone(),
                         connected: true,
                         workspaces: snapshot

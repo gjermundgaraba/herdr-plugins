@@ -22,6 +22,7 @@ a root helper, or use `sudo`.
 - macOS Accessibility permission only for configured system `key` bindings
 - Handy installed at `/Applications/Handy.app` for the reserved voice-control
   button
+- [Hunk](https://www.hunk.dev/) on `PATH` for the optional `diff` popup pane
 
 The bridge uses an unsupported proprietary device protocol. Read the
 [compatibility and safety notes](docs/micro-bridge.md) before setup.
@@ -43,8 +44,9 @@ service executable lives under
 `~/Library/Application Support/dev.herdr.codex-micro/`; grant Input Monitoring
 to that installed executable when macOS prompts. On a fresh install,
 `service-authorize` installs the stable service first and asks the running
-service process to request access. If no entry appears, open **System Settings
-→ Privacy & Security → Input Monitoring**, click **+**, authenticate, and add
+service process to request access. If no entry appears, open Input Monitoring
+under Privacy & Security in System Settings, click the plus button,
+authenticate, and add
 `~/Library/Application Support/dev.herdr.codex-micro/codex-micro`; then rerun
 `service-authorize`.
 
@@ -108,9 +110,10 @@ herdr plugin config-dir gjermundgaraba.herdr-micro
 
 `config.json` contains Herdr controls and lighting. The service reserves Button
 5 (`ACT10`) for Handy and consumes its press directly by running
-`handy --toggle-transcription`. This works without Herdr and does not synthesize
-F19 or any other CGEvent, so Secure Input does not block it. Keep
-`controls.buttons["5"]` set to `null`.
+`/Applications/Handy.app/Contents/MacOS/handy --toggle-transcription`; a Handy
+installed elsewhere is not found through `PATH`. This works without Herdr and
+does not synthesize F19 or any other CGEvent, so Secure Input does not block
+it. Keep `controls.buttons["5"]` set to `null`.
 
 The other buttons, dial, joystick, gestures, routing, and lighting policy stay
 in the Herdr client. The stock wide keycap spans switches 5 and 6, so Button 6
@@ -125,24 +128,32 @@ any frontmost app (requires Accessibility):
 "2": { "action": "key", "key": "F19" }
 ```
 
-`key` names cover F13–F20; `keycode` accepts any macOS virtual keycode (0–127)
+`key` names cover F13 to F20; `keycode` accepts any macOS virtual keycode (0 to 127)
 instead of `key`, and optional `modifiers` adds any of `cmd`, `shift`, `alt`,
 `ctrl`, and `fn`.
 
-The actions are `prompt`, `submit`, `fast`, `focus-pane`, `script`, and
-`key`; the default configuration demonstrates most of them plus `byAgent`
+The actions are `prompt`, `input`, `submit`, `fast`, `focus-pane`, `script`,
+and `key`; the default configuration demonstrates most of them plus `byAgent`
 variants. Buttons also accept gesture bindings:
 
 ```json
 "1": { "tap": { "action": "submit" }, "hold": { "action": "fast" }, "holdMs": 400 }
 ```
 
-`tap`, `doubleTap`, `hold`, and `release` each take an action; `holdMs` and
-`doubleTapMs` tune the timing.
+`tap`, `doubleTap`, `hold`, and `release` each take an action. `holdMs`
+defaults to 500 and `doubleTapMs` to 250; both must be between 50 and 5000.
+Gesture bindings are accepted on buttons and the dial press only, not on dial
+rotation or joystick directions, and a `byAgent` variant cannot hold a `key`
+action.
 
 Runtime files use the plugin state directory: `run/micro.sock`,
 `logs/micro.log`, and `data/backups/`. The device service writes its own log to
 `~/Library/Logs/dev.herdr.codex-micro/service.log`.
+
+The manifest also declares a `diff` popup pane that runs `hunk diff --watch`
+in the current workspace. No button is bound to it by default; open it with
+`herdr plugin pane open --plugin gjermundgaraba.herdr-micro --entrypoint diff`.
+`doctor` warns when Hunk is missing.
 
 ## Effort controls
 
@@ -179,14 +190,14 @@ mutations are never replayed. Gesture routes are captured at the first press.
 Delayed work is rejected if that TUI is no longer the uniquely focused client;
 it never retargets to a different TUI.
 
-**Explicit OS-global exceptions:** existing `action: "key"` bindings synthesize
-macOS keycodes (named F13–F20 or configured keycode/modifiers), even without a
-focused Herdr TUI. The device service's reserved Handy button is also global.
-Neither exception is a Herdr input route. Official device ownership still gates
-all bridge work as before.
+Two bindings work OS-globally. `action: "key"` bindings synthesize macOS
+keycodes (named F13 to F20, or a configured keycode with modifiers) even
+without a focused Herdr TUI, and the device service's reserved Handy button is
+global too. Neither is a Herdr input route, and official device ownership still
+gates all bridge work.
 
 Scripts run locally from the plugin root and receive `HERDR_FRONTEND_SOCKET`,
-`HERDR_PANE_ID`, and `HERDR_MICRO_BIN_PATH` (the independent installed binary).
+`HERDR_PANE_ID`, and `HERDR_MICRO_BIN_PATH` (the plugin's own `bin/herdr-micro`).
 Use `client input text TEXT` or `client input keys KEY...`. Input is
 deliberately untargeted. External commands run normally, outside frontend
 validation.

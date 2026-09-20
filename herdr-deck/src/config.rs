@@ -199,7 +199,7 @@ pub fn parse_config(value: Value) -> Result<Config, String> {
             .ok_or_else(|| "herdr.sessions must be an array".to_owned())?
             .iter()
             .enumerate()
-            .map(|(index, value)| session_key(value, &format!("herdr.sessions[{index}]")))
+            .map(|(index, value)| endpoint_id(value, &format!("herdr.sessions[{index}]")))
             .collect::<Result<Vec<_>, _>>()?,
         None => Vec::new(),
     };
@@ -479,19 +479,15 @@ fn string(value: &Value, label: &str) -> Result<String, String> {
         .ok_or_else(|| format!("{label} must be a non-empty string"))
 }
 
-fn session_key(value: &Value, label: &str) -> Result<String, String> {
-    let key = string(value, label)?;
-    let valid = key.split_once('/').is_some_and(|(host, session)| {
-        !host.is_empty()
-            && !session.is_empty()
-            && host.trim() == host
-            && session.trim() == session
-            && !session.contains('/')
-    });
+fn endpoint_id(value: &Value, label: &str) -> Result<String, String> {
+    let id = string(value, label)?;
+    let valid = id == "local" || id.strip_prefix("ssh:").is_some_and(|rest| !rest.is_empty());
     if !valid {
-        return Err(format!("{label} must be a <host>/<session> key"));
+        return Err(format!(
+            "{label} must be an endpoint id: `local` or `ssh:<id>`"
+        ));
     }
-    Ok(key)
+    Ok(id)
 }
 
 fn optional_string(
@@ -555,7 +551,7 @@ mod tests {
     #[test]
     fn parses_complete_configuration_and_all_actions() {
         let mut value = valid();
-        value["herdr"]["sessions"] = json!(["local/default", "local/review"]);
+        value["herdr"]["sessions"] = json!(["local", "ssh:0123456789abcdef"]);
         value["devices"][0]["buttons"] = json!({
             "0": { "action": "focus-slot" },
             "1": { "action": "focus-pane", "direction": "left" },
@@ -567,7 +563,7 @@ mod tests {
         });
         let config = parse_config(value).unwrap();
         assert_eq!(config.devices[0].buttons["6"], Action::SystemEnter);
-        assert_eq!(config.herdr.sessions, ["local/default", "local/review"]);
+        assert_eq!(config.herdr.sessions, ["local", "ssh:0123456789abcdef"]);
         assert_eq!(config.devices[0].serial.as_deref(), Some("one"));
         assert_eq!(
             config.devices[0].buttons["0"],
@@ -609,19 +605,19 @@ mod tests {
         assert!(parse_config(omitted).unwrap().herdr.sessions.is_empty());
 
         let mut malformed = valid();
-        malformed["herdr"]["sessions"] = json!(["local/default", 1]);
+        malformed["herdr"]["sessions"] = json!(["local", 1]);
         assert!(
             parse_config(malformed)
                 .unwrap_err()
                 .contains("herdr.sessions[1] must be a non-empty string")
         );
 
-        let mut bare_name = valid();
-        bare_name["herdr"]["sessions"] = json!(["default"]);
+        let mut session_key = valid();
+        session_key["herdr"]["sessions"] = json!(["local/default"]);
         assert!(
-            parse_config(bare_name)
+            parse_config(session_key)
                 .unwrap_err()
-                .contains("herdr.sessions[0] must be a <host>/<session> key")
+                .contains("herdr.sessions[0] must be an endpoint id")
         );
 
         let mut legacy = valid();

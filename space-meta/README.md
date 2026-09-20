@@ -4,11 +4,11 @@ Space numbers and PR badges in the Herdr spaces sidebar.
 
 Publishes two workspace metadata tokens:
 
-- `$numbered_workspace` — `1 workspace-name`, using the space's stable
+- `$numbered_workspace`: `1 workspace-name`, using the space's stable
   expanded group order; grouped worktree children use `1 branch-name #123`
   when a PR exists
-- `$branch_line` — an invisibly padded `branch` plus optional `#123`, aligned
-  below the workspace label; the padding tracks one- and two-digit numbers
+- `$branch_line`: an invisibly padded `branch` plus optional `#123`, aligned
+  below the workspace label; the padding tracks the space number's digit count
 
 Refreshes on startup, workspace lifecycle events (created / updated / renamed /
 closed / moved / reordered / focused), worktree changes, and the `refresh`
@@ -64,7 +64,7 @@ herdr plugin action invoke gjermundgaraba.herdr-space-meta.refresh
   clears them, and the plugin repopulates them on the next event or the
   `refresh` action.
 - Branch/PR metadata resolves from a workspace's worktree checkout path when
-  available; otherwise it best-effort uses the first snapshot pane in the
+  available; otherwise it falls back to the first snapshot pane in the
   workspace's first tab. Branch switches refresh on the next registered event
   for that workspace. Run the `refresh` action to refresh all workspace
   branches; PR results remain cached for up to 60 seconds.

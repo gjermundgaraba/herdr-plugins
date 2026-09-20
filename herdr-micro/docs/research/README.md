@@ -35,7 +35,7 @@ evidence, but their ownership architecture and F19 action path are superseded.
   independent Herdr agent lights and emit the corresponding vendor events.
   The device's original Layer 1 remains available for the Codex desktop app.
 - Six Agent LEDs are independently controllable. On the tested Codex Micro,
-  thread IDs 6–12 did not light the seven lower keys; lower-key backlight and
+  thread IDs 6 to 12 did not light the seven lower keys; lower-key backlight and
   perimeter lighting are aggregate zones.
 - Agent-key focus, configured prompts/actions, dial effort changes for Codex,
   Claude Code, and Pi, automatic Layer 1/2 selection, and default/named Herdr

@@ -1,7 +1,7 @@
 id = "gjermundgaraba.herdr-move-pane"
 name = "Move Pane"
 version = "0.1.0"
-min_herdr_version = "0.9.1"
+min_herdr_version = "0.8.0"
 description = "Move the focused pane into a new tab, or pick a tab when the workspace has several"
 platforms = ["macos", "linux"]
 

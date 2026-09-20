@@ -33,9 +33,10 @@ herdr plugin install gjermundgaraba/herdr-plugins/fork-to-pane
 Restart OpenCode after installing its integration. Its native session reference
 becomes available after a session-bearing event.
 
-For Pi, Codex, Claude Code, and OpenCode, invoke **Fork agent into right pane**
-from the Herdr action menu or bind it in
-`~/.config/herdr/config.toml`:
+For Pi, Codex, Claude Code, and OpenCode, bind the fork action in
+`~/.config/herdr/config.toml` (plugin actions have no menu in Herdr; from a
+shell, `herdr plugin action invoke gjermundgaraba.herdr-fork-to-pane.fork`
+does the same):
 
 ```toml
 [[keys.command]]
@@ -72,16 +73,19 @@ command palette. This is an Amp command, not the Herdr fork action above.
 For an Amp-specific shortcut, find the command's full ID with `amp config keymap`
 after loading the companion, then bind it using `amp.keymap` in Amp settings.
 
-The companion runs only inside Herdr. On invocation it passes `ctx.thread.id`
+The companion registers its command only inside Herdr and only for local Amp
+executors; on a remote executor the command does not appear. On invocation it
+passes `ctx.thread.id`
 directly to the installed plugin's executable as `--amp-thread T-…`. It locates
 the executable through `herdr plugin list`; there are no background reports,
 pane tokens, timers, or prompt hooks. Requires Amp's `registerCommand` API with
 the current thread in the command context.
 
 The executable waits for Amp's input to be ready, pastes the reference without
-pressing Enter, then focuses the new pane. If startup or paste fails, the pane
-stays open when launch may have occurred, and an error is reported rather than
-retrying the paste. The companion does not intercept or modify user messages.
+pressing Enter, then focuses the new pane. If startup or the paste fails, the
+pane stays open whenever Amp may already have launched, and the plugin reports
+an error instead of retrying the paste. The companion does not intercept or
+modify user messages.
 
 ## Warp limitation
 
@@ -93,7 +97,8 @@ and is not a substitute for forking.
 
 ## Development
 
-Run these commands from the repository root:
+Run these commands from the repository root. The Bun test is not part of CI,
+so run it locally after touching the companion:
 
 ```sh
 cargo test -p herdr-fork-to-pane

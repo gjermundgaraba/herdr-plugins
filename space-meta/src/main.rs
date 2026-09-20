@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(2);
-const SOURCE_ID: &str = "gjermundgaraba.space-meta";
+const SOURCE_ID: &str = "gjermundgaraba.herdr-space-meta";
 const PR_CACHE_TTL_SECS: u64 = 60;
 const PENDING_FILE_PREFIX: &str = "space-meta.pending";
 const BRAILLE_BLANK: char = '\u{2800}';

@@ -74,9 +74,9 @@ The service-owned device gate is:
 | ChatGPT/Codex desktop frontmost | Close the physical device |
 | Official writer inactive | Open USB or BLE and replay desired state |
 
-Separately, Herdr selects Layer 2 when exactly one TUI reports focus and routes actions through it. Without a unique focused TUI,
-the bridge preserves the last applicable Herdr layer and dispatches no Herdr
-action.
+Separately, Herdr selects Layer 2 when exactly one TUI reports focus and
+routes actions through it. Without a unique focused TUI, the bridge preserves
+the last applicable Herdr layer and dispatches no Herdr action.
 
 Layer 2 keeps `KV_OAI_AG00` through `KV_OAI_AG05` for six-way status lighting
 and native action codes for configured controls. `micro-setup` accepts only a
@@ -125,8 +125,8 @@ Layer 1 and complete blank lighting, including when a status check already
 opened the device. Status queries alone do not reset lighting. Controller
 disconnect restores Layer 1 and blanks every supported surface. The worker
 invalidates its send cache before a lighting attempt so a lost IPC reply cannot
-prevent a later replacement. Version 1 clients and services are rejected;
-update both binaries together using the start flow above.
+prevent a later replacement. Any protocol version other than 2 is rejected in
+both directions; update both binaries together using the start flow above.
 
 Gestures capture the frontend and agent context at the initial press. Navigation
 uses `navigate`; keys/text use ordinary `input`, which follows current TUI focus,

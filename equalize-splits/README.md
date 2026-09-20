@@ -8,9 +8,9 @@ middle pane then restores a 50/50 layout.
 New splits only equalize their connected directional group. Pane closes
 equalize each directional group in the affected tab.
 
-Herdr 0.8.0 does not include the split source or requested ratio in
-`pane.created`, so explicit split ratios and panes created by `layout.apply`
-can be equalized too.
+Herdr's `pane.created` event carries no split source or requested ratio (still
+true in 0.9.1), so the plugin cannot tell an explicit-ratio split or a
+`layout.apply` pane from an ordinary split. Those get equalized too.
 
 ## Install
 

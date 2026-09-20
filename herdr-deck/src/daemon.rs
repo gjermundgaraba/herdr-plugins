@@ -91,7 +91,7 @@ pub fn main(args: Vec<String>) -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "Usage: herdr-deck <command>\n\n  devices                   List visible supported devices\n  check [config]            Validate configuration\n  doctor [config]           Check config, Herdr frontends, and device visibility\n  frames <state> <dir> [config]  Write one animation loop as JPEG key frames\n  push [source] [target]    Atomically install configuration\n  run [config]              Run the direct-HID daemon\n  install-service [plist]   Install and start the launchd user service\n  uninstall-service [plist] Stop and remove the launchd user service\n"
+        "Usage: herdr-deck <command>\n\n  devices                   List every visible Elgato device (Plus and Pedal are managed)\n  check [config]            Validate configuration\n  doctor [config]           Check config, Herdr frontends, and device visibility\n  frames <state> <dir> [config]  Write one animation loop as JPEG key frames\n  push [source] [target]    Atomically install configuration\n  run [config]              Run the direct-HID daemon\n  install-service [plist] [config]  Install and start the launchd user service\n  uninstall-service [plist] Stop and remove the launchd user service\n"
     );
 }
 
@@ -1023,7 +1023,7 @@ impl Daemon {
                 .as_ref()
                 .and_then(|model| model.sessions.iter().find(|session| session.key == *key))
                 .map(|session| session_label(session).to_owned())
-                .unwrap_or_else(|| key.rsplit('/').next().unwrap_or(key).to_owned()),
+                .unwrap_or_else(|| key.clone()),
         }
     }
 
@@ -1333,11 +1333,7 @@ fn workspace_for_agent<'a>(
 }
 
 fn session_label(session: &SessionState) -> &str {
-    if session.host == "local" {
-        &session.name
-    } else {
-        &session.key
-    }
+    &session.name
 }
 
 fn supported(kind: Kind) -> bool {
@@ -1469,7 +1465,6 @@ mod tests {
     fn session(key: &str, name: &str, connected: bool, focused: bool) -> SessionState {
         SessionState {
             key: key.into(),
-            host: key.split('/').next().unwrap().into(),
             name: name.into(),
             connected,
             workspaces: vec![WorkspaceInfo {
@@ -1557,65 +1552,65 @@ mod tests {
 
     #[test]
     fn filters_cycle_active_and_connected_allowed_sessions() {
-        let alpha = session("local/alpha", "alpha", true, false);
-        let beta = session("local/beta", "beta", true, false);
-        let stopped = session("local/stopped", "stopped", false, false);
+        let alpha = session("local", "alpha", true, false);
+        let beta = session("ssh:beta", "beta", true, false);
+        let stopped = session("ssh:stopped", "stopped", false, false);
         assert!(session_matches(&alpha, &[], &SessionFilter::All, None));
         assert!(!session_matches(&stopped, &[], &SessionFilter::All, None,));
         assert!(session_matches(
             &beta,
-            &["local/beta".into()],
+            &["ssh:beta".into()],
             &SessionFilter::All,
             None,
         ));
         assert!(!session_matches(
             &alpha,
-            &["local/beta".into()],
+            &["ssh:beta".into()],
             &SessionFilter::All,
             None,
         ));
         assert!(!session_matches(
             &alpha,
             &[],
-            &SessionFilter::Session("local/beta".into()),
+            &SessionFilter::Session("ssh:beta".into()),
             None,
         ));
         assert!(session_matches(
             &alpha,
             &[],
             &SessionFilter::Active,
-            Some("local/alpha"),
+            Some("local"),
         ));
         assert!(!session_matches(
             &beta,
             &[],
             &SessionFilter::Active,
-            Some("local/alpha"),
+            Some("local"),
         ));
         assert!(!session_matches(
             &alpha,
-            &["local/beta".into()],
+            &["ssh:beta".into()],
             &SessionFilter::Active,
-            Some("local/alpha"),
+            Some("local"),
         ));
         assert!(!session_matches(&alpha, &[], &SessionFilter::Active, None,));
 
-        let keys = vec!["local/alpha".into(), "local/beta".into()];
+        let keys = vec!["local".into(), "ssh:beta".into()];
         let active_filter = cycle_filter(&SessionFilter::All, &keys, CycleDirection::Next);
         assert_eq!(active_filter, SessionFilter::Active);
         let alpha_filter = cycle_filter(&active_filter, &keys, CycleDirection::Next);
-        assert_eq!(alpha_filter, SessionFilter::Session("local/alpha".into()));
+        assert_eq!(alpha_filter, SessionFilter::Session("local".into()));
         assert_eq!(
             cycle_filter(&alpha_filter, &keys, CycleDirection::Next),
-            SessionFilter::Session("local/beta".into())
+            SessionFilter::Session("ssh:beta".into())
         );
         assert_eq!(
             cycle_filter(&SessionFilter::All, &keys, CycleDirection::Previous),
-            SessionFilter::Session("local/beta".into())
+            SessionFilter::Session("ssh:beta".into())
         );
 
-        let mut vanished = SessionFilter::Session("local/beta".into());
-        retain_filter(&mut vanished, &["local/alpha".into()]);
+        let mut vanished = SessionFilter::Session("ssh:beta".into());
+        retain_filter(&mut vanished, &["local".into()]);
         assert_eq!(vanished, SessionFilter::All);
         let mut active_filter = SessionFilter::Active;
         retain_filter(&mut active_filter, &[]);
@@ -1624,8 +1619,8 @@ mod tests {
 
     #[test]
     fn session_scoped_lookup_handles_duplicate_terminal_and_workspace_ids() {
-        let alpha = session("local/alpha", "Alpha", true, true);
-        let beta = session("local/beta", "Beta", true, true);
+        let alpha = session("local", "Alpha", true, true);
+        let beta = session("ssh:beta", "Beta", true, true);
         assert_eq!(
             workspace_for_agent(&alpha, &alpha.agents[0]).unwrap().label,
             "Alpha"
@@ -1635,9 +1630,9 @@ mod tests {
             "Beta"
         );
 
-        let remote = session("workbox/default", "default", true, false);
+        let remote = session("ssh:workbox", "Workbox", true, false);
         assert_eq!(session_label(&alpha), "Alpha");
-        assert_eq!(session_label(&remote), "workbox/default");
+        assert_eq!(session_label(&remote), "Workbox");
     }
 
     #[test]
@@ -1676,8 +1671,8 @@ mod tests {
         let (commands, receiver) = mpsc::channel();
         let (events, results) = mpsc::channel();
         let route = ActionRoute {
-            session: "local/alpha".into(),
-            client_route: test_client_route("local/alpha"),
+            session: "local".into(),
+            client_route: test_client_route("local"),
             source_pane: Some("pane".into()),
             target: crate::routing::AgentIdentity::from(&agent("terminal", "pane", false)),
             generation: 1,
@@ -1750,8 +1745,8 @@ mod tests {
             } = action_command(
                 "test",
                 ActionRoute {
-                    session: "local/alpha".into(),
-                    client_route: test_client_route("local/alpha"),
+                    session: "local".into(),
+                    client_route: test_client_route("local"),
                     source_pane: Some("source-pane".into()),
                     target: crate::routing::AgentIdentity::from(&agent(
                         "terminal", "pane-1", false,
@@ -1764,7 +1759,7 @@ mod tests {
                 panic!("expected frontend call");
             };
             assert_eq!(name, "test");
-            assert_eq!(route.session, "local/alpha");
+            assert_eq!(route.session, "local");
             assert_eq!(route.source_pane.as_deref(), Some("source-pane"));
             assert_eq!(request, expected);
         }
