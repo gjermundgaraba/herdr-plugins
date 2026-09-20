@@ -1,0 +1,34 @@
+{
+  "herdr": { "slotCount": 8, "sessions": [] },
+  "states": {
+    "blocked": { "background": "#50252b", "foreground": "#e2e6e0" },
+    "done": { "background": "#1c3d1e", "foreground": "#e2e6e0" },
+    "working": { "background": "#173654", "foreground": "#e2e6e0" },
+    "idle": { "background": "#383c36", "foreground": "#888f84" },
+    "unknown": { "background": "#282a27", "foreground": "#767d72" }
+  },
+  "devices": [
+    {
+      "serial": "A00WA4411LI67S", "enabled": true, "role": "dashboard", "brightness": 85, "buttons": {},
+      "encoders": {
+        "0": { "press": { "action": "submit" }, "clockwise": { "action": "send-keys", "keys": ["down"] }, "counterclockwise": { "action": "send-keys", "keys": ["up"] } },
+        "1": { "press": { "action": "prompt", "text": "/model" }, "clockwise": { "action": "send-keys", "keys": ["ctrl+shift+right"] }, "counterclockwise": { "action": "send-keys", "keys": ["ctrl+shift+left"] } },
+        "2": { "press": { "action": "prompt", "text": "/copy" }, "clockwise": { "action": "focus-pane", "direction": "right" }, "counterclockwise": { "action": "focus-pane", "direction": "left" } },
+        "3": { "press": { "action": "cycle-session", "direction": "next" }, "clockwise": { "action": "cycle-session", "direction": "next" }, "counterclockwise": { "action": "cycle-session", "direction": "previous" } }
+      },
+      "touch": {
+        "0": { "action": "cycle-session", "direction": "next" },
+        "1": { "action": "send-keys", "keys": ["ctrl+shift+right"] },
+        "2": { "action": "submit" },
+        "3": { "action": "send-keys", "keys": ["ctrl+c"] },
+        "swipeLeft": { "action": "cycle-session", "direction": "next" },
+        "swipeRight": { "action": "cycle-session", "direction": "previous" }
+      }
+    },
+    {
+      "serial": "A00YA4272193CD", "enabled": true, "role": "pedal", "brightness": 100,
+      "buttons": { "0": { "action": "system-key", "key": "f19" }, "1": { "action": "system-key", "key": "enter" }, "2": { "action": "system-key", "key": "f19" } },
+      "encoders": {}, "touch": {}
+    }
+  ]
+}

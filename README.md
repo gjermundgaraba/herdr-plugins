@@ -9,9 +9,9 @@ These plugins target the
 `custom-v3` branch, currently based on upstream 0.9.1. The fork adds the
 per-TUI frontend socket (protocol 7), the `agent.prompt` client command lane
 method, and the client-side `[keys]` actions the pickers replaced. Stock
-`herdrdev/herdr` has none of these, so Micro does not work against it. The
-socket's Rust client is the `herdr-frontend` crate under `sdk/frontend` in the
-fork; Micro depends on it as a git dependency, so `Cargo.lock` pins the exact
+`herdrdev/herdr` has none of these, so Micro and Deck do not work against it.
+The socket's Rust client is the `herdr-frontend` crate under `sdk/frontend` in
+the fork; Micro and Deck depend on it as a git dependency, so `Cargo.lock` pins the exact
 fork commit the plugins were built against and `cargo update -p herdr-frontend`
 is how the plugins follow the fork. Everything else here runs on stock Herdr.
 The fork documents the socket and the actions in
@@ -25,6 +25,7 @@ The fork documents the socket and the actions in
 | [move-pane](move-pane) | Move the focused pane to another tab or a new tab from one keybinding |
 | [space-meta](space-meta) | Space numbers and PR badges in the spaces sidebar |
 | [herdr-micro](herdr-micro) | Control Herdr from a Work Louder Codex Micro |
+| [herdr-deck](herdr-deck) | Stream Deck dashboard and controls for Herdr agents |
 
 Install plugins as needed (Micro does not depend on Hub):
 
@@ -37,7 +38,10 @@ herdr plugin install gjermundgaraba/herdr-plugins/move-pane
 herdr plugin install gjermundgaraba/herdr-plugins/space-meta
 ```
 
-Herdr Micro connects directly to per-TUI frontend sockets. See [Micro installation](herdr-micro/README.md#install).
+Herdr Micro and Herdr Deck connect directly to per-TUI frontend sockets and
+run as LaunchAgents rather than plugins. See
+[Micro installation](herdr-micro/README.md#install) and
+[Deck setup](herdr-deck/README.md).
 
 For local development:
 
@@ -84,8 +88,9 @@ including overlays. See the
 [Micro bridge](herdr-micro/docs/micro-bridge.md) for routing and script behavior.
 
 The other Nix packages are `equalize-splits`, `fork-to-pane`, `move-pane`, and
-`space-meta`. `herdr-micro` has no Nix package: its service binary must be
-locally codesigned.
+`space-meta`. `herdr-micro` has no Nix package because its service binary must
+be locally codesigned, and `herdr-deck` has none because it links system
+`jpeg-turbo` and HID libraries.
 
 Each package's filtered source contains its full local path-dependency closure,
 so editing one plugin does not invalidate unrelated plugin outputs, while edits

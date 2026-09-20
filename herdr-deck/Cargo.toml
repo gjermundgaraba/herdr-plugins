@@ -1,0 +1,20 @@
+[package]
+name = "herdr-deck"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Direct-HID Stream Deck dashboard for Herdr"
+repository.workspace = true
+
+[dependencies]
+elgato-streamdeck = "0.13.1"
+herdr-client.workspace = true
+herdr-frontend.workspace = true
+hidapi = "2.6.6"
+libc.workspace = true
+resvg = { version = "0.48.1", default-features = false, features = ["text"] }
+serde_json.workspace = true
+signal-hook = { version = "0.4.4", default-features = false }
+turbojpeg = { version = "1.5.1", default-features = false, features = ["pkg-config"] }
