@@ -64,7 +64,8 @@ cross that limit.
 stable API has no snapshot cursor or server-generation token, so consumers
 must tolerate replayed events and refresh state after reconnecting.
 
-Validated against Herdr 0.8.0, socket protocol 19.
+Validated against the [Herdr fork build](../../README.md#herdr-build)
+(0.9.1, socket protocol 22).
 
 ## Local frontend protocol 7 (Unix)
 

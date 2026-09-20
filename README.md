@@ -2,6 +2,18 @@
 
 Independent plugins and tools for [Herdr](https://herdr.dev/).
 
+## Herdr build
+
+These plugins target the
+[gjermundgaraba/herdr](https://github.com/gjermundgaraba/herdr) fork on the
+`custom-v3` branch, currently based on upstream 0.9.1. The fork adds the
+per-TUI frontend socket (protocol 7), the `agent.prompt` client command lane
+method, and the client-side `[keys]` actions the pickers replaced. Stock
+`herdrdev/herdr` has none of these, so Micro and the SDK's `frontend` module
+do not work against it. Protocol 7 is lockstep: rebuild and reinstall the
+plugins whenever the fork changes it. The fork documents the socket and the
+actions in `docs/next/website/src/content/docs/frontend-api.md`.
+
 | Package | Description |
 | --- | --- |
 | [herdr-hub](herdr-hub) | Runtime session/host inventory and relay |
@@ -49,8 +61,8 @@ Use the [Hub local-development sequence](herdr-hub/README.md#local-development)
 and [Micro local-development sequence](herdr-micro/README.md#local-development)
 for those service-backed plugins.
 
-Each plugin directory above has its own `herdr-plugin.toml`; Herdr 0.8.2 does
-not install cross-plugin dependencies.
+Each plugin directory above has its own `herdr-plugin.toml`; Herdr does not
+install cross-plugin dependencies.
 
 ## Nix
 

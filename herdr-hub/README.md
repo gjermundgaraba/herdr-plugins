@@ -43,8 +43,7 @@ overrides its configuration file (default `~/.config/herdr-hub/config.toml`).
 
 From a fresh repository checkout, build and stage the executable before
 linking the plugin. These commands mirror the manifest's `[[build]]` commands;
-`herdr plugin link` registers a working tree but does not run them in Herdr
-0.8.2.
+`herdr plugin link` registers a working tree but does not run them.
 
 ```sh
 cargo build --release --locked -p herdr-hub

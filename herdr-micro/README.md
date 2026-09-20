@@ -13,7 +13,8 @@ a root helper, or use `sudo`.
 
 - macOS and a Codex Micro; the current hardware baseline is stock firmware
   0.6.2
-- The custom Herdr build with frontend socket protocol 7 (Hub is not required)
+- The [Herdr fork build](../README.md#herdr-build) with frontend socket
+  protocol 7 (Hub is not required)
 - Rust 1.89 or newer when building from source
 - An Apple Development code-signing identity when building from source
 - Work Louder Input for the one-time Layer 2 setup
