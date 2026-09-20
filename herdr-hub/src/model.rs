@@ -10,7 +10,6 @@ impl Default for Store {
         Self {
             model: Model {
                 version: 0,
-                active: None,
                 hosts: vec![HostState {
                     key: "local".into(),
                     connected: true,
@@ -85,18 +84,6 @@ impl Store {
             .collect()
     }
 
-    pub(crate) fn set_active(&mut self, key: Option<String>) -> Option<ServerMessage> {
-        if self.model.active == key {
-            return None;
-        }
-        self.model.active.clone_from(&key);
-        self.bump();
-        Some(ServerMessage::Active {
-            version: self.model.version,
-            key,
-        })
-    }
-
     pub(crate) fn set_host(&mut self, host: HostState) -> Option<ServerMessage> {
         if let Some(current) = self
             .model
@@ -146,7 +133,6 @@ mod tests {
             tabs: Vec::new(),
             agents: Vec::new(),
             socket_path: None,
-            client_focused: None,
         }
     }
 
@@ -171,7 +157,6 @@ mod tests {
     #[test]
     fn unchanged_singletons_do_not_consume_versions() {
         let mut store = Store::default();
-        assert!(store.set_active(None).is_none());
         assert!(
             store
                 .set_host(HostState {
@@ -182,8 +167,6 @@ mod tests {
                 .is_none()
         );
         assert_eq!(store.get().version, 0);
-        assert!(store.set_active(Some("local/default".into())).is_some());
-        assert_eq!(store.get().version, 1);
     }
 
     #[test]

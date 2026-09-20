@@ -89,7 +89,7 @@ impl Server {
             bail!("Herdr Hub refuses to run as root")
         }
         let socket_path = herdr_hub_client::socket_path();
-        let lock_path = PathBuf::from(format!("/tmp/herdr-hub-{uid}.lock"));
+        let lock_path = socket_path.with_extension("lock");
         Self::start_at(tx, socket_path, lock_path)
     }
 
@@ -496,7 +496,6 @@ mod tests {
     fn model(version: u64) -> Model {
         Model {
             version,
-            active: None,
             hosts: vec![HostState {
                 key: "local".into(),
                 connected: true,
@@ -560,9 +559,9 @@ mod tests {
         };
         server.add_subscriber(id, stream, &model(7)).unwrap();
         let mut reader = BufReader::new(client);
-        server.broadcast(&ServerMessage::Active {
+        server.broadcast(&ServerMessage::SessionRemoved {
             version: 8,
-            key: Some("local/default".into()),
+            key: "frontend".into(),
         });
         server.broadcast(&ServerMessage::Host {
             version: 9,
@@ -578,7 +577,7 @@ mod tests {
         ));
         assert!(matches!(
             next(&mut reader),
-            Some(ServerMessage::Active { version: 8, .. })
+            Some(ServerMessage::SessionRemoved { version: 8, .. })
         ));
         assert!(matches!(
             next(&mut reader),
@@ -602,7 +601,10 @@ mod tests {
             peers.push(peer);
         }
         for version in 1..=3 {
-            server.broadcast(&ServerMessage::Active { version, key: None });
+            server.broadcast(&ServerMessage::SessionRemoved {
+                version,
+                key: "local/default".into(),
+            });
         }
         for version in 1..=3 {
             let left = receivers[0].recv().unwrap();
@@ -611,7 +613,7 @@ mod tests {
             assert_eq!(left.last(), Some(&b'\n'));
             assert!(
                 matches!(serde_json::from_slice::<ServerMessage>(&left).unwrap(),
-                ServerMessage::Active { version: actual, .. } if actual == version)
+                ServerMessage::SessionRemoved { version: actual, .. } if actual == version)
             );
         }
         cleanup(server, directory);
@@ -633,9 +635,9 @@ mod tests {
             peers.push(peer);
         }
         let oversized = "x".repeat(ndjson::MAX_FRAME_BYTES);
-        server.broadcast(&ServerMessage::Active {
+        server.broadcast(&ServerMessage::SessionRemoved {
             version: 1,
-            key: Some(oversized.clone()),
+            key: oversized.clone(),
         });
         assert!(server.subscribers.is_empty());
         for mut peer in peers {
@@ -649,7 +651,7 @@ mod tests {
         }
         let (stream, mut peer) = UnixStream::pair().unwrap();
         let mut oversized_model = model(0);
-        oversized_model.active = Some(oversized);
+        oversized_model.hosts[0].error = Some(oversized);
         assert!(server.add_subscriber(3, stream, &oversized_model).is_err());
         assert_eq!(peer.read(&mut [0]).unwrap(), 0);
         assert!(server.subscribers.is_empty());
@@ -674,9 +676,9 @@ mod tests {
         else {
             panic!("expected call request")
         };
-        server.broadcast(&ServerMessage::Active {
+        server.broadcast(&ServerMessage::SessionRemoved {
             version: 1,
-            key: None,
+            key: "local/default".into(),
         });
         reply_call(stream, id, Ok(json!({"focused": true})));
         let mut reader = BufReader::new(client);
@@ -746,16 +748,22 @@ mod tests {
         let (outgoing, _receiver) = mpsc::sync_channel(SUBSCRIBER_QUEUE);
         for version in 0..SUBSCRIBER_QUEUE as u64 {
             outgoing
-                .send(encode_message(&ServerMessage::Active { version, key: None }).unwrap())
+                .send(
+                    encode_message(&ServerMessage::SessionRemoved {
+                        version,
+                        key: "local/default".into(),
+                    })
+                    .unwrap(),
+                )
                 .unwrap();
         }
         let (shutdown, _peer) = UnixStream::pair().unwrap();
         server
             .subscribers
             .insert(1, Subscriber { outgoing, shutdown });
-        server.broadcast(&ServerMessage::Active {
+        server.broadcast(&ServerMessage::SessionRemoved {
             version: 2,
-            key: None,
+            key: "local/default".into(),
         });
         assert!(server.subscribers.is_empty());
         cleanup(server, directory);

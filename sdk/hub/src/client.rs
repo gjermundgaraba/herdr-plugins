@@ -1,10 +1,10 @@
 use std::{
     io::{self, BufReader, Write},
-    os::{fd::AsRawFd, unix::net::UnixStream},
+    os::unix::net::UnixStream,
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use serde::Serialize;
@@ -92,18 +92,26 @@ impl HubClient {
         params: Value,
         timeout: Duration,
     ) -> Result<Value> {
-        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let mut socket = self.connect(timeout)?;
-        write_message(
-            &mut socket,
-            &ClientMessage::Call {
+        self.request(
+            |id| ClientMessage::Call {
                 protocol: PROTOCOL,
                 id,
                 session: session.into(),
                 method: method.into(),
                 params,
             },
-        )?;
+            timeout,
+        )
+    }
+
+    fn request(
+        &self,
+        message: impl FnOnce(u64) -> ClientMessage,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let mut socket = self.connect(timeout)?;
+        write_message(&mut socket, &message(id))?;
         let mut reader = BufReader::new(socket);
         let mut pending = Vec::new();
         match read_message_with_timeout(&mut reader, &mut pending, timeout)? {
@@ -158,10 +166,6 @@ impl HubClient {
                 } else {
                     model.hosts.push(host.clone());
                 }
-                model.version = *version;
-            }
-            ServerMessage::Active { version, key } => {
-                model.active.clone_from(key);
                 model.version = *version;
             }
             ServerMessage::Reply { .. }
@@ -277,38 +281,9 @@ fn read_message_with_timeout(
     pending: &mut Vec<u8>,
     timeout: Duration,
 ) -> Result<Option<ServerMessage>> {
-    reader.get_ref().set_nonblocking(true)?;
-    let deadline = Instant::now() + timeout;
-    let result = loop {
-        match read_message(reader, pending) {
-            Err(Error::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    break Err(Error::Io(io::ErrorKind::TimedOut.into()));
-                }
-                let mut descriptor = libc::pollfd {
-                    fd: reader.get_ref().as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                let milliseconds = remaining.as_millis().max(1).min(i32::MAX as u128) as i32;
-                // SAFETY: descriptor points to one initialized pollfd for this call.
-                let ready = unsafe { libc::poll(&raw mut descriptor, 1, milliseconds) };
-                if ready == 0 {
-                    break Err(Error::Io(io::ErrorKind::TimedOut.into()));
-                }
-                if ready < 0 {
-                    let error = io::Error::last_os_error();
-                    if error.kind() != io::ErrorKind::Interrupted {
-                        break Err(Error::Io(error));
-                    }
-                }
-            }
-            result => break result,
-        }
-    };
-    reader.get_ref().set_nonblocking(false)?;
-    result
+    herdr_client::ndjson::read_frame_with_timeout(reader, pending, timeout)?
+        .map(|frame| serde_json::from_slice(&frame).map_err(Error::Json))
+        .transpose()
 }
 
 #[cfg(test)]
@@ -337,7 +312,6 @@ mod tests {
     fn model(version: u64) -> Model {
         Model {
             version,
-            active: None,
             hosts: vec![HostState {
                 key: "local".into(),
                 connected: true,
@@ -359,7 +333,6 @@ mod tests {
             tabs: Vec::new(),
             agents: Vec::new(),
             socket_path: Some("/tmp/herdr.sock".into()),
-            client_focused: None,
         }
     }
 
@@ -390,9 +363,9 @@ mod tests {
             writeln!(
                 socket,
                 "{}",
-                serde_json::to_string(&ServerMessage::Active {
+                serde_json::to_string(&ServerMessage::SessionRemoved {
                     version: 4,
-                    key: Some("local/default".into()),
+                    key: "local/default".into()
                 })
                 .unwrap()
             )
@@ -405,9 +378,9 @@ mod tests {
         assert_eq!(initial.version, 3);
         assert_eq!(
             stream.next().unwrap(),
-            Some(ServerMessage::Active {
+            Some(ServerMessage::SessionRemoved {
                 version: 4,
-                key: Some("local/default".into()),
+                key: "local/default".into()
             })
         );
         server.join().unwrap();
@@ -497,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_replaces_and_removes_by_key_and_sets_active() {
+    fn apply_replaces_and_removes_sessions_and_hosts() {
         let mut current = model(0);
         current.sessions.push(session("local/default", false));
 
@@ -524,15 +497,6 @@ mod tests {
         );
         assert_eq!(current.hosts.len(), 1);
         assert_eq!(current.hosts[0].error.as_deref(), Some("offline"));
-
-        HubClient::apply(
-            &mut current,
-            &ServerMessage::Active {
-                version: 3,
-                key: Some("local/default".into()),
-            },
-        );
-        assert_eq!(current.active.as_deref(), Some("local/default"));
 
         HubClient::apply(
             &mut current,

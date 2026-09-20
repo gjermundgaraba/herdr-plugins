@@ -1,41 +1,35 @@
-//! Bridge state and its reconciliation with the hub's active session and the
+//! Bridge state and its reconciliation with the uniquely focused TUI and the
 //! HID device.
 
+use crate::frontends::{ClientState, Model};
 use codex_micro::{ExternalOwner, external_owner, service::ServiceStatus};
-use herdr_hub_client::{AgentInfo, HubClient, Model, ServerMessage, SessionState};
+use herdr_client::frontend::Agent;
 use serde_json::{Value, json};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, Ordering},
 };
 
 use crate::{
     actions::HERDR_LAYER,
     config::{Config, Controls, enabled_buttons},
-    hub::{self, Session},
-    protocol::{SLOT_COUNT, assign_slots, lighting},
+    frontends::{self, ClientRoute},
+    protocol::{SLOT_COUNT, SlotKey, assign_slots, lighting},
 };
 
-use super::{DAEMON_PROTOCOL_VERSION, device, dispatch::agent_identity, log, log_changed};
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(super) struct ActiveRoute {
-    pub(super) session_key: Option<String>,
-}
+use super::{DAEMON_PROTOCOL_VERSION, device, log, log_changed};
 
 pub(super) struct State {
     pub(super) config: Config,
     pub(super) model: Model,
-    pub(super) active_route: Arc<Mutex<ActiveRoute>>,
     pub(super) routing_ready: bool,
-    pub(super) routing_generation: Arc<AtomicU64>,
-    pub(super) agents: Vec<AgentInfo>,
-    pub(super) slots: Vec<Option<String>>,
+    pub(super) agents: Vec<(SlotKey, Agent)>,
+    pub(super) available: Vec<(SlotKey, ClientRoute, Agent)>,
+    pub(super) slots: Vec<Option<SlotKey>>,
     pub(super) device_state: String,
     pub(super) owner: Option<ExternalOwner>,
     pub(super) active_layer: Option<usize>,
     pub(super) last_device_error: String,
-    pub(super) last_herdr_error: String,
     pub(super) last_controls_error: String,
 }
 
@@ -44,35 +38,37 @@ impl State {
         Self {
             config,
             model: empty_model(),
-            active_route: Arc::new(Mutex::new(ActiveRoute::default())),
             routing_ready: false,
-            routing_generation: Arc::new(AtomicU64::new(0)),
             agents: Vec::new(),
+            available: Vec::new(),
             slots: vec![None; SLOT_COUNT],
             device_state: "starting".into(),
             owner: None,
             active_layer: None,
             last_device_error: String::new(),
-            last_herdr_error: String::new(),
             last_controls_error: String::new(),
         }
     }
 
     pub(super) fn status(&self) -> Value {
-        let active = active_session(&self.model);
+        let active = self.model.foremost_client();
         json!({
             "device": if self.owner.is_some() { "yielded" } else { &self.device_state },
             "deviceError": (!self.last_device_error.is_empty()).then_some(&self.last_device_error),
             "owner": self.owner.map(|owner| owner.to_string()),
-            "session": active.map(|session| &session.name),
-            "routing": if self.routing_ready { "ready" } else if self.model.active.is_some() { "unavailable" } else { "none" },
+            "client": active.map(|client| &client.client_id),
+            "routing": if self.routing_ready { "ready" } else if self.model.foremost_client().is_some() { "unavailable" } else { "none" },
             "version": env!("CARGO_PKG_VERSION"),
             "protocol": DAEMON_PROTOCOL_VERSION,
-            "sessions": self.model.sessions.iter().filter(|session| session.connected).map(|session| &session.name).collect::<Vec<_>>(),
+            "endpoints": active.map(|client| client.endpoints.iter().map(|endpoint| json!({
+                "id": endpoint.endpoint_id, "label": endpoint.label, "status": endpoint.status,
+            })).collect::<Vec<_>>()),
             "layer": self.active_layer,
             "agents": self.agents.len(),
-            "slots": self.slots.iter().map(|id| id.as_ref().and_then(|id| {
-                self.agents.iter().find(|agent| agent.terminal_id == *id).map(|agent| json!({
+            "inputTarget": active.and_then(|client| client.input_target.as_ref()),
+            "slots": self.slots.iter().map(|slot| slot.as_ref().and_then(|slot| {
+                self.available.iter().find(|(key, _, _)| key == slot).map(|(_, route, agent)| json!({
+                    "endpoint": route.endpoint_id,
                     "pane": agent.pane_id,
                     "agent": agent.agent,
                     "status": agent.agent_status,
@@ -81,30 +77,17 @@ impl State {
         })
     }
 
-    pub(super) fn invalidate_routing(&mut self) {
-        if self.routing_ready {
-            self.routing_ready = false;
-            self.routing_generation.fetch_add(1, Ordering::AcqRel);
-        }
+    pub(super) fn disable_routing(&mut self) {
+        self.routing_ready = false;
     }
-
-    pub(super) fn routing_generation(&self) -> u64 {
-        self.routing_generation.load(Ordering::Acquire)
-    }
-}
-
-#[derive(Clone)]
-pub(super) struct InputRoute {
-    pub(super) session: Session,
-    pub(super) generation: u64,
 }
 
 #[derive(Clone)]
 pub(super) struct InputContext {
     pub(super) controls: Controls,
-    pub(super) route: Option<InputRoute>,
-    pub(super) target: Option<AgentInfo>,
-    pub(super) slots: Vec<Option<AgentInfo>>,
+    pub(super) route: Option<ClientRoute>,
+    pub(super) target: Option<Agent>,
+    pub(super) slots: Vec<Option<(ClientRoute, Agent)>>,
 }
 
 impl InputContext {
@@ -115,13 +98,6 @@ impl InputContext {
             target: None,
             slots: vec![None; SLOT_COUNT],
         }
-    }
-
-    pub(super) fn selected(&self, routing_generation: &AtomicU64) -> Option<InputRoute> {
-        self.route
-            .as_ref()
-            .filter(|route| route.generation == routing_generation.load(Ordering::Acquire))
-            .cloned()
     }
 }
 
@@ -143,103 +119,86 @@ pub(super) fn apply_service_status(state: &mut State, status: &ServiceStatus) ->
 pub(super) fn device_output(state: &State) -> device::Output {
     device::Output {
         layer: state.active_layer,
-        lighting: lighting(&state.slots, &state.agents, &state.config.lighting),
+        lighting: if state.model.foremost_client().is_none() {
+            Default::default()
+        } else {
+            lighting(&state.slots, &state.agents, &state.config.lighting)
+        },
     }
 }
 
 fn empty_model() -> Model {
-    Model {
-        version: 0,
-        active: None,
-        hosts: Vec::new(),
-        sessions: Vec::new(),
-    }
+    Model::default()
 }
 
-fn active_session(model: &Model) -> Option<&SessionState> {
-    let key = model.active.as_deref()?;
-    model
-        .sessions
+fn selected_agent(client: &ClientState) -> Option<Agent> {
+    let target = client.input_target.as_ref()?;
+    let endpoint = client
+        .endpoints
         .iter()
-        .find(|session| session.key == key && session.connected)
-}
-
-fn active_route(model: &Model) -> ActiveRoute {
-    ActiveRoute {
-        session_key: active_session(model).map(|session| session.key.clone()),
-    }
-}
-
-fn routing_identity(model: &Model) -> (ActiveRoute, Option<(String, String, Option<String>)>) {
-    let route = active_route(model);
-    let focused =
-        active_session(model).and_then(|session| session.agents.iter().find(|agent| agent.focused));
-    (route, agent_identity(focused))
-}
-
-#[cfg(test)]
-fn sync_active_route(state: &State) {
-    *state
-        .active_route
-        .lock()
-        .unwrap_or_else(|error| error.into_inner()) = active_route(&state.model);
+        .find(|e| e.endpoint_id == target.endpoint_id && e.is_available())?;
+    let snapshot = endpoint.snapshot.as_ref()?;
+    snapshot
+        .agents
+        .iter()
+        .find(|a| a.pane_id == target.pane_id)
+        .cloned()
 }
 
 pub(super) fn reconcile_active(state: &mut State, stopping: &AtomicBool) {
-    let Some(session) = active_session(&state.model) else {
-        state.invalidate_routing();
-        state.agents.clear();
-        state.slots.fill(None);
-        return;
-    };
-
-    state.slots = assign_slots(&state.slots, &session.agents);
-    state.agents.clone_from(&session.agents);
-    if state.owner.is_some() || stopping.load(Ordering::Acquire) {
-        state.invalidate_routing();
+    state.available.clear();
+    if let Some(client) = state.model.foremost_client() {
+        for endpoint in &client.endpoints {
+            let Some(route) = client.route(&endpoint.endpoint_id) else {
+                continue;
+            };
+            let Some(snapshot) = &endpoint.snapshot else {
+                continue;
+            };
+            for agent in &snapshot.agents {
+                let key = (endpoint.endpoint_id.clone(), agent.pane_id.clone());
+                state.available.push((key, route.clone(), agent.clone()));
+            }
+        }
+    }
+    state.agents = state
+        .available
+        .iter()
+        .map(|(key, route, agent)| {
+            let mut projected = agent.clone();
+            projected.focused = agent.focused
+                && state.model.foremost_client().is_some_and(|c| {
+                    c.active_endpoint_id.as_deref() == Some(route.endpoint_id.as_str())
+                });
+            (key.clone(), projected)
+        })
+        .collect();
+    state.slots = assign_slots(&state.slots, &state.agents);
+    if state.model.foremost_client().is_none()
+        || state.owner.is_some()
+        || stopping.load(Ordering::Acquire)
+    {
+        state.disable_routing();
     } else {
         state.active_layer = Some(HERDR_LAYER);
         state.routing_ready = true;
     }
 }
 
-pub(super) fn apply_hub_update(state: &mut State, update: hub::Update, stopping: &AtomicBool) {
-    let published_route = Arc::clone(&state.active_route);
-    let mut published_route = published_route
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    let previous_identity = routing_identity(&state.model);
-    let connected = update.is_ok();
-    match update {
-        Ok(ServerMessage::Hello { model, .. }) => state.model = model,
-        Ok(message) => HubClient::apply(&mut state.model, &message),
-        Err(error) => {
-            state.model = empty_model();
-            log_changed(
-                &mut state.last_herdr_error,
-                error.to_string(),
-                "Herdr hub unavailable: ",
-            );
-        }
+pub(super) fn apply_frontend_update(
+    state: &mut State,
+    clients: frontends::Update,
+    stopping: &AtomicBool,
+) {
+    let before = state.model.foremost_client().map(|c| c.client_id.clone());
+    state.model.clients = clients;
+    let after = state.model.foremost_client().map(|c| c.client_id.clone());
+    if before != after {
+        log(after
+            .map(|id| format!("Herdr client selected: {id}"))
+            .unwrap_or_else(|| "Herdr client unselected".into()));
     }
-    let next_identity = routing_identity(&state.model);
-    if previous_identity != next_identity {
-        state.invalidate_routing();
-    }
-    published_route.clone_from(&next_identity.0);
-    drop(published_route);
-    if previous_identity.0.session_key != next_identity.0.session_key {
-        log(next_identity
-            .0
-            .session_key
-            .as_ref()
-            .map(|key| format!("Herdr session selected: {key}"))
-            .unwrap_or_else(|| "Herdr session unselected".into()));
-    }
-    if connected {
-        state.last_herdr_error.clear();
-    }
-    reconcile_active(state, stopping)
+    reconcile_active(state, stopping);
 }
 
 pub(super) fn refresh_owner(state: &mut State) -> bool {
@@ -248,7 +207,7 @@ pub(super) fn refresh_owner(state: &mut State) -> bool {
         state.owner = owner;
         if let Some(owner) = state.owner {
             log(format!("device owned by {owner}"));
-            state.invalidate_routing();
+            state.disable_routing();
         } else {
             log("device owner cleared");
         }
@@ -263,30 +222,28 @@ pub(super) fn publish(status: &Arc<Mutex<Value>>, state: &State) {
 }
 
 pub(super) fn update_input_context(context: &Mutex<Arc<InputContext>>, state: &State) {
-    let target = state.agents.iter().find(|agent| agent.focused);
+    let client = state.model.foremost_client();
+    let target = client.and_then(selected_agent);
     let route = state
         .routing_ready
-        .then(|| active_session(&state.model))
-        .flatten()
-        .map(|session| InputRoute {
-            session: Session {
-                key: session.key.clone(),
-                name: session.name.clone(),
-                socket_path: session.socket_path.clone(),
-            },
-            generation: state.routing_generation(),
-        });
+        .then(|| client.map(ClientState::input_route))
+        .flatten();
     *context.lock().unwrap_or_else(|error| error.into_inner()) = Arc::new(InputContext {
         controls: state.config.controls.clone(),
         route,
-        target: target.cloned(),
+        target,
         slots: state
             .slots
             .iter()
-            .map(|id| {
-                id.as_deref()
-                    .and_then(|id| state.agents.iter().find(|agent| agent.terminal_id == id))
-                    .cloned()
+            .map(|slot| {
+                state
+                    .routing_ready
+                    .then(|| {
+                        slot.as_ref()
+                            .and_then(|slot| state.available.iter().find(|(key, _, _)| key == slot))
+                            .map(|(_, route, agent)| (route.clone(), agent.clone()))
+                    })
+                    .flatten()
             })
             .collect(),
     });
@@ -295,7 +252,7 @@ pub(super) fn update_input_context(context: &Mutex<Arc<InputContext>>, state: &S
 pub(super) fn handle_input_disconnect(state: &mut State, error: String) {
     state.device_state = "unavailable".into();
     log_changed(&mut state.last_device_error, error, "device disconnected: ");
-    state.invalidate_routing();
+    state.disable_routing();
 }
 
 pub(super) fn apply_config_load(
@@ -332,310 +289,85 @@ pub(super) fn apply_config_load(
 }
 #[cfg(test)]
 mod tests {
-    use herdr_hub_client::{Error as HubError, HostState, SessionState};
-
     use super::*;
-
-    fn agent(terminal: &str, pane: &str, kind: &str) -> AgentInfo {
-        serde_json::from_value(json!({
-            "terminal_id": terminal,
-            "agent": kind,
-            "agent_status": "idle",
-            "workspace_id": "w1",
-            "tab_id": "w1:t1",
-            "pane_id": pane,
-            "focused": true,
-            "state_change_seq": 1,
-            "cwd": "/tmp",
-            "revision": 1
-        }))
-        .unwrap()
+    use herdr_client::frontend::Snapshot;
+    fn client(id: &str, focused: Option<bool>) -> ClientState {
+        ClientState { socket_path: format!("/tmp/{id}.sock").into(), snapshot: serde_json::from_value::<Snapshot>(json!({
+            "client_id":id,"pid":1,"revision":1,"focused":focused,"input_ready":true,"active_endpoint_id":"a","input_target":null,
+            "endpoints":[endpoint("a"),endpoint("b")]
+        })).unwrap() }
     }
-
-    fn session(key: &str, agents: Vec<AgentInfo>) -> SessionState {
-        SessionState {
-            key: key.into(),
-            host: "local".into(),
-            name: key.rsplit('/').next().unwrap().into(),
-            connected: true,
-            error: None,
-            protocol: 20,
-            workspaces: Vec::new(),
-            tabs: Vec::new(),
-            agents,
-            socket_path: Some(format!("/tmp/{}.sock", key.rsplit('/').next().unwrap()).into()),
-            client_focused: Some(true),
-        }
+    fn endpoint(id: &str) -> Value {
+        json!({"endpoint_id":id,"label":id,"status":"online","generation":1,"boot_id":"boot","methods":[],
+        "snapshot":{"boot_id":"boot","revision":1,"workspaces":[],"tabs":[],"panes":[],"agents":[{"pane_id":"pane","workspace_id":"w","tab_id":"t","agent":"codex","agent_status":"idle","state_change_seq":1,"state_labels":[],"tokens":[],"focused":true}]}})
     }
-
-    fn model(agents: Vec<AgentInfo>) -> Model {
-        Model {
-            version: 4,
-            active: Some("local/work".into()),
-            hosts: vec![HostState {
-                key: "local".into(),
-                connected: true,
-                error: None,
-            }],
-            sessions: vec![session("local/work", agents)],
-        }
+    fn apply(state: &mut State, clients: Vec<ClientState>) {
+        apply_frontend_update(state, clients, &AtomicBool::new(false));
     }
-
-    fn hello(model: Model) -> hub::Update {
-        Ok(ServerMessage::Hello {
-            protocol: herdr_hub_client::PROTOCOL,
-            model,
-        })
-    }
-
     #[test]
-    fn hub_model_active_session_supplies_agents_and_route() {
+    fn only_unique_true_focus_routes_and_lights() {
         let mut state = State::new(Config::default());
-        let stopping = AtomicBool::new(false);
-        let mut active = model(vec![agent("terminal", "pane", "codex")]);
-        active.sessions[0].client_focused = None;
-        apply_hub_update(&mut state, hello(active), &stopping);
+        for clients in [
+            vec![],
+            vec![client("a", None)],
+            vec![client("a", Some(false))],
+            vec![client("a", Some(true)), client("b", Some(true))],
+        ] {
+            apply(&mut state, clients);
+            assert!(!state.routing_ready);
+            assert!(state.agents.is_empty());
+            assert!(state.slots.iter().all(Option::is_none));
+        }
+        apply(&mut state, vec![client("a", Some(true)), client("b", None)]);
         assert!(state.routing_ready);
-        assert_eq!(state.agents.len(), 1);
-        assert_eq!(state.slots[0].as_deref(), Some("terminal"));
+        assert_eq!(state.agents.len(), 2);
+        assert_ne!(state.slots[0], state.slots[1]);
+        assert!(state.agents[0].1.focused);
+        assert!(!state.agents[1].1.focused);
+    }
+    #[test]
+    fn overlay_or_unavailable_lease_preserves_ordinary_input_route() {
+        let mut state = State::new(Config::default());
+        let mut c = client("a", Some(true));
+        c.snapshot.input_ready = false;
+        apply(&mut state, vec![c]);
         let shared = Mutex::new(Arc::new(InputContext::new(&state.config)));
         update_input_context(&shared, &state);
-        let context = Arc::clone(&shared.lock().unwrap());
-        let route = context.route.as_ref().unwrap();
-        assert_eq!(route.session.key, "local/work");
-        assert_eq!(
-            *state.active_route.lock().unwrap(),
-            ActiveRoute {
-                session_key: Some("local/work".into()),
-            }
-        );
+        let context = shared.into_inner().unwrap();
+        assert!(context.route.is_some());
+        assert!(context.target.is_none());
     }
-
     #[test]
-    fn title_churn_updates_context_without_changing_lights_or_routing() {
-        let stopping = AtomicBool::new(false);
+    fn sticky_pane_slots_survive_endpoint_switch_and_agent_title_churn() {
         let mut state = State::new(Config::default());
-        let mut current = agent("terminal", "pane", "codex");
-        apply_hub_update(&mut state, hello(model(vec![current.clone()])), &stopping);
-        let output = device_output(&state);
-        let generation = state.routing_generation();
-        let context = Mutex::new(Arc::new(InputContext::new(&state.config)));
-
-        for revision in 2..102 {
-            current.terminal_title = Some(format!("working {revision}"));
-            current.revision = revision;
-            apply_hub_update(
-                &mut state,
-                Ok(ServerMessage::Session {
-                    version: revision,
-                    session: session("local/work", vec![current.clone()]),
-                }),
-                &stopping,
-            );
-            update_input_context(&context, &state);
-            assert_eq!(device_output(&state), output);
-            assert_eq!(state.routing_generation(), generation);
-            assert_eq!(
-                context
-                    .lock()
-                    .unwrap()
-                    .target
-                    .as_ref()
-                    .unwrap()
-                    .terminal_title,
-                current.terminal_title
-            );
-        }
-
-        current.agent_status = "working".into();
-        apply_hub_update(&mut state, hello(model(vec![current])), &stopping);
-        assert_ne!(device_output(&state), output);
-    }
-
-    #[test]
-    fn active_and_focused_agent_changes_invalidate_captured_routes() {
-        let stopping = AtomicBool::new(false);
-        let mut initial = model(vec![agent("work-agent", "work-pane", "codex")]);
-        initial.sessions.push(session(
-            "local/personal",
-            vec![agent("personal-agent", "personal-pane", "claude")],
-        ));
-        let mut state = State::new(Config::default());
-        apply_hub_update(&mut state, hello(initial), &stopping);
-        let first_generation = state.routing_generation();
-
-        apply_hub_update(
-            &mut state,
-            Ok(ServerMessage::Active {
-                version: 5,
-                key: Some("local/personal".into()),
-            }),
-            &stopping,
-        );
-        assert!(state.routing_ready);
-        assert_ne!(state.routing_generation(), first_generation);
-        assert_eq!(state.agents[0].pane_id, "personal-pane");
-
-        let agent_generation = state.routing_generation();
-        apply_hub_update(
-            &mut state,
-            Ok(ServerMessage::Session {
-                version: 7,
-                session: session(
-                    "local/personal",
-                    vec![agent("new-agent", "new-pane", "claude")],
-                ),
-            }),
-            &stopping,
-        );
-        assert_ne!(state.routing_generation(), agent_generation);
-        assert_eq!(state.agents[0].pane_id, "new-pane");
-    }
-
-    #[test]
-    fn disconnected_or_missing_active_session_clears_the_route() {
-        let stopping = AtomicBool::new(false);
-        let mut state = State::new(Config::default());
-        apply_hub_update(
-            &mut state,
-            hello(model(vec![agent("terminal", "pane", "codex")])),
-            &stopping,
-        );
-        let ready_generation = state.routing_generation();
-
-        let mut disconnected = session("local/work", vec![agent("terminal", "pane", "codex")]);
-        disconnected.connected = false;
-        apply_hub_update(
-            &mut state,
-            Ok(ServerMessage::Session {
-                version: 5,
-                session: disconnected,
-            }),
-            &stopping,
-        );
-        assert!(!state.routing_ready);
-        assert!(state.agents.is_empty());
-        assert!(state.slots.iter().all(Option::is_none));
-        assert_ne!(state.routing_generation(), ready_generation);
-
-        apply_hub_update(
-            &mut state,
-            Ok(ServerMessage::Session {
-                version: 6,
-                session: session("local/work", vec![agent("terminal", "pane", "codex")]),
-            }),
-            &stopping,
-        );
-        assert!(state.routing_ready);
-        let restored_generation = state.routing_generation();
-
-        apply_hub_update(
-            &mut state,
-            Ok(ServerMessage::Active {
-                version: 7,
-                key: None,
-            }),
-            &stopping,
-        );
-        assert!(!state.routing_ready);
-        assert!(state.agents.is_empty());
-        assert_ne!(state.routing_generation(), restored_generation);
-        assert_eq!(*state.active_route.lock().unwrap(), ActiveRoute::default());
-    }
-
-    #[test]
-    fn hub_outage_revokes_routes_and_blanks_agents() {
-        let mut state = State::new(Config::default());
-        let stopping = AtomicBool::new(false);
-        apply_hub_update(
-            &mut state,
-            hello(model(vec![agent("terminal", "pane", "codex")])),
-            &stopping,
-        );
-        let generation = state.routing_generation();
-
-        apply_hub_update(&mut state, Err(HubError::Disconnected), &stopping);
-
-        assert!(state.model.sessions.is_empty());
-        assert!(state.model.active.is_none());
-        assert!(!state.routing_ready);
-        assert!(state.agents.is_empty());
-        assert!(state.slots.iter().all(Option::is_none));
-        assert_ne!(state.routing_generation(), generation);
-        assert_eq!(state.last_herdr_error, "hub disconnected");
-    }
-
-    #[test]
-    fn status_matches_the_control_contract() {
-        let mut state = State::new(Config::default());
-        let stopping = AtomicBool::new(false);
-        apply_hub_update(&mut state, hello(model(Vec::new())), &stopping);
-        let status = state.status();
-        assert_eq!(status["session"], "work");
-        assert_eq!(status["routing"], "ready");
-        assert!(status.get("sessionMappings").is_none());
-        assert!(status.get("focusedTerminal").is_none());
-        assert!(status.get("frontmost").is_none());
-        assert_eq!(status["version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(status["protocol"], DAEMON_PROTOCOL_VERSION);
-    }
-
-    #[test]
-    fn owner_gate_revokes_then_restores_routing() {
-        let stopping = AtomicBool::new(false);
-        let mut state = State::new(Config::default());
-        state.model = model(vec![agent("terminal", "pane", "codex")]);
-        sync_active_route(&state);
-        state.owner = Some(ExternalOwner::Input);
-        reconcile_active(&mut state, &stopping);
-        assert!(!state.routing_ready);
-        state.owner = None;
-        reconcile_active(&mut state, &stopping);
-        assert!(state.routing_ready);
-    }
-
-    #[test]
-    fn service_status_replaces_stale_device_availability() {
-        let mut state = State::new(Config::default());
-        state.device_state = "connected".into();
-        let mut status = ServiceStatus {
-            device: None,
-            external_owner: None,
-            last_error: Some("reopen failed".into()),
-            input_monitoring: codex_micro::InputMonitoringAccess::Granted,
-        };
-
-        assert!(apply_service_status(&mut state, &status));
-        assert_eq!(state.device_state, "unavailable");
-        status.device = Some(codex_micro::DeviceInfo {
-            transport: codex_micro::Transport::Usb,
-            firmware: "0.6.2".into(),
-        });
-        status.last_error = None;
-        assert!(apply_service_status(&mut state, &status));
-        assert_eq!(state.device_state, "connected");
-    }
-
-    #[test]
-    fn config_load_reports_only_config_changes() {
-        let config = Config::default();
-        let enabled = enabled_buttons(&config.controls);
-        let mut state = State::new(config.clone());
-
-        assert!(!apply_config_load(&mut state, Ok(config.clone()), enabled));
-        assert!(!apply_config_load(
-            &mut state,
-            Err("invalid config".into()),
-            enabled
-        ));
-        assert!(!apply_config_load(
-            &mut state,
-            Err("invalid config".into()),
-            enabled
-        ));
-        assert!(!apply_config_load(&mut state, Ok(config.clone()), enabled));
-        let mut changed = config;
-        changed.lighting.focused_brightness /= 2.0;
-        assert!(apply_config_load(&mut state, Ok(changed), enabled));
+        let mut c = client("a", Some(true));
+        let s = c.snapshot.endpoints[0].snapshot.as_mut().unwrap();
+        let template = s.agents[0].clone();
+        s.agents = (0..8)
+            .map(|n| {
+                let mut a = template.clone();
+                a.pane_id = format!("p{n}");
+                a.state_change_seq = n;
+                a
+            })
+            .collect();
+        apply(&mut state, vec![c.clone()]);
+        let slots = state.slots.clone();
+        let lights = device_output(&state);
+        c.snapshot.revision += 1;
+        c.snapshot.endpoints[0].snapshot.as_mut().unwrap().agents[7].title = Some("renamed".into());
+        apply(&mut state, vec![c.clone()]);
+        assert_eq!(slots, state.slots);
+        assert_eq!(lights, device_output(&state));
+        c.snapshot.active_endpoint_id = Some("b".into());
+        apply(&mut state, vec![c.clone()]);
+        assert_eq!(slots, state.slots);
+        c.snapshot.endpoints[0].snapshot.as_mut().unwrap().agents[7].agent_status = "done".into();
+        apply(&mut state, vec![c.clone()]);
+        let lights = device_output(&state);
+        // Acknowledgment-only status snapshot must relight without a new runtime revision.
+        c.snapshot.endpoints[0].snapshot.as_mut().unwrap().agents[7].agent_status = "idle".into();
+        apply(&mut state, vec![c]);
+        assert_ne!(lights, device_output(&state));
     }
 }

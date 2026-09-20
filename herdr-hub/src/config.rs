@@ -22,6 +22,9 @@ pub struct HostConfig {
 }
 
 pub fn path() -> Result<PathBuf> {
+    if let Some(path) = env::var_os("HERDR_HUB_CONFIG_PATH").filter(|path| !path.is_empty()) {
+        return Ok(path.into());
+    }
     let home = env::var_os("HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)

@@ -123,12 +123,19 @@ mod tests {
 
     #[test]
     fn command_runner_reports_stderr_and_reaps_timeouts() {
+        // These paths test stderr/cleanup, not shell startup latency. Keep
+        // generous startup headroom on loaded macOS; explicit timeout cases
+        // below retain their 20ms deadlines and prompt-reaping assertions.
+        let startup_allowance = Duration::from_secs(5);
         let error = run_command_with_timeout(
             Command::new("/bin/sh").args(["-c", "printf failure >&2; exit 7"]),
-            Duration::from_secs(1),
+            startup_allowance,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("failure"));
+        assert!(
+            error.to_string().contains("failure"),
+            "unexpected command error: {error:#}"
+        );
 
         let started = Instant::now();
         let error = run_command_with_timeout(
@@ -154,7 +161,7 @@ mod tests {
             Command::new("/bin/sh")
                 .args(["-c", "(sleep 0.2; : > \"$HERDR_TEST_MARKER\") &"])
                 .env("HERDR_TEST_MARKER", &marker),
-            Duration::from_secs(1),
+            startup_allowance,
         )
         .unwrap();
         thread::sleep(Duration::from_millis(300));
@@ -166,7 +173,7 @@ mod tests {
         );
         let error = run_command_with_timeout(
             Command::new("/bin/sh").args(["-c", &noisy]),
-            Duration::from_secs(1),
+            startup_allowance,
         )
         .unwrap_err();
         let detail = error.to_string();

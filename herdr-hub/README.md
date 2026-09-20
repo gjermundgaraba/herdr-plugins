@@ -1,7 +1,9 @@
 # Herdr Hub
 
-Herdr Hub keeps one versioned agent model for all running Herdr sessions and
-pushes it to local dashboards over a private per-user socket.
+Herdr Hub keeps a versioned inventory of local and remote Herdr sessions,
+workspaces, tabs, and agents. It pushes changes and routes session API calls over
+a private per-user socket. It has no TUI client model or focus selection.
+Micro and local tools use each TUI's frontend socket directly.
 
 ## Setup
 
@@ -26,10 +28,14 @@ herdr-hub doctor
 Use **Show Herdr Hub status** for a compact summary. A source or Nix install
 also exposes `herdr-hub dump` to print the complete model once.
 
-The hub publishes `active` from the forked Herdr server's
-`session.snapshot.client_focused` field. It polls all local session snapshots
-centrally every 250 ms because Herdr does not emit an event when client focus
-changes. No Ghostty integration or macOS privacy permission is required.
+Hub protocol **6** carries `hello`, `session`, `session_removed`, and `host`
+updates, plus session-scoped `call` replies. It does not discover frontend
+sockets, route client input, or activate endpoints. Rebuild Hub SDK consumers
+and local/remote Hub binaries together when updating.
+
+`doctor` checks the linked plugin, installed service, and configured remote hosts.
+`HERDR_HUB_SOCKET_PATH` overrides the Hub socket and `HERDR_HUB_CONFIG_PATH`
+overrides its configuration file (default `~/.config/herdr-hub/config.toml`).
 
 ## Local development
 
@@ -88,9 +94,9 @@ symlink the staged `herdr-hub/bin/herdr-hub` into a directory on `PATH`, such
 as `~/.local/bin`. There is no `cargo install` path. Do not run the macOS
 service commands on a Linux relay host.
 
-The local hub keeps one `ssh` relay per configured host. The remote hub owns one
-250 ms snapshot loop per remote-local session and pushes changed state through
-that relay; consumers never poll Herdr, and there is no direct-socket fallback.
+Configured hosts retain one `ssh` relay each for the separate session inventory.
+The remote hub owns one 250 ms snapshot loop per remote-local session and pushes
+changed state through that relay. This inventory is independent of TUI frontend membership and focus.
 On Linux there is no standalone user service: the plugin hooks and `notify`
 command are supported and the hub runs in-process for `herdr-hub relay` when no
 local hub is already listening.

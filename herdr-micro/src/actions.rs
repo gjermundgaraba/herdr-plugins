@@ -1,61 +1,56 @@
-use anyhow::{Result, anyhow};
-use herdr_client::AgentInfo;
+use anyhow::Result;
+use herdr_client::frontend::{Agent, Input};
 use serde_json::{Value, json};
-
-use crate::PLUGIN_ID;
 
 pub const HERDR_LAYER: usize = 2;
 
-pub type Caller<'a> = dyn Fn(&str, Value) -> Result<Value> + 'a;
-
-pub fn focus_agent(call: &Caller<'_>, pane_id: &str) -> Result<()> {
-    call("agent.focus", json!({ "target": pane_id }))?;
-    Ok(())
+/// One request Micro sends through the captured TUI route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Call {
+    Navigate {
+        pane_id: String,
+    },
+    Input(Input),
+    /// An endpoint method advertised on the TUI's client command lane.
+    Call {
+        method: String,
+        params: Value,
+    },
 }
+
+impl Call {
+    fn method(method: &str, params: Value) -> Self {
+        Self::Call {
+            method: method.into(),
+            params,
+        }
+    }
+}
+
+pub type Caller<'a> = dyn Fn(Call) -> Result<()> + 'a;
 
 pub fn focus_pane(call: &Caller<'_>, pane_id: &str, direction: &str) -> Result<()> {
-    call(
+    call(Call::method(
         "pane.focus_direction",
-        json!({ "pane_id": pane_id, "direction": direction }),
-    )?;
-    Ok(())
+        json!({"pane_id": pane_id, "direction": direction}),
+    ))
 }
 
-pub fn prompt(call: &Caller<'_>, prompt: &str, submit: bool, agent: &AgentInfo) -> Result<()> {
-    let pane = &agent.pane_id;
+/// A submitted prompt targets the captured agent pane; unsubmitted text is
+/// ordinary input and follows TUI focus.
+pub fn prompt(call: &Caller<'_>, prompt: &str, submit: bool, agent: &Agent) -> Result<()> {
     if submit {
-        call("agent.prompt", json!({ "target": pane, "text": prompt }))?;
+        call(Call::method(
+            "agent.prompt",
+            json!({"target": agent.pane_id, "text": prompt}),
+        ))
     } else {
-        call("pane.send_text", json!({ "pane_id": pane, "text": prompt }))?;
+        call(Call::Input(Input::Text(prompt.into())))
     }
-    Ok(())
 }
 
-pub fn submit(call: &Caller<'_>, agent: &AgentInfo) -> Result<()> {
-    call(
-        "agent.send_keys",
-        json!({ "target": &agent.pane_id, "keys": ["enter"] }),
-    )?;
-    Ok(())
-}
-
-pub fn open_diff(call: &Caller<'_>, agent: &AgentInfo) -> Result<()> {
-    let cwd = agent
-        .foreground_cwd
-        .as_deref()
-        .filter(|cwd| !cwd.is_empty())
-        .or(agent.cwd.as_deref().filter(|cwd| !cwd.is_empty()))
-        .ok_or_else(|| anyhow!("focused agent has no repository context"))?;
-    call(
-        "plugin.pane.open",
-        json!({
-            "plugin_id": PLUGIN_ID,
-            "entrypoint": "diff",
-            "cwd": cwd,
-            "focus": true,
-        }),
-    )?;
-    Ok(())
+pub fn submit(call: &Caller<'_>) -> Result<()> {
+    call(Call::Input(Input::Keys(vec!["enter".into()])))
 }
 
 pub use codex_micro::service::layer_identity;
@@ -64,7 +59,7 @@ mod tests {
     use std::cell::RefCell;
 
     use super::*;
-    use serde_json::json;
+    use crate::PLUGIN_ID;
 
     #[test]
     fn layer_identity_matches_the_plugin_id() {
@@ -72,38 +67,34 @@ mod tests {
     }
 
     #[test]
-    fn actions_forward_exact_methods_and_parameters() {
+    fn actions_forward_exact_calls() {
         let calls = RefCell::new(Vec::new());
-        let caller = |method: &str, params: Value| {
-            calls.borrow_mut().push((method.to_owned(), params));
-            Ok(json!({"type":"ok"}))
+        let caller = |call: Call| {
+            calls.borrow_mut().push(call);
+            Ok(())
         };
-        let agent: AgentInfo = serde_json::from_value(json!({
-            "terminal_id":"term1", "agent":"codex", "agent_status":"idle",
-            "workspace_id":"w1", "tab_id":"w1:t1", "pane_id":"w1:p1",
-            "focused":true, "state_change_seq":1, "cwd":"/tmp", "revision":1
+        let agent: Agent = serde_json::from_value(json!({
+            "agent":"codex", "agent_status":"idle", "workspace_id":"w1", "tab_id":"w1:t1",
+            "pane_id":"w1:p1", "focused":true, "state_change_seq":1,
+            "state_labels":[], "tokens":[]
         }))
         .unwrap();
 
         prompt(&caller, "hello", true, &agent).unwrap();
-        submit(&caller, &agent).unwrap();
+        prompt(&caller, "draft", false, &agent).unwrap();
+        submit(&caller).unwrap();
         focus_pane(&caller, &agent.pane_id, "left").unwrap();
 
         assert_eq!(
             calls.into_inner(),
             [
-                (
-                    "agent.prompt".into(),
-                    json!({"target":"w1:p1", "text":"hello"})
+                Call::method("agent.prompt", json!({"target":"w1:p1","text":"hello"})),
+                Call::Input(Input::Text("draft".into())),
+                Call::Input(Input::Keys(vec!["enter".into()])),
+                Call::method(
+                    "pane.focus_direction",
+                    json!({"pane_id":"w1:p1","direction":"left"})
                 ),
-                (
-                    "agent.send_keys".into(),
-                    json!({"target":"w1:p1", "keys":["enter"]})
-                ),
-                (
-                    "pane.focus_direction".into(),
-                    json!({"pane_id":"w1:p1", "direction":"left"})
-                )
             ]
         );
     }

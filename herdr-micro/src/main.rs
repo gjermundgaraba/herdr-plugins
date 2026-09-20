@@ -12,7 +12,8 @@ use std::{
     time::Duration,
 };
 
-const USAGE: &str = "usage: herdr-micro <start|doctor|status|configure|setup-pi-effort|stop|setup>";
+const USAGE: &str =
+    "usage: herdr-micro <start|doctor|status|configure|setup-pi-effort|stop|setup|client>";
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
@@ -30,6 +31,7 @@ fn run(args: Vec<OsString>) -> Result<ExitCode> {
     };
     let rest = &args[1..];
     match command {
+        "client" => client(rest),
         "start" if rest.is_empty() => start(),
         "daemon" if rest.is_empty() => {
             std::panic::set_hook(Box::new(|panic| {
@@ -135,5 +137,25 @@ fn setup_micro() -> Result<ExitCode> {
         report.firmware
     );
     println!("Config: {}", report.config.display());
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Script-facing input into the TUI named by `HERDR_FRONTEND_SOCKET`.
+fn client(args: &[OsString]) -> Result<ExitCode> {
+    use herdr_client::frontend::{FrontendClient, Input};
+    let args: Vec<&str> = args
+        .iter()
+        .map(|arg| arg.to_str().context("client arguments must be UTF-8"))
+        .collect::<Result<_>>()?;
+    let request = match args.as_slice() {
+        ["input", "text", text] => Input::Text((*text).into()),
+        ["input", "keys", keys @ ..] if !keys.is_empty() => {
+            Input::Keys(keys.iter().map(|k| (*k).into()).collect())
+        }
+        _ => bail!("expected client input text TEXT or client input keys KEY..."),
+    };
+    let client = FrontendClient::from_env()?;
+    let result = serde_json::to_value(client.input(&request)?)?;
+    println!("{}", serde_json::to_string(&result)?);
     Ok(ExitCode::SUCCESS)
 }

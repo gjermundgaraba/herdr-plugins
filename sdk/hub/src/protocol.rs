@@ -4,12 +4,11 @@ use herdr_client::{AgentInfo, TabInfo, WorkspaceInfo};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const PROTOCOL: u32 = 3;
+pub const PROTOCOL: u32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Model {
     pub version: u64,
-    pub active: Option<String>,
     pub hosts: Vec<HostState>,
     pub sessions: Vec<SessionState>,
 }
@@ -34,16 +33,6 @@ pub struct SessionState {
     pub tabs: Vec<TabInfo>,
     pub agents: Vec<AgentInfo>,
     pub socket_path: Option<PathBuf>,
-    #[serde(deserialize_with = "required_option")]
-    pub client_focused: Option<bool>,
-}
-
-fn required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Option::deserialize(deserializer)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,7 +62,6 @@ pub enum ServerMessage {
     Session { version: u64, session: SessionState },
     SessionRemoved { version: u64, key: String },
     Host { version: u64, host: HostState },
-    Active { version: u64, key: Option<String> },
     Reply { id: u64, result: Value },
     ReplyError { id: u64, error: String },
     Error { error: String },
@@ -106,13 +94,23 @@ mod tests {
             protocol: PROTOCOL,
             model: Model {
                 version: 4,
-                active: Some("local/default".into()),
                 hosts: vec![HostState {
                     key: "local".into(),
                     connected: true,
                     error: None,
                 }],
-                sessions: Vec::new(),
+                sessions: vec![SessionState {
+                    key: "local/default".into(),
+                    host: "local".into(),
+                    name: "default".into(),
+                    connected: true,
+                    error: None,
+                    protocol: 20,
+                    workspaces: Vec::new(),
+                    tabs: Vec::new(),
+                    agents: Vec::new(),
+                    socket_path: None,
+                }],
             },
         };
         let encoded = serde_json::to_vec(&server).unwrap();
@@ -124,65 +122,5 @@ mod tests {
             serde_json::from_slice::<Value>(&encoded).unwrap()["type"],
             "hello"
         );
-    }
-
-    #[test]
-    fn tagged_messages_reject_unknown_fields() {
-        let value = serde_json::json!({
-            "type": "subscribe",
-            "protocol": PROTOCOL,
-            "extra": true,
-        });
-        assert!(serde_json::from_value::<ClientMessage>(value).is_err());
-    }
-
-    #[test]
-    fn session_tabs_are_required() {
-        let value = serde_json::json!({
-            "key": "local/default",
-            "host": "local",
-            "name": "default",
-            "connected": true,
-            "error": null,
-            "protocol": 20,
-            "workspaces": [],
-            "agents": [],
-            "socket_path": null,
-            "client_focused": null,
-        });
-        assert!(serde_json::from_value::<SessionState>(value).is_err());
-    }
-
-    #[test]
-    fn session_focus_is_required_and_terminal_is_rejected() {
-        let missing = serde_json::json!({
-            "key": "local/default",
-            "host": "local",
-            "name": "default",
-            "connected": true,
-            "error": null,
-            "protocol": 20,
-            "workspaces": [],
-            "tabs": [],
-            "agents": [],
-            "socket_path": null,
-        });
-        assert!(serde_json::from_value::<SessionState>(missing).is_err());
-
-        let legacy = serde_json::json!({
-            "key": "local/default",
-            "host": "local",
-            "name": "default",
-            "connected": true,
-            "error": null,
-            "protocol": 20,
-            "workspaces": [],
-            "tabs": [],
-            "agents": [],
-            "socket_path": null,
-            "client_focused": true,
-            "terminal": "ghostty-1",
-        });
-        assert!(serde_json::from_value::<SessionState>(legacy).is_err());
     }
 }

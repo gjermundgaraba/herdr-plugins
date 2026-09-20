@@ -12,7 +12,7 @@ pane=${HERDR_PANE_ID:-}
     echo "thinking-effort: missing HERDR_PANE_ID" >&2
     exit 2
 }
-herdr_bin=${HERDR_BIN_PATH:-herdr}
+micro_bin=${HERDR_MICRO_BIN_PATH:?missing HERDR_MICRO_BIN_PATH}
 
 if [ "$operation" = claude ]; then
     case "${2:-}" in
@@ -23,12 +23,12 @@ if [ "$operation" = claude ]; then
             exit 2
             ;;
     esac
-    "$herdr_bin" pane send-text "$pane" /effort
-    "$herdr_bin" pane send-keys "$pane" enter
+    "$micro_bin" client input text /effort
+    "$micro_bin" client input keys enter
     sleep 0.15
-    "$herdr_bin" pane send-keys "$pane" "$key"
+    "$micro_bin" client input keys "$key"
     sleep 0.1
-    exec "$herdr_bin" pane send-keys "$pane" enter
+    exec "$micro_bin" client input keys enter
 fi
 
-exec "$herdr_bin" pane send-keys "$pane" "$operation"
+exec "$micro_bin" client input keys "$operation"

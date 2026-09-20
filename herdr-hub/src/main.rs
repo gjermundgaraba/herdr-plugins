@@ -84,7 +84,6 @@ fn status() -> Result<()> {
         .context("hub is unreachable")?;
     let summary = json!({
         "version": model.version,
-        "active": model.active,
         "hosts": model.hosts.len(),
         "sessions": model.sessions.len(),
         "connected_sessions": model.sessions.iter().filter(|session| session.connected).count(),
@@ -240,7 +239,6 @@ mod tests {
     fn model_with_hosts(hosts: Vec<HostState>) -> Model {
         Model {
             version: 1,
-            active: None,
             hosts,
             sessions: Vec::new(),
         }

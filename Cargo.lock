@@ -333,18 +333,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "herdr-history"
-version = "0.4.0"
-dependencies = [
- "anyhow",
- "herdr-client",
- "libc",
- "serde_json",
-]
-
-[[package]]
 name = "herdr-hub"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "herdr-client",
@@ -371,12 +361,11 @@ dependencies = [
 
 [[package]]
 name = "herdr-micro"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "codex-micro",
  "herdr-client",
- "herdr-hub-client",
  "libc",
  "objc2-core-graphics",
  "serde",
@@ -392,7 +381,6 @@ dependencies = [
  "anyhow",
  "crossterm",
  "herdr-client",
- "herdr-picker-sdk",
  "herdr-ratatui",
  "libc",
  "nucleo-matcher",
@@ -402,34 +390,6 @@ dependencies = [
  "toml",
  "unicode-truncate",
  "unicode-width",
-]
-
-[[package]]
-name = "herdr-picker-agents"
-version = "0.1.0"
-dependencies = [
- "herdr-hub-client",
- "herdr-picker-sdk",
- "serde_json",
-]
-
-[[package]]
-name = "herdr-picker-sdk"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "herdr-hub-client",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "herdr-picker-workspaces"
-version = "0.1.0"
-dependencies = [
- "herdr-hub-client",
- "herdr-picker-sdk",
- "serde_json",
 ]
 
 [[package]]

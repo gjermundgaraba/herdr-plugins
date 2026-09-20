@@ -4,14 +4,11 @@ Independent plugins and tools for [Herdr](https://herdr.dev/).
 
 | Package | Description |
 | --- | --- |
-| [herdr-hub](herdr-hub) | Shared agent model, active-session state, and action relay for every Herdr dashboard |
+| [herdr-hub](herdr-hub) | Runtime session/host inventory and relay |
 | [herdr-picker](herdr-picker) | Standalone declarative fuzzy picker and workflow runner |
-| [herdr-picker-agents](herdr-picker-agents) | Live Herdr agent picker example in Rust |
-| [herdr-picker-workspaces](herdr-picker-workspaces) | Live Herdr workspace picker example in Rust |
-| [herdr-picker-scripts](herdr-picker-scripts) | One-shot agent, workspace, and pane-moving examples in Python |
+| [herdr-picker-scripts](herdr-picker-scripts) | One-shot agent and workspace provider examples in Python |
 | [equalize-splits](equalize-splits) | Automatically equalize pane sizes after splitting |
 | [fork-to-pane](fork-to-pane) | Fork Pi, Codex, Claude Code, or OpenCode into a new pane; branch Amp with a thread reference |
-| [history](history) | Vim-style back/forward focus history |
 | [space-meta](space-meta) | Space numbers and PR badges in the spaces sidebar |
 | [herdr-micro](herdr-micro) | Control Herdr from a Work Louder Codex Micro |
 
@@ -21,20 +18,17 @@ Install the standalone picker on `PATH`:
 nix profile install github:gjermundgaraba/herdr-plugins#herdr-picker
 ```
 
-Install plugins as needed. When installing Micro, run the Hub line first:
+Install plugins as needed (Micro does not depend on Hub):
 
 ```sh
 herdr plugin install gjermundgaraba/herdr-plugins/equalize-splits
 herdr plugin install gjermundgaraba/herdr-plugins/fork-to-pane
-herdr plugin install gjermundgaraba/herdr-plugins/history
 herdr plugin install gjermundgaraba/herdr-plugins/herdr-hub
 herdr plugin install gjermundgaraba/herdr-plugins/herdr-micro
 herdr plugin install gjermundgaraba/herdr-plugins/space-meta
 ```
 
-Herdr Micro depends on Herdr Hub. Install Hub first and verify its service as
-described in the [Hub setup](herdr-hub/README.md#setup), then continue with the
-[Micro installation](herdr-micro/README.md#install).
+Herdr Micro connects directly to per-TUI frontend sockets. See [Micro installation](herdr-micro/README.md#install).
 
 For local development:
 
@@ -48,7 +42,6 @@ service steps in their package READMEs.
 ```sh
 herdr plugin link "$PWD/equalize-splits"
 herdr plugin link "$PWD/fork-to-pane"
-herdr plugin link "$PWD/history"
 herdr plugin link "$PWD/space-meta"
 ```
 
@@ -72,22 +65,17 @@ result/bin/herdr-picker --version
 The hub output is both a linkable plugin root and a CLI package; follow the
 [Hub setup](herdr-hub/README.md#setup) to install and start it.
 
-The hub targets the production Herdr fork at commit `85ad1d77`. It reads the
-fork's `session.snapshot.client_focused` field in one canonical 250 ms loop and
-pushes active-session changes to every consumer; consumers do not poll Herdr or
-integrate with a terminal app directly.
+The agent list, Back/Forward history, and the unread hold are native to the
+custom Herdr build as `[keys]` actions; see its configuration docs. Micro
+connects directly to the TUI's protocol-7 frontend socket; Hub retains only
+session/host inventory and relay. Frontend calls carry the endpoint ID and the
+server boot ID whose pane ids they use. Input uses the ordinary TUI dispatcher,
+including overlays. See the
+[Micro bridge](herdr-micro/docs/micro-bridge.md) for routing and script behavior.
 
-The other package names include `herdr-hub`, `herdr-picker-agents`,
-`herdr-picker-workspaces`, `equalize-splits`, `fork-to-pane`, `history`, and
-`space-meta`. The two picker examples are independent optional binary packages.
-Every package builds on Linux and macOS, but the hub-backed live pickers require
-the macOS hub service; Linux supports the hub's remote hooks and relay, not a
-standalone local service. Plugin packages contain a complete, prebuilt plugin
-root, so linking them never invokes Cargo. The picker packages expose their
-executables under `bin/`; `herdr-hub` exposes both
-`herdr-hub/bin/herdr-hub` for plugin commands and `bin/herdr-hub` for `PATH`.
-`herdr-micro` has no Nix package: its service binary must be codesigned with a
-local Apple Development identity.
+Other Nix packages include `herdr-hub`, `equalize-splits`, `fork-to-pane`, and
+`space-meta`.
+`herdr-micro` has no Nix package: its service binary must be locally codesigned.
 
 For Home Manager, add the picker package to the profile:
 
@@ -112,7 +100,7 @@ on later activations, so there is no activation-time Rust compilation and no
 binary cache is required.
 
 Each package's filtered source contains its full local path-dependency closure.
-The picker and its Rust examples share `sdk/picker` and `sdk/hub`; popup chrome
+The generic picker uses `sdk/hub`; popup chrome
 lives in `sdk/ratatui`; plugin-environment clients use `sdk/rust`.
 Consequently, editing one plugin does not invalidate unrelated plugin outputs,
 while edits to a shared SDK invalidate packages that include it.
@@ -126,14 +114,12 @@ Enter the repository development shell with the same pinned Rust toolchain using
 and colors for Rust popup integrations, including external consumers such as
 ClankerSnip. It intentionally does not own application state or event loops.
 
-[`sdk/picker`](sdk/picker) provides the picker wire types and shared live Herdr
-provider plumbing used by the independent agent and workspace examples.
-
 [`sdk/hub`](sdk/hub) provides the versioned hub protocol, streaming model
-client, action calls, and shared agent attention ordering.
+client, and action calls.
 
 The reusable client under [`sdk/rust`](sdk/rust) also validates Herdr's plugin
-environment and supplies the repository file layout:
+environment, supplies the frontend socket client (`frontend::FrontendClient`),
+shared agent attention ordering, and the repository file layout:
 
 ```text
 HERDR_PLUGIN_CONFIG_DIR/   user-edited configuration

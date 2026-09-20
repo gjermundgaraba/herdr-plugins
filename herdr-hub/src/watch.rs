@@ -179,7 +179,6 @@ fn connected_state(session: &LocalSession, snapshot: SessionSnapshot) -> Session
         tabs: snapshot.tabs,
         agents: snapshot.agents,
         socket_path: Some(session.socket_path.clone()),
-        client_focused: snapshot.client_focused,
     }
 }
 
@@ -236,7 +235,6 @@ fn disconnected_state(session: &LocalSession, protocol: u32, error: String) -> S
         tabs: Vec::new(),
         agents: Vec::new(),
         socket_path: Some(session.socket_path.clone()),
-        client_focused: None,
     }
 }
 
@@ -246,19 +244,18 @@ mod tests {
 
     use super::*;
 
-    fn state(focused: Option<bool>) -> SessionState {
+    fn state(connected: bool) -> SessionState {
         SessionState {
             key: "local/default".into(),
             host: "local".into(),
             name: "default".into(),
-            connected: true,
+            connected,
             error: None,
             protocol: MIN_PROTOCOL,
             workspaces: Vec::new(),
             tabs: Vec::new(),
             agents: Vec::new(),
             socket_path: Some("/tmp/herdr.sock".into()),
-            client_focused: focused,
         }
     }
 
@@ -267,16 +264,16 @@ mod tests {
         let (updates, received) = mpsc::sync_channel(2);
         let active = AtomicBool::new(true);
         let mut previous = None;
-        publish_changed(&updates, &active, 4, &mut previous, state(Some(false))).unwrap();
-        publish_changed(&updates, &active, 4, &mut previous, state(Some(false))).unwrap();
+        publish_changed(&updates, &active, 4, &mut previous, state(false)).unwrap();
+        publish_changed(&updates, &active, 4, &mut previous, state(false)).unwrap();
         assert!(matches!(received.try_recv(), Ok(Event::Watch(_))));
         assert!(received.try_recv().is_err());
 
-        publish_changed(&updates, &active, 4, &mut previous, state(Some(true))).unwrap();
+        publish_changed(&updates, &active, 4, &mut previous, state(true)).unwrap();
         let Event::Watch(update) = received.try_recv().unwrap() else {
             panic!("expected watcher update")
         };
-        assert_eq!(update.state.client_focused, Some(true));
+        assert!(update.state.connected);
     }
 
     #[test]
@@ -285,7 +282,7 @@ mod tests {
         let active = Arc::new(AtomicBool::new(true));
         let worker_active = Arc::clone(&active);
         let worker = thread::spawn(move || {
-            send_state(&updates, &worker_active, 1, state(None))
+            send_state(&updates, &worker_active, 1, state(false))
                 .unwrap_err()
                 .to_string()
         });
@@ -295,14 +292,11 @@ mod tests {
     }
 
     #[test]
-    fn disconnected_snapshots_cannot_claim_focus() {
+    fn disconnected_snapshots_are_unavailable() {
         let session = LocalSession {
             name: "default".into(),
             socket_path: "/tmp/herdr.sock".into(),
         };
-        assert_eq!(
-            disconnected_state(&session, MIN_PROTOCOL, "offline".into()).client_focused,
-            None
-        );
+        assert!(!disconnected_state(&session, MIN_PROTOCOL, "offline".into()).connected);
     }
 }

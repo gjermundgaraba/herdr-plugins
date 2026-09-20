@@ -333,27 +333,11 @@ impl Core {
             self.watchers.remove(&update.key);
             return self.remove_session(&update.key);
         }
-        let previous = self.model.session(&update.key);
-        let initial = previous.is_none_or(|session| !session.connected);
-        let gained_focus = update.state.connected
-            && update.state.client_focused == Some(true)
-            && previous.is_none_or(|session| session.client_focused != Some(true));
-        let lost_active = self.model.get().active.as_deref() == Some(update.key.as_str())
-            && (!update.state.connected || update.state.client_focused != Some(true));
         let mut messages = Vec::new();
         if let Some(message) = self.model.publish_session(update.state) {
             messages.push(message);
         }
-        let next_active = if gained_focus && !initial {
-            Some(update.key)
-        } else if lost_active || self.model.get().active.is_none() || (gained_focus && initial) {
-            self.sole_focused()
-        } else {
-            self.model.get().active.clone()
-        };
-        if let Some(message) = self.model.set_active(next_active) {
-            messages.push(message);
-        }
+
         messages
     }
 
@@ -515,44 +499,8 @@ impl Core {
                 .any(|state| state.key == host && state.connected)
     }
 
-    fn focused_local_sessions(&self) -> Vec<String> {
-        self.model
-            .get()
-            .sessions
-            .iter()
-            .filter(|session| {
-                session.host == "local" && session.connected && session.client_focused == Some(true)
-            })
-            .map(|session| session.key.clone())
-            .collect()
-    }
-
-    fn sole_other_focused(&self, key: &str) -> Option<String> {
-        let mut focused = self
-            .focused_local_sessions()
-            .into_iter()
-            .filter(|candidate| candidate != key);
-        let only = focused.next()?;
-        focused.next().is_none().then_some(only)
-    }
-
-    fn sole_focused(&self) -> Option<String> {
-        let mut focused = self.focused_local_sessions().into_iter();
-        let only = focused.next()?;
-        focused.next().is_none().then_some(only)
-    }
-
     fn remove_session(&mut self, key: &str) -> Vec<ServerMessage> {
-        let mut messages = Vec::new();
-        if (self.model.get().active.as_deref() == Some(key) || self.model.get().active.is_none())
-            && let Some(message) = self.model.set_active(self.sole_other_focused(key))
-        {
-            messages.push(message);
-        }
-        if let Some(message) = self.model.remove_session(key) {
-            messages.push(message);
-        }
-        messages
+        self.model.remove_session(key).into_iter().collect()
     }
 
     fn socket_path(&self, key: &str) -> Option<PathBuf> {
@@ -616,7 +564,6 @@ mod tests {
             tabs: Vec::new(),
             agents: Vec::new(),
             socket_path: Some(format!("/tmp/herdr/sessions/{name}/herdr.sock").into()),
-            client_focused: None,
         }
     }
 
@@ -671,130 +618,6 @@ mod tests {
         ));
     }
 
-    fn apply_focus(core: &mut Core, name: &str, focused: Option<bool>) -> Vec<ServerMessage> {
-        if !core.watchers.contains_key(&format!("local/{name}")) {
-            core.add(session(name)).unwrap();
-        }
-        let key = format!("local/{name}");
-        let generation = core.watchers[&key].watcher.generation;
-        let mut update = state(name, true);
-        update.client_focused = focused;
-        core.apply(Update {
-            key,
-            generation,
-            state: update,
-        })
-    }
-
-    #[test]
-    fn fresh_focus_gain_claims_active_and_stale_true_does_not_steal_it_back() {
-        let (tx, _rx) = mpsc::sync_channel(64);
-        let mut core = Core::new(tx);
-        apply_focus(&mut core, "a", Some(true));
-        apply_focus(&mut core, "b", Some(false));
-        assert_eq!(core.model.get().active.as_deref(), Some("local/a"));
-
-        apply_focus(&mut core, "b", Some(true));
-        assert_eq!(core.model.get().active.as_deref(), Some("local/b"));
-        apply_focus(&mut core, "a", Some(true));
-        assert_eq!(core.model.get().active.as_deref(), Some("local/b"));
-    }
-
-    #[test]
-    fn initial_focus_ambiguity_fails_closed() {
-        let (tx, _rx) = mpsc::sync_channel(64);
-        let mut core = Core::new(tx);
-        apply_focus(&mut core, "a", Some(true));
-        apply_focus(&mut core, "b", Some(true));
-        assert_eq!(core.model.get().active, None);
-    }
-
-    #[test]
-    fn ambiguity_recovers_when_one_focus_claim_is_lost() {
-        let (tx, _rx) = mpsc::sync_channel(64);
-        let mut core = Core::new(tx);
-        apply_focus(&mut core, "a", Some(true));
-        assert_eq!(core.model.get().active.as_deref(), Some("local/a"));
-        apply_focus(&mut core, "b", Some(true));
-        assert_eq!(core.model.get().active, None);
-
-        apply_focus(&mut core, "a", Some(false));
-        assert_eq!(core.model.get().active.as_deref(), Some("local/b"));
-    }
-
-    #[test]
-    fn ambiguity_recovers_when_one_focus_claim_is_removed() {
-        let (tx, _rx) = mpsc::sync_channel(64);
-        let mut core = Core::new(tx);
-        apply_focus(&mut core, "a", Some(true));
-        apply_focus(&mut core, "b", Some(true));
-        assert_eq!(core.model.get().active, None);
-
-        let messages = core.remove_session("local/a");
-        assert!(matches!(
-            messages.as_slice(),
-            [
-                ServerMessage::Active {
-                    key: Some(active),
-                    ..
-                },
-                ServerMessage::SessionRemoved { key, .. }
-            ] if active == "local/b" && key == "local/a"
-        ));
-        assert_eq!(core.model.get().active.as_deref(), Some("local/b"));
-    }
-
-    #[test]
-    fn active_loss_disconnect_and_remove_use_only_a_sole_focused_fallback() {
-        let (tx, _rx) = mpsc::sync_channel(64);
-        let mut core = Core::new(tx);
-        apply_focus(&mut core, "a", Some(true));
-        apply_focus(&mut core, "b", Some(false));
-        apply_focus(&mut core, "b", Some(true));
-
-        apply_focus(&mut core, "b", Some(false));
-        assert_eq!(core.model.get().active.as_deref(), Some("local/a"));
-
-        apply_focus(&mut core, "b", Some(true));
-        let key = "local/b";
-        let generation = core.watchers[key].watcher.generation;
-        let messages = core.apply(Update {
-            key: key.into(),
-            generation,
-            state: state("b", false),
-        });
-        assert_eq!(core.model.get().active.as_deref(), Some("local/a"));
-        assert!(messages.iter().any(|message| matches!(message, ServerMessage::Active { key: Some(key), .. } if key == "local/a")));
-
-        apply_focus(&mut core, "b", Some(false));
-        apply_focus(&mut core, "b", Some(true));
-        core.remove_session("local/b");
-        assert_eq!(core.model.get().active.as_deref(), Some("local/a"));
-
-        apply_focus(&mut core, "c", Some(true));
-        apply_focus(&mut core, "b", Some(false));
-        apply_focus(&mut core, "b", Some(true));
-        apply_focus(&mut core, "b", Some(false));
-        assert_eq!(core.model.get().active, None);
-    }
-
-    #[test]
-    fn reconnecting_into_ambiguous_focus_fails_closed() {
-        let (tx, _rx) = mpsc::sync_channel(64);
-        let mut core = Core::new(tx);
-        apply_focus(&mut core, "a", Some(true));
-        apply_focus(&mut core, "b", Some(false));
-        let key = "local/b";
-        let generation = core.watchers[key].watcher.generation;
-        core.apply(Update {
-            key: key.into(),
-            generation,
-            state: state("b", false),
-        });
-        apply_focus(&mut core, "b", Some(true));
-        assert_eq!(core.model.get().active, None);
-    }
-
     #[test]
     fn remote_epoch_owns_host_sessions_and_call_replies() {
         let (tx, _rx) = mpsc::sync_channel(64);
@@ -830,7 +653,6 @@ mod tests {
         });
         assert!(connected.replies.is_empty());
         assert_eq!(core.model.get().sessions.len(), 1);
-        assert_eq!(core.model.get().sessions[0].client_focused, None);
         assert!(matches!(
             core.route("workbox/default"),
             Some(Route::Remote { ref host, epoch: 2 }) if host == "workbox"

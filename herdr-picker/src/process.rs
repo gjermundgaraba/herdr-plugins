@@ -15,9 +15,9 @@ use std::{
     time::Duration,
 };
 
+use crate::wire::ProviderMessage;
 use anyhow::{Context, Result, anyhow, bail};
 use herdr_client::{Client, Error, ndjson, open_rotating_log};
-use herdr_picker_sdk::ProviderMessage;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 

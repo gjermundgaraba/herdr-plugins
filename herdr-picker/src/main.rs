@@ -2,6 +2,7 @@ mod config;
 mod model;
 mod process;
 mod ui;
+mod wire;
 
 use std::{
     collections::BTreeMap,

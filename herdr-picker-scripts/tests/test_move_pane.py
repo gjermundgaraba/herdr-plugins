@@ -114,7 +114,6 @@ class MovePaneTests(unittest.TestCase):
         items = json.loads(output.getvalue())["items"]
         self.assertEqual([item["id"] for item in items], ["new-tab", "w1:t2"])
         self.assertNotIn("badge", items[1])
-        self.assertNotIn("search", items[1])
 
     def test_existing_tab_submit_moves_right_and_focuses(self):
         context = {

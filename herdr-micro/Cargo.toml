@@ -1,6 +1,6 @@
 [package]
 name = "herdr-micro"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -12,7 +12,6 @@ repository.workspace = true
 anyhow.workspace = true
 codex-micro = { path = "../codex-micro" }
 herdr-client.workspace = true
-herdr-hub-client.workspace = true
 libc.workspace = true
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["CGEvent", "CGEventTypes", "CGRemoteOperation"] }
 serde.workspace = true

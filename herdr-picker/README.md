@@ -141,8 +141,8 @@ print(json.dumps({"items": items}), flush=True)
 Complete worked examples live in
 [`herdr-picker-scripts`](../herdr-picker-scripts) (plain Python scripts) and
 the live Rust packages
-[`herdr-picker-agents`](../herdr-picker-agents) and
-[`herdr-picker-workspaces`](../herdr-picker-workspaces).
+the one-shot [`herdr-picker-scripts`](../herdr-picker-scripts) examples.
+Herdr agent/workspace navigation now lives in the TUI Navigator.
 
 `id` and `title` are required and IDs must be unique. Put domain data under
 `value`. Optional UI fields are `subtitle`, `detail`, `badge`, `indicator`,

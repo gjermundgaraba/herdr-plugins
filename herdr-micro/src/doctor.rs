@@ -5,7 +5,7 @@ use codex_micro::{
     InputMonitoringAccess,
     service::{Client as DeviceClient, ServiceStatus},
 };
-use herdr_hub_client::HubClient;
+use herdr_client::frontend::{self, FrontendClient};
 use std::{
     env, fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Command, sync::mpsc,
     time::Duration,
@@ -89,20 +89,24 @@ fn service_status() -> Result<ServiceStatus> {
 
 pub fn doctor() -> Report {
     let mut report = Report::default();
-    match HubClient::new().subscribe(Duration::from_millis(750)) {
-        Ok((_stream, model)) => {
-            let connected = model
-                .sessions
-                .iter()
-                .filter(|session| session.connected)
-                .count();
-            report.push(
-                Level::Ok,
-                format!("Herdr hub: connected; {connected} session(s) available"),
-            );
-        }
-        Err(error) => report.push(Level::Fail, format!("Herdr hub: {error}")),
-    }
+    let paths = frontend::discover(&frontend::directory());
+    let snapshots: Vec<_> = paths
+        .iter()
+        .filter_map(|path| {
+            FrontendClient::connect(path)
+                .with_timeout(Duration::from_millis(750))
+                .snapshot()
+                .ok()
+        })
+        .collect();
+    let focused = snapshots.iter().filter(|s| s.focused == Some(true)).count();
+    report.push(
+        if focused == 1 { Level::Ok } else { Level::Warn },
+        format!(
+            "Herdr frontends: {} connected; {focused} report focus (exactly one required)",
+            snapshots.len()
+        ),
+    );
     check(&mut report, "Codex Micro service executable", || {
         let path = service_executable()?;
         let metadata = fs::metadata(&path)?;

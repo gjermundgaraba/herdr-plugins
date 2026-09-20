@@ -13,29 +13,21 @@ a root helper, or use `sudo`.
 
 - macOS and a Codex Micro; the current hardware baseline is stock firmware
   0.6.2
-- A Herdr build with `client_focused` in `session.snapshot`
-- The `herdr-hub` plugin installed and its service running
+- The custom Herdr build with frontend socket protocol 7 (Hub is not required)
 - Rust 1.89 or newer when building from source
 - An Apple Development code-signing identity when building from source
 - Work Louder Input for the one-time Layer 2 setup
 - macOS Input Monitoring permission for the installed Codex Micro service
 - macOS Accessibility permission only for configured system `key` bindings
 - Handy installed at `/Applications/Handy.app` for the reserved voice-control
-  button and [Hunk](https://www.hunk.dev/) only for the optional `diff` action
+  button
 
 The bridge uses an unsupported proprietary device protocol. Read the
 [compatibility and safety notes](docs/micro-bridge.md) before setup.
 
 ## Install
 
-Install the required Hub first:
-
-```sh
-herdr plugin install gjermundgaraba/herdr-plugins/herdr-hub
-```
-
-In Herdr, run **Install Herdr Hub service**. When its action log reports
-success, run **Check Herdr Hub setup**. Then install and authorize Micro:
+Install and authorize Micro:
 
 ```sh
 herdr plugin install gjermundgaraba/herdr-plugins/herdr-micro
@@ -43,10 +35,6 @@ herdr plugin enable gjermundgaraba.herdr-micro
 herdr plugin action invoke service-authorize \
   --plugin gjermundgaraba.herdr-micro
 ```
-
-For a Hub source checkout, follow its
-[local-development setup](../herdr-hub/README.md#local-development). Remote
-hosts have separate [Hub instructions](../herdr-hub/README.md#remote-hosts).
 
 `herdr-micro start`, including the plugin startup hook, installs or refreshes
 the per-user `dev.herdr.codex-micro` LaunchAgent automatically. The stable
@@ -140,7 +128,7 @@ any frontmost app (requires Accessibility):
 instead of `key`, and optional `modifiers` adds any of `cmd`, `shift`, `alt`,
 `ctrl`, and `fn`.
 
-The actions are `prompt`, `submit`, `fast`, `diff`, `focus-pane`, `script`, and
+The actions are `prompt`, `submit`, `fast`, `focus-pane`, `script`, and
 `key`; the default configuration demonstrates most of them plus `byAgent`
 variants. Buttons also accept gesture bindings:
 
@@ -173,19 +161,34 @@ boundaries.
 
 ## Routing and operation
 
-The bridge subscribes to `herdr-hub` for one pushed model of default and named
-Herdr sessions. The hub publishes the active session from Herdr's
-`client_focused` snapshot field; the bridge revalidates that session and the
-captured target before each action. The device service remains available when
-the hub is absent, but only its reserved Handy action is local; gestures and
-all other actions need the hub.
+The bridge discovers owner-only per-TUI frontend sockets and subscribes directly.
+Exactly one TUI must report `focused: true`; absent, unknown, or conflicting
+focus blanks lights and disables Herdr routing. Quiet subscriptions stay live
+until EOF. The six sticky agent slots use `(endpoint_id, pane_id)` identity;
+server `agent.focused` highlights the active endpoint's focused slot.
 
-- Work Louder Input running or ChatGPT/Codex desktop frontmost: Herdr
-  suppresses routing
-- Independently, the service enforces the gate by closing the physical device
-- Official writer inactive: the service reopens USB or BLE and replays state
-- Hub reports an active Herdr session: Herdr selects Layer 2 and routes to that
-  session; no active session means no Herdr action
+Agent buttons use `navigate`, including SSH endpoints. Ordinary keys/text use
+`input`, so they work in a plain shell or an open Navigator, even when a runtime
+lease is unavailable. For configuration use `{"action":"input","keys":["enter"]}`
+or `{"action":"input","text":"hello"}`. Targeted agent prompts require their
+captured endpoint to already be active; they never activate implicitly. Calls
+carry the endpoint and the server boot whose pane ids they use, so a restarted
+server rejects them instead of acting on a reused id; cancelled or disconnected
+mutations are never replayed. Gesture routes are captured at the first press.
+Delayed work is rejected if that TUI is no longer the uniquely focused client;
+it never retargets to a different TUI.
+
+**Explicit OS-global exceptions:** existing `action: "key"` bindings synthesize
+macOS keycodes (named F13–F20 or configured keycode/modifiers), even without a
+focused Herdr TUI. The device service's reserved Handy button is also global.
+Neither exception is a Herdr input route. Official device ownership still gates
+all bridge work as before.
+
+Scripts run locally from the plugin root and receive `HERDR_FRONTEND_SOCKET`,
+`HERDR_PANE_ID`, and `HERDR_MICRO_BIN_PATH` (the independent installed binary).
+Use `client input text TEXT` or `client input keys KEY...`. Input is
+deliberately untargeted. External commands run normally, outside frontend
+validation.
 
 Useful actions:
 

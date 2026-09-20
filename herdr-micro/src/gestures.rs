@@ -6,8 +6,8 @@ use std::{
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct GestureContext {
-    pub session_key: String,
-    pub generation: u64,
+    pub route: crate::frontends::ClientRoute,
+    pub target: Option<herdr_client::frontend::Agent>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -193,10 +193,15 @@ mod tests {
     use super::*;
     use crate::config::Action;
 
-    fn context(session_key: &str, generation: u64) -> Option<GestureContext> {
+    fn context(client_id: &str, generation: u64) -> Option<GestureContext> {
         Some(GestureContext {
-            session_key: session_key.into(),
-            generation,
+            route: crate::frontends::ClientRoute {
+                client_id: client_id.into(),
+                endpoint_id: "endpoint".into(),
+                boot_id: Some(format!("boot-{generation}")),
+                socket_path: "/tmp/test.sock".into(),
+            },
+            target: None,
         })
     }
 
@@ -205,7 +210,7 @@ mod tests {
         let mut dispatcher = GestureDispatcher::default();
         let binding = Binding::Gesture(Box::new(GestureBinding {
             tap: Some(Action::Submit),
-            double_tap: Some(Action::Diff),
+            double_tap: Some(Action::Fast),
             ..Default::default()
         }));
         let now = Instant::now();
@@ -222,7 +227,7 @@ mod tests {
         let fired = dispatcher.handle("key", Some(&binding), true, context("second", 2), now);
         assert!(fired.is_empty());
         let fired = dispatcher.handle("key", Some(&binding), false, context("second", 2), now);
-        assert_eq!(fired[0].action, Action::Diff);
+        assert_eq!(fired[0].action, Action::Fast);
         assert_eq!(fired[0].context, context("first", 1));
     }
 
@@ -231,7 +236,7 @@ mod tests {
         let mut dispatcher = GestureDispatcher::default();
         let binding = Binding::Gesture(Box::new(GestureBinding {
             tap: Some(Action::Submit),
-            double_tap: Some(Action::Diff),
+            double_tap: Some(Action::Fast),
             double_tap_ms: Some(100),
             ..Default::default()
         }));

@@ -11,7 +11,7 @@ stock Codex Micro firmware 0.6.2
      -> lifecycle, official-writer gate, replay, reserved Handy action
      -> owner-only, exact-version typed Unix socket
   -> herdr-micro daemon (optional policy client)
-     -> pushed herdr-hub model and call passthrough
+     -> direct frontend discovery + push subscriptions + navigate/input/call
      -> gestures, actions, and lighting policy
 ```
 
@@ -38,11 +38,11 @@ guarded keymap reads/writes. There is no generic raw device RPC and no path to
 the device that bypasses the service. The physical-device gate is
 service-owned.
 
-`herdr-micro` is a client of that service and of `herdr-hub`. The hub publishes
-the active Herdr session from `session.snapshot.client_focused`. The bridge
-freezes and revalidates action targets, handles gestures, and computes
-lighting. Stopping the hub blanks Herdr lighting and routing without stopping
-the device LaunchAgent.
+`herdr-micro` connects directly to the device service and local TUI frontend
+sockets. Exactly one reported-focused TUI supplies endpoint inventories and
+ordinary input routing. Hub has no client-facing role. EOF removes a TUI; a quiet
+subscription is not considered stale. No focused TUI blanks Herdr lighting and
+routing without stopping the device LaunchAgent.
 
 ## Device ownership
 
@@ -74,8 +74,7 @@ The service-owned device gate is:
 | ChatGPT/Codex desktop frontmost | Close the physical device |
 | Official writer inactive | Open USB or BLE and replay desired state |
 
-Separately, Herdr selects Layer 2 when the hub publishes an active Herdr
-session and routes actions there. When the hub publishes no active session,
+Separately, Herdr selects Layer 2 when exactly one TUI reports focus and routes actions through it. Without a unique focused TUI,
 the bridge preserves the last applicable Herdr layer and dispatches no Herdr
 action.
 
@@ -102,8 +101,11 @@ actuate both Button 5 and Button 6, so Button 6 is `null` by default.
 
 ## Herdr action scheduling
 
-One hub subscription supplies all session, agent, and active-session changes;
-the bridge does not poll Herdr. Built-in actions use the hub call passthrough.
+One push subscription per discovered TUI supplies endpoint and agent changes.
+Discovery retries with backoff; subscriptions do not poll snapshots or require
+heartbeats. Slots use endpoint-qualified pane identity. The active endpoint's
+`agent.focused` drives highlighting. Buttons navigate using a captured route;
+ordinary input remains usable in client overlays without a pane input target.
 Routing updates never wait for device I/O. A separate worker retains only the
 latest desired layer and lighting, compares actual light values, and writes
 only changes. Terminal-title animations and other agent metadata do not resend
@@ -126,26 +128,32 @@ invalidates its send cache before a lighting attempt so a lost IPC reply cannot
 prevent a later replacement. Version 1 clients and services are rejected;
 update both binaries together using the start flow above.
 
-Before a queued binding runs, its captured session key must still match the
-hub's current active route, and `agent.get` must return the captured terminal,
-pane, and agent identity with
-`focused == true`; an Agent-key focus checks the captured identity without
-requiring it to already be focused.
+Gestures capture the frontend and agent context at the initial press. Navigation
+uses `navigate`; keys/text use ordinary `input`, which follows current TUI focus,
+including overlays. Targeted prompts and focus moves are frontend `call`s to
+`agent.prompt` and `pane.focus_direction`, carrying the captured endpoint ID
+and server boot ID; submits and unsubmitted text are ordinary input. The TUI
+rejects a call on an inactive endpoint; no implicit activation or mutation
+replay follows cancellation/EOF.
+Delayed work rechecks the current unique-focused client before dispatch; lost or
+conflicting focus rejects it without retargeting. There is no dispatch-time
+agent revalidation. Configuration changes and
+physical device disconnection clear pending gestures.
 
-Script actions run from the plugin root after the same session, pane, agent,
-and routing generation are revalidated. A script also requires a local session
-socket; remote hub sessions refuse script actions.
+Scripts run locally from the plugin root with `HERDR_FRONTEND_SOCKET`,
+`HERDR_PANE_ID` and `HERDR_MICRO_BIN_PATH` pointing at `bin/herdr-micro`.
+Use `client input text TEXT` or `client input keys KEY...`.
+See the README for explicit OS-global key and reserved Handy exceptions.
 
-Scripts receive `HERDR_SOCKET_PATH`, `HERDR_SESSION`, and `HERDR_PANE_ID`, and
-inherit `HERDR_BIN_PATH`. Output is bounded. One worker runs accepted scripts
-in FIFO order, with a queue of 16 and a five-second deadline.
+Output is bounded. One worker runs accepted scripts in FIFO order, with a queue
+of 16 and a five-second deadline.
 
 ## Compatibility and limitations
 
 | Component | Current boundary |
 |---|---|
 | Platform | macOS only |
-| Herdr | A build with `session.snapshot.client_focused`, with `herdr-hub` running |
+| Herdr | The custom Herdr build with frontend socket protocol 7 (no Hub dependency) |
 | Build toolchain | Rust 1.89 or newer |
 | Codex Micro firmware | Stock 0.6.2 baseline; USB `device.status` physically confirmed |
 | Device transport | USB preferred; Bluetooth Low Energy supported |

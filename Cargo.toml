@@ -3,16 +3,12 @@ resolver = "3"
 members = [
     "herdr-hub",
     "herdr-picker",
-    "herdr-picker-agents",
-    "herdr-picker-workspaces",
     "equalize-splits",
     "fork-to-pane",
     "herdr-micro",
     "codex-micro",
     "space-meta",
-    "history",
     "sdk/hub",
-    "sdk/picker",
     "sdk/ratatui",
     "sdk/rust",
 ]
@@ -27,7 +23,6 @@ repository = "https://github.com/gjermundgaraba/herdr-plugins"
 anyhow = "1.0.104"
 herdr-client = { path = "sdk/rust" }
 herdr-hub-client = { path = "sdk/hub" }
-herdr-picker-sdk = { path = "sdk/picker" }
 herdr-ratatui = { path = "sdk/ratatui" }
 libc = "0.2.189"
 objc2-core-foundation = { version = "0.3.2", default-features = false }

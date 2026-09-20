@@ -24,31 +24,32 @@ use std::{
 use crate::{
     config::{config_path, enabled_buttons, load, provision},
     control::listen_for_control,
-    hub,
+    frontends,
 };
 use dispatch::{action_worker, input_worker};
 use reconcile::{
-    InputContext, State, apply_config_load, apply_hub_update, apply_service_status, device_output,
-    handle_input_disconnect, publish, reconcile_active, refresh_owner, update_input_context,
+    InputContext, State, apply_config_load, apply_frontend_update, apply_service_status,
+    device_output, handle_input_disconnect, publish, reconcile_active, refresh_owner,
+    update_input_context,
 };
 
 const CONFIG_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const OWNER_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 const WORK_QUEUE_CAPACITY: usize = 16;
 // Replacing the lighting IPC contract requires replacing a running policy client too.
-pub const DAEMON_PROTOCOL_VERSION: u32 = 11;
+pub const DAEMON_PROTOCOL_VERSION: u32 = 12;
 
 static LOG_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 enum RuntimeEvent {
-    Hub(Box<hub::Update>),
+    Frontends(Box<frontends::Update>),
     InputDisconnected(String),
     Device(device::Update),
 }
 
 fn apply_runtime_event(event: RuntimeEvent, state: &mut State, stopping: &AtomicBool) {
     match event {
-        RuntimeEvent::Hub(update) => apply_hub_update(state, *update, stopping),
+        RuntimeEvent::Frontends(update) => apply_frontend_update(state, *update, stopping),
         RuntimeEvent::InputDisconnected(error) => {
             handle_input_disconnect(state, error);
             reconcile_active(state, stopping);
@@ -82,8 +83,7 @@ fn apply_runtime_batch(
     dirty: &mut bool,
 ) {
     *dirty = true;
-    // Apply transitions in order so even a focus round-trip revokes captured
-    // actions. Bound the batch to keep owner/config checks responsive.
+    // Apply transitions in order and bound the batch to keep owner/config checks responsive.
     for event in events.into_iter().take(256) {
         if stopping.load(Ordering::Acquire) {
             break;
@@ -179,10 +179,17 @@ pub fn run_daemon() -> Result<()> {
     let stopping = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(SIGINT, Arc::clone(&stopping))?;
     signal_hook::flag::register(SIGTERM, Arc::clone(&stopping))?;
-    hub::spawn_updates({
-        let runtime_tx = runtime_tx.clone();
-        move |update| runtime_tx.send(RuntimeEvent::Hub(Box::new(update))).is_ok()
-    });
+    frontends::spawn_updates(
+        {
+            let runtime_tx = runtime_tx.clone();
+            move |update| {
+                runtime_tx
+                    .send(RuntimeEvent::Frontends(Box::new(update)))
+                    .is_ok()
+            }
+        },
+        stopping.clone(),
+    );
     let device = device::Worker::spawn(
         device_tx.clone(),
         {
@@ -196,26 +203,15 @@ pub fn run_daemon() -> Result<()> {
     let mut state = State::new(config);
     let input_context = Arc::new(Mutex::new(Arc::new(InputContext::new(&state.config))));
     let worker = thread::spawn({
-        let routing_generation = Arc::clone(&state.routing_generation);
-        let active_route = Arc::clone(&state.active_route);
         let stopping = Arc::clone(&stopping);
-        move || action_worker(work_rx, routing_generation, active_route, stopping)
+        let context = Arc::clone(&input_context);
+        move || action_worker(work_rx, stopping, context)
     });
     let input = thread::spawn({
         let context = Arc::clone(&input_context);
-        let routing_generation = Arc::clone(&state.routing_generation);
         let work = work_tx.clone();
         let stopping = Arc::clone(&stopping);
-        move || {
-            input_worker(
-                device_rx,
-                context,
-                routing_generation,
-                work,
-                runtime_tx,
-                stopping,
-            )
-        }
+        move || input_worker(device_rx, context, work, runtime_tx, stopping)
     });
     let status = Arc::new(Mutex::new(state.status()));
     let server = listen_for_control(Arc::clone(&status), Arc::clone(&stopping))?;
@@ -282,7 +278,7 @@ pub fn run_daemon() -> Result<()> {
     }
 
     log("stopping");
-    state.invalidate_routing();
+    state.disable_routing();
     stopping.store(true, Ordering::Release);
     device.shutdown();
     drop(device_tx);
@@ -343,49 +339,40 @@ mod tests {
             );
         }
         state.routing_ready = true;
-        state.invalidate_routing();
+        state.disable_routing();
         stopping.store(true, Ordering::Release);
         publish(&status, &state);
         assert_ne!(status.lock().unwrap()["routing"], "ready");
     }
 
     #[test]
-    fn runtime_batches_preserve_focus_round_trips_and_bound_work() {
-        use herdr_hub_client::{Model, ServerMessage, SessionState};
+    fn runtime_batches_apply_latest_focus_and_bound_work() {
+        use crate::frontends::ClientState;
         let config = crate::config::Config::default();
         let mut state = State::new(config);
         let stopping = AtomicBool::new(false);
-        let session = |name: &str| SessionState {
-            key: name.into(),
-            host: "local".into(),
-            name: name.into(),
-            connected: true,
-            error: None,
-            protocol: 20,
-            workspaces: vec![],
-            tabs: vec![],
-            agents: vec![],
-            socket_path: Some(format!("/tmp/{name}.sock").into()),
-            client_focused: Some(true),
-        };
         let event = |active: &str| {
-            RuntimeEvent::Hub(Box::new(Ok(ServerMessage::Hello {
-                protocol: herdr_hub_client::PROTOCOL,
-                model: Model {
-                    version: 4,
-                    active: Some(active.into()),
-                    hosts: vec![],
-                    sessions: vec![session("a"), session("b")],
+            RuntimeEvent::Frontends(Box::new(vec![ClientState {
+                socket_path: "/tmp/test.sock".into(),
+                snapshot: herdr_client::frontend::Snapshot {
+                    client_id: active.into(),
+                    revision: 1,
+                    focused: Some(true),
+                    input_ready: false,
+                    active_endpoint_id: None,
+                    endpoints: vec![],
+                    input_target: None,
                 },
-            })))
+            }]))
         };
         apply_runtime_event(event("a"), &mut state, &stopping);
-        let generation = state.routing_generation();
         let mut dirty = false;
         apply_runtime_batch([event("b"), event("a")], &mut state, &stopping, &mut dirty);
         assert!(dirty);
-        assert_eq!(state.model.active.as_deref(), Some("a"));
-        assert!(state.routing_generation() > generation);
+        assert_eq!(
+            state.model.foremost_client().map(|c| c.client_id.as_str()),
+            Some("a")
+        );
         let mut received = 0;
         let events = std::iter::from_fn(|| {
             received += 1;
@@ -399,14 +386,12 @@ mod tests {
     fn lighting_failure_does_not_revoke_a_herdr_route() {
         let mut state = State::new(crate::config::Config::default());
         state.routing_ready = true;
-        let generation = state.routing_generation();
         apply_runtime_event(
             RuntimeEvent::Device(device::Update::Error("keyboard access denied".into())),
             &mut state,
             &AtomicBool::new(false),
         );
         assert!(state.routing_ready);
-        assert_eq!(state.routing_generation(), generation);
         assert_eq!(state.last_device_error, "keyboard access denied");
     }
 

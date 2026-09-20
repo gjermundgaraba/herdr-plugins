@@ -1,4 +1,4 @@
-pub use herdr_picker_sdk::{Item, Tone, validate_items};
+pub use crate::wire::{Item, Tone, validate_items};
 use nucleo_matcher::{
     Config, Matcher, Utf32String,
     pattern::{CaseMatching, Normalization, Pattern},
@@ -183,7 +183,7 @@ mod tests {
         assert!(validate_items(&[]).is_ok());
         assert_eq!(
             validate_items(&[item("same", "One", ""), item("same", "Two", "")]),
-            Err(herdr_picker_sdk::ItemsError::DuplicateId { id: "same".into() })
+            Err(crate::wire::ItemsError::DuplicateId { id: "same".into() })
         );
     }
 

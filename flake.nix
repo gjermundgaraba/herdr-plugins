@@ -63,33 +63,10 @@
           sourceRoots = [
             "herdr-picker"
             "sdk/hub"
-            "sdk/picker"
             "sdk/ratatui"
             "sdk/rust"
           ];
           binOnly = true;
-        };
-
-        herdr-picker-agents = {
-          sourceRoots = [
-            "herdr-picker-agents"
-            "sdk/hub"
-            "sdk/picker"
-            "sdk/rust"
-          ];
-          binOnly = true;
-          exampleFiles = [ "agents.toml" ];
-        };
-
-        herdr-picker-workspaces = {
-          sourceRoots = [
-            "herdr-picker-workspaces"
-            "sdk/hub"
-            "sdk/picker"
-            "sdk/rust"
-          ];
-          binOnly = true;
-          exampleFiles = [ "workspaces.toml" ];
         };
 
         equalize-splits = {
@@ -102,13 +79,6 @@
         fork-to-pane = {
           sourceRoots = [
             "fork-to-pane"
-            "sdk/rust"
-          ];
-        };
-
-        history = {
-          sourceRoots = [
-            "history"
             "sdk/rust"
           ];
         };

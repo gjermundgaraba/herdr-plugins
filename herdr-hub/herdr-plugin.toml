@@ -1,7 +1,7 @@
 id = "gjermundgaraba.herdr-hub"
 name = "Herdr Hub"
-version = "0.2.0"
-min_herdr_version = "0.8.2"
+version = "0.3.0"
+min_herdr_version = "0.9.0"
 description = "One agent model for every Herdr dashboard"
 platforms = ["macos", "linux"]
 

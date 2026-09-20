@@ -335,12 +335,8 @@ struct LocalFilter {
 
 impl LocalFilter {
     fn from_model(mut model: Model) -> (Self, ServerMessage) {
-        model.active = None;
         model.hosts.retain(|host| host.key == "local");
         model.sessions.retain(|session| session.host == "local");
-        for session in &mut model.sessions {
-            session.client_focused = None;
-        }
         let sessions = model
             .sessions
             .iter()
@@ -358,7 +354,6 @@ impl LocalFilter {
     fn message(&mut self, mut message: ServerMessage) -> Option<ServerMessage> {
         match &mut message {
             ServerMessage::Session { session, .. } if session.host == "local" => {
-                session.client_focused = None;
                 self.sessions.insert(session.key.clone());
                 Some(message)
             }
@@ -367,7 +362,6 @@ impl LocalFilter {
             | ServerMessage::Session { .. }
             | ServerMessage::SessionRemoved { .. }
             | ServerMessage::Host { .. }
-            | ServerMessage::Active { .. }
             | ServerMessage::Reply { .. }
             | ServerMessage::ReplyError { .. }
             | ServerMessage::Error { .. } => None,
@@ -393,7 +387,6 @@ mod tests {
             tabs: Vec::new(),
             agents: Vec::new(),
             socket_path: Some("/tmp/herdr.sock".into()),
-            client_focused: Some(true),
         }
     }
 
@@ -401,7 +394,6 @@ mod tests {
     fn filters_initial_and_incremental_state_to_local_sessions() {
         let model = Model {
             version: 8,
-            active: Some("local/default".into()),
             hosts: vec![
                 HostState {
                     key: "local".into(),
@@ -423,11 +415,9 @@ mod tests {
         let ServerMessage::Hello { model, .. } = hello else {
             panic!("expected hello")
         };
-        assert_eq!(model.active, None);
         assert_eq!(model.hosts.len(), 1);
         assert_eq!(model.sessions.len(), 1);
         assert_eq!(model.sessions[0].key, "local/default");
-        assert_eq!(model.sessions[0].client_focused, None);
 
         assert!(
             filter
@@ -445,13 +435,14 @@ mod tests {
                 })
                 .is_none()
         );
-        let Some(ServerMessage::Session { session, .. }) = filter.message(ServerMessage::Session {
-            version: 11,
-            session: session("local/new", "local"),
-        }) else {
+        let Some(ServerMessage::Session { session: _, .. }) =
+            filter.message(ServerMessage::Session {
+                version: 11,
+                session: session("local/new", "local"),
+            })
+        else {
             panic!("expected local session")
         };
-        assert_eq!(session.client_focused, None);
         assert!(
             filter
                 .message(ServerMessage::SessionRemoved {

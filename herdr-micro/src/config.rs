@@ -17,7 +17,12 @@ pub enum Action {
         #[serde(default)]
         submit: Option<bool>,
     },
-    Diff,
+    Input {
+        #[serde(default)]
+        text: Option<String>,
+        #[serde(default)]
+        keys: Option<Vec<String>>,
+    },
     Fast,
     Submit,
     Script {
@@ -363,6 +368,9 @@ fn validate_action(action: &Action, label: &str) -> Result<(), String> {
         Action::Script { command, .. } if command.trim().is_empty() => {
             Err(format!("{label}.command must be a non-empty string"))
         }
+        Action::Input { text, keys } if text.is_some() == keys.is_some() => Err(format!(
+            "{label}: input requires exactly one of text or keys"
+        )),
         Action::Key { key, keycode, .. } => key_action_code(key.as_deref(), *keycode)
             .map(|_| ())
             .map_err(|error| format!("{label}: {error}")),

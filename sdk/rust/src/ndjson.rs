@@ -42,6 +42,32 @@ pub fn read_frame(reader: &mut impl BufRead, pending: &mut Vec<u8>) -> io::Resul
     }
 }
 
+/// Read a Unix socket frame within one wall-clock budget. Partial frames stay
+/// in `pending`, and the socket's previous read timeout is restored. Buffered
+/// frames are returned without waiting.
+#[cfg(unix)]
+pub fn read_frame_with_timeout(
+    reader: &mut io::BufReader<std::os::unix::net::UnixStream>,
+    pending: &mut Vec<u8>,
+    timeout: std::time::Duration,
+) -> io::Result<Option<Vec<u8>>> {
+    let socket = reader.get_ref();
+    let previous = socket.read_timeout()?;
+    // macOS rejects socket options once the peer has hung up. The socket then
+    // only has buffered bytes and EOF left, which a read returns without
+    // blocking, so timeout changes are best effort. A zero timeout would
+    // disable the timeout in std; keep it as "poll once".
+    let _ = socket.set_read_timeout(Some(timeout.max(std::time::Duration::from_millis(1))));
+    let result = match read_frame(reader, pending) {
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            Err(io::ErrorKind::TimedOut.into())
+        }
+        result => result,
+    };
+    let _ = reader.get_ref().set_read_timeout(previous);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
@@ -112,6 +138,44 @@ mod tests {
         assert_eq!(
             read_frame(&mut reader, &mut pending).unwrap().as_deref(),
             Some(b"{\"a\":1}\n".as_slice())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timed_socket_read_preserves_partial_frames_and_previous_timeout() {
+        use std::{io::Write, os::unix::net::UnixStream, time::Duration};
+
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let mut reader = io::BufReader::new(socket);
+        let mut pending = Vec::new();
+        peer.write_all(b"{\"a\"").unwrap();
+        let error = read_frame_with_timeout(&mut reader, &mut pending, Duration::from_millis(10))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(pending, b"{\"a\"");
+        assert_eq!(
+            reader.get_ref().read_timeout().unwrap(),
+            Some(Duration::from_secs(30))
+        );
+
+        peer.write_all(b":1}\n{}\n").unwrap();
+        assert_eq!(
+            read_frame_with_timeout(&mut reader, &mut pending, Duration::from_secs(1)).unwrap(),
+            Some(b"{\"a\":1}\n".to_vec())
+        );
+        // The second frame is buffered; a zero timeout must not skip it.
+        assert_eq!(
+            read_frame_with_timeout(&mut reader, &mut pending, Duration::ZERO).unwrap(),
+            Some(b"{}\n".to_vec())
+        );
+        drop(peer);
+        assert_eq!(
+            read_frame_with_timeout(&mut reader, &mut pending, Duration::from_secs(1)).unwrap(),
+            None
         );
     }
 }

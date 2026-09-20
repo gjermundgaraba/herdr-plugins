@@ -1,9 +1,17 @@
 use crate::config::{AgentStatus, Direction, Light, LightingConfig};
 use codex_micro::service::Lighting;
-use herdr_hub_client::{AgentInfo, attention_order, attention_rank};
+use herdr_client::attention::{attention_order, attention_rank};
+use herdr_client::frontend::Agent;
 use std::collections::{HashMap, HashSet};
 
 pub const SLOT_COUNT: usize = 6;
+
+/// An agent pane, qualified by its endpoint so ids never collide across machines.
+pub type SlotKey = (String, String);
+
+pub fn slot_order(a: &(SlotKey, Agent), b: &(SlotKey, Agent)) -> std::cmp::Ordering {
+    attention_order((&a.0.0, &a.1), (&b.0.0, &b.1))
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct JoystickEvent {
@@ -11,7 +19,7 @@ pub struct JoystickEvent {
     pub direction: Option<Direction>,
 }
 
-fn status(agent: &AgentInfo) -> AgentStatus {
+fn status(agent: &Agent) -> AgentStatus {
     match agent.agent_status.as_str() {
         "idle" => AgentStatus::Idle,
         "working" => AgentStatus::Working,
@@ -20,36 +28,39 @@ fn status(agent: &AgentInfo) -> AgentStatus {
         _ => AgentStatus::Unknown,
     }
 }
-pub fn assign_slots(previous: &[Option<String>], agents: &[AgentInfo]) -> Vec<Option<String>> {
+pub fn assign_slots(
+    previous: &[Option<SlotKey>],
+    agents: &[(SlotKey, Agent)],
+) -> Vec<Option<SlotKey>> {
     let mut sorted: Vec<_> = agents.iter().collect();
-    sorted.sort_by(|a, b| attention_order(("", a), ("", b)));
+    sorted.sort_by(|a, b| slot_order(a, b));
     let by_id: HashMap<_, _> = agents
         .iter()
-        .map(|agent| (agent.terminal_id.as_str(), agent))
+        .map(|(key, _)| (key, agents_entry(agents, key)))
         .collect();
     let mut slots: Vec<_> = (0..SLOT_COUNT)
         .map(|index| {
             previous
                 .get(index)
                 .and_then(Option::as_ref)
-                .filter(|id| by_id.contains_key(id.as_str()))
+                .filter(|key| by_id.contains_key(key))
                 .cloned()
         })
         .collect();
     let mut slotted: HashSet<_> = slots.iter().flatten().cloned().collect();
     for candidate in sorted {
-        if slotted.contains(&candidate.terminal_id) {
+        if slotted.contains(&candidate.0) {
             continue;
         }
         if let Some(empty) = slots.iter().position(Option::is_none) {
-            slots[empty] = Some(candidate.terminal_id.clone());
-            slotted.insert(candidate.terminal_id.clone());
+            slots[empty] = Some(candidate.0.clone());
+            slotted.insert(candidate.0.clone());
             continue;
         }
         let victim = (1..SLOT_COUNT).fold(0, |victim, index| {
-            if attention_order(
-                ("", by_id[slots[index].as_ref().unwrap().as_str()]),
-                ("", by_id[slots[victim].as_ref().unwrap().as_str()]),
+            if slot_order(
+                by_id[slots[index].as_ref().unwrap()],
+                by_id[slots[victim].as_ref().unwrap()],
             )
             .is_gt()
             {
@@ -58,26 +69,32 @@ pub fn assign_slots(previous: &[Option<String>], agents: &[AgentInfo]) -> Vec<Op
                 victim
             }
         });
-        let displaced = by_id[slots[victim].as_ref().unwrap().as_str()];
-        if attention_rank(&candidate.agent_status) <= attention_rank(&displaced.agent_status) {
+        let displaced = by_id[slots[victim].as_ref().unwrap()];
+        if attention_rank(&candidate.1.agent_status) <= attention_rank(&displaced.1.agent_status) {
             break;
         }
-        slotted.remove(&displaced.terminal_id);
-        slots[victim] = Some(candidate.terminal_id.clone());
-        slotted.insert(candidate.terminal_id.clone());
+        slotted.remove(&displaced.0);
+        slots[victim] = Some(candidate.0.clone());
+        slotted.insert(candidate.0.clone());
     }
     slots
 }
+fn agents_entry<'a>(agents: &'a [(SlotKey, Agent)], key: &SlotKey) -> &'a (SlotKey, Agent) {
+    agents
+        .iter()
+        .find(|(candidate, _)| candidate == key)
+        .expect("key taken from the same list")
+}
 fn slot_lighting(
-    slots: &[Option<String>],
-    by_id: &HashMap<&str, &AgentInfo>,
+    slots: &[Option<SlotKey>],
+    by_id: &HashMap<&SlotKey, &Agent>,
     config: &LightingConfig,
 ) -> [Light; SLOT_COUNT] {
     std::array::from_fn(|index| {
         slots
             .get(index)
             .and_then(Option::as_ref)
-            .and_then(|id| by_id.get(id.as_str()))
+            .and_then(|key| by_id.get(key))
             .map(|a| {
                 let mut l = config.light(status(a));
                 if a.focused {
@@ -89,17 +106,19 @@ fn slot_lighting(
     })
 }
 pub fn lighting(
-    slots: &[Option<String>],
-    agents: &[AgentInfo],
+    slots: &[Option<SlotKey>],
+    agents: &[(SlotKey, Agent)],
     config: &LightingConfig,
 ) -> Lighting {
-    let by_id: HashMap<_, _> = agents.iter().map(|a| (a.terminal_id.as_str(), a)).collect();
+    let by_id: HashMap<_, _> = agents.iter().map(|(key, agent)| (key, agent)).collect();
     let best = slots
         .iter()
         .flatten()
-        .filter_map(|id| by_id.get(id.as_str()))
-        .min_by(|a, b| attention_order(("", a), ("", b)));
-    let light = best.map(|a| config.light(status(a))).unwrap_or_default();
+        .filter_map(|key| by_id.get(key).map(|agent| (key, *agent)))
+        .min_by(|a, b| attention_order((&a.0.0, a.1), (&b.0.0, b.1)));
+    let light = best
+        .map(|(_, a)| config.light(status(a)))
+        .unwrap_or_default();
     Lighting {
         ambient: if config.ambient {
             light
@@ -155,12 +174,16 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use serde_json::json;
-    fn agent(id: &str, status: &str, focused: bool) -> AgentInfo {
-        serde_json::from_value(json!({
-            "terminal_id":id, "agent_status":status, "workspace_id":"w1",
-            "tab_id":"w1:t1", "pane_id":"w1:p1", "focused":focused, "revision":1
+    fn agent(id: &str, status: &str, focused: bool) -> (SlotKey, Agent) {
+        let agent = serde_json::from_value(json!({
+            "agent_status":status, "workspace_id":"w1", "tab_id":"w1:t1", "pane_id":id,
+            "focused":focused, "state_change_seq":1, "state_labels":[], "tokens":[]
         }))
-        .unwrap()
+        .unwrap();
+        (("local".into(), id.into()), agent)
+    }
+    fn key(id: &str) -> Option<SlotKey> {
+        Some(("local".into(), id.into()))
     }
     #[test]
     fn sticky_slots_lighting_and_joystick() {
@@ -169,7 +192,7 @@ mod tests {
             agent("working", "working", false),
         ];
         let slots = assign_slots(&[], &agents);
-        assert_eq!(slots[..2], [Some("working".into()), Some("idle".into())]);
+        assert_eq!(slots[..2], [key("working"), key("idle")]);
         assert_eq!(
             joystick_event(0.25, 0.9, Some(0), 0.75, 0.3).direction,
             Some(Direction::Down)

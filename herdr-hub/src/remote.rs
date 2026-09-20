@@ -651,7 +651,7 @@ impl Connection<'_> {
             ServerMessage::ReplyError { id, error } => self.finish_call(id, Err(error)),
             ServerMessage::Error { error } => bail!(error),
             ServerMessage::Hello { .. } => bail!("relay sent a second Hello"),
-            ServerMessage::Host { .. } | ServerMessage::Active { .. } => Ok(()),
+            ServerMessage::Host { .. } => Ok(()),
         }
     }
 
@@ -754,7 +754,6 @@ fn rewrite_session(host: &str, mut session: SessionState) -> Option<(String, Ses
     session.host = host.into();
     session.key = format!("{host}/{name}");
     session.socket_path = None;
-    session.client_focused = None;
     Some((remote_key, session))
 }
 
@@ -1036,7 +1035,6 @@ mod tests {
             tabs: Vec::new(),
             agents: Vec::new(),
             socket_path: Some("/tmp/herdr.sock".into()),
-            client_focused: Some(true),
         }
     }
 
@@ -1178,13 +1176,12 @@ mod tests {
     }
 
     #[test]
-    fn session_rewrite_is_strict_and_clears_remote_focus() {
+    fn session_rewrite_is_strict_and_removes_remote_socket() {
         let (_, rewritten) =
             rewrite_session("workbox", session("local/default", "local", "default")).unwrap();
         assert_eq!(rewritten.key, "workbox/default");
         assert_eq!(rewritten.host, "workbox");
         assert_eq!(rewritten.socket_path, None);
-        assert_eq!(rewritten.client_focused, None);
 
         assert!(rewrite_session("workbox", session("other/default", "other", "default")).is_none());
         assert!(rewrite_session("workbox", session("local/wrong", "local", "default")).is_none());
@@ -1246,7 +1243,7 @@ mod tests {
             protocol: PROTOCOL,
             model: Model {
                 version: 4,
-                active: Some("local/default".into()),
+
                 hosts: vec![HostState {
                     key: "local".into(),
                     connected: true,
@@ -1275,7 +1272,7 @@ mod tests {
             result: json!({"focused": true}),
         };
         let source = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\nprintf '%s\\n' '{}'\nIFS= read -r call\nprintf '%s\\n' \"$call\" > '{}'\nprintf '%s\\n' '{}'\nprintf '%s\\n' '{}'\nprintf '%s\\n' '{{\"type\":\"active\",\"version\":8,\"key\":null}}'\nprintf '%s\\n' '{}'\nprintf '%s\\n' '{}'\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\nprintf '%s\\n' '{}'\nIFS= read -r call\nprintf '%s\\n' \"$call\" > '{}'\nprintf '%s\\n' '{}'\nprintf '%s\\n' '{}'\nprintf '%s\\n' '{{\"type\":\"host\",\"version\":8,\"host\":{{\"key\":\"local\",\"connected\":true,\"error\":null}}}}'\nprintf '%s\\n' '{}'\nprintf '%s\\n' '{}'\n",
             args_path.display(),
             serde_json::to_string(&hello).unwrap(),
             call_path.display(),
@@ -1303,7 +1300,6 @@ mod tests {
                 assert_eq!(sessions.len(), 1);
                 assert_eq!(sessions[0].key, "workbox/default");
                 assert_eq!(sessions[0].socket_path, None);
-                assert_eq!(sessions[0].client_focused, None);
             }
             other => panic!("expected Connected, got {other:?}"),
         }
@@ -1377,7 +1373,7 @@ mod tests {
             protocol: PROTOCOL,
             model: Model {
                 version: 1,
-                active: None,
+
                 hosts: Vec::new(),
                 sessions: vec![session("local/default", "local", "default")],
             },
@@ -1430,7 +1426,7 @@ mod tests {
                 protocol: PROTOCOL,
                 model: Model {
                     version: 1,
-                    active: None,
+
                     hosts: Vec::new(),
                     sessions: vec![session("local/default", "local", "default")],
                 },
@@ -1480,7 +1476,7 @@ mod tests {
             protocol: PROTOCOL,
             model: Model {
                 version: 1,
-                active: None,
+
                 hosts: Vec::new(),
                 sessions: vec![session("local/default", "local", "default")],
             },
@@ -1539,7 +1535,7 @@ mod tests {
             protocol: PROTOCOL,
             model: Model {
                 version: 1,
-                active: None,
+
                 hosts: Vec::new(),
                 sessions: vec![session("local/default", "local", "default")],
             },
@@ -1593,7 +1589,7 @@ mod tests {
             protocol: PROTOCOL,
             model: Model {
                 version: 1,
-                active: None,
+
                 hosts: Vec::new(),
                 sessions: vec![session("local/default", "local", "default")],
             },
@@ -1709,7 +1705,7 @@ mod tests {
             protocol: PROTOCOL,
             model: Model {
                 version: 1,
-                active: None,
+
                 hosts: Vec::new(),
                 sessions: vec![session("local/default", "local", "default")],
             },
@@ -1729,7 +1725,7 @@ mod tests {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' '{}'\nIFS= read -r first\nprintf '%s\\n' '{}'\ni=0\nwhile [ \"$i\" -lt 10000 ]; do\n  printf '%s\\n' '{{\"type\":\"active\",\"version\":3,\"key\":null}}'\n  i=$((i + 1))\ndone\nIFS= read -r second\nprintf '%s\\n' '{}'\nprintf '%s\\n' '{}'\n",
+                "#!/bin/sh\nprintf '%s\\n' '{}'\nIFS= read -r first\nprintf '%s\\n' '{}'\ni=0\nwhile [ \"$i\" -lt 10000 ]; do\n  printf '%s\\n' '{{\"type\":\"host\",\"version\":3,\"host\":{{\"key\":\"local\",\"connected\":true,\"error\":null}}}}'\n  i=$((i + 1))\ndone\nIFS= read -r second\nprintf '%s\\n' '{}'\nprintf '%s\\n' '{}'\n",
                 serde_json::to_string(&hello).unwrap(),
                 serde_json::to_string(&marker).unwrap(),
                 serde_json::to_string(&reply_one).unwrap(),
