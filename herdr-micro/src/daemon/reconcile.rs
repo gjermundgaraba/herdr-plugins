@@ -3,7 +3,7 @@
 
 use crate::frontends::{ClientState, Model};
 use codex_micro::{ExternalOwner, external_owner, service::ServiceStatus};
-use herdr_client::frontend::Agent;
+use herdr_frontend::Agent;
 use serde_json::{Value, json};
 use std::sync::{
     Arc, Mutex,
@@ -290,7 +290,7 @@ pub(super) fn apply_config_load(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use herdr_client::frontend::Snapshot;
+    use herdr_frontend::Snapshot;
     fn client(id: &str, focused: Option<bool>) -> ClientState {
         ClientState { socket_path: format!("/tmp/{id}.sock").into(), snapshot: serde_json::from_value::<Snapshot>(json!({
             "client_id":id,"pid":1,"revision":1,"focused":focused,"input_ready":true,"active_endpoint_id":"a","input_target":null,

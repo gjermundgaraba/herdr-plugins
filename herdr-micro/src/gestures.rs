@@ -7,7 +7,7 @@ use std::{
 #[derive(Clone, Debug, PartialEq)]
 pub struct GestureContext {
     pub route: crate::frontends::ClientRoute,
-    pub target: Option<herdr_client::frontend::Agent>,
+    pub target: Option<herdr_frontend::Agent>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -4,7 +4,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use codex_micro::DeviceEvent;
 use herdr_client::AgentStatus;
-use herdr_client::frontend::{Agent, Input, NavigationTarget};
+use herdr_frontend::{Agent, Input, NavigationTarget};
 use std::{
     path::Path,
     process::Command,

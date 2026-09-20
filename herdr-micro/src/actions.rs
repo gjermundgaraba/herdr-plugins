@@ -1,5 +1,5 @@
 use anyhow::Result;
-use herdr_client::frontend::{Agent, Input};
+use herdr_frontend::{Agent, Input};
 use serde_json::{Value, json};
 
 pub const HERDR_LAYER: usize = 2;

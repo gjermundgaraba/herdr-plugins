@@ -1,7 +1,7 @@
 use crate::config::{AgentStatus, Direction, Light, LightingConfig};
 use codex_micro::service::Lighting;
-use herdr_client::attention::{attention_order, attention_rank};
-use herdr_client::frontend::Agent;
+use herdr_frontend::Agent;
+use herdr_frontend::{attention_order, attention_rank};
 use std::collections::{HashMap, HashSet};
 
 pub const SLOT_COUNT: usize = 6;

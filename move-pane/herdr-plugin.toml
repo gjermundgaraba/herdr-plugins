@@ -1,0 +1,32 @@
+id = "gjermundgaraba.herdr-move-pane"
+name = "Move Pane"
+version = "0.1.0"
+min_herdr_version = "0.9.1"
+description = "Move the focused pane into a new tab, or pick a tab when the workspace has several"
+platforms = ["macos", "linux"]
+
+[[build]]
+command = ["cargo", "build", "--release", "--locked", "-p", "herdr-move-pane"]
+
+[[build]]
+command = ["mkdir", "-p", "bin"]
+
+[[build]]
+command = ["install", "-m", "750", "../target/release/herdr-move-pane", "bin/.herdr-move-pane.new"]
+
+[[build]]
+command = ["mv", "-f", "bin/.herdr-move-pane.new", "bin/herdr-move-pane"]
+
+[[actions]]
+id = "move"
+title = "Move pane to tab"
+description = "Move the focused pane into a new tab, or pick a tab when the workspace has several"
+contexts = ["pane"]
+command = ["bin/herdr-move-pane"]
+
+[[panes]]
+id = "pick"
+title = "Move pane"
+platforms = ["macos", "linux"]
+placement = "popup"
+command = ["bin/herdr-move-pane", "pick"]

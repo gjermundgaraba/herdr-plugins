@@ -4,11 +4,8 @@
 //! Herdr's internal Rust types. Unknown JSON fields are ignored and raw calls
 //! remain available so a newer Herdr method does not require a client release.
 
-pub mod attention;
 mod client;
 mod env;
-#[cfg(unix)]
-pub mod frontend;
 pub mod hash;
 pub mod ndjson;
 mod types;

@@ -1,5 +1,5 @@
 //! Direct TUI discovery. Quiet subscriptions stay live until EOF; no heartbeat.
-use herdr_client::frontend::{self, FrontendClient, Route, Snapshot};
+use herdr_frontend::{self as frontend, FrontendClient, Route, Snapshot};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,

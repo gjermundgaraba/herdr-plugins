@@ -1,8 +1,0 @@
-title = "Move pane"
-submit = ["herdr-picker-move-pane.py", "submit"]
-
-[[steps]]
-id = "destination"
-title = "Choose destination"
-source = ["herdr-picker-move-pane.py", "source"]
-search = "local"

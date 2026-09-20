@@ -354,7 +354,7 @@ mod tests {
         let event = |active: &str| {
             RuntimeEvent::Frontends(Box::new(vec![ClientState {
                 socket_path: "/tmp/test.sock".into(),
-                snapshot: herdr_client::frontend::Snapshot {
+                snapshot: herdr_frontend::Snapshot {
                     client_id: active.into(),
                     revision: 1,
                     focused: Some(true),

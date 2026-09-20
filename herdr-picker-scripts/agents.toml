@@ -1,8 +1,0 @@
-title = "Agents"
-submit = ["herdr-picker-focus-agent.py"]
-
-[[steps]]
-id = "agent"
-title = "Choose agent"
-source = ["herdr-picker-agents.py"]
-search = "local"

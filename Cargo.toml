@@ -2,14 +2,13 @@
 resolver = "3"
 members = [
     "herdr-hub",
-    "herdr-picker",
+    "move-pane",
     "equalize-splits",
     "fork-to-pane",
     "herdr-micro",
     "codex-micro",
     "space-meta",
     "sdk/hub",
-    "sdk/ratatui",
     "sdk/rust",
 ]
 
@@ -22,12 +21,11 @@ repository = "https://github.com/gjermundgaraba/herdr-plugins"
 [workspace.dependencies]
 anyhow = "1.0.104"
 herdr-client = { path = "sdk/rust" }
+herdr-frontend = { git = "https://github.com/gjermundgaraba/herdr", branch = "custom-v3" }
 herdr-hub-client = { path = "sdk/hub" }
-herdr-ratatui = { path = "sdk/ratatui" }
 libc = "0.2.189"
 objc2-core-foundation = { version = "0.3.2", default-features = false }
 ratatui = { version = "0.30.2", default-features = false }
-ratatui-core = "0.1.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tempfile = "3.27.0"

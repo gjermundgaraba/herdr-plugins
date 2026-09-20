@@ -59,14 +59,11 @@
           alsoBin = true;
         };
 
-        herdr-picker = {
+        move-pane = {
           sourceRoots = [
-            "herdr-picker"
-            "sdk/hub"
-            "sdk/ratatui"
+            "move-pane"
             "sdk/rust"
           ];
-          binOnly = true;
         };
 
         equalize-splits = {
@@ -96,7 +93,6 @@
       };
 
       # Plugin manifests declare "macos"/"linux"; Nix says "darwin"/"linux".
-      # Crates without a manifest are plain CLI tools that build everywhere.
       platformsFor =
         name:
         let
@@ -178,28 +174,23 @@
               cargoReleaseDir = "target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release";
               installBinaries = lib.concatMapStringsSep "\n" (
                 binary:
-                if definition.binOnly or false then
-                  ''install -Dm755 "${cargoReleaseDir}/${binary}" "$out/bin/${binary}"''
-                else
-                  ''
-                    install -Dm755 "${cargoReleaseDir}/${binary}" "$out/${name}/bin/${binary}"
-                    ${lib.optionalString (definition.alsoBin or false) ''
-                      mkdir -p "$out/bin"
-                      ln -s "../${name}/bin/${binary}" "$out/bin/${binary}"
-                    ''}
-                  ''
+                ''
+                  install -Dm755 "${cargoReleaseDir}/${binary}" "$out/${name}/bin/${binary}"
+                  ${lib.optionalString (definition.alsoBin or false) ''
+                    mkdir -p "$out/bin"
+                    ln -s "../${name}/bin/${binary}" "$out/bin/${binary}"
+                  ''}
+                ''
               ) (binariesFor name crate);
-              installExampleFiles = lib.concatMapStringsSep "\n" (
-                file:
-                ''install -Dm444 "${name}/examples/${file}" "$out/share/herdr-picker/examples/${file}"''
-              ) (definition.exampleFiles or [ ]);
             in
             rustPlatform.buildRustPackage {
-              pname = if definition.binOnly or false then name else "herdr-plugin-${name}";
+              pname = "herdr-plugin-${name}";
               inherit (crate.package) version;
               src = pluginSource;
 
               cargoLock.lockFile = ./Cargo.lock;
+              # herdr-frontend is a git dependency on the Herdr fork.
+              cargoLock.allowBuiltinFetchGit = true;
               cargoBuildFlags = [
                 "--package"
                 crate.package.name
@@ -213,29 +204,22 @@
               installPhase = ''
                 runHook preInstall
 
-                ${lib.optionalString (!(definition.binOnly or false)) ''
-                  install -Dm444 "${name}/herdr-plugin.toml" "$out/${name}/herdr-plugin.toml"
-                ''}
+                install -Dm444 "${name}/herdr-plugin.toml" "$out/${name}/herdr-plugin.toml"
                 ${lib.optionalString (name == "fork-to-pane") ''
                   install -Dm444 "${name}/amp-plugin.ts" "$out/${name}/amp-plugin.ts"
                 ''}
                 ${installBinaries}
-                ${installExampleFiles}
 
                 runHook postInstall
               '';
 
               passthru = {
                 localPathDependencyClosure = definition.sourceRoots;
-              } // lib.optionalAttrs (!(definition.binOnly or false)) {
                 pluginRoot = linkPath;
               };
 
               meta = {
-                description =
-                  if definition.binOnly or false
-                  then crate.package.description
-                  else "Prebuilt ${name} plugin for Herdr";
+                description = "Prebuilt ${name} plugin for Herdr";
                 homepage = "https://github.com/gjermundgaraba/herdr-plugins/tree/main/${name}";
                 license = lib.licenses.asl20;
                 platforms =

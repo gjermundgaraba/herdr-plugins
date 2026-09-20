@@ -12,6 +12,7 @@ repository.workspace = true
 anyhow.workspace = true
 codex-micro = { path = "../codex-micro" }
 herdr-client.workspace = true
+herdr-frontend.workspace = true
 libc.workspace = true
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["CGEvent", "CGEventTypes", "CGRemoteOperation"] }
 serde.workspace = true

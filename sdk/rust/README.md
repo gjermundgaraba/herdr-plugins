@@ -67,33 +67,9 @@ must tolerate replayed events and refresh state after reconnecting.
 Validated against the [Herdr fork build](../../README.md#herdr-build)
 (0.9.1, socket protocol 22).
 
-## Local frontend protocol 7 (Unix)
+## Frontend socket
 
-`frontend::FrontendClient` connects directly to one TUI's socket, independently
-of the runtime `Client`. `from_env()` reads `HERDR_FRONTEND_SOCKET`;
-`connect(path)` takes an explicit socket. `discover(&directory())` lists the
-owner-only sockets in the TUI socket directory; a socket whose TUI has exited
-refuses connections. Older protocols are rejected at the hello; there is no
-fallback.
-
-The methods are `snapshot`, `subscribe`, `select`, `input`, and `call`.
-`Subscription::next_snapshot(timeout)` delivers pushed snapshots; the timeout
-only lets the caller check for cancellation and does not expire a quiet TUI.
-EOF ends the subscription.
-
-`Snapshot::route(endpoint_id)` yields a `Route` of endpoint ID and server boot
-ID for an available endpoint. `select` and `call` take a route; the TUI
-rejects a route whose boot no longer matches with `stale_route` rather than
-acting on a reused pane id. `call` runs any method the endpoint advertises on
-its client command lane, with the runtime API's parameter shape, and requires
-the endpoint to already be active. `Input::Text` and `Input::Keys` carry no
-route: they follow the TUI's own focus and overlays.
-
-`select` returns the focus call's result on the active endpoint, or `{"ok":true}`
-once another endpoint is observed focused. Any `Ok` means the target is focused.
-`cancelled`, `timeout`, transport timeouts, malformed replies, and EOF mean the
-mutation outcome is unknown; nothing is retried automatically.
-
-Pickers are ordinary plugin-owned terminal applications, hosted through a
-`local_terminal` keybinding on the TUI host. There are no picker wire types,
-requests, events, or presentation capabilities in this SDK.
+The per-TUI frontend socket (protocol 7) is a fork feature, and its Rust
+client lives with the fork as the `herdr-frontend` crate under `sdk/frontend`
+in [gjermundgaraba/herdr](https://github.com/gjermundgaraba/herdr). This crate
+has no fork-specific code.

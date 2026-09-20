@@ -9,26 +9,22 @@ These plugins target the
 `custom-v3` branch, currently based on upstream 0.9.1. The fork adds the
 per-TUI frontend socket (protocol 7), the `agent.prompt` client command lane
 method, and the client-side `[keys]` actions the pickers replaced. Stock
-`herdrdev/herdr` has none of these, so Micro and the SDK's `frontend` module
-do not work against it. Protocol 7 is lockstep: rebuild and reinstall the
-plugins whenever the fork changes it. The fork documents the socket and the
-actions in `docs/next/website/src/content/docs/frontend-api.md`.
+`herdrdev/herdr` has none of these, so Micro does not work against it. The
+socket's Rust client is the `herdr-frontend` crate under `sdk/frontend` in the
+fork; Micro depends on it as a git dependency, so `Cargo.lock` pins the exact
+fork commit the plugins were built against and `cargo update -p herdr-frontend`
+is how the plugins follow the fork. Everything else here runs on stock Herdr.
+The fork documents the socket and the actions in
+`docs/next/website/src/content/docs/frontend-api.md`.
 
 | Package | Description |
 | --- | --- |
 | [herdr-hub](herdr-hub) | Runtime session/host inventory and relay |
-| [herdr-picker](herdr-picker) | Standalone declarative fuzzy picker and workflow runner |
-| [herdr-picker-scripts](herdr-picker-scripts) | One-shot agent and workspace provider examples in Python |
 | [equalize-splits](equalize-splits) | Automatically equalize pane sizes after splitting |
 | [fork-to-pane](fork-to-pane) | Fork Pi, Codex, Claude Code, or OpenCode into a new pane; branch Amp with a thread reference |
+| [move-pane](move-pane) | Move the focused pane to another tab or a new tab from one keybinding |
 | [space-meta](space-meta) | Space numbers and PR badges in the spaces sidebar |
 | [herdr-micro](herdr-micro) | Control Herdr from a Work Louder Codex Micro |
-
-Install the standalone picker on `PATH`:
-
-```sh
-nix profile install github:gjermundgaraba/herdr-plugins#herdr-picker
-```
 
 Install plugins as needed (Micro does not depend on Hub):
 
@@ -37,6 +33,7 @@ herdr plugin install gjermundgaraba/herdr-plugins/equalize-splits
 herdr plugin install gjermundgaraba/herdr-plugins/fork-to-pane
 herdr plugin install gjermundgaraba/herdr-plugins/herdr-hub
 herdr plugin install gjermundgaraba/herdr-plugins/herdr-micro
+herdr plugin install gjermundgaraba/herdr-plugins/move-pane
 herdr plugin install gjermundgaraba/herdr-plugins/space-meta
 ```
 
@@ -45,15 +42,16 @@ Herdr Micro connects directly to per-TUI frontend sockets. See [Micro installati
 For local development:
 
 Build each plugin using its README before linking it. `herdr plugin link` only
-registers the working tree; it does not run manifest `[[build]]` commands. The
-picker runs directly from `PATH`. Each plugin runs its installed copy under
-its own `bin/`; Cargo `target/` is only needed while building and staging.
+registers the working tree; it does not run manifest `[[build]]` commands.
+Each plugin runs its installed copy under its own `bin/`; Cargo `target/` is
+only needed while building and staging.
 Hub and Micro also require the staging and
 service steps in their package READMEs.
 
 ```sh
 herdr plugin link "$PWD/equalize-splits"
 herdr plugin link "$PWD/fork-to-pane"
+herdr plugin link "$PWD/move-pane"
 herdr plugin link "$PWD/space-meta"
 ```
 
@@ -70,12 +68,12 @@ The flake builds each plugin independently with the Rust version in
 `rust-toolchain.toml` and the committed `Cargo.lock`:
 
 ```sh
-nix build .#herdr-picker
-result/bin/herdr-picker --version
+nix build .#herdr-hub
+result/bin/herdr-hub --version
 ```
 
-The hub output is both a linkable plugin root and a CLI package; follow the
-[Hub setup](herdr-hub/README.md#setup) to install and start it.
+Every output is a linkable plugin root; the hub output is also a CLI package.
+Follow the [Hub setup](herdr-hub/README.md#setup) to install and start it.
 
 The agent list, Back/Forward history, and the unread hold are native to the
 custom Herdr build as `[keys]` actions; see its configuration docs. Micro
@@ -85,53 +83,24 @@ server boot ID whose pane ids they use. Input uses the ordinary TUI dispatcher,
 including overlays. See the
 [Micro bridge](herdr-micro/docs/micro-bridge.md) for routing and script behavior.
 
-Other Nix packages include `herdr-hub`, `equalize-splits`, `fork-to-pane`, and
-`space-meta`.
-`herdr-micro` has no Nix package: its service binary must be locally codesigned.
+The other Nix packages are `equalize-splits`, `fork-to-pane`, `move-pane`, and
+`space-meta`. `herdr-micro` has no Nix package: its service binary must be
+locally codesigned.
 
-For Home Manager, add the picker package to the profile:
-
-```nix
-inputs.herdr-plugins.url = "github:gjermundgaraba/herdr-plugins";
-```
-
-Then pass the flake inputs to this Home Manager module:
-
-```nix
-{ inputs, pkgs, ... }:
-{
-  home.packages = [
-    inputs.herdr-plugins.packages.${pkgs.stdenv.hostPlatform.system}.herdr-picker
-  ];
-}
-```
-
-That exposes `herdr-picker` on `PATH`; no plugin registration is needed for
-direct popup keybindings. Nix reuses an unchanged package from the local store
-on later activations, so there is no activation-time Rust compilation and no
-binary cache is required.
-
-Each package's filtered source contains its full local path-dependency closure.
-The generic picker uses `sdk/hub`; popup chrome
-lives in `sdk/ratatui`; plugin-environment clients use `sdk/rust`.
-Consequently, editing one plugin does not invalidate unrelated plugin outputs,
-while edits to a shared SDK invalidate packages that include it.
+Each package's filtered source contains its full local path-dependency closure,
+so editing one plugin does not invalidate unrelated plugin outputs, while edits
+to a shared SDK invalidate packages that include it.
 
 Enter the repository development shell with the same pinned Rust toolchain using
 `nix develop`.
 
 ## Plugin SDK and files
 
-[`sdk/ratatui`](sdk/ratatui) provides shared search chrome, key hints,
-and colors for Rust popup integrations, including external consumers such as
-ClankerSnip. It intentionally does not own application state or event loops.
-
 [`sdk/hub`](sdk/hub) provides the versioned hub protocol, streaming model
 client, and action calls.
 
 The reusable client under [`sdk/rust`](sdk/rust) also validates Herdr's plugin
-environment, supplies the frontend socket client (`frontend::FrontendClient`),
-shared agent attention ordering, and the repository file layout:
+environment and the repository file layout:
 
 ```text
 HERDR_PLUGIN_CONFIG_DIR/   user-edited configuration

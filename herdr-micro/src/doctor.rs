@@ -5,7 +5,7 @@ use codex_micro::{
     InputMonitoringAccess,
     service::{Client as DeviceClient, ServiceStatus},
 };
-use herdr_client::frontend::{self, FrontendClient};
+use herdr_frontend::{self as frontend, FrontendClient};
 use std::{
     env, fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Command, sync::mpsc,
     time::Duration,

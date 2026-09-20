@@ -333,6 +333,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "herdr-frontend"
+version = "0.1.0"
+source = "git+https://github.com/gjermundgaraba/herdr?branch=custom-v3#1425af4033ce8d662f536643c05d096c8e5628d6"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "herdr-hub"
 version = "0.3.0"
 dependencies = [
@@ -366,6 +376,7 @@ dependencies = [
  "anyhow",
  "codex-micro",
  "herdr-client",
+ "herdr-frontend",
  "libc",
  "objc2-core-graphics",
  "serde",
@@ -375,28 +386,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "herdr-picker"
+name = "herdr-move-pane"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "crossterm",
  "herdr-client",
- "herdr-ratatui",
- "libc",
- "nucleo-matcher",
  "ratatui",
- "serde",
  "serde_json",
- "toml",
- "unicode-truncate",
- "unicode-width",
-]
-
-[[package]]
-name = "herdr-ratatui"
-version = "0.1.0"
-dependencies = [
- "ratatui-core",
 ]
 
 [[package]]
@@ -549,16 +546,6 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys",
-]
-
-[[package]]
-name = "nucleo-matcher"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf33f538733d1a5a3494b836ba913207f14d9d4a1d3cd67030c5061bdd2cac85"
-dependencies = [
- "memchr",
- "unicode-segmentation",
 ]
 
 [[package]]

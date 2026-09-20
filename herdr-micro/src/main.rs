@@ -142,7 +142,7 @@ fn setup_micro() -> Result<ExitCode> {
 
 /// Script-facing input into the TUI named by `HERDR_FRONTEND_SOCKET`.
 fn client(args: &[OsString]) -> Result<ExitCode> {
-    use herdr_client::frontend::{FrontendClient, Input};
+    use herdr_frontend::{FrontendClient, Input};
     let args: Vec<&str> = args
         .iter()
         .map(|arg| arg.to_str().context("client arguments must be UTF-8"))

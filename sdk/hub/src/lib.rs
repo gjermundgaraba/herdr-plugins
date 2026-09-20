@@ -5,7 +5,6 @@ mod client;
 
 #[cfg(unix)]
 pub use client::{Error, HubClient, Result, Stream};
-pub use herdr_client::attention::{attention_order, attention_rank};
 pub use herdr_client::{AgentInfo, AgentStatus, TabInfo, WorkspaceInfo};
 pub use protocol::{ClientMessage, HostState, Model, PROTOCOL, ServerMessage, SessionState};
 
