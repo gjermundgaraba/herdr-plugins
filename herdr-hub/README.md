@@ -5,6 +5,9 @@ workspaces, tabs, and agents. It pushes changes and routes session API calls ove
 a private per-user socket. It has no TUI client model or focus selection.
 Micro and local tools use each TUI's frontend socket directly.
 
+Requires stock Herdr >= 0.9.0; the fork build is not needed. The
+`install-service` LaunchAgent is macOS-only.
+
 ## Setup
 
 ```sh

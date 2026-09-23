@@ -34,7 +34,7 @@ cache so background pane exits equalize the affected tab. Cache and locking are
 isolated by Herdr socket, and each server startup replaces the session-local
 pane map. The `pane.moved` trigger refreshes this cache; it does not resize the
 destination tab. Runtime state lives under `HERDR_PLUGIN_STATE_DIR`. Requires
-Herdr >= 0.8.0. Installing from GitHub requires `cargo` to build the binary.
+stock Herdr >= 0.8.0; the fork build is not needed. Installing from GitHub requires `cargo` to build the binary.
 
 ## Development
 

@@ -2,7 +2,7 @@ id = "gjermundgaraba.herdr-hub"
 name = "Herdr Hub"
 version = "0.3.0"
 min_herdr_version = "0.9.0"
-description = "Session and host inventory and relay for Herdr dashboards"
+description = "Background service that tracks local and remote Herdr sessions and agents and relays session API calls over a private socket. No UI of its own"
 platforms = ["macos", "linux"]
 
 [[build]]

@@ -9,6 +9,13 @@ Configured and physically verified here:
 
 The CLI enumerates every model `elgato-streamdeck` recognizes. The daemon manages only Plus and Pedal, the two devices whose rendering and input paths are tested here.
 
+## Requirements
+
+- macOS and a Stream Deck + (the Pedal is optional)
+- The [Herdr fork build](../README.md#herdr-build) with frontend socket
+  protocol 7; stock Herdr does not have the socket (Hub is not required)
+- `jpeg-turbo` (`brew install jpeg-turbo`) to build
+
 ## Safe takeover
 
 Do not uninstall Elgato first. Quit it, verify Herdr Deck, then disable its login item. Both programs need exclusive access to the HID devices.

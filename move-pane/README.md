@@ -10,7 +10,7 @@ the highlighted entry, `1`-`9` move it to that entry at once, and `Esc`, `q`,
 or `ctrl+c` cancel. Moving into an existing tab splits to the right of its
 focused pane and follows the pane.
 
-Requires Herdr >= 0.8.0.
+Requires stock Herdr >= 0.8.0; the fork build is not needed.
 
 ## Install
 

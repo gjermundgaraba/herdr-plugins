@@ -2,9 +2,23 @@
 
 Independent plugins and tools for [Herdr](https://herdr.dev/).
 
+Most of these run on stock Herdr. Only [herdr-micro](herdr-micro) and
+[herdr-deck](herdr-deck) need the [Herdr fork build](#herdr-build); the
+**Requires** column below says which is which.
+
+| Package | Description | Requires |
+| --- | --- | --- |
+| [equalize-splits](equalize-splits) | Automatically equalize pane sizes after splits and closes | Stock Herdr >= 0.8.0 |
+| [fork-to-pane](fork-to-pane) | Fork Pi, Codex, Claude Code, or OpenCode into a new pane; branch Amp with a thread reference | Stock Herdr >= 0.8.0 |
+| [move-pane](move-pane) | Move the focused pane to another tab or a new tab from one keybinding | Stock Herdr >= 0.8.0 |
+| [space-meta](space-meta) | Space numbers, branch names, git-dirty markers, and PR badges in the spaces sidebar (macOS) | Stock Herdr >= 0.8.0 |
+| [herdr-hub](herdr-hub) | Background inventory and relay for local and remote Herdr sessions | Stock Herdr >= 0.9.0 |
+| [herdr-micro](herdr-micro) | Control Herdr from a Work Louder Codex Micro (macOS) | [Fork build](#herdr-build) |
+| [herdr-deck](herdr-deck) | Stream Deck dashboard and controls for Herdr agents (macOS) | [Fork build](#herdr-build) |
+
 ## Herdr build
 
-These plugins target the
+Micro and Deck target the
 [gjermundgaraba/herdr](https://github.com/gjermundgaraba/herdr) fork on the
 `custom-v3` branch, currently based on upstream 0.9.1. The fork adds the
 per-TUI frontend socket (protocol 7), the `agent.prompt` client command lane
@@ -28,17 +42,10 @@ session/host inventory and relay. See the
 [Micro bridge](herdr-micro/docs/micro-bridge.md) for routing and script
 behavior.
 
-| Package | Description |
-| --- | --- |
-| [herdr-hub](herdr-hub) | Runtime session/host inventory and relay |
-| [equalize-splits](equalize-splits) | Automatically equalize pane sizes after splits and closes |
-| [fork-to-pane](fork-to-pane) | Fork Pi, Codex, Claude Code, or OpenCode into a new pane; branch Amp with a thread reference |
-| [move-pane](move-pane) | Move the focused pane to another tab or a new tab from one keybinding |
-| [space-meta](space-meta) | Space numbers and PR badges in the spaces sidebar |
-| [herdr-micro](herdr-micro) | Control Herdr from a Work Louder Codex Micro |
-| [herdr-deck](herdr-deck) | Stream Deck dashboard and controls for Herdr agents |
+## Install
 
-Install plugins as needed (Micro does not depend on Hub):
+Install plugins as needed (Micro does not depend on Hub). Each plugin is built
+from source when installed, so you need a Rust toolchain with cargo.
 
 ```sh
 herdr plugin install gjermundgaraba/herdr-plugins/equalize-splits

@@ -2,7 +2,7 @@ id = "gjermundgaraba.herdr-micro"
 name = "Herdr Micro"
 version = "0.2.0"
 min_herdr_version = "0.9.1"
-description = "Control Herdr from a Work Louder Codex Micro"
+description = "Shows Herdr agent state on a Work Louder Codex Micro keypad and sends its controls to the focused agent. Needs the keypad and the gjermundgaraba/herdr custom-v3 fork build; stock Herdr won't work"
 platforms = ["macos"]
 
 [[build]]

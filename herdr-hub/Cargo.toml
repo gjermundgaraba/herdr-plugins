@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "Shared agent-state hub for Herdr sessions"
+description = "Inventory and relay for local and remote Herdr sessions"
 repository.workspace = true
 
 [dependencies]
