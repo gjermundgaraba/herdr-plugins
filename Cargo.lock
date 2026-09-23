@@ -571,10 +571,11 @@ dependencies = [
 
 [[package]]
 name = "herdr-space-meta"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "herdr-client",
- "serde",
+ "libc",
+ "objc2-core-foundation",
  "serde_json",
  "tempfile",
 ]

@@ -1,9 +1,9 @@
 id = "gjermundgaraba.herdr-space-meta"
 name = "Space Meta"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.8.0"
-description = "Space numbers and PR badges in the spaces sidebar"
-platforms = ["macos", "linux"]
+description = "Adds space numbers, branch names, git-dirty markers, and PR badges to the spaces sidebar. Needs git; PR badges also need gh"
+platforms = ["macos"]
 
 [[build]]
 command = ["cargo", "build", "--release", "--locked", "-p", "herdr-space-meta"]
@@ -22,45 +22,5 @@ command = ["bin/herdr-space-meta"]
 
 [[actions]]
 id = "refresh"
-title = "Refresh space numbers and PR badges"
-command = ["bin/herdr-space-meta"]
-
-[[events]]
-on = "workspace.created"
-command = ["bin/herdr-space-meta"]
-
-[[events]]
-on = "workspace.updated"
-command = ["bin/herdr-space-meta"]
-
-[[events]]
-on = "workspace.renamed"
-command = ["bin/herdr-space-meta"]
-
-[[events]]
-on = "workspace.closed"
-command = ["bin/herdr-space-meta"]
-
-[[events]]
-on = "workspace.moved"
-command = ["bin/herdr-space-meta"]
-
-[[events]]
-on = "workspace.reordered"
-command = ["bin/herdr-space-meta"]
-
-[[events]]
-on = "workspace.focused"
-command = ["bin/herdr-space-meta"]
-
-[[events]]
-on = "worktree.created"
-command = ["bin/herdr-space-meta"]
-
-[[events]]
-on = "worktree.opened"
-command = ["bin/herdr-space-meta"]
-
-[[events]]
-on = "worktree.removed"
+title = "Restart the space-meta daemon and republish all tokens"
 command = ["bin/herdr-space-meta"]

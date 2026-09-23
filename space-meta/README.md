@@ -1,23 +1,42 @@
 # Space Meta
 
-Space numbers and PR badges in the Herdr spaces sidebar.
+Adds space numbers, branch names, git-dirty markers, and PR badges to the Herdr
+spaces sidebar through tokens you place in your config.
 
-Publishes two workspace metadata tokens:
+Publishes three workspace metadata tokens:
 
+- `$git_dirty`: amber Nerd Font pencil `` (U+F448) when `git status` reports
+  staged, unstaged, or untracked changes; absent when clean or not a repository
 - `$numbered_workspace`: `1 workspace-name`, using the space's stable
   expanded group order; grouped worktree children use `1 branch-name #123`
-  when a PR exists
+  when an open PR exists
 - `$branch_line`: an invisibly padded `branch` plus optional `#123`, aligned
   below the workspace label; the padding tracks the space number's digit count
 
-Refreshes on startup, workspace lifecycle events (created / updated / renamed /
-closed / moved / reordered / focused), worktree changes, and the `refresh`
-action. PR lookups are cached per checkout and current branch for 60 seconds,
-so switching between spaces does not hit the network each time.
+One daemon per Herdr session does all the work; its only periodic work is
+the PR refresh:
+
+- Workspace, worktree, tab, and pane lifecycle events arrive over the
+  socket's `events.subscribe`; a burst becomes one `session.snapshot` fetch.
+- Each space's repository root (and, for linked worktrees, the worktree's own
+  git directory) is watched with FSEvents, which batches activity for 0.75 s.
+  Each batch is answered with one `git status --porcelain=v2 --branch`, giving
+  the branch and dirty state together. The repository's own `status.*`
+  settings apply, so `status.showUntrackedFiles=no` is honoured. A linked
+  worktree's shared object store and refs are not watched; a main checkout's
+  `.git` lies inside its tree, so a fetch there costs one scan.
+- PR numbers come from `gh pr list --head <branch> --state open`, looked up
+  when a checkout's branch changes and refreshed every five minutes. An answer
+  for a branch no longer checked out is discarded; a failed lookup (offline,
+  rate-limited, no `gh`) keeps the previous badge until the next refresh.
+  Answers live in memory only.
+- Only changed tokens are reported, and a space's row is first reported once
+  its directory has been scanned, so a restart never flashes unscanned rows.
 
 ## Setup
 
 Requires `git`; PR badges additionally require the [GitHub CLI](https://cli.github.com/) (`gh`).
+macOS only (FSEvents).
 
 Add the tokens to your `~/.config/herdr/config.toml`:
 
@@ -25,7 +44,7 @@ Add the tokens to your `~/.config/herdr/config.toml`:
 [ui.sidebar.spaces]
 rows = [
   ["state_icon", { token = "$numbered_workspace", bold = true, dim = false }],
-  ["$branch_line", "git_status"],
+  ["$branch_line", { token = "$git_dirty", fg = "#e5c07b", dim = false }, "git_status"],
 ]
 ```
 
@@ -58,16 +77,21 @@ herdr plugin link "$PWD/space-meta"
 herdr plugin action invoke gjermundgaraba.herdr-space-meta.refresh
 ```
 
+The `refresh` action stops the running daemon, starts the installed
+executable, and republishes every token, so it doubles as the way to pick up
+a rebuild.
+
 ## Notes
 
 - Tokens are display-only metadata held in memory by Herdr: a server restart
-  clears them, and the plugin repopulates them on the next event or the
-  `refresh` action.
+  clears them, and the `startup` hook starts a fresh daemon that republishes.
 - Branch/PR metadata resolves from a workspace's worktree checkout path when
-  available; otherwise it falls back to the first snapshot pane in the
-  workspace's first tab. Branch switches refresh on the next registered event
-  for that workspace. Run the `refresh` action to refresh all workspace
-  branches; PR results remain cached for up to 60 seconds.
+  available; otherwise from the first snapshot pane in the workspace's first
+  tab, whichever directory of the repository that is. Herdr emits no event
+  when a pane changes directory, so that fallback is re-sampled only at
+  workspace, worktree, tab, and pane lifecycle events or `refresh`. A
+  directory that is not (or no longer) a repository is not watched; it is
+  re-checked at those same events, so a `git init` shows up at the next one.
 - Herdr's plugin snapshot does not expose desktop worktree-group collapse
   state, so numbering remains in stable expanded order while a group is
   collapsed.
@@ -76,3 +100,11 @@ herdr plugin action invoke gjermundgaraba.herdr-space-meta.refresh
   `worktree/` removed), even when Herdr's built-in row uses a custom name.
 - Keep `$numbered_workspace` in the inline style table shown above so the
   composite number/name remains bold; write `$branch_line` as a bare token.
+
+## Daemon lifecycle
+
+The `startup` hook and the `refresh` action both start the daemon; a lock
+file in the plugin's run directory keeps one per session socket and records
+its pid. The daemon exits on its own when the session socket closes. If it dies for any other reason, badges stay
+as last published until `refresh` or a server restart; errors are appended to
+`logs/space-meta.log` under the plugin state directory.
