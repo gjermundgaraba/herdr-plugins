@@ -9,6 +9,7 @@ members = [
     "herdr-micro",
     "codex-micro",
     "space-meta",
+    "space-groups",
     "sdk/hub",
     "sdk/rust",
 ]

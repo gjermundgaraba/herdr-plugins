@@ -87,6 +87,13 @@
           ];
         };
 
+        space-groups = {
+          sourceRoots = [
+            "space-groups"
+            "sdk/rust"
+          ];
+        };
+
         # herdr-micro is deliberately absent: its service binary must be
         # codesigned with a local Apple Development identity, which a pure Nix
         # build cannot do. Build it through the plugin manifest instead.

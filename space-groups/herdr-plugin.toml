@@ -1,0 +1,47 @@
+id = "gjermundgaraba.herdr-space-groups"
+name = "Space Groups"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Assign spaces to named groups shown under collapsible sidebar headers. Needs the Herdr fork build"
+platforms = ["macos", "linux"]
+
+[[build]]
+command = ["cargo", "build", "--release", "--locked", "-p", "herdr-space-groups"]
+
+[[build]]
+command = ["mkdir", "-p", "bin"]
+
+[[build]]
+command = ["install", "-m", "750", "../target/release/herdr-space-groups", "bin/.herdr-space-groups.new"]
+
+[[build]]
+command = ["mv", "-f", "bin/.herdr-space-groups.new", "bin/herdr-space-groups"]
+
+[[startup]]
+command = ["bin/herdr-space-groups"]
+
+[[events]]
+on = "workspace.closed"
+command = ["bin/herdr-space-groups"]
+
+[[events]]
+on = "workspace.moved"
+command = ["bin/herdr-space-groups"]
+
+[[events]]
+on = "workspace.reordered"
+command = ["bin/herdr-space-groups"]
+
+[[actions]]
+id = "assign"
+title = "Set space group"
+description = "Pick, create, or clear the group of the focused space"
+contexts = ["workspace"]
+command = ["bin/herdr-space-groups"]
+
+[[panes]]
+id = "pick"
+title = "Space group"
+platforms = ["macos", "linux"]
+placement = "popup"
+command = ["bin/herdr-space-groups"]

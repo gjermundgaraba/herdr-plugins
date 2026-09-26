@@ -570,6 +570,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "herdr-space-groups"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "herdr-client",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "herdr-space-meta"
 version = "0.2.0"
 dependencies = [

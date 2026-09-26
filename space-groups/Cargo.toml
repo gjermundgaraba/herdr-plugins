@@ -1,0 +1,20 @@
+[package]
+name = "herdr-space-groups"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Assign Herdr spaces to named sidebar groups and restore the groups across restarts"
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+crossterm = "0.29.0"
+herdr-client.workspace = true
+ratatui = { workspace = true, features = ["crossterm_0_29"] }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
