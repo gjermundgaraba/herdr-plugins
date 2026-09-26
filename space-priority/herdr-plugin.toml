@@ -1,0 +1,36 @@
+id = "gjermundgaraba.herdr-space-priority"
+name = "Space Priority"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Mark spaces as priority so their blocked and done agents sort first. Needs the Herdr fork build"
+platforms = ["macos", "linux"]
+
+[[build]]
+command = ["cargo", "build", "--release", "--locked", "-p", "herdr-space-priority"]
+
+[[build]]
+command = ["mkdir", "-p", "bin"]
+
+[[build]]
+command = ["install", "-m", "750", "../target/release/herdr-space-priority", "bin/.herdr-space-priority.new"]
+
+[[build]]
+command = ["mv", "-f", "bin/.herdr-space-priority.new", "bin/herdr-space-priority"]
+
+[[startup]]
+command = ["bin/herdr-space-priority"]
+
+[[events]]
+on = "workspace.created"
+command = ["bin/herdr-space-priority"]
+
+[[events]]
+on = "workspace.closed"
+command = ["bin/herdr-space-priority"]
+
+[[actions]]
+id = "toggle"
+title = "Toggle space priority"
+description = "Mark or unmark the focused space and its worktrees as priority"
+contexts = ["workspace"]
+command = ["bin/herdr-space-priority"]

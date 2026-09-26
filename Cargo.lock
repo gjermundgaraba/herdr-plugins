@@ -594,6 +594,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "herdr-space-priority"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "herdr-client",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "hidapi"
 version = "2.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

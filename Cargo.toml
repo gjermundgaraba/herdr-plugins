@@ -10,6 +10,7 @@ members = [
     "codex-micro",
     "space-meta",
     "space-groups",
+    "space-priority",
     "sdk/hub",
     "sdk/rust",
 ]

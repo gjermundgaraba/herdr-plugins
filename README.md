@@ -3,8 +3,8 @@
 Independent plugins and tools for [Herdr](https://herdr.dev/).
 
 Most of these run on stock Herdr. Only [herdr-micro](herdr-micro),
-[herdr-deck](herdr-deck), and [space-groups](space-groups) need the
-[Herdr fork build](#herdr-build); the
+[herdr-deck](herdr-deck), [space-groups](space-groups), and
+[space-priority](space-priority) need the [Herdr fork build](#herdr-build); the
 **Requires** column below says which is which.
 
 | Package | Description | Requires |
@@ -14,20 +14,22 @@ Most of these run on stock Herdr. Only [herdr-micro](herdr-micro),
 | [move-pane](move-pane) | Move the focused pane to another tab or a new tab from one keybinding | Stock Herdr >= 0.8.0 |
 | [space-meta](space-meta) | Space numbers, branch names, git-dirty markers, and PR badges in the spaces sidebar (macOS) | Stock Herdr >= 0.8.0 |
 | [space-groups](space-groups) | Named space groups under collapsible sidebar headers | [Fork build](#herdr-build) |
+| [space-priority](space-priority) | Priority spaces whose blocked and done agents sort first | [Fork build](#herdr-build) |
 | [herdr-hub](herdr-hub) | Background inventory and relay for local and remote Herdr sessions | Stock Herdr >= 0.9.0 |
 | [herdr-micro](herdr-micro) | Control Herdr from a Work Louder Codex Micro (macOS) | [Fork build](#herdr-build) |
 | [herdr-deck](herdr-deck) | Stream Deck dashboard and controls for Herdr agents (macOS) | [Fork build](#herdr-build) |
 
 ## Herdr build
 
-Micro, Deck, and space-groups target the
+Micro, Deck, space-groups, and space-priority target the
 [gjermundgaraba/herdr](https://github.com/gjermundgaraba/herdr) fork on the
 `custom-v3` branch, currently based on upstream 0.9.1. The fork adds the
 per-TUI frontend socket (protocol 7), the `agent.prompt` client command lane
-method, the client-side `[keys]` actions that replaced the picker plugins, and
-the sidebar space groups driven by the `space_group` workspace token. Stock
-`herdrdev/herdr` has none of these, so Micro, Deck, and space-groups do not work
-against it. Everything else here runs on stock Herdr.
+method, the client-side `[keys]` actions that replaced the picker plugins, the
+sidebar space groups driven by the `space_group` workspace token, and the
+priority agent order that reads the `space_priority` workspace token. Stock
+`herdrdev/herdr` has none of these, so Micro, Deck, space-groups, and
+space-priority do not work against it. Everything else here runs on stock Herdr.
 
 The socket's Rust client is the `herdr-frontend` crate under `sdk/frontend` in
 the fork. Micro and Deck pull it in as a git dependency, so `Cargo.lock` pins
@@ -57,6 +59,7 @@ herdr plugin install gjermundgaraba/herdr-plugins/herdr-micro
 herdr plugin install gjermundgaraba/herdr-plugins/move-pane
 herdr plugin install gjermundgaraba/herdr-plugins/space-meta
 herdr plugin install gjermundgaraba/herdr-plugins/space-groups
+herdr plugin install gjermundgaraba/herdr-plugins/space-priority
 ```
 
 Herdr Micro and Herdr Deck connect directly to per-TUI frontend sockets. Micro
@@ -77,6 +80,7 @@ herdr plugin link "$PWD/fork-to-pane"
 herdr plugin link "$PWD/move-pane"
 herdr plugin link "$PWD/space-meta"
 herdr plugin link "$PWD/space-groups"
+herdr plugin link "$PWD/space-priority"
 ```
 
 Use the [Hub local-development sequence](herdr-hub/README.md#local-development)
@@ -102,7 +106,7 @@ is also a CLI package.
 Follow the [Hub setup](herdr-hub/README.md#setup) to install and start it.
 
 The other Nix packages are `equalize-splits`, `fork-to-pane`, `move-pane`,
-`space-meta`, and `space-groups`. `herdr-micro` has no Nix
+`space-meta`, `space-groups`, and `space-priority`. `herdr-micro` has no Nix
 package because its service binary must be locally codesigned, and
 `herdr-deck` has none because it links system `jpeg-turbo` and HID libraries.
 
