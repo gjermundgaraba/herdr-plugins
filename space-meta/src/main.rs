@@ -18,8 +18,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use herdr_client::{
-    Client, Environment, Error, EventSubscription, SessionSnapshot, open_rotating_log,
-    socket_scope_dir,
+    Client, Environment, Error, EventSubscription, PluginInvocation, SessionSnapshot,
+    open_rotating_log, socket_scope_dir,
 };
 use serde_json::json;
 
@@ -93,7 +93,10 @@ fn run() -> Result<(), String> {
     if std::env::args().nth(1).as_deref() == Some("--daemon") {
         return daemon(&paths);
     }
-    if environment.action_id.as_deref() == Some("refresh") {
+    if matches!(
+        environment.invocation(),
+        Some(PluginInvocation::Startup | PluginInvocation::Action("refresh"))
+    ) {
         stop_daemon(&paths)?;
     }
     start_daemon(&paths)
@@ -122,8 +125,10 @@ fn daemon_stopped(lock: &File) -> Result<bool, String> {
     }
 }
 
-/// The `refresh` action restarts the daemon so a rebuilt executable takes
-/// over and every token is republished.
+/// The `refresh` action and the `startup` hook restart the daemon so a rebuilt
+/// executable takes over and every token is republished. At startup after a
+/// live handoff, the previous server's daemon can still hold the lock; it
+/// exits once that server drops its connection, so it is never trusted.
 fn stop_daemon(paths: &Paths) -> Result<(), String> {
     let lock = open_lock(&paths.lock)?;
     if daemon_stopped(&lock)? {

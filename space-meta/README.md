@@ -103,8 +103,11 @@ a rebuild.
 
 ## Daemon lifecycle
 
-The `startup` hook and the `refresh` action both start the daemon; a lock
-file in the plugin's run directory keeps one per session socket and records
-its pid. The daemon exits on its own when the session socket closes. If it dies for any other reason, badges stay
+The `startup` hook and the `refresh` action both restart the daemon: they
+stop any running one, then start the installed executable. A lock file in the
+plugin's run directory keeps one daemon per session socket and records its
+pid. Restarting at startup matters after a live handoff, where the previous
+server's daemon can still hold the lock and exits only once that server lets
+go of it. The daemon exits on its own when the session socket closes. If it dies for any other reason, badges stay
 as last published until `refresh` or a server restart; errors are appended to
 `logs/space-meta.log` under the plugin state directory.
