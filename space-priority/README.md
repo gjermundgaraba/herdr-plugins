@@ -13,9 +13,12 @@ order ignores the token this plugin sets.
 The plugin sets the `space_priority` workspace metadata token to `★` on
 priority spaces. The fork reads it when sorting agents by priority:
 
-1. Blocked agents in priority spaces, then done agents in priority spaces,
-   each group most recent first.
+1. Blocked agents in priority spaces, then done agents in priority spaces.
 2. Everyone else in the usual priority order: blocked, done, working, idle.
+
+Within each status, the fork queues blocked and done agents oldest state
+change first, so the agent that has waited longest comes up next. Working and
+idle agents show the most recent first.
 
 Working, idle, and unknown agents in a priority space keep their normal
 place, so a busy priority space does not crowd out an agent that needs you
@@ -54,6 +57,8 @@ description = "Toggle space priority"
 ```
 
 The action flips the focused space and shows a notification with the result.
+On the fork build, **Toggle space priority** also appears in a space's
+right-click menu and flips the space you clicked.
 
 To see which spaces are priority, place the token in your spaces sidebar
 rows; it renders `★` on priority spaces and nothing elsewhere:

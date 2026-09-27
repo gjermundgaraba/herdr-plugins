@@ -31,6 +31,6 @@ command = ["bin/herdr-space-priority"]
 [[actions]]
 id = "toggle"
 title = "Toggle space priority"
-description = "Mark or unmark the focused space and its worktrees as priority"
+description = "Mark or unmark a space and its worktrees as priority"
 contexts = ["workspace"]
 command = ["bin/herdr-space-priority"]

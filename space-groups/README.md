@@ -60,7 +60,9 @@ command = "gjermundgaraba.herdr-space-groups.assign"
 description = "Set space group"
 ```
 
-The action opens a popup for the focused space. Type to filter the existing
+The action opens a popup for the focused space. On the fork build, **Set space
+group** also appears in a space's right-click menu and targets the space you
+clicked. Type to filter the existing
 groups or to name a new one, move with `↑`/`↓` (or `ctrl+n`/`ctrl+p`), and
 press `Enter`. With an empty query, **Remove from group** clears the space's
 group. `Esc` cancels.

@@ -35,7 +35,7 @@ command = ["bin/herdr-space-groups"]
 [[actions]]
 id = "assign"
 title = "Set space group"
-description = "Pick, create, or clear the group of the focused space"
+description = "Pick, create, or clear a space's group"
 contexts = ["workspace"]
 command = ["bin/herdr-space-groups"]
 
