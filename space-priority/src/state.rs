@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct State {
-    /// Family anchors marked as priority; see `family::anchor`.
+    /// Spaces marked as priority.
     #[serde(default)]
     pub workspaces: BTreeSet<String>,
 }

@@ -3,11 +3,9 @@
 //! done agents in those spaces sort ahead of every other agent; the token's
 //! value doubles as a sidebar marker.
 //!
-//! A worktree family shares its checkout's mark, so every member carries the
-//! token, and creating or closing a space re-syncs it. Metadata tokens do not
-//! survive a server restart or live handoff, so marks are saved per session
-//! and republished by the startup hook.
-mod family;
+//! Each space carries its own mark, and closing a space forgets it. Metadata
+//! tokens do not survive a server restart or live handoff, so marks are saved
+//! per session and republished by the startup hook.
 mod state;
 
 use std::collections::BTreeSet;
@@ -49,13 +47,7 @@ fn run() -> Result<()> {
     let state_path = state_path(&environment)?;
     let client = Client::from_env()?.with_timeout(SOCKET_TIMEOUT);
     match environment.invocation() {
-        Some(
-            PluginInvocation::Startup
-            | PluginInvocation::Event {
-                name: "workspace.created",
-                ..
-            },
-        ) => sync(&client, &state_path, None),
+        Some(PluginInvocation::Startup) => sync(&client, &state_path, None),
         Some(PluginInvocation::Event {
             name: "workspace.closed",
             event,
@@ -92,7 +84,7 @@ fn sync(client: &Client, state_path: &Path, closed: Option<&str>) -> Result<()> 
     publish(client, state_path, &saved, &saved.workspaces, &workspaces)
 }
 
-/// Flips the mark of the focused space's family.
+/// Flips the mark of the focused space.
 fn toggle(client: &Client, state_path: &Path) -> Result<()> {
     let snapshot = client.snapshot().context("read session snapshot")?;
     let workspace_id = std::env::var("HERDR_WORKSPACE_ID")
@@ -105,18 +97,17 @@ fn toggle(client: &Client, state_path: &Path) -> Result<()> {
         .iter()
         .find(|workspace| workspace.workspace_id == workspace_id)
         .context("the space is gone")?;
-    let anchor = family::anchor(&workspaces, target);
     let saved = State::load(state_path).context("read saved priority spaces")?;
-    let mut marks = resolve(&saved.workspaces, &workspaces);
-    let marked = !marks.remove(&anchor.workspace_id);
+    let mut marks = prune(&saved.workspaces, &workspaces);
+    let marked = !marks.remove(&target.workspace_id);
     if marked {
-        marks.insert(anchor.workspace_id.clone());
+        marks.insert(target.workspace_id.clone());
     }
     publish(client, state_path, &saved, &marks, &workspaces)?;
     let body = if marked {
-        format!("{} is a priority space", anchor.label)
+        format!("{} is a priority space", target.label)
     } else {
-        format!("{} is no longer a priority space", anchor.label)
+        format!("{} is no longer a priority space", target.label)
     };
     client
         .call_value(
@@ -127,7 +118,7 @@ fn toggle(client: &Client, state_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Saves `marks` resolved against `workspaces` and reports every token that
+/// Saves `marks` without spaces that are gone and reports every token that
 /// differs from them.
 fn publish(
     client: &Client,
@@ -152,7 +143,7 @@ fn publish(
     Ok(())
 }
 
-/// Writes `marks` resolved against `workspaces` when they differ from the
+/// Writes `marks` without spaces that are gone when they differ from the
 /// `saved` state, and returns them.
 fn store(
     state_path: &Path,
@@ -161,7 +152,7 @@ fn store(
     workspaces: &[WorkspaceInfo],
 ) -> Result<BTreeSet<String>> {
     let state = State {
-        workspaces: resolve(marks, workspaces),
+        workspaces: prune(marks, workspaces),
     };
     if state != *saved {
         state.save(state_path).context("save priority spaces")?;
@@ -169,21 +160,20 @@ fn store(
     Ok(state.workspaces)
 }
 
-/// Saved marks moved onto their family anchors, without spaces that are gone.
-/// A space marked on its own passes its mark to a checkout opened later.
-fn resolve(saved: &BTreeSet<String>, workspaces: &[WorkspaceInfo]) -> BTreeSet<String> {
+/// Saved marks without spaces that are gone.
+fn prune(saved: &BTreeSet<String>, workspaces: &[WorkspaceInfo]) -> BTreeSet<String> {
     saved
         .iter()
-        .filter_map(|id| {
+        .filter(|id| {
             workspaces
                 .iter()
-                .find(|workspace| &workspace.workspace_id == id)
+                .any(|workspace| &workspace.workspace_id == *id)
         })
-        .map(|workspace| family::anchor(workspaces, workspace).workspace_id.clone())
+        .cloned()
         .collect()
 }
 
-/// Token updates that give each space its family anchor's mark.
+/// Token updates that give each space its saved mark.
 fn changes<'a>(
     workspaces: &'a [WorkspaceInfo],
     marked: &BTreeSet<String>,
@@ -191,9 +181,7 @@ fn changes<'a>(
     workspaces
         .iter()
         .filter_map(|workspace| {
-            let want = marked
-                .contains(&family::anchor(workspaces, workspace).workspace_id)
-                .then_some(MARK);
+            let want = marked.contains(&workspace.workspace_id).then_some(MARK);
             let have = workspace.tokens.get(TOKEN_KEY).map(String::as_str);
             (have != want).then_some((workspace.workspace_id.as_str(), want))
         })
@@ -203,30 +191,33 @@ fn changes<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use family::tests::space;
+    use serde_json::json;
+
+    fn space(id: &str, marked: bool) -> WorkspaceInfo {
+        serde_json::from_value(json!({
+            "workspace_id": id, "number": 1, "label": id, "focused": false,
+            "pane_count": 1, "tab_count": 1, "active_tab_id": format!("{id}:t1"),
+            "agent_status": "idle",
+            "tokens": if marked { json!({TOKEN_KEY: MARK}) } else { json!({}) },
+        }))
+        .unwrap()
+    }
 
     fn ids(ids: &[&str]) -> BTreeSet<String> {
         ids.iter().map(|id| (*id).to_owned()).collect()
     }
 
     #[test]
-    fn marks_move_to_their_anchor_and_gone_spaces_drop() {
-        let spaces = [
-            space("child", false, Some(("repo", true))),
-            space("parent", false, Some(("repo", false))),
-            space("plain", false, None),
-        ];
-        assert_eq!(
-            resolve(&ids(&["child", "plain", "closed"]), &spaces),
-            ids(&["parent", "plain"])
-        );
+    fn gone_spaces_drop_from_the_marks() {
+        let spaces = [space("kept", false), space("other", false)];
+        assert_eq!(prune(&ids(&["kept", "closed"]), &spaces), ids(&["kept"]));
     }
 
     #[test]
     fn a_new_mark_is_saved_beside_the_earlier_ones() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("priority.json");
-        let spaces = [space("first", true, None), space("second", false, None)];
+        let spaces = [space("first", true), space("second", false)];
         let saved = State {
             workspaces: ids(&["first"]),
         };
@@ -240,20 +231,16 @@ mod tests {
     }
 
     #[test]
-    fn a_marked_family_marks_every_member_and_clears_the_rest() {
+    fn each_space_gets_its_own_mark() {
         let spaces = [
-            space("parent", true, Some(("repo", false))),
-            space("child", false, Some(("repo", true))),
-            space("plain", true, None),
-            space("other", false, None),
+            space("kept", true),
+            space("new", false),
+            space("cleared", true),
+            space("other", false),
         ];
         assert_eq!(
-            changes(&spaces, &ids(&["parent"])),
-            [("child", Some(MARK)), ("plain", None)]
-        );
-        assert_eq!(
-            changes(&spaces, &ids(&["parent", "plain"])),
-            [("child", Some(MARK))]
+            changes(&spaces, &ids(&["kept", "new"])),
+            [("new", Some(MARK)), ("cleared", None)]
         );
     }
 }

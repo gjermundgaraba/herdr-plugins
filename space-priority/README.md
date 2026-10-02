@@ -30,15 +30,13 @@ its sort toggle), and keeps strict space order otherwise. An agent view set
 through `agent.view.set` with its own sort replaces the priority order, and
 with it this lift.
 
-A worktree family shares its checkout's priority. Toggling a linked worktree
-marks its checkout and every worktree beside it, and a worktree opened later
-joins automatically.
+Each space carries its own mark. A linked worktree and its checkout are
+marked separately.
 
 Herdr keeps metadata tokens in memory only, so the plugin saves priority
 spaces per session under its state directory and republishes them from its
-`startup` hook, which also runs after a live handoff. The `workspace.created`
-and `workspace.closed` hooks keep worktree families in sync and forget
-closed spaces.
+`startup` hook, which also runs after a live handoff. The `workspace.closed`
+hook forgets closed spaces.
 
 ## Setup
 
@@ -72,8 +70,6 @@ rows = [
 
 ## Notes
 
-- Closing a family's checkout drops the family's priority; the remaining
-  worktrees are no longer a family.
 - `herdr workspace report-metadata` can set the `space_priority` token too,
   but such marks are not saved, and the next sync overwrites the token's
   value with `★` or clears it.

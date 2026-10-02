@@ -21,16 +21,12 @@ command = ["mv", "-f", "bin/.herdr-space-priority.new", "bin/herdr-space-priorit
 command = ["bin/herdr-space-priority"]
 
 [[events]]
-on = "workspace.created"
-command = ["bin/herdr-space-priority"]
-
-[[events]]
 on = "workspace.closed"
 command = ["bin/herdr-space-priority"]
 
 [[actions]]
 id = "toggle"
 title = "Toggle space priority"
-description = "Mark or unmark a space and its worktrees as priority"
+description = "Mark or unmark a space as priority"
 contexts = ["workspace"]
 command = ["bin/herdr-space-priority"]
