@@ -9,11 +9,6 @@ history but writes to a new native session:
 - Claude Code: `claude --resume <session-id> --fork-session`
 - OpenCode: `opencode --session <session-id> --fork`
 
-Amp is also supported as a **branch with a reference**, not a full-history fork.
-The new pane starts Amp with `@T-… ` prefilled in its input. Add your task, edit or
-remove the reference, and submit when ready. Nothing is submitted automatically,
-and no hidden context is added later. It does not resume or modify the original thread.
-
 Both agents share the same working directory and files. This plugin does not
 create a Git worktree.
 
@@ -33,10 +28,10 @@ herdr plugin install gjermundgaraba/herdr-plugins/fork-to-pane
 Restart OpenCode after installing its integration. Its native session reference
 becomes available after a session-bearing event.
 
-For Pi, Codex, Claude Code, and OpenCode, bind the fork action in
-`~/.config/herdr/config.toml` (plugin actions have no menu in Herdr; from a
-shell, `herdr plugin action invoke gjermundgaraba.herdr-fork-to-pane.fork`
-does the same):
+Bind the fork action in `~/.config/herdr/config.toml` (plugin actions have no
+menu in Herdr; from a shell,
+`herdr plugin action invoke gjermundgaraba.herdr-fork-to-pane.fork` does the
+same):
 
 ```toml
 [[keys.command]]
@@ -51,58 +46,12 @@ Reload keybindings with `herdr server reload-config`.
 Requires stock Herdr >= 0.8.0 (the fork build is not needed) and a Pi, Codex, Claude Code, or OpenCode version with the fork
 command shown above.
 
-## Amp setup
-
-Amp [removed native thread forking](https://ampcode.com/news/stick-a-fork-in-it).
-For reference-based branching, install the bundled [Amp companion](amp-plugin.ts)
-in Amp's user-local plugin directory on each machine running Herdr:
-
-```sh
-mkdir -p ~/.config/amp/plugins
-cp /absolute/path/to/fork-to-pane/amp-plugin.ts \
-  ~/.config/amp/plugins/herdr-fork-to-pane.ts
-```
-
-Copy from the installed Herdr plugin's directory or this checkout. Amp's plugin
-loader rejects symlinks. To update the companion, copy the new version over this
-same file rather than installing a second copy. Reload Amp plugins or restart Amp
-after installing or updating.
-
-Open an existing thread and run **Herdr: Branch into right pane** from Amp's
-command palette. This is an Amp command, not the Herdr fork action above.
-For an Amp-specific shortcut, find the command's full ID with `amp config keymap`
-after loading the companion, then bind it using `amp.keymap` in Amp settings.
-
-The companion registers its command only inside Herdr and only for local Amp
-executors; on a remote executor the command does not appear. On invocation it
-passes `ctx.thread.id`
-directly to the installed plugin's executable as `--amp-thread T-…`. It locates
-the executable through `herdr plugin list`; there are no background reports,
-pane tokens, timers, or prompt hooks. Requires Amp's `registerCommand` API with
-the current thread in the command context.
-
-The executable waits for Amp's input to be ready, pastes the reference without
-pressing Enter, then focuses the new pane. If startup or the paste fails, the
-pane stays open whenever Amp may already have launched, and the plugin reports
-an error instead of retrying the paste. The companion does not intercept or
-modify user messages.
-
-## Warp limitation
-
-The [interactive `/fork` command](https://docs.warp.dev/agents/cli/reference/)
-can copy the current conversation, but the CLI exposes no startup fork flag and
-Herdr has no native Warp session integration. The plugin cannot reliably launch
-that copy in another Herdr pane. `warp --resume` reopens the original conversation
-and is not a substitute for forking.
-
 ## Development
 
-Run these commands from the repository root. The Bun test is not part of CI,
-so run it locally after touching the companion:
+Run these commands from the repository root:
 
 ```sh
 cargo test -p herdr-fork-to-pane
-bun test fork-to-pane/amp-plugin.test.ts
 cargo build --release --locked -p herdr-fork-to-pane
 mkdir -p fork-to-pane/bin
 install -m 750 target/release/herdr-fork-to-pane fork-to-pane/bin/.herdr-fork-to-pane.new

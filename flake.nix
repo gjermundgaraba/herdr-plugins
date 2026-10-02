@@ -221,9 +221,6 @@
                 runHook preInstall
 
                 install -Dm444 "${name}/herdr-plugin.toml" "$out/${name}/herdr-plugin.toml"
-                ${lib.optionalString (name == "fork-to-pane") ''
-                  install -Dm444 "${name}/amp-plugin.ts" "$out/${name}/amp-plugin.ts"
-                ''}
                 ${installBinaries}
 
                 runHook postInstall

@@ -10,7 +10,7 @@ Most of these run on stock Herdr. Only [herdr-micro](herdr-micro),
 | Package | Description | Requires |
 | --- | --- | --- |
 | [equalize-splits](equalize-splits) | Automatically equalize pane sizes after splits and closes | Stock Herdr >= 0.8.0 |
-| [fork-to-pane](fork-to-pane) | Fork Pi, Codex, Claude Code, or OpenCode into a new pane; branch Amp with a thread reference | Stock Herdr >= 0.8.0 |
+| [fork-to-pane](fork-to-pane) | Fork Pi, Codex, Claude Code, or OpenCode into a new pane | Stock Herdr >= 0.8.0 |
 | [move-pane](move-pane) | Move the focused pane to another tab or a new tab from one keybinding | Stock Herdr >= 0.8.0 |
 | [space-meta](space-meta) | Space numbers, branch names, git-dirty markers, and PR badges in the spaces sidebar (macOS) | Stock Herdr >= 0.8.0 |
 | [space-groups](space-groups) | Named space groups under collapsible sidebar headers | [Fork build](#herdr-build) |

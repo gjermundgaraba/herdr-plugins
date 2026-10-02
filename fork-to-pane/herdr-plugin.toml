@@ -2,7 +2,7 @@ id = "gjermundgaraba.herdr-fork-to-pane"
 name = "Fork to Pane"
 version = "0.1.0"
 min_herdr_version = "0.8.0"
-description = "Fork the focused Pi, Codex, Claude Code, or OpenCode session into a new pane. Amp gets a branch with a thread reference instead. Needs each agent's Herdr integration and a keybinding"
+description = "Fork the focused Pi, Codex, Claude Code, or OpenCode session into a new pane. Needs each agent's Herdr integration and a keybinding"
 platforms = ["linux", "macos"]
 
 [[build]]
@@ -20,6 +20,6 @@ command = ["mv", "-f", "bin/.herdr-fork-to-pane.new", "bin/herdr-fork-to-pane"]
 [[actions]]
 id = "fork"
 title = "Fork agent into right pane"
-description = "Fork Pi, Codex, Claude Code, or OpenCode; for Amp use its Herdr: Branch into right pane command"
+description = "Fork Pi, Codex, Claude Code, or OpenCode"
 contexts = ["pane"]
 command = ["bin/herdr-fork-to-pane"]
