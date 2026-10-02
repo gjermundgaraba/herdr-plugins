@@ -83,13 +83,13 @@ fn state_path(environment: &Environment) -> Result<PathBuf> {
 /// Republishes the saved marks against the current spaces, leaving out a
 /// space that is closing but may still be listed.
 fn sync(client: &Client, state_path: &Path, closed: Option<&str>) -> Result<()> {
-    let state = State::load(state_path).context("read saved priority spaces")?;
+    let saved = State::load(state_path).context("read saved priority spaces")?;
     let mut workspaces = client
         .snapshot()
         .context("read session snapshot")?
         .workspaces;
     workspaces.retain(|workspace| Some(workspace.workspace_id.as_str()) != closed);
-    publish(client, state_path, state, &workspaces)
+    publish(client, state_path, &saved, &saved.workspaces, &workspaces)
 }
 
 /// Flips the mark of the focused space's family.
@@ -106,13 +106,13 @@ fn toggle(client: &Client, state_path: &Path) -> Result<()> {
         .find(|workspace| workspace.workspace_id == workspace_id)
         .context("the space is gone")?;
     let anchor = family::anchor(&workspaces, target);
-    let mut state = State::load(state_path).context("read saved priority spaces")?;
-    state.workspaces = resolve(&state.workspaces, &workspaces);
-    let marked = !state.workspaces.remove(&anchor.workspace_id);
+    let saved = State::load(state_path).context("read saved priority spaces")?;
+    let mut marks = resolve(&saved.workspaces, &workspaces);
+    let marked = !marks.remove(&anchor.workspace_id);
     if marked {
-        state.workspaces.insert(anchor.workspace_id.clone());
+        marks.insert(anchor.workspace_id.clone());
     }
-    publish(client, state_path, state, &workspaces)?;
+    publish(client, state_path, &saved, &marks, &workspaces)?;
     let body = if marked {
         format!("{} is a priority space", anchor.label)
     } else {
@@ -127,20 +127,17 @@ fn toggle(client: &Client, state_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Saves the marks resolved against `workspaces` and reports every token
-/// that differs from them.
+/// Saves `marks` resolved against `workspaces` and reports every token that
+/// differs from them.
 fn publish(
     client: &Client,
     state_path: &Path,
-    mut state: State,
+    saved: &State,
+    marks: &BTreeSet<String>,
     workspaces: &[WorkspaceInfo],
 ) -> Result<()> {
-    let marked = resolve(&state.workspaces, workspaces);
-    if marked != state.workspaces {
-        state.workspaces = marked;
-        state.save(state_path).context("save priority spaces")?;
-    }
-    for (workspace_id, mark) in changes(workspaces, &state.workspaces) {
+    let marks = store(state_path, saved, marks, workspaces)?;
+    for (workspace_id, mark) in changes(workspaces, &marks) {
         client
             .call_value(
                 "workspace.report_metadata",
@@ -153,6 +150,23 @@ fn publish(
             .with_context(|| format!("publish the priority of {workspace_id}"))?;
     }
     Ok(())
+}
+
+/// Writes `marks` resolved against `workspaces` when they differ from the
+/// `saved` state, and returns them.
+fn store(
+    state_path: &Path,
+    saved: &State,
+    marks: &BTreeSet<String>,
+    workspaces: &[WorkspaceInfo],
+) -> Result<BTreeSet<String>> {
+    let state = State {
+        workspaces: resolve(marks, workspaces),
+    };
+    if state != *saved {
+        state.save(state_path).context("save priority spaces")?;
+    }
+    Ok(state.workspaces)
 }
 
 /// Saved marks moved onto their family anchors, without spaces that are gone.
@@ -206,6 +220,23 @@ mod tests {
             resolve(&ids(&["child", "plain", "closed"]), &spaces),
             ids(&["parent", "plain"])
         );
+    }
+
+    #[test]
+    fn a_new_mark_is_saved_beside_the_earlier_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("priority.json");
+        let spaces = [space("first", true, None), space("second", false, None)];
+        let saved = State {
+            workspaces: ids(&["first"]),
+        };
+        saved.save(&path).unwrap();
+        let both = ids(&["first", "second"]);
+        assert_eq!(store(&path, &saved, &both, &spaces).unwrap(), both);
+        let saved = State::load(&path).unwrap();
+        assert_eq!(saved.workspaces, both);
+        assert!(store(&path, &saved, &ids(&[]), &spaces).unwrap().is_empty());
+        assert!(State::load(&path).unwrap().workspaces.is_empty());
     }
 
     #[test]
