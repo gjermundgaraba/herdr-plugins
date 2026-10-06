@@ -2,17 +2,16 @@
 
 Independent plugins and tools for [Herdr](https://herdr.dev/).
 
-Most of these run on stock Herdr. Only [herdr-micro](herdr-micro),
-[herdr-deck](herdr-deck), [space-groups](space-groups), and
-[space-priority](space-priority) need the [Herdr fork build](#herdr-build); the
-**Requires** column below says which is which.
+Everything here except [herdr-hub](herdr-hub) needs the
+[Herdr fork build](#herdr-build); the **Requires** column below says which is
+which.
 
 | Package | Description | Requires |
 | --- | --- | --- |
-| [equalize-splits](equalize-splits) | Automatically equalize pane sizes after splits and closes | Stock Herdr >= 0.8.0 |
-| [fork-to-pane](fork-to-pane) | Fork Pi, Codex, Claude Code, or OpenCode into a new pane | Stock Herdr >= 0.8.0 |
-| [move-pane](move-pane) | Move the focused pane to another tab or a new tab from one keybinding | Stock Herdr >= 0.8.0 |
-| [space-meta](space-meta) | Space numbers, branch names, git-dirty markers, and PR badges in the spaces sidebar (macOS) | Stock Herdr >= 0.8.0 |
+| [equalize-splits](equalize-splits) | Automatically equalize pane sizes after splits and closes | [Fork build](#herdr-build) |
+| [fork-to-pane](fork-to-pane) | Fork Pi, Codex, Claude Code, or OpenCode into a new pane | [Fork build](#herdr-build) |
+| [move-pane](move-pane) | Move a pane to another tab or a new tab from Herdr's native picker | [Fork build](#herdr-build) |
+| [space-meta](space-meta) | Space numbers, branch names, git-dirty markers, and PR badges in the spaces sidebar (macOS) | [Fork build](#herdr-build) |
 | [space-groups](space-groups) | Named space groups under collapsible sidebar headers | [Fork build](#herdr-build) |
 | [space-priority](space-priority) | Priority spaces whose blocked and done agents sort first | [Fork build](#herdr-build) |
 | [herdr-hub](herdr-hub) | Background inventory and relay for local and remote Herdr sessions | Stock Herdr >= 0.9.0 |
@@ -21,15 +20,17 @@ Most of these run on stock Herdr. Only [herdr-micro](herdr-micro),
 
 ## Herdr build
 
-Micro, Deck, space-groups, and space-priority target the
+The plugins target the
 [gjermundgaraba/herdr](https://github.com/gjermundgaraba/herdr) fork on the
-`custom-v3` branch, currently based on upstream 0.9.1. The fork adds the
+`custom-v3` branch, currently based on upstream 0.9.3. The fork adds the
 per-TUI frontend socket (protocol 7), the `agent.prompt` client command lane
-method, the client-side `[keys]` actions that replaced the picker plugins, the
-sidebar space groups driven by the `space_group` workspace token, and the
-priority agent order that reads the `space_priority` workspace token. Stock
-`herdrdev/herdr` has none of these, so Micro, Deck, space-groups, and
-space-priority do not work against it. Everything else here runs on stock Herdr.
+method, the client-side `[keys]` actions that replaced the picker plugins,
+native space groups (`workspace.set_group`) and persisted workspace tokens, the
+priority agent order that reads the `space_priority` workspace token, the
+native `ui.pick` picker, plugin entries in right-click menus with one
+`plugin.invoke` path, a richer invocation context, and `tab_id` on pane close
+events plus `pane.cwd_changed`. Stock `herdrdev/herdr` has none of these, so
+only herdr-hub runs against it.
 
 The socket's Rust client is the `herdr-frontend` crate under `sdk/frontend` in
 the fork. Micro and Deck pull it in as a git dependency, so `Cargo.lock` pins
