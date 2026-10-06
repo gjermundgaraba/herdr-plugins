@@ -28,10 +28,10 @@ herdr plugin install gjermundgaraba/herdr-plugins/fork-to-pane
 Restart OpenCode after installing its integration. Its native session reference
 becomes available after a session-bearing event.
 
-Bind the fork action in `~/.config/herdr/config.toml` (plugin actions have no
-menu in Herdr; from a shell,
-`herdr plugin action invoke gjermundgaraba.herdr-fork-to-pane.fork` does the
-same):
+Bind the fork action in `~/.config/herdr/config.toml`. It also appears in a
+pane's right-click menu, where it forks the clicked pane's session, and from a
+shell `herdr plugin invoke gjermundgaraba.herdr-fork-to-pane.fork` does the
+same:
 
 ```toml
 [[keys.command]]
