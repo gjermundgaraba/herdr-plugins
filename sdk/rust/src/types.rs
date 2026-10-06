@@ -63,6 +63,12 @@ pub struct WorkspaceInfo {
     #[serde(default)]
     pub tokens: HashMap<String, String>,
     pub worktree: Option<WorkspaceWorktreeInfo>,
+    /// The space group of the space's worktree family.
+    #[serde(default)]
+    pub group: Option<String>,
+    /// The family checkout whose group a linked worktree shares.
+    #[serde(default)]
+    pub family_anchor_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
