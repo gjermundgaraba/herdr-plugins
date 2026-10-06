@@ -19,13 +19,13 @@ use std::{
 use crate::{
     actions::{Call, Caller, focus_pane, prompt as send_prompt, submit},
     config::{Action, Binding, Direction, Modifier, key_action_code, key_binding},
-    frontends::ClientRoute,
     gestures::{Fired, GestureContext, GestureDispatcher},
     macos,
     process::{COMMAND_TIMEOUT, run_command_with_timeout},
     protocol::{SLOT_COUNT, joystick_event},
     setup::plugin_root,
 };
+use herdr_frontend::directory::ClientRoute;
 
 use super::{RuntimeEvent, log, reconcile::InputContext};
 

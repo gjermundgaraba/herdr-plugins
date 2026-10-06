@@ -24,9 +24,9 @@ use std::{
 use crate::{
     config::{config_path, enabled_buttons, load, provision},
     control::listen_for_control,
-    frontends,
 };
 use dispatch::{action_worker, input_worker};
+use herdr_frontend::directory;
 use reconcile::{
     InputContext, State, apply_config_load, apply_frontend_update, apply_service_status,
     device_output, handle_input_disconnect, publish, reconcile_active, refresh_owner,
@@ -42,7 +42,7 @@ pub const DAEMON_PROTOCOL_VERSION: u32 = 12;
 static LOG_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 enum RuntimeEvent {
-    Frontends(Box<frontends::Update>),
+    Frontends(Box<directory::Update>),
     InputDisconnected(String),
     Device(device::Update),
 }
@@ -179,10 +179,17 @@ pub fn run_daemon() -> Result<()> {
     let stopping = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(SIGINT, Arc::clone(&stopping))?;
     signal_hook::flag::register(SIGTERM, Arc::clone(&stopping))?;
-    frontends::spawn_updates(
+    directory::spawn_updates(
+        herdr_frontend::directory(),
         {
             let runtime_tx = runtime_tx.clone();
+            // The bridge acts on the latest state, so repeats are dropped.
+            let mut previous = None;
             move |update| {
+                if previous.as_ref() == Some(&update) {
+                    return true;
+                }
+                previous = Some(update.clone());
                 runtime_tx
                     .send(RuntimeEvent::Frontends(Box::new(update)))
                     .is_ok()
@@ -347,7 +354,7 @@ mod tests {
 
     #[test]
     fn runtime_batches_apply_latest_focus_and_bound_work() {
-        use crate::frontends::ClientState;
+        use herdr_frontend::directory::ClientState;
         let config = crate::config::Config::default();
         let mut state = State::new(config);
         let stopping = AtomicBool::new(false);

@@ -1,9 +1,9 @@
 //! Bridge state and its reconciliation with the uniquely focused TUI and the
 //! HID device.
 
-use crate::frontends::{ClientState, Model};
 use codex_micro::{ExternalOwner, external_owner, service::ServiceStatus};
 use herdr_frontend::Agent;
+use herdr_frontend::directory::{self, ClientRoute, ClientState, Model};
 use serde_json::{Value, json};
 use std::sync::{
     Arc, Mutex,
@@ -13,7 +13,6 @@ use std::sync::{
 use crate::{
     actions::HERDR_LAYER,
     config::{Config, Controls, enabled_buttons},
-    frontends::{self, ClientRoute},
     protocol::{SLOT_COUNT, SlotKey, assign_slots, lighting},
 };
 
@@ -187,7 +186,7 @@ pub(super) fn reconcile_active(state: &mut State, stopping: &AtomicBool) {
 
 pub(super) fn apply_frontend_update(
     state: &mut State,
-    clients: frontends::Update,
+    clients: directory::Update,
     stopping: &AtomicBool,
 ) {
     let before = state.model.foremost_client().map(|c| c.client_id.clone());

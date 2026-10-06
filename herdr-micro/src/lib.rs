@@ -3,7 +3,6 @@ pub mod config;
 pub mod control;
 pub mod daemon;
 pub mod doctor;
-pub mod frontends;
 pub mod gestures;
 pub mod macos;
 pub mod process;

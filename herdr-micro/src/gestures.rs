@@ -6,7 +6,7 @@ use std::{
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct GestureContext {
-    pub route: crate::frontends::ClientRoute,
+    pub route: herdr_frontend::directory::ClientRoute,
     pub target: Option<herdr_frontend::Agent>,
 }
 
@@ -195,7 +195,7 @@ mod tests {
 
     fn context(client_id: &str, generation: u64) -> Option<GestureContext> {
         Some(GestureContext {
-            route: crate::frontends::ClientRoute {
+            route: herdr_frontend::directory::ClientRoute {
                 client_id: client_id.into(),
                 endpoint_id: "endpoint".into(),
                 boot_id: Some(format!("boot-{generation}")),
