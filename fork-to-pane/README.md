@@ -36,7 +36,7 @@ same):
 ```toml
 [[keys.command]]
 key = "prefix+f"
-type = "plugin_action"
+type = "plugin"
 command = "gjermundgaraba.herdr-fork-to-pane.fork"
 description = "fork agent into right pane"
 ```

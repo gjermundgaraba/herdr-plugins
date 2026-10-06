@@ -49,7 +49,7 @@ Bind the action in `~/.config/herdr/config.toml`:
 ```toml
 [[keys.command]]
 key = "prefix+shift+p"
-type = "plugin_action"
+type = "plugin"
 command = "gjermundgaraba.herdr-space-priority.toggle"
 description = "Toggle space priority"
 ```

@@ -55,7 +55,7 @@ Bind the action in `~/.config/herdr/config.toml`:
 ```toml
 [[keys.command]]
 key = "prefix+shift+g"
-type = "plugin_action"
+type = "plugin"
 command = "gjermundgaraba.herdr-space-groups.assign"
 description = "Set space group"
 ```
