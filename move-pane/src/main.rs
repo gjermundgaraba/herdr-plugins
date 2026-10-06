@@ -1,28 +1,16 @@
 //! Move the focused pane to another tab. With one tab the pane goes straight
-//! into a new tab; otherwise a popup lists the destinations.
+//! into a new tab; otherwise Herdr's native picker lists the destinations.
 use std::{process::ExitCode, time::Duration};
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use herdr_client::{Client, Environment, TabInfo};
-use ratatui::{
-    Frame,
-    layout::{Constraint, Layout},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{List, ListItem, ListState},
-};
+use herdr_client::{Client, Environment, PickItem, PickOutcome, PickParams, TabInfo};
 use serde_json::json;
 
-const ENV_PANE: &str = "HERDR_MOVE_PANE_ID";
-const ENV_WORKSPACE: &str = "HERDR_MOVE_WORKSPACE_ID";
-const ENV_TAB: &str = "HERDR_MOVE_TAB_ID";
 const NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(2);
+const NEW_TAB: &str = "new-tab";
 
 fn main() -> ExitCode {
-    let pick = std::env::args().nth(1).as_deref() == Some("pick");
-    let result = if pick { run_pick() } else { run_action() };
-    match result {
+    match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("move-pane: {error:#}");
@@ -37,13 +25,10 @@ fn main() -> ExitCode {
     }
 }
 
-/// The action: move directly when the workspace has one tab, else open the
-/// popup with the pane identity pinned in its environment.
-fn run_action() -> Result<()> {
-    let Environment {
-        plugin_id, context, ..
-    } = Environment::load()?;
-    let context = context.context("HERDR_PLUGIN_CONTEXT_JSON is not set")?;
+fn run() -> Result<()> {
+    let context = Environment::load()?
+        .context
+        .context("HERDR_PLUGIN_CONTEXT_JSON is not set")?;
     let pane_id = context
         .focused_pane_id
         .context("the invocation names no pane")?;
@@ -53,65 +38,30 @@ fn run_action() -> Result<()> {
     let tab_id = context.tab_id.context("the invocation names no tab")?;
     let mut tabs = context.tabs;
     tabs.sort_by_key(|tab| tab.number);
-    let destinations = destinations(&tabs, &tab_id);
+    let destinations = destinations(&workspace_id, &tabs, &tab_id);
     let client = Client::from_env()?;
-    if let [only] = destinations.as_slice() {
-        return move_pane(&client, &pane_id, only);
-    }
-    let plugin_id = plugin_id.context("HERDR_PLUGIN_ID is not set")?;
-    client
-        .call_value(
-            "plugin.pane.open",
-            &json!({
-                "plugin_id": plugin_id,
-                "entrypoint": "pick",
-                "placement": "popup",
-                "width": 56,
-                "height": destinations.len() + 4,
-                "focus": true,
-                "env": {
-                    ENV_PANE: pane_id,
-                    ENV_WORKSPACE: workspace_id,
-                    ENV_TAB: tab_id,
-                },
-            }),
-        )
-        .context("open the move-pane popup")?;
-    Ok(())
-}
-
-fn run_pick() -> Result<()> {
-    let pane_id = required(ENV_PANE)?;
-    let workspace_id = required(ENV_WORKSPACE)?;
-    let tab_id = required(ENV_TAB)?;
-    let client = Client::from_env()?;
-    let destinations = destinations(&tabs_in(&client, &workspace_id)?, &tab_id);
-    let mut terminal = ratatui::try_init()?;
-    let choice = choose(&mut terminal, &destinations);
-    ratatui::restore();
-    match choice? {
-        Some(destination) => move_pane(&client, &pane_id, destination),
-        None => Ok(()),
-    }
-}
-
-fn required(name: &str) -> Result<String> {
-    std::env::var(name)
-        .ok()
-        .filter(|value| !value.is_empty())
-        .with_context(|| format!("{name} is not set; run this through the move action"))
-}
-
-fn tabs_in(client: &Client, workspace_id: &str) -> Result<Vec<TabInfo>> {
-    let mut tabs: Vec<TabInfo> = client
-        .snapshot()
-        .context("read session snapshot")?
-        .tabs
-        .into_iter()
-        .filter(|tab| tab.workspace_id == workspace_id)
-        .collect();
-    tabs.sort_by_key(|tab| tab.number);
-    Ok(tabs)
+    let destination = match destinations.as_slice() {
+        [only] => only,
+        _ => {
+            let outcome = client
+                .pick(&PickParams {
+                    title: "Move pane to".into(),
+                    items: destinations.iter().map(Destination::item).collect(),
+                    selected: None,
+                    create: None,
+                    client_id: context.client_id,
+                })
+                .context("show the destination picker")?;
+            let PickOutcome::Picked { id } = outcome else {
+                return Ok(());
+            };
+            destinations
+                .iter()
+                .find(|destination| destination.id() == id)
+                .context("the picked destination is gone")?
+        }
+    };
+    move_pane(&client, &pane_id, destination)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,36 +71,40 @@ enum Destination {
 }
 
 impl Destination {
-    fn label(&self) -> &str {
+    fn id(&self) -> &str {
         match self {
-            Self::NewTab { .. } => "New tab",
-            Self::Tab(tab) => &tab.label,
+            Self::NewTab { .. } => NEW_TAB,
+            Self::Tab(tab) => &tab.tab_id,
         }
     }
 
-    fn detail(&self) -> String {
+    fn item(&self) -> PickItem {
         match self {
-            Self::NewTab { .. } => "move into a new tab".into(),
-            Self::Tab(tab) if tab.pane_count == 1 => "1 pane".into(),
-            Self::Tab(tab) => format!("{} panes", tab.pane_count),
+            Self::NewTab { .. } => PickItem::new(NEW_TAB, "New tab"),
+            Self::Tab(tab) => PickItem {
+                detail: Some(match tab.pane_count {
+                    1 => "1 pane".into(),
+                    count => format!("{count} panes"),
+                }),
+                badge: Some(tab.number.to_string()),
+                ..PickItem::new(&tab.tab_id, &tab.label)
+            },
         }
     }
 }
 
 /// A new tab first, then every other tab of the workspace in tab order.
-fn destinations(tabs: &[TabInfo], current_tab_id: &str) -> Vec<Destination> {
-    let workspace_id = tabs
-        .first()
-        .map(|tab| tab.workspace_id.clone())
-        .unwrap_or_default();
-    std::iter::once(Destination::NewTab { workspace_id })
-        .chain(
-            tabs.iter()
-                .filter(|tab| tab.tab_id != current_tab_id)
-                .cloned()
-                .map(Destination::Tab),
-        )
-        .collect()
+fn destinations(workspace_id: &str, tabs: &[TabInfo], current_tab_id: &str) -> Vec<Destination> {
+    std::iter::once(Destination::NewTab {
+        workspace_id: workspace_id.to_owned(),
+    })
+    .chain(
+        tabs.iter()
+            .filter(|tab| tab.tab_id != current_tab_id)
+            .cloned()
+            .map(Destination::Tab),
+    )
+    .collect()
 }
 
 fn move_pane(client: &Client, pane_id: &str, destination: &Destination) -> Result<()> {
@@ -169,96 +123,6 @@ fn move_pane(client: &Client, pane_id: &str, destination: &Destination) -> Resul
     Ok(())
 }
 
-fn choose<'a>(
-    terminal: &mut ratatui::DefaultTerminal,
-    destinations: &'a [Destination],
-) -> Result<Option<&'a Destination>> {
-    let mut selected = 0;
-    loop {
-        terminal.draw(|frame| render(frame, destinations, selected))?;
-        let Event::Key(key) = event::read()? else {
-            continue;
-        };
-        if key.kind == KeyEventKind::Release {
-            continue;
-        }
-        match step(key.code, key.modifiers, selected, destinations.len()) {
-            Step::Move(next) => selected = next,
-            Step::Confirm(index) => return Ok(destinations.get(index)),
-            Step::Cancel => return Ok(None),
-            Step::Ignore => {}
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum Step {
-    Move(usize),
-    Confirm(usize),
-    Cancel,
-    Ignore,
-}
-
-fn step(code: KeyCode, modifiers: KeyModifiers, selected: usize, len: usize) -> Step {
-    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
-    let last = len.saturating_sub(1);
-    match code {
-        KeyCode::Esc | KeyCode::Char('q') => Step::Cancel,
-        KeyCode::Char('c') if ctrl => Step::Cancel,
-        KeyCode::Enter => Step::Confirm(selected),
-        KeyCode::Down | KeyCode::Char('j') => Step::Move((selected + 1).min(last)),
-        KeyCode::Char('n') if ctrl => Step::Move((selected + 1).min(last)),
-        KeyCode::Up | KeyCode::Char('k') => Step::Move(selected.saturating_sub(1)),
-        KeyCode::Char('p') if ctrl => Step::Move(selected.saturating_sub(1)),
-        KeyCode::Char(digit @ '1'..='9') => {
-            let index = digit as usize - '1' as usize;
-            if index < len {
-                Step::Confirm(index)
-            } else {
-                Step::Ignore
-            }
-        }
-        _ => Step::Ignore,
-    }
-}
-
-fn render(frame: &mut Frame<'_>, destinations: &[Destination], selected: usize) {
-    let muted = Style::new().fg(Color::DarkGray);
-    let [title, body, hints] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(1),
-    ])
-    .areas(frame.area());
-    frame.render_widget(
-        Line::styled("Move pane to", Style::new().add_modifier(Modifier::BOLD)),
-        title,
-    );
-    let items = destinations.iter().enumerate().map(|(index, destination)| {
-        ListItem::new(Line::from(vec![
-            Span::styled(format!("{:>2} ", index + 1), muted),
-            Span::raw(destination.label().to_owned()),
-            Span::styled(format!("  {}", destination.detail()), muted),
-        ]))
-    });
-    let list = List::new(items).highlight_style(Style::new().bg(Color::Blue).fg(Color::White));
-    let mut state = ListState::default().with_selected(Some(selected));
-    frame.render_stateful_widget(list, body, &mut state);
-    frame.render_widget(
-        Line::from(vec![
-            Span::styled("j/k", Style::new().fg(Color::Cyan)),
-            Span::styled(" move  ", muted),
-            Span::styled("1-9", Style::new().fg(Color::Cyan)),
-            Span::styled(" jump  ", muted),
-            Span::styled("enter", Style::new().fg(Color::Cyan)),
-            Span::styled(" move  ", muted),
-            Span::styled("esc", Style::new().fg(Color::Cyan)),
-            Span::styled(" cancel", muted),
-        ]),
-        hints,
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,34 +139,13 @@ mod tests {
     #[test]
     fn destinations_start_with_a_new_tab_and_skip_the_current_one() {
         let tabs = [tab(1, "main", 2), tab(2, "logs", 1), tab(3, "tests", 3)];
-        let found = destinations(&tabs, "w1:t2");
-        let labels: Vec<_> = found.iter().map(Destination::label).collect();
+        let found = destinations("w1", &tabs, "w1:t2");
+        let items: Vec<_> = found.iter().map(Destination::item).collect();
+        let labels: Vec<_> = items.iter().map(|item| item.label.as_str()).collect();
         assert_eq!(labels, ["New tab", "main", "tests"]);
-        assert_eq!(
-            found[0],
-            Destination::NewTab {
-                workspace_id: "w1".into()
-            }
-        );
-        assert_eq!(found[2].detail(), "3 panes");
-        assert_eq!(destinations(&tabs[..1], "w1:t1").len(), 1);
-    }
-
-    #[test]
-    fn keys_move_confirm_and_cancel() {
-        let none = KeyModifiers::NONE;
-        let ctrl = KeyModifiers::CONTROL;
-        assert_eq!(step(KeyCode::Char('j'), none, 0, 3), Step::Move(1));
-        assert_eq!(step(KeyCode::Down, none, 2, 3), Step::Move(2));
-        assert_eq!(step(KeyCode::Char('n'), ctrl, 0, 3), Step::Move(1));
-        assert_eq!(step(KeyCode::Char('n'), none, 0, 3), Step::Ignore);
-        assert_eq!(step(KeyCode::Char('k'), none, 0, 3), Step::Move(0));
-        assert_eq!(step(KeyCode::Char('p'), ctrl, 2, 3), Step::Move(1));
-        assert_eq!(step(KeyCode::Enter, none, 1, 3), Step::Confirm(1));
-        assert_eq!(step(KeyCode::Char('3'), none, 0, 3), Step::Confirm(2));
-        assert_eq!(step(KeyCode::Char('4'), none, 0, 3), Step::Ignore);
-        assert_eq!(step(KeyCode::Esc, none, 0, 3), Step::Cancel);
-        assert_eq!(step(KeyCode::Char('q'), none, 0, 3), Step::Cancel);
-        assert_eq!(step(KeyCode::Char('c'), ctrl, 0, 3), Step::Cancel);
+        assert_eq!(found[0].id(), NEW_TAB);
+        assert_eq!(found[2].id(), "w1:t3");
+        assert_eq!(items[2].detail.as_deref(), Some("3 panes"));
+        assert_eq!(destinations("w1", &tabs[..1], "w1:t1").len(), 1);
     }
 }

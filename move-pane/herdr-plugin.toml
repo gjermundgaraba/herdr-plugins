@@ -24,9 +24,3 @@ description = "Move the focused pane into a new tab, or pick a tab when the work
 contexts = ["pane"]
 command = ["bin/herdr-move-pane"]
 
-[[panes]]
-id = "pick"
-title = "Move pane"
-platforms = ["macos", "linux"]
-placement = "popup"
-command = ["bin/herdr-move-pane", "pick"]

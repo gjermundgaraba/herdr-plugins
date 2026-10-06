@@ -4,13 +4,13 @@ Move the focused pane to another tab in its workspace, or into a new tab, from
 one keybinding in [Herdr](https://herdr.dev/).
 
 When the workspace has a single tab the pane moves straight into a new tab.
-Otherwise a small popup lists **New tab** and every other tab: `j`/`k`, the
-arrow keys, or `ctrl+n`/`ctrl+p` move the highlight, `Enter` moves the pane to
-the highlighted entry, `1`-`9` move it to that entry at once, and `Esc`, `q`,
-or `ctrl+c` cancel. Moving into an existing tab splits to the right of its
+Otherwise Herdr's native picker lists **New tab** and every other tab: type to
+filter, move with the arrow keys or `ctrl+n`/`ctrl+p`, press `Enter` to move the
+pane, or `Esc` to cancel. Moving into an existing tab splits to the right of its
 focused pane and follows the pane.
 
-Requires stock Herdr >= 0.8.0; the fork build is not needed.
+Requires the fork build of Herdr for the invocation context and the `ui.pick`
+picker.
 
 ## Install
 
