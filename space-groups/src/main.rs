@@ -47,8 +47,9 @@ fn run() -> Result<()> {
     let environment = Environment::load()?;
     let state_path = state_path(&environment)?;
     let client = Client::from_env()?.with_timeout(SOCKET_TIMEOUT);
+    let context = environment.context.clone().unwrap_or_default();
     match environment.invocation() {
-        Some(PluginInvocation::Startup) => restore(&client, &state_path),
+        Some(PluginInvocation::Startup) => restore(&client, &state_path, &context.workspaces),
         Some(PluginInvocation::Event {
             name: "workspace.closed",
             event,
@@ -62,8 +63,13 @@ fn run() -> Result<()> {
             name: "workspace.moved" | "workspace.reordered",
             event,
         }) => regroup_moved(&client, &state_path, &event.data),
-        Some(PluginInvocation::Action(_)) => open_picker(&client, &environment, &state_path),
-        Some(PluginInvocation::Pane(_)) => pick(&client, &state_path),
+        Some(PluginInvocation::Action(_)) => open_picker(
+            &client,
+            &environment,
+            &state_path,
+            context.workspace_id.as_deref(),
+        ),
+        Some(PluginInvocation::Pane(_)) => pick(&client, &state_path, &context.workspaces),
         _ => bail!("run this through the plugin's action, startup hook, or event hook"),
     }
 }
@@ -93,13 +99,15 @@ fn report(client: &Client, workspace_id: &str, group: Option<&str>) -> Result<()
 }
 
 /// Republishes saved groups and drops assignments whose space is gone.
-fn restore(client: &Client, state_path: &std::path::Path) -> Result<()> {
+fn restore(
+    client: &Client,
+    state_path: &std::path::Path,
+    workspaces: &[WorkspaceInfo],
+) -> Result<()> {
     let mut state = State::load(state_path).context("read saved groups")?;
-    let snapshot = client.snapshot().context("read session snapshot")?;
     let before = state.workspaces.len();
     state.workspaces.retain(|workspace_id, _| {
-        snapshot
-            .workspaces
+        workspaces
             .iter()
             .any(|workspace| &workspace.workspace_id == workspace_id)
     });
@@ -120,23 +128,14 @@ fn forget(state_path: &std::path::Path, workspace_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Opens the picker popup for the action's space, or the focused one.
+/// Opens the picker popup for the invocation's space.
 fn open_picker(
     client: &Client,
     environment: &Environment,
     state_path: &std::path::Path,
+    workspace_id: Option<&str>,
 ) -> Result<()> {
-    let workspace_id = match std::env::var("HERDR_WORKSPACE_ID")
-        .ok()
-        .filter(|id| !id.is_empty())
-    {
-        Some(id) => id,
-        None => client
-            .snapshot()
-            .context("read session snapshot")?
-            .focused_workspace_id
-            .context("no focused space")?,
-    };
+    let workspace_id = workspace_id.context("the invocation names no space")?;
     let groups = State::load(state_path)
         .context("read saved groups")?
         .groups();
@@ -161,13 +160,11 @@ fn open_picker(
     Ok(())
 }
 
-fn pick(client: &Client, state_path: &std::path::Path) -> Result<()> {
+fn pick(client: &Client, state_path: &std::path::Path, workspaces: &[WorkspaceInfo]) -> Result<()> {
     let workspace_id = std::env::var(ENV_WORKSPACE)
         .ok()
         .filter(|id| !id.is_empty())
         .with_context(|| format!("{ENV_WORKSPACE} is not set; run this through the action"))?;
-    let snapshot = client.snapshot().context("read session snapshot")?;
-    let workspaces = &snapshot.workspaces;
     let target = workspaces
         .iter()
         .find(|workspace| workspace.workspace_id == workspace_id)
