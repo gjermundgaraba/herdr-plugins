@@ -35,27 +35,28 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<()> {
-    let environment = Environment::load()?;
-    let source_pane_id = environment
-        .pane_id
-        .as_deref()
-        .context("HERDR_PANE_ID is not set")?;
-    let client = Client::from_env()?;
-    let source = client
-        .current_pane(Some(source_pane_id))
-        .context("read focused pane")?;
-    let session = source
-        .agent_session
-        .as_ref()
-        .ok_or_else(|| anyhow!(missing_session_message(source.agent.as_deref())))?;
+    let source = Environment::load()?
+        .context
+        .context("HERDR_PLUGIN_CONTEXT_JSON is not set")?;
+    let source_pane_id = source
+        .focused_pane_id
+        .context("the invocation names no pane")?;
+    let session = source.focused_pane_agent_session.as_ref().ok_or_else(|| {
+        anyhow!(missing_session_message(
+            source.focused_pane_agent.as_deref()
+        ))
+    })?;
     let (kind, args) = fork_command(session)?;
+    let client = Client::from_env()?;
     let pane = client
         .split_pane(&PaneSplitParams {
             workspace_id: None,
-            target_pane_id: Some(source.pane_id),
+            target_pane_id: Some(source_pane_id),
             direction: SplitDirection::Right,
             ratio: None,
-            cwd: source.foreground_cwd.or(source.cwd),
+            cwd: source
+                .focused_pane_foreground_cwd
+                .or(source.focused_pane_cwd),
             focus: false,
             env: HashMap::new(),
         })
