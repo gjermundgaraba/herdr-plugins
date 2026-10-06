@@ -1,9 +1,4 @@
-use std::{
-    collections::HashMap,
-    process::ExitCode,
-    thread,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, process::ExitCode, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
 use herdr_client::{
@@ -12,8 +7,6 @@ use herdr_client::{
 use serde_json::json;
 
 const NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(2);
-const SHELL_READY_TIMEOUT: Duration = Duration::from_secs(5);
-const READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 fn main() -> ExitCode {
     match run() {
@@ -62,16 +55,14 @@ fn run() -> Result<()> {
         })
         .context("split pane")?;
 
-    if let Err(error) = start_agent_when_shell_ready(
-        &client,
-        &AgentStartParams {
-            name: format!("f-{}", pane.pane_id.to_ascii_lowercase().replace(':', "-")),
-            kind: kind.into(),
-            pane_id: pane.pane_id.clone(),
-            args,
-            timeout_ms: None,
-        },
-    ) {
+    // Herdr waits for the new pane's shell to finish starting.
+    if let Err(error) = client.start_agent(&AgentStartParams {
+        name: format!("f-{}", pane.pane_id.to_ascii_lowercase().replace(':', "-")),
+        kind: kind.into(),
+        pane_id: pane.pane_id.clone(),
+        args,
+        timeout_ms: None,
+    }) {
         let message = format!("start {kind} fork: {error}");
         bail!(if start_was_rejected(&error) {
             rollback(&client, &pane.pane_id, message)
@@ -90,23 +81,6 @@ fn run() -> Result<()> {
         )
     })?;
     Ok(())
-}
-
-fn start_agent_when_shell_ready(client: &Client, params: &AgentStartParams) -> Result<(), Error> {
-    let deadline = Instant::now() + SHELL_READY_TIMEOUT;
-    loop {
-        match client.start_agent(params) {
-            Ok(_) => return Ok(()),
-            Err(error) if shell_is_starting(&error) && Instant::now() < deadline => {
-                thread::sleep(READY_POLL_INTERVAL);
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-fn shell_is_starting(error: &Error) -> bool {
-    matches!(error, Error::Api(error) if error.code == "agent_pane_busy")
 }
 
 fn start_was_rejected(error: &Error) -> bool {
@@ -229,18 +203,6 @@ mod tests {
             missing_session_message(Some("opencode")),
             "no native opencode session reference; run `herdr integration install opencode`"
         );
-    }
-
-    #[test]
-    fn only_pane_busy_is_a_shell_startup_race() {
-        assert!(shell_is_starting(&Error::Api(herdr_client::ApiError {
-            code: "agent_pane_busy".into(),
-            message: "not ready".into(),
-        })));
-        assert!(!shell_is_starting(&Error::Api(herdr_client::ApiError {
-            code: "agent_name_taken".into(),
-            message: "duplicate".into(),
-        })));
     }
 
     #[test]

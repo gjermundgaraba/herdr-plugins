@@ -43,7 +43,9 @@ description = "fork agent into right pane"
 
 Reload keybindings with `herdr server reload-config`.
 
-Requires stock Herdr >= 0.8.0 (the fork build is not needed) and a Pi, Codex, Claude Code, or OpenCode version with the fork
+Requires the [Herdr fork build](../README.md#herdr-build), which supplies the
+pane's agent session in the invocation context and waits for the new pane's
+shell, and a Pi, Codex, Claude Code, or OpenCode version with the fork
 command shown above.
 
 ## Development
