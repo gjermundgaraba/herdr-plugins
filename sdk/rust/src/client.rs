@@ -12,7 +12,8 @@ use serde_json::{Value, json};
 
 use crate::{
     AgentInfo, AgentStartParams, EventEnvelope, EventSubscription, LayoutDescription,
-    LayoutExportParams, LayoutSetSplitRatioParams, PaneInfo, PaneSplitParams, SessionSnapshot,
+    LayoutExportParams, LayoutSetSplitRatioParams, PaneInfo, PaneSplitParams, PickOutcome,
+    PickParams, SessionSnapshot,
 };
 
 type LocalStream = interprocess::local_socket::Stream;
@@ -113,6 +114,16 @@ impl Client {
     pub fn start_agent(&self, params: &AgentStartParams) -> Result<AgentInfo, Error> {
         let result: AgentStartedResult = self.call("agent.start", params)?;
         Ok(result.agent)
+    }
+
+    /// Show a native picker and wait until the user answers it. The wait
+    /// ignores this client's timeout, because it lasts as long as the user takes.
+    pub fn pick(&self, params: &PickParams) -> Result<PickOutcome, Error> {
+        let id = self.request_id();
+        let mut stream = self.connect()?;
+        write_request(&mut stream, &id, "ui.pick", params)?;
+        let result: PickedResult = read_response(&mut BufReader::new(stream), &id)?;
+        Ok(result.outcome)
     }
 
     /// Start a long-lived event subscription on a dedicated connection.
@@ -266,6 +277,11 @@ struct SnapshotResult {
 #[derive(Deserialize)]
 struct PaneResult {
     pane: PaneInfo,
+}
+
+#[derive(Deserialize)]
+struct PickedResult {
+    outcome: PickOutcome,
 }
 
 #[derive(Deserialize)]

@@ -317,3 +317,53 @@ impl EventSubscription {
         self
     }
 }
+
+/// One row of a native `ui.pick` picker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PickItem {
+    pub id: String,
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub badge: Option<String>,
+}
+
+impl PickItem {
+    pub fn new(id: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+            detail: None,
+            badge: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PickCreate {
+    /// Label of the row that turns unmatched query text into a new entry.
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PickParams {
+    pub title: String,
+    pub items: Vec<PickItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub create: Option<PickCreate>,
+    /// The client to show the picker on; pass the invocation context's
+    /// `client_id`. Herdr falls back to the foreground client.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PickOutcome {
+    Picked { id: String },
+    Created { text: String },
+    Cancelled,
+}
