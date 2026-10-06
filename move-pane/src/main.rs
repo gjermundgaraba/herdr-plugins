@@ -40,18 +40,25 @@ fn main() -> ExitCode {
 /// The action: move directly when the workspace has one tab, else open the
 /// popup with the pane identity pinned in its environment.
 fn run_action() -> Result<()> {
-    let environment = Environment::load()?;
+    let Environment {
+        plugin_id, context, ..
+    } = Environment::load()?;
+    let context = context.context("HERDR_PLUGIN_CONTEXT_JSON is not set")?;
+    let pane_id = context
+        .focused_pane_id
+        .context("the invocation names no pane")?;
+    let workspace_id = context
+        .workspace_id
+        .context("the invocation names no space")?;
+    let tab_id = context.tab_id.context("the invocation names no tab")?;
+    let mut tabs = context.tabs;
+    tabs.sort_by_key(|tab| tab.number);
+    let destinations = destinations(&tabs, &tab_id);
     let client = Client::from_env()?;
-    let pane = client
-        .current_pane(environment.pane_id.as_deref())
-        .context("read focused pane")?;
-    let destinations = destinations(&tabs_in(&client, &pane.workspace_id)?, &pane.tab_id);
     if let [only] = destinations.as_slice() {
-        return move_pane(&client, &pane.pane_id, only);
+        return move_pane(&client, &pane_id, only);
     }
-    let plugin_id = environment
-        .plugin_id
-        .context("HERDR_PLUGIN_ID is not set")?;
+    let plugin_id = plugin_id.context("HERDR_PLUGIN_ID is not set")?;
     client
         .call_value(
             "plugin.pane.open",
@@ -63,9 +70,9 @@ fn run_action() -> Result<()> {
                 "height": destinations.len() + 4,
                 "focus": true,
                 "env": {
-                    ENV_PANE: pane.pane_id,
-                    ENV_WORKSPACE: pane.workspace_id,
-                    ENV_TAB: pane.tab_id,
+                    ENV_PANE: pane_id,
+                    ENV_WORKSPACE: workspace_id,
+                    ENV_TAB: tab_id,
                 },
             }),
         )
