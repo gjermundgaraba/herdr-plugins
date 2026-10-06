@@ -1,5 +1,5 @@
 // Pure sidebar computations: stable display order and token formatting.
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use herdr_client::{SessionSnapshot, WorkspaceInfo};
@@ -11,67 +11,37 @@ pub struct DisplayEntry<'a> {
     pub grouped_child: bool,
 }
 
-/// Stable sidebar order with worktree groups expanded. A grouped repo's
-/// non-linked parent is emitted at the position of its first member, with the
-/// linked-worktree children right after it. Herdr does not expose desktop group
-/// collapse state through its plugin API.
+/// Stable sidebar order with worktree families expanded: a family shows at
+/// its first member's position, its checkout first and its linked worktrees,
+/// marked by Herdr's `family_anchor_id`, right after it. Herdr does not expose
+/// desktop group collapse state through its plugin API.
 pub fn display_order(snapshot: &SessionSnapshot) -> Vec<DisplayEntry<'_>> {
-    let mut members_by_key = HashMap::<&str, Vec<usize>>::new();
-    for (index, workspace) in snapshot.workspaces.iter().enumerate() {
-        if let Some(worktree) = &workspace.worktree {
-            members_by_key
-                .entry(&worktree.repo_key)
-                .or_default()
-                .push(index);
-        }
-    }
-    let grouped_parents: HashMap<&str, usize> = members_by_key
-        .iter()
-        .filter(|(_, members)| members.len() >= 2)
-        .filter_map(|(key, members)| {
-            members
-                .iter()
-                .copied()
-                .find(|index| {
-                    snapshot.workspaces[*index]
-                        .worktree
-                        .as_ref()
-                        .is_some_and(|worktree| !worktree.is_linked_worktree)
-                })
-                .map(|parent| (*key, parent))
-        })
-        .collect();
-
-    let mut emitted_groups = HashSet::<&str>::new();
-    let mut ordered = Vec::with_capacity(snapshot.workspaces.len());
-    for workspace in &snapshot.workspaces {
-        let Some((key, parent)) = workspace
-            .worktree
-            .as_ref()
-            .map(|worktree| worktree.repo_key.as_str())
-            .and_then(|key| grouped_parents.get(key).map(|&parent| (key, parent)))
-        else {
-            ordered.push(DisplayEntry {
-                workspace,
-                grouped_child: false,
-            });
-            continue;
-        };
-        if !emitted_groups.insert(key) {
+    let workspaces = &snapshot.workspaces;
+    let mut emitted = HashSet::<&str>::new();
+    let mut ordered = Vec::with_capacity(workspaces.len());
+    for workspace in workspaces {
+        let anchor = workspace
+            .family_anchor_id
+            .as_deref()
+            .unwrap_or(&workspace.workspace_id);
+        if !emitted.insert(anchor) {
             continue;
         }
-        let members = &members_by_key[key];
-        ordered.push(DisplayEntry {
-            workspace: &snapshot.workspaces[parent],
-            grouped_child: false,
-        });
         ordered.extend(
-            members
+            workspaces
                 .iter()
-                .copied()
-                .filter(|member| *member != parent)
-                .map(|member| DisplayEntry {
-                    workspace: &snapshot.workspaces[member],
+                .filter(|member| member.workspace_id == anchor)
+                .map(|workspace| DisplayEntry {
+                    workspace,
+                    grouped_child: false,
+                }),
+        );
+        ordered.extend(
+            workspaces
+                .iter()
+                .filter(|member| member.family_anchor_id.as_deref() == Some(anchor))
+                .map(|workspace| DisplayEntry {
+                    workspace,
                     grouped_child: true,
                 }),
         );
@@ -168,7 +138,8 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) fn workspace(id: &str, group: Option<(&str, bool)>) -> WorkspaceInfo {
+    /// A space, optionally in a worktree family with `(repo, linked, anchor)`.
+    pub(crate) fn workspace(id: &str, family: Option<(&str, bool, &str)>) -> WorkspaceInfo {
         WorkspaceInfo {
             workspace_id: id.into(),
             number: 0,
@@ -178,14 +149,19 @@ pub(crate) mod tests {
             tab_count: 0,
             active_tab_id: String::new(),
             agent_status: AgentStatus::from(AgentStatus::UNKNOWN),
-            tokens: HashMap::new(),
-            worktree: group.map(|(key, linked)| WorkspaceWorktreeInfo {
+            tokens: Default::default(),
+            worktree: family.map(|(key, linked, _)| WorkspaceWorktreeInfo {
                 repo_key: key.into(),
                 repo_name: key.into(),
                 repo_root: format!("/{key}"),
                 checkout_path: format!("/{id}"),
                 is_linked_worktree: linked,
             }),
+            group: None,
+            family_anchor_id: family
+                .map(|(_, _, anchor)| anchor)
+                .filter(|anchor| *anchor != id)
+                .map(Into::into),
         }
     }
 
@@ -212,10 +188,10 @@ pub(crate) mod tests {
     #[test]
     fn display_order_emits_noncontiguous_group_at_its_first_member() {
         let snapshot = snapshot(vec![
-            workspace("child-a", Some(("repo", true))),
+            workspace("child-a", Some(("repo", true, "parent"))),
             workspace("plain", None),
-            workspace("parent", Some(("repo", false))),
-            workspace("child-b", Some(("repo", true))),
+            workspace("parent", Some(("repo", false, "parent"))),
+            workspace("child-b", Some(("repo", true, "parent"))),
         ]);
         assert_eq!(
             display_roles(&snapshot),
@@ -224,25 +200,6 @@ pub(crate) mod tests {
                 ("child-a", true),
                 ("child-b", true),
                 ("plain", false),
-            ]
-        );
-    }
-
-    #[test]
-    fn display_order_leaves_linked_only_and_singleton_sets_ungrouped() {
-        let snapshot = snapshot(vec![
-            workspace("linked-a", Some(("linked-only", true))),
-            workspace("single-parent", Some(("singleton", false))),
-            workspace("plain", None),
-            workspace("linked-b", Some(("linked-only", true))),
-        ]);
-        assert_eq!(
-            display_roles(&snapshot),
-            [
-                ("linked-a", false),
-                ("single-parent", false),
-                ("plain", false),
-                ("linked-b", false),
             ]
         );
     }
@@ -275,7 +232,8 @@ pub(crate) mod tests {
             workspace_cwd(&snapshot, &snapshot.workspaces[0]),
             Some(PathBuf::from("/first-pane"))
         );
-        snapshot.workspaces[0].worktree = workspace("workspace", Some(("repo", true))).worktree;
+        snapshot.workspaces[0].worktree =
+            workspace("workspace", Some(("repo", true, "workspace"))).worktree;
         assert_eq!(
             workspace_cwd(&snapshot, &snapshot.workspaces[0]),
             Some(PathBuf::from("/workspace"))

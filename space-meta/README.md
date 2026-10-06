@@ -35,7 +35,9 @@ the PR refresh:
 
 ## Setup
 
-Requires `git`; PR badges additionally require the [GitHub CLI](https://cli.github.com/) (`gh`).
+Requires the [Herdr fork build](../README.md#herdr-build) for worktree families
+(`family_anchor_id`) and `pane.cwd_changed`, and `git`; PR badges additionally
+require the [GitHub CLI](https://cli.github.com/) (`gh`).
 macOS only (FSEvents).
 
 Add the tokens to your `~/.config/herdr/config.toml`:
@@ -87,11 +89,11 @@ a rebuild.
   clears them, and the `startup` hook starts a fresh daemon that republishes.
 - Branch/PR metadata resolves from a workspace's worktree checkout path when
   available; otherwise from the first snapshot pane in the workspace's first
-  tab, whichever directory of the repository that is. Herdr emits no event
-  when a pane changes directory, so that fallback is re-sampled only at
-  workspace, worktree, tab, and pane lifecycle events or `refresh`. A
-  directory that is not (or no longer) a repository is not watched; it is
-  re-checked at those same events, so a `git init` shows up at the next one.
+  tab, whichever directory of the repository that is. That fallback is
+  re-sampled at workspace, worktree, tab, and pane lifecycle events, at the
+  fork's `pane.cwd_changed`, and at `refresh`. A directory that is not (or no
+  longer) a repository is not watched; it is re-checked at those same events,
+  so a `git init` shows up at the next one.
 - Herdr's plugin snapshot does not expose desktop worktree-group collapse
   state, so numbering remains in stable expanded order while a group is
   collapsed.

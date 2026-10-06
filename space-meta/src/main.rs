@@ -40,9 +40,8 @@ const IDLE_WAKE: Duration = Duration::from_secs(24 * 60 * 60);
 const DAEMON_STOP_WAIT: Duration = Duration::from_secs(2);
 const LOG_MAX_BYTES: u64 = 256 * 1024;
 
-/// Everything that can change a space's number, label, or first pane. Herdr
-/// emits nothing when a pane changes directory, so a non-worktree space's
-/// checkout is re-sampled at these events only.
+/// Everything that can change a space's number, label, first pane, or that
+/// pane's directory, which is a non-worktree space's checkout.
 const SUBSCRIPTIONS: &[&str] = &[
     "workspace.created",
     "workspace.updated",
@@ -58,6 +57,7 @@ const SUBSCRIPTIONS: &[&str] = &[
     "pane.created",
     "pane.closed",
     "pane.moved",
+    "pane.cwd_changed",
 ];
 
 fn main() {
@@ -641,7 +641,7 @@ mod tests {
     #[test]
     fn render_holds_resolving_rows_and_folds_in_tracked_facts() {
         let snapshot = snapshot(vec![
-            workspace("ws", Some(("repo", false))),
+            workspace("ws", Some(("repo", false, "ws"))),
             workspace("plain", None),
         ]);
         let cwd = PathBuf::from("/ws");
