@@ -29,12 +29,11 @@ mv -f bin/.herdr-equalize-splits.new bin/herdr-equalize-splits
 herdr plugin link "$PWD"
 ```
 
-No keybinding or configuration is required. Its startup hook seeds a pane-to-tab
-cache so background pane exits equalize the affected tab. Cache and locking are
-isolated by Herdr socket, and each server startup replaces the session-local
-pane map. The `pane.moved` trigger refreshes this cache; it does not resize the
-destination tab. Runtime state lives under `HERDR_PLUGIN_STATE_DIR`. Requires
-stock Herdr >= 0.8.0; the fork build is not needed. Installing from GitHub requires `cargo` to build the binary.
+No keybinding or configuration is required. A closed or exited pane's event
+names its tab, which the plugin then equalizes, including background tabs.
+Moving a pane does not resize either tab. Locking is isolated by Herdr socket
+under `HERDR_PLUGIN_STATE_DIR`. Requires the [Herdr fork build](../README.md#herdr-build),
+whose `pane.closed` and `pane.exited` events carry `tab_id`. Installing from GitHub requires `cargo` to build the binary.
 
 ## Development
 

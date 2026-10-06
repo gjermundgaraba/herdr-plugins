@@ -296,7 +296,6 @@ dependencies = [
  "anyhow",
  "herdr-client",
  "serde_json",
- "tempfile",
 ]
 
 [[package]]

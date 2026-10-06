@@ -1,12 +1,10 @@
-use std::collections::HashMap;
 use std::fs::{self, File};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use herdr_client::{
-    Client, Environment, LayoutExportParams, LayoutNode, LayoutSetSplitRatioParams,
+    Client, Environment, Error, LayoutExportParams, LayoutNode, LayoutSetSplitRatioParams,
     PluginInvocation, SplitDirection, socket_scope_dir,
 };
 
@@ -22,10 +20,10 @@ struct RatioUpdate {
 }
 
 enum Trigger {
-    Startup,
-    Moved(String),
+    /// A new pane: equalize the region around it.
     Created(String),
-    Removed(String),
+    /// A pane left this tab: equalize the whole tab.
+    Removed { tab_id: String },
 }
 
 fn main() {
@@ -42,30 +40,25 @@ fn run() -> Result<()> {
         .socket_path
         .as_deref()
         .context("HERDR_SOCKET_PATH is not set")?;
+    let non_empty = |value: &serde_json::Value| {
+        value
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
     let trigger = match environment.invocation() {
-        Some(PluginInvocation::Startup) => Trigger::Startup,
         Some(PluginInvocation::Event {
             name: "pane.created",
             event,
-        }) => match event.data["pane"]["pane_id"].as_str() {
-            Some(pane_id) if !pane_id.is_empty() => Trigger::Created(pane_id.to_owned()),
-            _ => return Ok(()),
-        },
+        }) => non_empty(&event.data["pane"]["pane_id"]).map(Trigger::Created),
         Some(PluginInvocation::Event {
             name: "pane.closed" | "pane.exited",
             event,
-        }) => match event.data["pane_id"].as_str() {
-            Some(pane_id) if !pane_id.is_empty() => Trigger::Removed(pane_id.to_owned()),
-            _ => return Ok(()),
-        },
-        Some(PluginInvocation::Event {
-            name: "pane.moved",
-            event,
-        }) => match event.data["previous_pane_id"].as_str() {
-            Some(pane_id) if !pane_id.is_empty() => Trigger::Moved(pane_id.to_owned()),
-            _ => return Ok(()),
-        },
-        _ => return Ok(()),
+        }) => non_empty(&event.data["tab_id"]).map(|tab_id| Trigger::Removed { tab_id }),
+        _ => None,
+    };
+    let Some(trigger) = trigger else {
+        return Ok(());
     };
 
     let run_dir = socket_scope_dir(&plugin.run_dir().join("sessions"), socket_path);
@@ -82,55 +75,28 @@ fn run() -> Result<()> {
     fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600)).context("chmod lock")?;
     lock.lock().context("acquire lock")?;
     let client = Client::new(socket_path).with_timeout(SOCKET_TIMEOUT);
-    let snapshot = client.snapshot().context("snapshot session")?;
-    let cache_dir = socket_scope_dir(&plugin.cache_dir().join("sessions"), socket_path);
-    fs::create_dir_all(&cache_dir).context("create cache directory")?;
-    let pane_tabs_path = cache_dir.join("pane-tabs.json");
-    let mut pane_tabs = match trigger {
-        Trigger::Startup => HashMap::new(),
-        _ => load_pane_tabs(&pane_tabs_path)?,
-    };
-    let removed_tab_id = refresh_pane_tabs(
-        &mut pane_tabs,
-        snapshot
-            .panes
-            .iter()
-            .map(|pane| (pane.pane_id.as_str(), pane.tab_id.as_str())),
-        match &trigger {
-            Trigger::Moved(pane_id) | Trigger::Removed(pane_id) => Some(pane_id.as_str()),
-            _ => None,
-        },
-    );
-    save_pane_tabs(&pane_tabs_path, &pane_tabs)?;
 
-    let created_pane_id = match &trigger {
-        Trigger::Startup | Trigger::Moved(_) => return Ok(()),
-        Trigger::Created(pane_id) => Some(pane_id),
-        Trigger::Removed(_) => None,
-    };
-    let params = match created_pane_id {
-        Some(pane_id) => LayoutExportParams {
+    let params = match &trigger {
+        Trigger::Created(pane_id) => LayoutExportParams {
             pane_id: Some(pane_id.clone()),
             tab_id: None,
         },
-        None => {
-            let Some(tab_id) = removed_tab_id
-                .filter(|tab_id| snapshot.tabs.iter().any(|tab| tab.tab_id == *tab_id))
-            else {
-                return Ok(()); // The tab may have closed with its last pane.
-            };
-            LayoutExportParams {
-                tab_id: Some(tab_id),
-                pane_id: None,
-            }
-        }
+        Trigger::Removed { tab_id } => LayoutExportParams {
+            tab_id: Some(tab_id.clone()),
+            pane_id: None,
+        },
     };
-    let mut layout = client.export_layout(&params).context("export layout")?;
+    let mut layout = match client.export_layout(&params) {
+        Ok(layout) => layout,
+        // The tab closed with its last pane.
+        Err(Error::Api(error)) if error.code == "tab_not_found" => return Ok(()),
+        Err(error) => return Err(error).context("export layout"),
+    };
 
     for _ in 0..MAX_RATIO_UPDATES {
-        let plan = match created_pane_id {
-            Some(pane_id) => equalization_plan(&layout.root, pane_id),
-            None => full_equalization_plan(&layout.root),
+        let plan = match &trigger {
+            Trigger::Created(pane_id) => equalization_plan(&layout.root, pane_id),
+            Trigger::Removed { .. } => full_equalization_plan(&layout.root),
         };
         let Some(update) = plan.into_iter().next() else {
             return Ok(());
@@ -145,39 +111,6 @@ fn run() -> Result<()> {
             .context("set split ratio")?;
     }
     bail!("layout kept changing while equalizing")
-}
-
-fn refresh_pane_tabs<'a>(
-    pane_tabs: &mut HashMap<String, String>,
-    panes: impl IntoIterator<Item = (&'a str, &'a str)>,
-    removed_pane_id: Option<&str>,
-) -> Option<String> {
-    let removed_tab_id = removed_pane_id.and_then(|pane_id| pane_tabs.remove(pane_id));
-    pane_tabs.extend(
-        panes
-            .into_iter()
-            .map(|(pane_id, tab_id)| (pane_id.to_owned(), tab_id.to_owned())),
-    );
-    removed_tab_id
-}
-
-fn load_pane_tabs(path: &Path) -> Result<HashMap<String, String>> {
-    match fs::read(path) {
-        Ok(contents) => Ok(serde_json::from_slice(&contents).unwrap_or_default()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
-        Err(error) => Err(error).context("read pane-to-tab cache"),
-    }
-}
-
-fn save_pane_tabs(path: &Path, pane_tabs: &HashMap<String, String>) -> Result<()> {
-    let parent = path
-        .parent()
-        .context("pane-to-tab cache path has no parent")?;
-    let mut temporary =
-        tempfile::NamedTempFile::new_in(parent).context("open pane-to-tab cache temporary file")?;
-    serde_json::to_writer(&mut temporary, pane_tabs).context("write pane-to-tab cache")?;
-    temporary.persist(path).context("save pane-to-tab cache")?;
-    Ok(())
 }
 
 /// Equalize the connected same-direction region around a freshly created pane.
@@ -306,26 +239,6 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn cache_save_replaces_the_file_with_private_permissions() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("pane-tabs.json");
-        let old_path = directory.path().join("old-cache.json");
-        fs::write(&path, b"old").unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        fs::hard_link(&path, &old_path).unwrap();
-        let pane_tabs = HashMap::from([("pane-a".into(), "tab-a".into())]);
-
-        save_pane_tabs(&path, &pane_tabs).unwrap();
-
-        assert_eq!(load_pane_tabs(&path).unwrap(), pane_tabs);
-        assert_eq!(fs::read(&old_path).unwrap(), b"old");
-        assert_eq!(
-            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-    }
-
     fn pane(id: &str) -> LayoutNode {
         LayoutNode::Pane(LayoutPane {
             pane_id: Some(id.into()),
@@ -406,37 +319,6 @@ mod tests {
         );
 
         assert_eq!(equalization_plan(&root, "b"), vec![]);
-    }
-
-    #[test]
-    fn removed_panes_keep_other_pending_mappings() {
-        let mut pane_tabs = HashMap::from([
-            ("pane-a".into(), "tab-a".into()),
-            ("pane-b".into(), "tab-b".into()),
-        ]);
-
-        assert_eq!(
-            refresh_pane_tabs(&mut pane_tabs, [], Some("pane-a")),
-            Some("tab-a".into())
-        );
-        assert_eq!(pane_tabs.get("pane-b").map(String::as_str), Some("tab-b"));
-        refresh_pane_tabs(&mut pane_tabs, [("pane-b", "tab-c")], None);
-        assert_eq!(
-            refresh_pane_tabs(&mut pane_tabs, [], Some("pane-b")),
-            Some("tab-c".into())
-        );
-    }
-
-    #[test]
-    fn moved_pane_forgets_its_previous_id() {
-        let mut pane_tabs = HashMap::from([("old-id".into(), "tab-a".into())]);
-
-        refresh_pane_tabs(&mut pane_tabs, [("new-id", "tab-b")], Some("old-id"));
-
-        assert_eq!(
-            pane_tabs,
-            HashMap::from([("new-id".into(), "tab-b".into())])
-        );
     }
 
     #[test]

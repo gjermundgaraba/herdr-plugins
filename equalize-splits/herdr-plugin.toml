@@ -17,15 +17,8 @@ command = ["install", "-m", "750", "../target/release/herdr-equalize-splits", "b
 [[build]]
 command = ["mv", "-f", "bin/.herdr-equalize-splits.new", "bin/herdr-equalize-splits"]
 
-[[startup]]
-command = ["bin/herdr-equalize-splits"]
-
 [[events]]
 on = "pane.created"
-command = ["bin/herdr-equalize-splits"]
-
-[[events]]
-on = "pane.moved"
 command = ["bin/herdr-equalize-splits"]
 
 [[events]]

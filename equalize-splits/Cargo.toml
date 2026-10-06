@@ -12,4 +12,3 @@ repository.workspace = true
 anyhow.workspace = true
 herdr-client.workspace = true
 serde_json.workspace = true
-tempfile.workspace = true
