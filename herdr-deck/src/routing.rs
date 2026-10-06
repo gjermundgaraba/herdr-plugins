@@ -1,6 +1,7 @@
-use crate::frontends::{ClientRoute, ClientState, Model, Update, project_agent};
+use crate::frontends::project_agent;
 use herdr_client::{AgentInfo, WorkspaceInfo};
 use herdr_frontend::InputTarget;
+use herdr_frontend::directory::{ClientRoute, ClientState, Model, Update};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentIdentity {

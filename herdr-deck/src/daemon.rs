@@ -9,10 +9,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::frontends::{self, Model};
 use crate::routing::{DisplayModel, SessionState};
 use elgato_streamdeck::info::Kind;
 use herdr_client::AgentInfo;
+use herdr_frontend::directory::{self, Model};
 use herdr_frontend::{self as frontend, FrontendClient, Input, NavigationTarget};
 use serde_json::json;
 use signal_hook::consts::{SIGINT, SIGTERM};
@@ -173,7 +173,7 @@ fn doctor(override_path: Option<&str>) -> Result<(), String> {
                 .with_timeout(Duration::from_secs(2))
                 .snapshot()
             {
-                Ok(snapshot) => Some(frontends::ClientState {
+                Ok(snapshot) => Some(directory::ClientState {
                     socket_path: path,
                     snapshot,
                 }),
@@ -1075,7 +1075,7 @@ fn spawn_workers(events: mpsc::Sender<Event>, stopped: Arc<AtomicBool>) -> Worke
     let shared_routing = Arc::new(Mutex::new(RoutingState::default()));
     let frontend_routing = Arc::clone(&shared_routing);
     let frontend_events = events.clone();
-    let frontend_worker = frontends::spawn_updates(
+    let frontend_worker = directory::spawn_updates(
         frontend::directory(),
         move |clients| {
             let mut routing = frontend_routing.lock().unwrap_or_else(|e| e.into_inner());
@@ -1485,8 +1485,8 @@ mod tests {
         }
     }
 
-    fn test_client_route(endpoint: &str) -> frontends::ClientRoute {
-        frontends::ClientRoute {
+    fn test_client_route(endpoint: &str) -> directory::ClientRoute {
+        directory::ClientRoute {
             client_id: "client-a".into(),
             socket_path: "/tmp/test-deck.sock".into(),
             endpoint_id: endpoint.into(),
@@ -1784,7 +1784,7 @@ fn execute_frontend_call(
     validate()?;
     let snapshot = client.snapshot().map_err(|e| e.to_string())?;
     crate::routing::validate_client(
-        &frontends::ClientState {
+        &directory::ClientState {
             socket_path: client.socket_path().into(),
             snapshot,
         },
