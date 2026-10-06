@@ -39,9 +39,3 @@ description = "Pick, create, or clear a space's group"
 contexts = ["workspace"]
 command = ["bin/herdr-space-groups"]
 
-[[panes]]
-id = "pick"
-title = "Space group"
-platforms = ["macos", "linux"]
-placement = "popup"
-command = ["bin/herdr-space-groups"]

@@ -7,7 +7,6 @@
 //! Metadata tokens do not survive a server restart or live handoff, so every
 //! assignment is saved per session and republished by the startup hook.
 mod order;
-mod picker;
 mod state;
 
 use std::path::PathBuf;
@@ -15,16 +14,19 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use herdr_client::{Client, Environment, PluginInvocation, WorkspaceInfo, socket_scope_dir};
+use herdr_client::{
+    Client, Environment, PickCreate, PickItem, PickOutcome, PickParams, PluginContext,
+    PluginInvocation, WorkspaceInfo, socket_scope_dir,
+};
 use serde_json::json;
 
-use picker::Choice;
 use state::State;
 
 const SOURCE_ID: &str = "gjermundgaraba.herdr-space-groups";
 /// Workspace metadata key the fork's sidebar groups by.
 const TOKEN_KEY: &str = "space_group";
-const ENV_WORKSPACE: &str = "HERDR_SPACE_GROUPS_WORKSPACE_ID";
+/// Picker item id for clearing the group; group names are never empty.
+const REMOVE: &str = "";
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn main() -> ExitCode {
@@ -63,13 +65,7 @@ fn run() -> Result<()> {
             name: "workspace.moved" | "workspace.reordered",
             event,
         }) => regroup_moved(&client, &state_path, &event.data),
-        Some(PluginInvocation::Action(_)) => open_picker(
-            &client,
-            &environment,
-            &state_path,
-            context.workspace_id.as_deref(),
-        ),
-        Some(PluginInvocation::Pane(_)) => pick(&client, &state_path, &context.workspaces),
+        Some(PluginInvocation::Action(_)) => assign(&client, &state_path, &context),
         _ => bail!("run this through the plugin's action, startup hook, or event hook"),
     }
 }
@@ -128,43 +124,13 @@ fn forget(state_path: &std::path::Path, workspace_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Opens the picker popup for the invocation's space.
-fn open_picker(
-    client: &Client,
-    environment: &Environment,
-    state_path: &std::path::Path,
-    workspace_id: Option<&str>,
-) -> Result<()> {
-    let workspace_id = workspace_id.context("the invocation names no space")?;
-    let groups = State::load(state_path)
-        .context("read saved groups")?
-        .groups();
-    let plugin_id = environment
-        .plugin_id
+/// Asks for the group of the invocation's space in Herdr's native picker.
+fn assign(client: &Client, state_path: &std::path::Path, context: &PluginContext) -> Result<()> {
+    let workspace_id = context
+        .workspace_id
         .as_deref()
-        .context("HERDR_PLUGIN_ID is not set")?;
-    client
-        .call_value(
-            "plugin.pane.open",
-            &json!({
-                "plugin_id": plugin_id,
-                "entrypoint": "pick",
-                "placement": "popup",
-                "width": 48,
-                "height": (groups.len() + 7).min(20),
-                "focus": true,
-                "env": {ENV_WORKSPACE: workspace_id},
-            }),
-        )
-        .context("open the group picker")?;
-    Ok(())
-}
-
-fn pick(client: &Client, state_path: &std::path::Path, workspaces: &[WorkspaceInfo]) -> Result<()> {
-    let workspace_id = std::env::var(ENV_WORKSPACE)
-        .ok()
-        .filter(|id| !id.is_empty())
-        .with_context(|| format!("{ENV_WORKSPACE} is not set; run this through the action"))?;
+        .context("the invocation names no space")?;
+    let workspaces = &context.workspaces;
     let target = workspaces
         .iter()
         .find(|workspace| workspace.workspace_id == workspace_id)
@@ -179,14 +145,22 @@ fn pick(client: &Client, state_path: &std::path::Path, workspaces: &[WorkspaceIn
     };
     let mut state = State::load(state_path).context("read saved groups")?;
     let current = state.workspaces.get(&anchor.workspace_id).cloned();
-
-    let mut terminal = ratatui::try_init()?;
-    let choice = picker::choose(&mut terminal, &title, &state.groups(), current.as_deref());
-    ratatui::restore();
-    let group = match choice? {
-        None => return Ok(()),
-        Some(Choice::Group(group) | Choice::Create(group)) => Some(group),
-        Some(Choice::Remove) => None,
+    let group = match client
+        .pick(&pick_params(
+            title,
+            &state.groups(),
+            current.as_deref(),
+            context.client_id,
+        ))
+        .context("show the group picker")?
+    {
+        PickOutcome::Picked { id } if id == REMOVE => None,
+        PickOutcome::Picked { id: group } => Some(group),
+        PickOutcome::Created { text } => match state::normalize_group(&text) {
+            Some(group) => Some(group),
+            None => return Ok(()),
+        },
+        PickOutcome::Cancelled => return Ok(()),
     };
     if group == current {
         return Ok(());
@@ -215,6 +189,35 @@ fn pick(client: &Client, state_path: &std::path::Path, workspaces: &[WorkspaceIn
             .context("move the space into its group")?;
     }
     Ok(())
+}
+
+/// Existing groups with the current one selected, a create row for new
+/// names, and a remove row when the space has a group.
+fn pick_params(
+    title: String,
+    groups: &[String],
+    current: Option<&str>,
+    client_id: Option<u64>,
+) -> PickParams {
+    let mut items = groups
+        .iter()
+        .map(|group| PickItem {
+            badge: (Some(group.as_str()) == current).then(|| "●".to_owned()),
+            ..PickItem::new(group, group)
+        })
+        .collect::<Vec<_>>();
+    if current.is_some() {
+        items.push(PickItem::new(REMOVE, "Remove from group"));
+    }
+    PickParams {
+        title,
+        items,
+        selected: current.map(str::to_owned),
+        create: Some(PickCreate {
+            label: "New group".into(),
+        }),
+        client_id,
+    }
 }
 
 /// Gives each moved family the group of where it landed; see `order::regroup`.
@@ -261,4 +264,25 @@ fn regroup_moved(
         report(client, anchor, group.as_deref())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn picker_selects_the_current_group_and_offers_removal_only_when_grouped() {
+        let groups = ["infra".to_owned(), "work".to_owned()];
+        let grouped = pick_params("Group".into(), &groups, Some("work"), Some(3));
+        let ids: Vec<_> = grouped.items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, ["infra", "work", REMOVE]);
+        assert_eq!(grouped.items[1].badge.as_deref(), Some("●"));
+        assert_eq!(grouped.selected.as_deref(), Some("work"));
+        assert_eq!(grouped.client_id, Some(3));
+        assert!(grouped.create.is_some());
+
+        let ungrouped = pick_params("Group".into(), &groups, None, None);
+        assert_eq!(ungrouped.items.len(), 2);
+        assert_eq!(ungrouped.selected, None);
+    }
 }

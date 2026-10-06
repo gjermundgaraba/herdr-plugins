@@ -10,9 +10,7 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-crossterm = "0.29.0"
 herdr-client.workspace = true
-ratatui = { workspace = true, features = ["crossterm_0_29"] }
 serde.workspace = true
 serde_json.workspace = true
 

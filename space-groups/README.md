@@ -1,7 +1,7 @@
 # Space Groups
 
 Put spaces into named groups that the spaces sidebar shows under collapsible
-headers. You pick or create a group from a small popup, and the plugin keeps
+headers. You pick or create a group in Herdr's native picker, and the plugin keeps
 the assignment across server restarts and live handoffs.
 
 Requires the [Herdr fork build](../README.md#herdr-build): stock Herdr's
@@ -60,12 +60,11 @@ command = "gjermundgaraba.herdr-space-groups.assign"
 description = "Set space group"
 ```
 
-The action opens a popup for the focused space. On the fork build, **Set space
-group** also appears in a space's right-click menu and targets the space you
-clicked. Type to filter the existing
-groups or to name a new one, move with `↑`/`↓` (or `ctrl+n`/`ctrl+p`), and
-press `Enter`. With an empty query, **Remove from group** clears the space's
-group. `Esc` cancels.
+The action opens Herdr's native picker for the focused space. On the fork
+build, **Set space group** also appears in a space's right-click menu and
+targets the space you clicked. Type to filter the existing groups or to name a
+new one, move with `↑`/`↓` (or `ctrl+n`/`ctrl+p`), and press `Enter`.
+**Remove from group** clears a grouped space's group. `Esc` cancels.
 
 ## Notes
 
@@ -75,7 +74,7 @@ group. `Esc` cancels.
 - `herdr workspace report-metadata` can set the `space_group` token too, but
   such assignments are not saved and the space is not moved. A group whose
   members are not next to each other shows a header for each run; drag them
-  together or reassign through the popup. Collapsing one run of a group
+  together or reassign through the picker. Collapsing one run of a group
   collapses all of its runs.
 
 ## Local development
