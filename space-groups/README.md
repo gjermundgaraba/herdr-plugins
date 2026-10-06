@@ -39,10 +39,11 @@ regrouped by the `workspace.moved` and `workspace.reordered` hooks:
   shares it, or if it is the group's only space. Otherwise it joins the group
   above it (the one below at the very top).
 
-Herdr keeps metadata tokens in memory only, so the plugin saves assignments
-per session under its state directory and republishes them from its
-`startup` hook, which also runs after a live handoff. A `workspace.closed`
-hook forgets closed spaces.
+The plugin reports the token as persisted, so Herdr saves it with the session
+and it survives restarts and live handoffs; closing a space drops it. The
+plugin keeps no state of its own. Its `startup` hook imports the assignments
+earlier versions saved per session and renames that file to
+`groups.json.imported`.
 
 ## Setup
 
@@ -72,7 +73,7 @@ new one, move with `↑`/`↓` (or `ctrl+n`/`ctrl+p`), and press `Enter`.
   create or delete separately.
 - Collapse state belongs to each TUI client, like worktree groups.
 - `herdr workspace report-metadata` can set the `space_group` token too, but
-  such assignments are not saved and the space is not moved. A group whose
+  such assignments are saved only with `--persist` and the space is not moved. A group whose
   members are not next to each other shows a header for each run; drag them
   together or reassign through the picker. Collapsing one run of a group
   collapses all of its runs.

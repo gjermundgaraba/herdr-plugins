@@ -378,7 +378,6 @@ dependencies = [
  "herdr-client",
  "serde",
  "serde_json",
- "tempfile",
 ]
 
 [[package]]
@@ -400,7 +399,6 @@ dependencies = [
  "herdr-client",
  "serde",
  "serde_json",
- "tempfile",
 ]
 
 [[package]]

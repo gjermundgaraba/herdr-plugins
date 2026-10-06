@@ -4,11 +4,11 @@
 //! A space moved by other means, such as a sidebar drag, takes the group of
 //! where it landed.
 //!
-//! Metadata tokens do not survive a server restart or live handoff, so every
-//! assignment is saved per session and republished by the startup hook.
+//! Herdr saves the token with the session and drops it with its space, so the
+//! tokens are the only state.
 mod order;
-mod state;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -20,13 +20,13 @@ use herdr_client::{
 };
 use serde_json::json;
 
-use state::State;
-
 const SOURCE_ID: &str = "gjermundgaraba.herdr-space-groups";
 /// Workspace metadata key the fork's sidebar groups by.
 const TOKEN_KEY: &str = "space_group";
 /// Picker item id for clearing the group; group names are never empty.
 const REMOVE: &str = "";
+/// Longest group name accepted from the picker.
+const MAX_GROUP_LEN: usize = 40;
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn main() -> ExitCode {
@@ -47,37 +47,19 @@ fn main() -> ExitCode {
 
 fn run() -> Result<()> {
     let environment = Environment::load()?;
-    let state_path = state_path(&environment)?;
     let client = Client::from_env()?.with_timeout(SOCKET_TIMEOUT);
     let context = environment.context.clone().unwrap_or_default();
     match environment.invocation() {
-        Some(PluginInvocation::Startup) => restore(&client, &state_path, &context.workspaces),
-        Some(PluginInvocation::Event {
-            name: "workspace.closed",
-            event,
-        }) => {
-            let workspace_id = event.data["workspace_id"]
-                .as_str()
-                .context("workspace.closed event without workspace_id")?;
-            forget(&state_path, workspace_id)
+        Some(PluginInvocation::Startup) => {
+            import_saved_groups(&environment, &client, &context.workspaces)
         }
         Some(PluginInvocation::Event {
             name: "workspace.moved" | "workspace.reordered",
             event,
-        }) => regroup_moved(&client, &state_path, &event.data),
-        Some(PluginInvocation::Action(_)) => assign(&client, &state_path, &context),
+        }) => regroup_moved(&client, &event.data),
+        Some(PluginInvocation::Action(_)) => assign(&client, &context),
         _ => bail!("run this through the plugin's action, startup hook, or event hook"),
     }
-}
-
-/// Assignments are scoped to the session socket: workspace ids are per session.
-fn state_path(environment: &Environment) -> Result<PathBuf> {
-    let plugin = environment.require_plugin()?;
-    let socket = environment
-        .socket_path
-        .as_deref()
-        .context("HERDR_SOCKET_PATH is not set")?;
-    Ok(socket_scope_dir(&plugin.data_dir(), socket).join("groups.json"))
 }
 
 fn report(client: &Client, workspace_id: &str, group: Option<&str>) -> Result<()> {
@@ -88,44 +70,51 @@ fn report(client: &Client, workspace_id: &str, group: Option<&str>) -> Result<()
                 "workspace_id": workspace_id,
                 "source": SOURCE_ID,
                 "tokens": {TOKEN_KEY: group},
+                "persist": true,
             }),
         )
         .with_context(|| format!("publish the group of {workspace_id}"))?;
     Ok(())
 }
 
-/// Republishes saved groups and drops assignments whose space is gone.
-fn restore(
+/// One-shot import of the per-session file earlier versions saved groups in.
+/// The file is kept as `groups.json.imported`. Remove this once every session
+/// has started with this version.
+fn import_saved_groups(
+    environment: &Environment,
     client: &Client,
-    state_path: &std::path::Path,
     workspaces: &[WorkspaceInfo],
 ) -> Result<()> {
-    let mut state = State::load(state_path).context("read saved groups")?;
-    let before = state.workspaces.len();
-    state.workspaces.retain(|workspace_id, _| {
-        workspaces
+    #[derive(serde::Deserialize)]
+    struct Saved {
+        #[serde(default)]
+        workspaces: BTreeMap<String, String>,
+    }
+    let plugin = environment.require_plugin()?;
+    let socket = environment
+        .socket_path
+        .as_deref()
+        .context("HERDR_SOCKET_PATH is not set")?;
+    let path: PathBuf = socket_scope_dir(&plugin.data_dir(), socket).join("groups.json");
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("read saved groups"),
+    };
+    let saved: Saved = serde_json::from_slice(&bytes).context("parse saved groups")?;
+    for (workspace_id, group) in &saved.workspaces {
+        if workspaces
             .iter()
             .any(|workspace| &workspace.workspace_id == workspace_id)
-    });
-    if state.workspaces.len() != before {
-        state.save(state_path).context("save groups")?;
+        {
+            report(client, workspace_id, Some(group))?;
+        }
     }
-    for (workspace_id, group) in &state.workspaces {
-        report(client, workspace_id, Some(group))?;
-    }
-    Ok(())
-}
-
-fn forget(state_path: &std::path::Path, workspace_id: &str) -> Result<()> {
-    let mut state = State::load(state_path).context("read saved groups")?;
-    if state.workspaces.remove(workspace_id).is_some() {
-        state.save(state_path).context("save groups")?;
-    }
-    Ok(())
+    std::fs::rename(&path, path.with_extension("json.imported")).context("retire saved groups")
 }
 
 /// Asks for the group of the invocation's space in Herdr's native picker.
-fn assign(client: &Client, state_path: &std::path::Path, context: &PluginContext) -> Result<()> {
+fn assign(client: &Client, context: &PluginContext) -> Result<()> {
     let workspace_id = context
         .workspace_id
         .as_deref()
@@ -143,12 +132,11 @@ fn assign(client: &Client, state_path: &std::path::Path, context: &PluginContext
     } else {
         format!("Group for {}", anchor.label)
     };
-    let mut state = State::load(state_path).context("read saved groups")?;
-    let current = state.workspaces.get(&anchor.workspace_id).cloned();
+    let current = group_of(anchor).map(str::to_owned);
     let group = match client
         .pick(&pick_params(
             title,
-            &state.groups(),
+            &groups(workspaces),
             current.as_deref(),
             context.client_id,
         ))
@@ -156,7 +144,7 @@ fn assign(client: &Client, state_path: &std::path::Path, context: &PluginContext
     {
         PickOutcome::Picked { id } if id == REMOVE => None,
         PickOutcome::Picked { id: group } => Some(group),
-        PickOutcome::Created { text } => match state::normalize_group(&text) {
+        PickOutcome::Created { text } => match normalize_group(&text) {
             Some(group) => Some(group),
             None => return Ok(()),
         },
@@ -165,19 +153,14 @@ fn assign(client: &Client, state_path: &std::path::Path, context: &PluginContext
     if group == current {
         return Ok(());
     }
-    let stale = family[1..]
-        .iter()
-        .filter(|id| state.workspaces.remove(**id).is_some())
-        .collect::<Vec<_>>();
-    match &group {
-        Some(group) => state
-            .workspaces
-            .insert(anchor.workspace_id.clone(), group.clone()),
-        None => state.workspaces.remove(&anchor.workspace_id),
-    };
-    state.save(state_path).context("save groups")?;
-    for id in stale {
-        report(client, id, None)?;
+    // Only the anchor carries the family's group.
+    for id in &family[1..] {
+        let member = workspaces
+            .iter()
+            .find(|workspace| &workspace.workspace_id == id);
+        if member.and_then(group_of).is_some() {
+            report(client, id, None)?;
+        }
     }
     report(client, &anchor.workspace_id, group.as_deref())?;
     if let Some(before) = order::placement(workspaces, &family, group.as_deref()) {
@@ -221,11 +204,7 @@ fn pick_params(
 }
 
 /// Gives each moved family the group of where it landed; see `order::regroup`.
-fn regroup_moved(
-    client: &Client,
-    state_path: &std::path::Path,
-    data: &serde_json::Value,
-) -> Result<()> {
+fn regroup_moved(client: &Client, data: &serde_json::Value) -> Result<()> {
     let workspaces: Vec<WorkspaceInfo> = serde_json::from_value(data["workspaces"].clone())
         .context("move event without workspaces")?;
     let moved = match data["workspace_ids"].as_array() {
@@ -245,30 +224,79 @@ fn regroup_moved(
             anchors.push(anchor);
         }
     }
-    let changes = anchors
-        .into_iter()
-        .filter_map(|anchor| Some((anchor, order::regroup(&workspaces, anchor)?)))
-        .collect::<Vec<_>>();
-    if changes.is_empty() {
-        return Ok(());
-    }
-    let mut state = State::load(state_path).context("read saved groups")?;
-    for (anchor, group) in &changes {
-        match group {
-            Some(group) => state.workspaces.insert((*anchor).to_owned(), group.clone()),
-            None => state.workspaces.remove(*anchor),
-        };
-    }
-    state.save(state_path).context("save groups")?;
-    for (anchor, group) in changes {
-        report(client, anchor, group.as_deref())?;
+    for anchor in anchors {
+        if let Some(group) = order::regroup(&workspaces, anchor) {
+            report(client, anchor, group.as_deref())?;
+        }
     }
     Ok(())
+}
+
+fn group_of(workspace: &WorkspaceInfo) -> Option<&str> {
+    workspace.tokens.get(TOKEN_KEY).map(String::as_str)
+}
+
+/// Distinct group names in use, sorted case-insensitively.
+fn groups(workspaces: &[WorkspaceInfo]) -> Vec<String> {
+    let mut groups: Vec<String> = workspaces
+        .iter()
+        .filter_map(group_of)
+        .map(str::to_owned)
+        .collect();
+    groups.sort_by_key(|group| group.to_lowercase());
+    groups.dedup();
+    groups
+}
+
+/// Trims a typed group name, drops control characters, and caps its length.
+fn normalize_group(name: &str) -> Option<String> {
+    let name: String = name
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(MAX_GROUP_LEN)
+        .collect();
+    let name = name.trim_end().to_owned();
+    (!name.is_empty()).then_some(name)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn space(id: &str, group: Option<&str>) -> WorkspaceInfo {
+        serde_json::from_value(json!({
+            "workspace_id": id, "number": 1, "label": id, "focused": false,
+            "pane_count": 1, "tab_count": 1, "active_tab_id": format!("{id}:t1"),
+            "agent_status": "idle",
+            "tokens": group.map_or(json!({}), |group| json!({TOKEN_KEY: group})),
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn groups_are_distinct_and_sorted() {
+        let spaces = [
+            space("w1", Some("work")),
+            space("w2", Some("Play")),
+            space("w3", Some("work")),
+            space("w4", None),
+            space("w5", Some("infra")),
+        ];
+        assert_eq!(groups(&spaces), ["infra", "Play", "work"]);
+    }
+
+    #[test]
+    fn group_names_are_trimmed_and_capped() {
+        assert_eq!(normalize_group("  work \n"), Some("work".into()));
+        assert_eq!(normalize_group(" \t "), None);
+        assert_eq!(
+            normalize_group(&"x".repeat(60)).map(|name| name.len()),
+            Some(MAX_GROUP_LEN)
+        );
+    }
 
     #[test]
     fn picker_selects_the_current_group_and_offers_removal_only_when_grouped() {
