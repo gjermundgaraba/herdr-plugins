@@ -28,9 +28,10 @@ command = "gjermundgaraba.herdr-move-pane.move"
 description = "Move pane to tab"
 ```
 
-Plugin actions have no menu in Herdr, so the keybinding is the way in; from a
-shell, `herdr plugin action invoke gjermundgaraba.herdr-move-pane.move` moves
-the focused pane.
+The action also appears as "Move pane to tab" in a pane's right-click menu,
+where it moves the clicked pane. From a shell,
+`herdr plugin invoke gjermundgaraba.herdr-move-pane.move` moves the focused
+pane.
 
 ## Local development
 
