@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-use crate::EventEnvelope;
+use serde::Deserialize;
+
+use crate::{AgentSessionInfo, EventEnvelope, TabInfo, WorkspaceInfo};
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Environment {
@@ -20,6 +22,27 @@ pub struct Environment {
     pub event: Option<EventEnvelope>,
     pub entrypoint_id: Option<String>,
     pub pane_id: Option<String>,
+    pub context: Option<PluginContext>,
+}
+
+/// What Herdr passes in `HERDR_PLUGIN_CONTEXT_JSON`. Menu, key, and API
+/// invocations describe their target; the `focused_pane_*` fields name the
+/// target pane. Actions, panes, and startup hooks also get `tabs` (of the
+/// context workspace), `workspaces` (all, in server order), and `client_id`
+/// when a TUI client started them; event hooks get neither list.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct PluginContext {
+    pub workspace_id: Option<String>,
+    pub tab_id: Option<String>,
+    pub focused_pane_id: Option<String>,
+    pub focused_pane_cwd: Option<String>,
+    pub focused_pane_foreground_cwd: Option<String>,
+    pub focused_pane_agent: Option<String>,
+    pub focused_pane_agent_session: Option<AgentSessionInfo>,
+    pub client_id: Option<u64>,
+    pub tabs: Vec<TabInfo>,
+    pub workspaces: Vec<WorkspaceInfo>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -53,6 +76,14 @@ impl Environment {
                 .transpose()?,
             entrypoint_id: string_var("HERDR_PLUGIN_ENTRYPOINT_ID"),
             pane_id: string_var("HERDR_PANE_ID"),
+            context: string_var("HERDR_PLUGIN_CONTEXT_JSON")
+                .map(|json| {
+                    serde_json::from_str(&json).map_err(|source| EnvironmentError {
+                        variable: "HERDR_PLUGIN_CONTEXT_JSON",
+                        source,
+                    })
+                })
+                .transpose()?,
         })
     }
 
@@ -274,6 +305,30 @@ mod tests {
             environment.invocation(),
             Some(PluginInvocation::Pane("palette"))
         );
+    }
+
+    #[test]
+    fn parses_the_invocation_context() {
+        let context: PluginContext = serde_json::from_value(serde_json::json!({
+            "workspace_id": "w1",
+            "tab_id": "w1:t2",
+            "focused_pane_id": "w1:p3",
+            "focused_pane_agent_session": {
+                "source": "herdr:claude", "agent": "claude", "kind": "id", "value": "abc"
+            },
+            "client_id": 7,
+            "tabs": [{
+                "tab_id": "w1:t2", "workspace_id": "w1", "number": 2, "label": "two",
+                "focused": true, "pane_count": 1, "agent_status": "idle"
+            }],
+            "invocation_source": "keybinding",
+        }))
+        .unwrap();
+        assert_eq!(context.focused_pane_id.as_deref(), Some("w1:p3"));
+        assert_eq!(context.focused_pane_agent_session.unwrap().value, "abc");
+        assert_eq!(context.client_id, Some(7));
+        assert_eq!(context.tabs[0].number, 2);
+        assert!(context.workspaces.is_empty());
     }
 
     #[test]

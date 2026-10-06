@@ -32,6 +32,17 @@ match Environment::load()?.invocation() {
 }
 ```
 
+`Environment::context` is the typed `HERDR_PLUGIN_CONTEXT_JSON`. Menu, key, and
+API invocations describe their target pane, tab, and space. Actions, panes, and
+startup hooks also get the space's `tabs`, every space as `workspaces`, and the
+invoking TUI's `client_id`, so they rarely need a snapshot first:
+
+```rust
+let context = Environment::load()?.context.unwrap_or_default();
+let pane_id = context.focused_pane_id;
+let spaces = context.workspaces;
+```
+
 Methods added after this crate's tested Herdr version remain usable:
 
 ```rust

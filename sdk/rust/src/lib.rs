@@ -14,7 +14,7 @@ pub mod unix;
 
 pub use client::{ApiError, Client, Error, Subscription};
 pub use env::{
-    Environment, EnvironmentError, PluginEnvironmentError, PluginInvocation, PluginPaths,
-    open_rotating_log, socket_scope_dir,
+    Environment, EnvironmentError, PluginContext, PluginEnvironmentError, PluginInvocation,
+    PluginPaths, open_rotating_log, socket_scope_dir,
 };
 pub use types::*;
