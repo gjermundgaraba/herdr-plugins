@@ -20,14 +20,6 @@ command = ["mv", "-f", "bin/.herdr-space-groups.new", "bin/herdr-space-groups"]
 [[startup]]
 command = ["bin/herdr-space-groups"]
 
-[[events]]
-on = "workspace.moved"
-command = ["bin/herdr-space-groups"]
-
-[[events]]
-on = "workspace.reordered"
-command = ["bin/herdr-space-groups"]
-
 [[actions]]
 id = "assign"
 title = "Set space group"

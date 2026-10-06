@@ -1,8 +1,9 @@
 # Space Groups
 
 Put spaces into named groups that the spaces sidebar shows under collapsible
-headers. You pick or create a group in Herdr's native picker, and the plugin keeps
-the assignment across server restarts and live handoffs.
+headers. You pick or create a group in Herdr's native picker; the fork build
+does the rest natively and keeps the assignment across server restarts and
+live handoffs.
 
 Requires the [Herdr fork build](../README.md#herdr-build): stock Herdr's
 sidebar does not group spaces.
@@ -10,7 +11,8 @@ sidebar does not group spaces.
 ## How it works
 
 The fork's sidebar groups spaces by the `space_group` workspace metadata
-token, which this plugin sets:
+token. This plugin is only the picker: it applies your choice with
+`workspace.set_group`, and Herdr handles placement and regrouping.
 
 - The sidebar shows spaces in Herdr's workspace order and starts a
   `▾ name ── count` header wherever the group changes, with a divider where
@@ -31,7 +33,7 @@ reorders anything itself, so Herdr's workspace numbers and number keys always
 match it.
 
 A space moved any other way, by a sidebar drag or `herdr workspace move`, is
-regrouped by the `workspace.moved` and `workspace.reordered` hooks:
+regrouped by Herdr:
 
 - Dropped inside a group, it joins that group. Dropped among ungrouped
   spaces, it leaves its group.
@@ -39,11 +41,10 @@ regrouped by the `workspace.moved` and `workspace.reordered` hooks:
   shares it, or if it is the group's only space. Otherwise it joins the group
   above it (the one below at the very top).
 
-The plugin reports the token as persisted, so Herdr saves it with the session
-and it survives restarts and live handoffs; closing a space drops it. The
-plugin keeps no state of its own. Its `startup` hook imports the assignments
-earlier versions saved per session and renames that file to
-`groups.json.imported`.
+Herdr saves the token with the session, so it survives restarts and live
+handoffs; closing a space drops it. The plugin keeps no state of its own. Its
+`startup` hook imports the assignments earlier versions saved per session and
+renames that file to `groups.json.imported`.
 
 ## Setup
 
@@ -72,8 +73,10 @@ new one, move with `↑`/`↓` (or `ctrl+n`/`ctrl+p`), and press `Enter`.
 - A group exists while at least one space is in it; there is nothing to
   create or delete separately.
 - Collapse state belongs to each TUI client, like worktree groups.
-- `herdr workspace report-metadata` can set the `space_group` token too, but
-  such assignments are saved only with `--persist` and the space is not moved. A group whose
+- `workspace.set_group` is a plain socket method, so scripts can assign groups
+  too. `herdr workspace report-metadata` can set the `space_group` token
+  directly, but then the space is not moved, and the token is saved only with
+  `--persist`. A group whose
   members are not next to each other shows a header for each run; drag them
   together or reassign through the picker. Collapsing one run of a group
   collapses all of its runs.

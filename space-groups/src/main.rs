@@ -1,12 +1,8 @@
-//! Space Groups: assigns spaces to named groups through the `space_group`
-//! workspace metadata token, which the fork's sidebar turns into collapsible
-//! headers, and moves them into place so the server order matches the sidebar.
-//! A space moved by other means, such as a sidebar drag, takes the group of
-//! where it landed.
-//!
-//! Herdr saves the token with the session and drops it with its space, so the
-//! tokens are the only state.
-mod order;
+//! Space Groups: the picker for Herdr's native space groups. The action asks
+//! for a space's group in Herdr's native picker and applies it with
+//! `workspace.set_group`, which assigns the space's worktree family, moves it
+//! into place, and saves the group with the session. Herdr regroups spaces
+//! moved by other means, such as a sidebar drag, itself.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -21,7 +17,7 @@ use herdr_client::{
 use serde_json::json;
 
 const SOURCE_ID: &str = "gjermundgaraba.herdr-space-groups";
-/// Workspace metadata key the fork's sidebar groups by.
+/// Workspace metadata key Herdr's space groups read.
 const TOKEN_KEY: &str = "space_group";
 /// Picker item id for clearing the group; group names are never empty.
 const REMOVE: &str = "";
@@ -53,27 +49,18 @@ fn run() -> Result<()> {
         Some(PluginInvocation::Startup) => {
             import_saved_groups(&environment, &client, &context.workspaces)
         }
-        Some(PluginInvocation::Event {
-            name: "workspace.moved" | "workspace.reordered",
-            event,
-        }) => regroup_moved(&client, &event.data),
         Some(PluginInvocation::Action(_)) => assign(&client, &context),
-        _ => bail!("run this through the plugin's action, startup hook, or event hook"),
+        _ => bail!("run this through the plugin's action or startup hook"),
     }
 }
 
-fn report(client: &Client, workspace_id: &str, group: Option<&str>) -> Result<()> {
+fn set_group(client: &Client, workspace_id: &str, group: Option<&str>) -> Result<()> {
     client
         .call_value(
-            "workspace.report_metadata",
-            &json!({
-                "workspace_id": workspace_id,
-                "source": SOURCE_ID,
-                "tokens": {TOKEN_KEY: group},
-                "persist": true,
-            }),
+            "workspace.set_group",
+            &json!({"workspace_id": workspace_id, "group": group}),
         )
-        .with_context(|| format!("publish the group of {workspace_id}"))?;
+        .with_context(|| format!("set the group of {workspace_id}"))?;
     Ok(())
 }
 
@@ -107,7 +94,19 @@ fn import_saved_groups(
             .iter()
             .any(|workspace| &workspace.workspace_id == workspace_id)
         {
-            report(client, workspace_id, Some(group))?;
+            // The saved order already holds each group together, so this
+            // only restores the token.
+            client
+                .call_value(
+                    "workspace.report_metadata",
+                    &json!({
+                        "workspace_id": workspace_id,
+                        "source": SOURCE_ID,
+                        "tokens": {TOKEN_KEY: group},
+                        "persist": true,
+                    }),
+                )
+                .with_context(|| format!("restore the group of {workspace_id}"))?;
         }
     }
     std::fs::rename(&path, path.with_extension("json.imported")).context("retire saved groups")
@@ -124,15 +123,24 @@ fn assign(client: &Client, context: &PluginContext) -> Result<()> {
         .iter()
         .find(|workspace| workspace.workspace_id == workspace_id)
         .context("the space is gone")?;
-    // A worktree family shares its checkout's group, so the checkout is assigned.
-    let anchor = order::anchor(workspaces, target);
-    let family = order::family(workspaces, &anchor.workspace_id);
-    let title = if family.len() > 1 {
+    // A worktree family shares its checkout's group.
+    let anchor_id = target
+        .family_anchor_id
+        .as_deref()
+        .unwrap_or(&target.workspace_id);
+    let anchor = workspaces
+        .iter()
+        .find(|workspace| workspace.workspace_id == anchor_id)
+        .unwrap_or(target);
+    let has_family = workspaces
+        .iter()
+        .any(|workspace| workspace.family_anchor_id.as_deref() == Some(anchor_id));
+    let title = if has_family {
         format!("Group for {} and its worktrees", anchor.label)
     } else {
         format!("Group for {}", anchor.label)
     };
-    let current = group_of(anchor).map(str::to_owned);
+    let current = target.group.clone();
     let group = match client
         .pick(&pick_params(
             title,
@@ -150,26 +158,8 @@ fn assign(client: &Client, context: &PluginContext) -> Result<()> {
         },
         PickOutcome::Cancelled => return Ok(()),
     };
-    if group == current {
-        return Ok(());
-    }
-    // Only the anchor carries the family's group.
-    for id in &family[1..] {
-        let member = workspaces
-            .iter()
-            .find(|workspace| &workspace.workspace_id == id);
-        if member.and_then(group_of).is_some() {
-            report(client, id, None)?;
-        }
-    }
-    report(client, &anchor.workspace_id, group.as_deref())?;
-    if let Some(before) = order::placement(workspaces, &family, group.as_deref()) {
-        client
-            .call_value(
-                "workspace.move_block",
-                &json!({"workspace_ids": family, "before_workspace_id": before}),
-            )
-            .context("move the space into its group")?;
+    if group != current {
+        set_group(client, anchor_id, group.as_deref())?;
     }
     Ok(())
 }
@@ -203,45 +193,11 @@ fn pick_params(
     }
 }
 
-/// Gives each moved family the group of where it landed; see `order::regroup`.
-fn regroup_moved(client: &Client, data: &serde_json::Value) -> Result<()> {
-    let workspaces: Vec<WorkspaceInfo> = serde_json::from_value(data["workspaces"].clone())
-        .context("move event without workspaces")?;
-    let moved = match data["workspace_ids"].as_array() {
-        Some(ids) => ids.iter().filter_map(|id| id.as_str()).collect::<Vec<_>>(),
-        None => data["workspace_id"].as_str().into_iter().collect(),
-    };
-    let mut anchors = Vec::<&str>::new();
-    for id in moved {
-        let Some(workspace) = workspaces
-            .iter()
-            .find(|workspace| workspace.workspace_id == id)
-        else {
-            continue;
-        };
-        let anchor = order::anchor(&workspaces, workspace).workspace_id.as_str();
-        if !anchors.contains(&anchor) {
-            anchors.push(anchor);
-        }
-    }
-    for anchor in anchors {
-        if let Some(group) = order::regroup(&workspaces, anchor) {
-            report(client, anchor, group.as_deref())?;
-        }
-    }
-    Ok(())
-}
-
-fn group_of(workspace: &WorkspaceInfo) -> Option<&str> {
-    workspace.tokens.get(TOKEN_KEY).map(String::as_str)
-}
-
 /// Distinct group names in use, sorted case-insensitively.
 fn groups(workspaces: &[WorkspaceInfo]) -> Vec<String> {
     let mut groups: Vec<String> = workspaces
         .iter()
-        .filter_map(group_of)
-        .map(str::to_owned)
+        .filter_map(|workspace| workspace.group.clone())
         .collect();
     groups.sort_by_key(|group| group.to_lowercase());
     groups.dedup();
@@ -271,7 +227,7 @@ mod tests {
             "workspace_id": id, "number": 1, "label": id, "focused": false,
             "pane_count": 1, "tab_count": 1, "active_tab_id": format!("{id}:t1"),
             "agent_status": "idle",
-            "tokens": group.map_or(json!({}), |group| json!({TOKEN_KEY: group})),
+            "group": group,
         }))
         .unwrap()
     }
