@@ -29,8 +29,8 @@ use objc2_core_foundation::{
 use objc2_io_kit::{
     IOHIDAccessType, IOHIDCheckAccess, IOHIDDevice, IOHIDManager, IOHIDReportType,
     IOHIDRequestAccess, IOHIDRequestType, IOOptionBits, IOReturn, kIOHIDLocationIDKey,
-    kIOHIDProductIDKey, kIOHIDSerialNumberKey, kIOHIDTransportKey, kIOHIDVendorIDKey,
-    kIOReturnNotPermitted, kIOReturnSuccess,
+    kIOHIDPrimaryUsagePageKey, kIOHIDProductIDKey, kIOHIDSerialNumberKey, kIOHIDTransportKey,
+    kIOHIDVendorIDKey, kIOReturnNotPermitted, kIOReturnSuccess,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -39,6 +39,9 @@ use crate::wire::{REPORT_ID, REPORT_SIZE, Reassembler, encode_message};
 
 const MICRO_VENDOR_ID: i32 = 0x303A;
 const MICRO_PRODUCT_ID: i32 = 0x8360;
+/// The vendor-defined interface that carries the RPC channel; the keyboard
+/// and consumer interfaces never answer it.
+const MICRO_RPC_USAGE_PAGE: i64 = 0xFF00;
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const RESPONSE_SLACK: Duration = Duration::from_millis(100);
 const DEVICE_OPEN_TIMEOUT: Duration = Duration::from_secs(7);
@@ -699,11 +702,7 @@ impl<'a> Owner<'a> {
                 }
                 bail!(error)
             }
-            if self
-                .writer_tx
-                .send(output_wire(&report, self.transport))
-                .is_err()
-            {
+            if self.writer_tx.send(report.to_vec()).is_err() {
                 let error = "device writer stopped";
                 self.disconnect(error.into());
                 bail!(error)
@@ -940,6 +939,7 @@ unsafe extern "C-unwind" fn removal_callback(
 
 struct DeviceCandidate {
     device: objc2_core_foundation::CFRetained<IOHIDDevice>,
+    rpc: bool,
     transport: Transport,
     location: Option<i64>,
     serial: String,
@@ -959,6 +959,7 @@ fn choose_devices(manager: &IOHIDManager) -> Result<Vec<DeviceCandidate>> {
     unsafe { devices.values(pointers.as_mut_ptr()) };
     let location_key = cf_string(kIOHIDLocationIDKey);
     let serial_key = cf_string(kIOHIDSerialNumberKey);
+    let usage_page_key = cf_string(kIOHIDPrimaryUsagePageKey);
     let mut candidates = Vec::new();
     for pointer in pointers {
         let Some(pointer) = NonNull::new(pointer.cast_mut()) else {
@@ -975,19 +976,33 @@ fn choose_devices(manager: &IOHIDManager) -> Result<Vec<DeviceCandidate>> {
             .property(&serial_key)
             .and_then(|value| value.downcast_ref::<CFString>().map(ToString::to_string))
             .unwrap_or_default();
+        let rpc = device
+            .property(&usage_page_key)
+            .and_then(|value| value.downcast_ref::<CFNumber>().and_then(CFNumber::as_i64))
+            == Some(MICRO_RPC_USAGE_PAGE);
         candidates.push(DeviceCandidate {
+            rpc,
             transport: device_transport(&device),
             device,
             location,
             serial,
         });
     }
+    // Each candidate that cannot answer costs a full handshake timeout, so the
+    // RPC interface goes first.
     candidates.sort_by(|left, right| {
-        (left.transport, left.location, left.serial.as_str()).cmp(&(
-            right.transport,
-            right.location,
-            right.serial.as_str(),
-        ))
+        (
+            !left.rpc,
+            left.transport,
+            left.location,
+            left.serial.as_str(),
+        )
+            .cmp(&(
+                !right.rpc,
+                right.transport,
+                right.location,
+                right.serial.as_str(),
+            ))
     });
     if candidates.is_empty() {
         bail!("Codex Micro not found or unavailable")
@@ -1007,14 +1022,6 @@ fn device_transport(device: &IOHIDDevice) -> Transport {
 
 fn cf_string(value: &CStr) -> objc2_core_foundation::CFRetained<CFString> {
     CFString::from_str(value.to_str().expect("IOKit keys are UTF-8"))
-}
-
-fn output_wire(report: &[u8; REPORT_SIZE], transport: Transport) -> Vec<u8> {
-    if transport == Transport::Usb {
-        report[1..].to_vec()
-    } else {
-        report.to_vec()
-    }
 }
 
 fn device_info(transport: Transport, status: &Value) -> Result<DeviceInfo> {
@@ -1106,20 +1113,6 @@ mod tests {
             objc2_core_foundation::CFRunLoopRunResult::HandledSource
         );
         writer.join().unwrap();
-    }
-
-    #[test]
-    fn usb_omits_only_the_report_id() {
-        let mut report = [0; REPORT_SIZE];
-        report[0] = REPORT_ID;
-        report[1] = 2;
-        let usb = output_wire(&report, Transport::Usb);
-        assert_eq!(usb.len(), 63);
-        assert_eq!(usb[0], 2);
-        assert_eq!(
-            output_wire(&report, Transport::BluetoothLowEnergy).len(),
-            64
-        );
     }
 
     #[test]
