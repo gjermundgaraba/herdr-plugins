@@ -249,6 +249,8 @@ mod tests {
             agent_status: "idle".into(),
             tokens: HashMap::new(),
             worktree: None,
+            group: None,
+            family_anchor_id: None,
         };
         assert_eq!(
             agent_label(&value, Some(&workspace)),

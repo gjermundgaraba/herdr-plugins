@@ -229,6 +229,8 @@ pub fn project_model(raw: &Model) -> DisplayModel {
                                 agent_status: w.agent_status.as_str().into(),
                                 tokens: Default::default(),
                                 worktree: None,
+                                group: None,
+                                family_anchor_id: None,
                             })
                             .collect(),
                         agents: snapshot

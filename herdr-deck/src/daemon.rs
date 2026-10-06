@@ -1478,6 +1478,8 @@ mod tests {
                 agent_status: "working".into(),
                 tokens: HashMap::new(),
                 worktree: None,
+                group: None,
+                family_anchor_id: None,
             }],
             agents: vec![agent("terminal", "pane", focused)],
         }
