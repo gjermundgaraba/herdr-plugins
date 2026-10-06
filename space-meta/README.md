@@ -55,7 +55,7 @@ spaces. Then:
 
 ```sh
 herdr server reload-config
-herdr plugin action invoke gjermundgaraba.herdr-space-meta.refresh
+herdr plugin invoke gjermundgaraba.herdr-space-meta.refresh
 ```
 
 ## Install
@@ -74,7 +74,7 @@ mkdir -p space-meta/bin
 install -m 750 target/release/herdr-space-meta space-meta/bin/.herdr-space-meta.new
 mv -f space-meta/bin/.herdr-space-meta.new space-meta/bin/herdr-space-meta
 herdr plugin link "$PWD/space-meta"
-herdr plugin action invoke gjermundgaraba.herdr-space-meta.refresh
+herdr plugin invoke gjermundgaraba.herdr-space-meta.refresh
 ```
 
 The `refresh` action stops the running daemon, starts the installed
