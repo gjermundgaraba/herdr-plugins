@@ -51,8 +51,7 @@ the USB interface, detach a macOS driver, install a root helper, or require
 `sudo`. macOS Input Monitoring must be granted to the stable installed service:
 
 ```sh
-herdr plugin action invoke service-authorize \
-  --plugin gjermundgaraba.herdr-micro
+herdr plugin invoke gjermundgaraba.herdr-micro.service-authorize
 ```
 
 Fresh-install behavior, Input Monitoring troubleshooting, and code-signing

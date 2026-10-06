@@ -156,8 +156,8 @@ pub fn doctor() -> Report {
                 report.push(
                     Level::Fail,
                     format!(
-                        "Codex Micro Input Monitoring: {:?}; run `herdr plugin action invoke \
-                         service-authorize --plugin gjermundgaraba.herdr-micro`",
+                        "Codex Micro Input Monitoring: {:?}; run `herdr plugin invoke \
+                         gjermundgaraba.herdr-micro.service-authorize`",
                         status.input_monitoring
                     ),
                 );

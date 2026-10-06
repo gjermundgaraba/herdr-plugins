@@ -34,8 +34,7 @@ Install and authorize Micro:
 ```sh
 herdr plugin install gjermundgaraba/herdr-plugins/herdr-micro
 herdr plugin enable gjermundgaraba.herdr-micro
-herdr plugin action invoke service-authorize \
-  --plugin gjermundgaraba.herdr-micro
+herdr plugin invoke gjermundgaraba.herdr-micro.service-authorize
 ```
 
 `herdr-micro start`, including the plugin startup hook, installs or refreshes
@@ -70,8 +69,7 @@ install -m 750 ../target/release/codex-micro bin/.codex-micro.new
 mv -f bin/.herdr-micro.new bin/herdr-micro
 mv -f bin/.codex-micro.new bin/codex-micro
 herdr plugin link . --enabled
-herdr plugin action invoke service-authorize \
-  --plugin gjermundgaraba.herdr-micro
+herdr plugin invoke gjermundgaraba.herdr-micro.service-authorize
 ```
 
 ## Set up the Micro
@@ -83,21 +81,21 @@ herdr plugin action invoke service-authorize \
    fresh install nothing is running yet; skip this step.
 
    ```sh
-   herdr plugin action invoke micro-stop --plugin gjermundgaraba.herdr-micro
+   herdr plugin invoke gjermundgaraba.herdr-micro.micro-stop
    ```
 
 3. Clone the device's OAI controls into Layer 2. Setup accepts only a blank or
    previously managed layer, backs up the keymap, and verifies the write.
 
    ```sh
-   herdr plugin action invoke micro-setup --plugin gjermundgaraba.herdr-micro
+   herdr plugin invoke gjermundgaraba.herdr-micro.micro-setup
    ```
 
 4. Start and check the integration.
 
    ```sh
-   herdr plugin action invoke micro-start --plugin gjermundgaraba.herdr-micro
-   herdr plugin action invoke doctor --plugin gjermundgaraba.herdr-micro
+   herdr plugin invoke gjermundgaraba.herdr-micro.micro-start
+   herdr plugin invoke gjermundgaraba.herdr-micro.doctor
    ```
 
 ## Configuration and controls
@@ -161,8 +159,7 @@ Install the bundled Pi extension once, then run `/reload` in existing Pi
 sessions:
 
 ```sh
-herdr plugin action invoke setup-pi-effort \
-  --plugin gjermundgaraba.herdr-micro
+herdr plugin invoke gjermundgaraba.herdr-micro.setup-pi-effort
 ```
 
 Codex uses its native `alt+.` and `alt+,` TUI defaults; if those bindings are
@@ -205,8 +202,8 @@ validation.
 Useful actions:
 
 ```sh
-herdr plugin action invoke micro-status --plugin gjermundgaraba.herdr-micro
-herdr plugin action invoke micro-stop --plugin gjermundgaraba.herdr-micro
+herdr plugin invoke gjermundgaraba.herdr-micro.micro-status
+herdr plugin invoke gjermundgaraba.herdr-micro.micro-stop
 herdr plugin log list --plugin gjermundgaraba.herdr-micro --limit 20
 ```
 
