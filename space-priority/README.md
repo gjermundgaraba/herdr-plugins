@@ -33,10 +33,10 @@ with it this lift.
 Each space carries its own mark. A linked worktree and its checkout are
 marked separately.
 
-Herdr keeps metadata tokens in memory only, so the plugin saves priority
-spaces per session under its state directory and republishes them from its
-`startup` hook, which also runs after a live handoff. The `workspace.closed`
-hook forgets closed spaces.
+The plugin reports the token as persisted, so Herdr saves it with the session
+and it survives restarts and live handoffs; closing a space drops it. The
+plugin keeps no state of its own. Its `startup` hook imports the marks earlier
+versions saved per session and renames that file to `priority.json.imported`.
 
 ## Setup
 

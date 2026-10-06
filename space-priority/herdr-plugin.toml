@@ -20,10 +20,6 @@ command = ["mv", "-f", "bin/.herdr-space-priority.new", "bin/herdr-space-priorit
 [[startup]]
 command = ["bin/herdr-space-priority"]
 
-[[events]]
-on = "workspace.closed"
-command = ["bin/herdr-space-priority"]
-
 [[actions]]
 id = "toggle"
 title = "Toggle space priority"
