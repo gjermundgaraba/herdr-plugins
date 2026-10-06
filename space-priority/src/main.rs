@@ -46,18 +46,31 @@ fn run() -> Result<()> {
     let environment = Environment::load()?;
     let state_path = state_path(&environment)?;
     let client = Client::from_env()?.with_timeout(SOCKET_TIMEOUT);
+    let context = environment.context.clone().unwrap_or_default();
     match environment.invocation() {
-        Some(PluginInvocation::Startup) => sync(&client, &state_path, None),
+        Some(PluginInvocation::Startup) => sync(&client, &state_path, &context.workspaces),
         Some(PluginInvocation::Event {
             name: "workspace.closed",
             event,
         }) => {
-            let workspace_id = event.data["workspace_id"]
+            let closed = event.data["workspace_id"]
                 .as_str()
                 .context("workspace.closed event without workspace_id")?;
-            sync(&client, &state_path, Some(workspace_id))
+            // Event hooks get no workspace list, and the closing space may
+            // still be listed.
+            let mut workspaces = client
+                .snapshot()
+                .context("read session snapshot")?
+                .workspaces;
+            workspaces.retain(|workspace| workspace.workspace_id != closed);
+            sync(&client, &state_path, &workspaces)
         }
-        Some(PluginInvocation::Action(_)) => toggle(&client, &state_path),
+        Some(PluginInvocation::Action(_)) => toggle(
+            &client,
+            &state_path,
+            context.workspace_id.as_deref(),
+            &context.workspaces,
+        ),
         _ => bail!("run this through the plugin's action, startup hook, or event hook"),
     }
 }
@@ -72,38 +85,31 @@ fn state_path(environment: &Environment) -> Result<PathBuf> {
     Ok(socket_scope_dir(&plugin.data_dir(), socket).join("priority.json"))
 }
 
-/// Republishes the saved marks against the current spaces, leaving out a
-/// space that is closing but may still be listed.
-fn sync(client: &Client, state_path: &Path, closed: Option<&str>) -> Result<()> {
+/// Republishes the saved marks against the current spaces.
+fn sync(client: &Client, state_path: &Path, workspaces: &[WorkspaceInfo]) -> Result<()> {
     let saved = State::load(state_path).context("read saved priority spaces")?;
-    let mut workspaces = client
-        .snapshot()
-        .context("read session snapshot")?
-        .workspaces;
-    workspaces.retain(|workspace| Some(workspace.workspace_id.as_str()) != closed);
-    publish(client, state_path, &saved, &saved.workspaces, &workspaces)
+    publish(client, state_path, &saved, &saved.workspaces, workspaces)
 }
 
-/// Flips the mark of the focused space.
-fn toggle(client: &Client, state_path: &Path) -> Result<()> {
-    let snapshot = client.snapshot().context("read session snapshot")?;
-    let workspace_id = std::env::var("HERDR_WORKSPACE_ID")
-        .ok()
-        .filter(|id| !id.is_empty())
-        .or(snapshot.focused_workspace_id)
-        .context("no focused space")?;
-    let workspaces = snapshot.workspaces;
+/// Flips the mark of the invocation's space.
+fn toggle(
+    client: &Client,
+    state_path: &Path,
+    workspace_id: Option<&str>,
+    workspaces: &[WorkspaceInfo],
+) -> Result<()> {
+    let workspace_id = workspace_id.context("the invocation names no space")?;
     let target = workspaces
         .iter()
         .find(|workspace| workspace.workspace_id == workspace_id)
         .context("the space is gone")?;
     let saved = State::load(state_path).context("read saved priority spaces")?;
-    let mut marks = prune(&saved.workspaces, &workspaces);
+    let mut marks = prune(&saved.workspaces, workspaces);
     let marked = !marks.remove(&target.workspace_id);
     if marked {
         marks.insert(target.workspace_id.clone());
     }
-    publish(client, state_path, &saved, &marks, &workspaces)?;
+    publish(client, state_path, &saved, &marks, workspaces)?;
     let body = if marked {
         format!("{} is a priority space", target.label)
     } else {
