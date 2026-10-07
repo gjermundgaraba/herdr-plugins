@@ -310,7 +310,7 @@ dependencies = [
 [[package]]
 name = "herdr-frontend"
 version = "0.1.0"
-source = "git+https://github.com/gjermundgaraba/herdr?branch=custom-v3#a740975b59250aea82ebc24ee037862ce9aa2a92"
+source = "git+https://github.com/gjermundgaraba/herdr?branch=custom-v3#db2938c8529bdbd3bf0c92acf93524698b17ae00"
 dependencies = [
  "libc",
  "serde",
