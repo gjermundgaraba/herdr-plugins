@@ -1,17 +1,19 @@
 # Space Priority
 
-Mark spaces as priority so that their agents waiting on you jump the queue.
-In the priority agent order, blocked and done agents in a priority space come
-before every other agent, in the agent list, the Agents sidebar, and
-next/previous agent navigation.
+Mark spaces as priority so that their agents waiting on you jump the queue,
+and optionally gather them in a pinned section at the top of the spaces
+sidebar.
 
-Requires the [Herdr fork build](../README.md#herdr-build): stock Herdr's agent
-order ignores the token this plugin sets.
+Requires the [Herdr fork build](../README.md#herdr-build): stock Herdr ignores
+the token this plugin sets. The fork itself knows nothing about priority; you
+point its generic options at the token in your config (see
+[Setup](#setup)).
 
 ## How it works
 
 The plugin sets the `space_priority` workspace metadata token to `★` on
-priority spaces. The fork reads it when sorting agents by priority:
+priority spaces. With `ui.agent_priority_tokens` listing that token, the
+fork's priority agent order puts:
 
 1. Blocked agents in priority spaces, then done agents in priority spaces.
 2. Everyone else in the usual priority order: blocked, done, working, idle.
@@ -22,13 +24,19 @@ idle agents show the most recent first.
 
 Working, idle, and unknown agents in a priority space keep their normal
 place, so a busy priority space does not crowd out an agent that needs you
-elsewhere. Agents on a disconnected machine still sort last.
+elsewhere. Agents on a disconnected machine still sort last. The agent picker
+shows `★` before agents in a priority space.
 
 Only the priority order changes. The agent list always uses it; the Agents
 sidebar uses it when `ui.agent_panel_sort = "priority"` (or after you click
 its sort toggle), and keeps strict space order otherwise. An agent view set
 through `agent.view.set` with its own sort replaces the priority order, and
 with it this lift.
+
+A `[[ui.sidebar.spaces.pinned]]` section for the token shows copies of the
+priority spaces under a header at the top of the spaces sidebar, and only
+while at least one space is marked. The spaces also keep their regular place
+and space group.
 
 Each space carries its own mark. A linked worktree and its checkout are
 marked separately.
@@ -58,8 +66,22 @@ The action flips the focused space and shows a notification with the result.
 On the fork build, **Toggle space priority** also appears in a space's
 right-click menu and flips the space you clicked.
 
-To see which spaces are priority, place the token in your spaces sidebar
-rows; it renders `★` on priority spaces and nothing elsewhere:
+Point the fork's generic options at the token in the same file. The lift
+and the pinned section are independent; use either or both:
+
+```toml
+[ui]
+agent_panel_sort = "priority"
+agent_priority_tokens = ["space_priority"]
+
+[[ui.sidebar.spaces.pinned]]
+title = "Priority"
+token = "space_priority"
+fg = "#e5c07b"
+```
+
+To mark priority spaces in their regular rows too, place the token in your
+spaces sidebar rows; it renders `★` on priority spaces and nothing elsewhere:
 
 ```toml
 [ui.sidebar.spaces]

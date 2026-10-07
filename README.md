@@ -13,7 +13,7 @@ which.
 | [move-pane](move-pane) | Move a pane to another tab or a new tab from Herdr's native picker | [Fork build](#herdr-build) |
 | [space-meta](space-meta) | Space numbers, branch names, git-dirty markers, and PR badges in the spaces sidebar (macOS) | [Fork build](#herdr-build) |
 | [space-groups](space-groups) | Named space groups under collapsible sidebar headers | [Fork build](#herdr-build) |
-| [space-priority](space-priority) | Priority spaces whose blocked and done agents sort first | [Fork build](#herdr-build) |
+| [space-priority](space-priority) | Priority spaces whose blocked and done agents sort first, optionally pinned in the sidebar | [Fork build](#herdr-build) |
 | [herdr-hub](herdr-hub) | Background inventory and relay for local and remote Herdr sessions | Stock Herdr >= 0.9.0 |
 | [herdr-micro](herdr-micro) | Control Herdr from a Work Louder Codex Micro (macOS) | [Fork build](#herdr-build) |
 | [herdr-deck](herdr-deck) | Stream Deck dashboard and controls for Herdr agents (macOS) | [Fork build](#herdr-build) |
@@ -26,7 +26,8 @@ The plugins target the
 per-TUI frontend socket (protocol 7), the `agent.prompt` client command lane
 method, the client-side `[keys]` actions that replaced the picker plugins,
 native space groups (`workspace.set_group`) and persisted workspace tokens, the
-priority agent order that reads the `space_priority` workspace token, the
+priority agent order with configurable lift tokens
+(`ui.agent_priority_tokens`), pinned spaces sidebar sections, the
 native `ui.pick` picker, plugin entries in right-click menus with one
 `plugin.invoke` path, a richer invocation context, and `tab_id` on pane close
 events plus `pane.cwd_changed`. Stock `herdrdev/herdr` has none of these, so
