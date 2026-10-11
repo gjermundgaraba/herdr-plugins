@@ -1,6 +1,6 @@
 [package]
 name = "herdr-deck"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -11,7 +11,7 @@ repository.workspace = true
 [dependencies]
 elgato-streamdeck = "0.13.1"
 herdr-client.workspace = true
-herdr-frontend.workspace = true
+herdr-device.workspace = true
 hidapi = "2.6.6"
 libc.workspace = true
 resvg = { version = "0.48.1", default-features = false, features = ["text"] }

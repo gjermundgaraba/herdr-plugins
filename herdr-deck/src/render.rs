@@ -8,7 +8,7 @@ use std::{
 use resvg::{tiny_skia, usvg};
 use turbojpeg::{Compressor, Image, PixelFormat, Subsamp};
 
-use herdr_client::{AgentInfo, WorkspaceInfo};
+use herdr_client::ClientReportAgent;
 
 use crate::{
     config::{AgentStatus, StateColors},
@@ -139,8 +139,7 @@ impl Renderer {
         &mut self,
         width: u32,
         height: u32,
-        agent: Option<&AgentInfo>,
-        workspace: Option<&WorkspaceInfo>,
+        agent: Option<&ClientReportAgent>,
         focused: bool,
         active_session: bool,
         session_badge: Option<&str>,
@@ -151,12 +150,16 @@ impl Renderer {
         let state = if offline {
             AgentStatus::Unknown
         } else {
-            status(agent.map(|a| a.agent_status.as_str()).unwrap_or("unknown"))
+            status(
+                agent
+                    .map(|row| row.agent.agent_status.as_str())
+                    .unwrap_or("unknown"),
+            )
         };
         let colors = states
             .get(&state)
             .ok_or_else(|| RenderError(format!("missing {} colors", state.as_str())))?;
-        let label = agent.map(|a| agent_label(a, workspace));
+        let label = agent.map(agent_label);
         let (title, subtitle) = if offline {
             ("OFFLINE".to_owned(), String::new())
         } else if let Some(label) = label {
@@ -298,14 +301,14 @@ impl Renderer {
         width: u32,
         height: u32,
         session: &str,
-        agents: &[&AgentInfo],
+        agents: &[&ClientReportAgent],
         states: &HashMap<AgentStatus, StateColors>,
         offline: bool,
     ) -> Result<Arc<[u8]>, RenderError> {
         let count = |name: &str| {
             agents
                 .iter()
-                .filter(|agent| agent.agent_status.as_str() == name)
+                .filter(|row| row.agent.agent_status.as_str() == name)
                 .count()
         };
         let section = width as f64 / 4.0;
@@ -877,36 +880,14 @@ mod tests {
     #[test]
     fn animated_jpeg_is_cached_at_device_dimensions() {
         let mut renderer = Renderer::new().unwrap();
-        let agent = AgentInfo {
-            terminal_id: "t1".into(),
-            name: Some("coder".into()),
-            agent: None,
-            title: None,
-            terminal_title: None,
-            terminal_title_stripped: None,
-            display_agent: None,
-            agent_status: "working".into(),
-            screen_detection_skipped: false,
-            state_labels: HashMap::new(),
-            tokens: HashMap::new(),
-            agent_session: None,
-            workspace_id: "w1".into(),
-            tab_id: "tab1".into(),
-            pane_id: "p1".into(),
-            focused: false,
-            launch_pending: false,
-            interactive_ready: true,
-            state_change_seq: 0,
-            cwd: None,
-            foreground_cwd: None,
-            revision: 0,
-        };
+        let mut agent = crate::clients::tests::fixture_report().agents[0].clone();
+        agent.agent.name = Some("coder".into());
+        agent.agent.agent_status = "working".into();
         let first = renderer
             .render_key(
                 120,
                 120,
                 Some(&agent),
-                None,
                 false,
                 false,
                 Some("local/default"),
@@ -920,7 +901,6 @@ mod tests {
                 120,
                 120,
                 Some(&agent),
-                None,
                 false,
                 false,
                 Some("local/default"),
@@ -934,7 +914,6 @@ mod tests {
                 120,
                 120,
                 Some(&agent),
-                None,
                 false,
                 false,
                 Some("local/default"),
@@ -948,7 +927,6 @@ mod tests {
                 120,
                 120,
                 Some(&agent),
-                None,
                 false,
                 false,
                 Some("review"),
@@ -962,7 +940,6 @@ mod tests {
                 120,
                 120,
                 Some(&agent),
-                None,
                 false,
                 true,
                 Some("local/default"),

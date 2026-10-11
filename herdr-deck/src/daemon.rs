@@ -3,28 +3,34 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::routing::{DisplayModel, SessionState};
 use elgato_streamdeck::info::Kind;
-use herdr_client::AgentInfo;
-use herdr_frontend::directory::{self, Model};
-use herdr_frontend::{self as frontend, FrontendClient, Input, NavigationTarget};
+use herdr_client::{
+    ClientReportAgent,
+    follow::{self, ClientKey, DaemonState, Directory, JumpTarget},
+    sessions,
+    slots::{SlotKey, resize_slots, sticky_slots},
+};
+use herdr_device::{
+    Focus, JumpDispatcher, JumpError, Keystroke, OsInput, PostError, Refusal, SUBMIT_SETTLE, macos,
+    selection_change, type_inputs,
+};
 use serde_json::json;
 use signal_hook::consts::{SIGINT, SIGTERM};
 
+use crate::clients::{DisplayModel, SessionState, active_endpoint, project_model};
 use crate::config::{
     Action, AgentStatus, Config, CycleDirection, DeviceConfig, DeviceIdentity, DeviceRole,
-    Direction, config_path, escape_xml, load_config, select_device_config,
+    config_path, escape_xml, load_config, select_device_config,
 };
 use crate::device::{self, DeviceEvent, DeviceHandle, DeviceInfo, FrameBatch, InputEvent};
 use crate::render::Renderer;
-use crate::routing::{ActionRoute, RoutingState, active_endpoint, project_model};
-use crate::slots::{SlotAgent, SlotKey, agent_label, assign_slots, resize_slots};
+use crate::slots::agent_label;
 
 const ANIMATION_TIMER_FPS: u64 = 30;
 const ANIMATION_INTERVAL: Duration = Duration::from_micros(1_000_000 / ANIMATION_TIMER_FPS);
@@ -33,7 +39,9 @@ const DONE_UPDATE_FPS: u64 = 10;
 const IDLE_INTERVAL_MS: u64 = 200;
 const CONFIG_INTERVAL: Duration = Duration::from_secs(1);
 const SCAN_INTERVAL: Duration = Duration::from_secs(2);
-const ACTION_TIMEOUT: Duration = Duration::from_secs(5);
+/// Keyboard work waiting for the action worker. A control that fires faster
+/// than its prompts are typed is ignored beyond this, not queued.
+const ACTION_QUEUE_CAPACITY: usize = 16;
 
 pub fn main(args: Vec<String>) -> Result<(), String> {
     let command = args.first().map(String::as_str).unwrap_or("help");
@@ -91,7 +99,7 @@ pub fn main(args: Vec<String>) -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "Usage: herdr-deck <command>\n\n  devices                   List every visible Elgato device (Plus and Pedal are managed)\n  check [config]            Validate configuration\n  doctor [config]           Check config, Herdr frontends, and device visibility\n  frames <state> <dir> [config]  Write one animation loop as JPEG key frames\n  push [source] [target]    Atomically install configuration\n  run [config]              Run the direct-HID daemon\n  install-service [plist] [config]  Install and start the launchd user service\n  uninstall-service [plist] Stop and remove the launchd user service\n"
+        "Usage: herdr-deck <command>\n\n  devices                   List every visible Elgato device (Plus and Pedal are managed)\n  check [config]            Validate configuration\n  doctor [config]           Check config, Herdr clients, and device visibility\n  frames <state> <dir> [config]  Write one animation loop as JPEG key frames\n  push [source] [target]    Atomically install configuration\n  run [config]              Run the direct-HID daemon\n  install-service [plist] [config]  Install and start the launchd user service\n  uninstall-service [plist] Stop and remove the launchd user service\n"
     );
 }
 
@@ -109,10 +117,16 @@ fn frames(state: &str, dir: &str, config_override: Option<&str>) -> Result<(), S
     let config = load_config(config_path(config_override)?)?;
     let dir = PathBuf::from(dir);
     fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
-    let agent: AgentInfo = serde_json::from_value(json!({
-        "terminal_id": "preview", "agent": "claude", "title": "preview",
-        "agent_status": state.as_str(), "workspace_id": "preview",
-        "tab_id": "preview", "pane_id": "preview", "focused": false, "revision": 1,
+    let agent: ClientReportAgent = serde_json::from_value(json!({
+        "endpoint_id": "local", "focused": false, "workspace_label": "preview",
+        "workspace_number": 1, "cwd": null, "foreground_cwd": null,
+        "agent": {
+            "pane_id": "preview", "workspace_id": "preview", "tab_id": "preview",
+            "name": null, "display_agent": null, "agent": "claude", "title": "preview",
+            "terminal_title": null, "terminal_title_stripped": null,
+            "agent_status": state.as_str(), "state_change_seq": 0,
+            "state_labels": [], "tokens": [], "focused": false,
+        },
     }))
     .map_err(|error| error.to_string())?;
     let mut renderer = Renderer::new().map_err(|error| error.to_string())?;
@@ -125,7 +139,6 @@ fn frames(state: &str, dir: &str, config_override: Option<&str>) -> Result<(), S
                 120,
                 120,
                 Some(&agent),
-                None,
                 false,
                 false,
                 None,
@@ -165,44 +178,47 @@ fn devices_json(devices: &[DeviceInfo]) -> Result<String, String> {
 fn doctor(override_path: Option<&str>) -> Result<(), String> {
     let path = config_path(override_path)?;
     let config = load_config(&path)?;
-    let paths = frontend::discover(&frontend::directory());
-    let clients = paths
-        .into_iter()
-        .filter_map(|path| {
-            match FrontendClient::connect(&path)
-                .with_timeout(Duration::from_secs(2))
-                .snapshot()
-            {
-                Ok(snapshot) => Some(directory::ClientState {
-                    socket_path: path,
-                    snapshot,
-                }),
-                Err(error) => {
-                    eprintln!("{}: {error}", path.display());
-                    None
-                }
-            }
-        })
-        .collect::<Vec<_>>();
-    if clients.is_empty() {
-        return Err("no compatible Herdr frontends available".into());
-    }
-    let model = Model { clients };
-    println!(
-        "frontends: {} connected; unique focused client: {}",
-        model.clients.len(),
-        model.foremost_client().is_some()
-    );
-    let model = project_model(&model);
-    let connected = model
-        .sessions
+    let sessions = sessions::discover().map_err(|error| error.to_string())?;
+    let directory = follow::list_once(&sessions, Duration::from_secs(2), |session, error| {
+        eprintln!("Herdr session {}: {error}", session.name)
+    });
+    if !directory
+        .daemons
         .iter()
-        .filter(|session| {
-            session.connected
-                && (config.herdr.sessions.is_empty()
-                    || config.herdr.sessions.contains(&session.key))
-        })
-        .count();
+        .any(|daemon| matches!(daemon.state, DaemonState::Following { .. }))
+    {
+        return Err("no Herdr daemon answered client.list".into());
+    }
+    // One reading has no history: the running service follows the client
+    // that last took focus, which this reading cannot name.
+    println!(
+        "clients: {} attached across {} session(s); {}",
+        directory.client_count(),
+        directory.daemons.len(),
+        match directory.followed_client() {
+            Some(client) if client.has_focus() => format!(
+                "client {} of session {} has focus",
+                client.client_id, client.session
+            ),
+            Some(client) => format!(
+                "none has focus now; the dashboard follows the client that last took it, \
+                 or client {} of session {} if none did since it started",
+                client.client_id, client.session
+            ),
+            None => "none has sent a report, so the dashboard has no client to follow".into(),
+        }
+    );
+    let connected = project_model(&directory).map_or(0, |model| {
+        model
+            .sessions
+            .iter()
+            .filter(|session| {
+                session.connected
+                    && (config.herdr.sessions.is_empty()
+                        || config.herdr.sessions.contains(&session.key))
+            })
+            .count()
+    });
     let devices = device::list_devices()?;
     let matched = devices
         .iter()
@@ -213,7 +229,7 @@ fn doctor(override_path: Option<&str>) -> Result<(), String> {
         .count();
     println!("config: ok ({})", path.display());
     report_keyboard_access(&config);
-    println!("frontend endpoints: {connected} available in focused-client scope");
+    println!("endpoints: {connected} shown from the client a dashboard started now would follow");
     println!("devices: {matched}/{} managed and visible", devices.len());
     if matched == 0 {
         return Err("no configured devices visible; quit Elgato Stream Deck and retry".into());
@@ -256,6 +272,11 @@ fn install_service(plist_path: Option<&str>, config_override: Option<&str>) -> R
     let source = std::env::current_exe().map_err(|error| error.to_string())?;
     let config = config_path(config_override)?;
     load_config(&config)?;
+    // launchd gives the service neither HERDR_BIN_PATH nor the user's PATH,
+    // so the herdr it lists sessions with is fixed here, before anything is
+    // installed.
+    let herdr = sessions::resolve_herdr()
+        .map_err(|error| format!("cannot find the herdr executable the service needs: {error}"))?;
     let home = std::env::var_os("HOME").ok_or_else(|| "HOME is not set".to_string())?;
     let home = PathBuf::from(home);
     let working_directory = home.join("Library/Application Support/dev.herdr.deck");
@@ -267,15 +288,7 @@ fn install_service(plist_path: Option<&str>, config_override: Option<&str>) -> R
     fs::create_dir_all(&logs).map_err(|error| error.to_string())?;
     atomic_install(&source, &executable)?;
     let log = logs.join("daemon.log");
-    let discovery_env = discovery_environment(std::env::var_os("HERDR_CLIENT_API_DIR").as_deref());
-    let plist = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>dev.herdr.deck</string>\n<key>ProgramArguments</key><array><string>{}</string><string>run</string><string>{}</string></array>\n<key>WorkingDirectory</key><string>{}</string>\n{discovery_env}<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\n<key>ThrottleInterval</key><integer>5</integer>\n<key>StandardOutPath</key><string>{}</string>\n<key>StandardErrorPath</key><string>{}</string>\n</dict></plist>\n",
-        escape_xml(&executable.to_string_lossy()),
-        escape_xml(&config.to_string_lossy()),
-        escape_xml(&working_directory.to_string_lossy()),
-        escape_xml(&log.to_string_lossy()),
-        escape_xml(&log.to_string_lossy()),
-    );
+    let plist = service_plist(&executable, &config, &working_directory, &log, &herdr);
     fs::write(&destination, plist).map_err(|error| error.to_string())?;
     fs::set_permissions(&destination, fs::Permissions::from_mode(0o600))
         .map_err(|error| error.to_string())?;
@@ -289,6 +302,21 @@ fn install_service(plist_path: Option<&str>, config_override: Option<&str>) -> R
         destination.display()
     );
     Ok(())
+}
+
+fn service_plist(
+    executable: &Path,
+    config: &Path,
+    working_directory: &Path,
+    log: &Path,
+    herdr: &Path,
+) -> String {
+    let [executable, config, working_directory, log, herdr] =
+        [executable, config, working_directory, log, herdr]
+            .map(|path| escape_xml(&path.to_string_lossy()));
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>dev.herdr.deck</string>\n<key>ProgramArguments</key><array><string>{executable}</string><string>run</string><string>{config}</string></array>\n<key>WorkingDirectory</key><string>{working_directory}</string>\n<key>EnvironmentVariables</key><dict><key>HERDR_BIN_PATH</key><string>{herdr}</string></dict>\n<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\n<key>ThrottleInterval</key><integer>5</integer>\n<key>StandardOutPath</key><string>{log}</string>\n<key>StandardErrorPath</key><string>{log}</string>\n</dict></plist>\n"
+    )
 }
 
 // Replace the directory entry, never truncate an executable a daemon may be using.
@@ -356,7 +384,7 @@ fn run_launchctl(args: &[&str], ignore_failure: bool) -> Result<(), String> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ButtonSignature {
     offline: bool,
-    terminal_id: Option<String>,
+    pane_id: Option<String>,
     status: Option<String>,
     focused: bool,
     active_session: bool,
@@ -390,7 +418,7 @@ enum Event {
     Animation,
     AnimationFailed(String),
     Scan(Result<Vec<DeviceInfo>, String>),
-    Frontends(RoutingState),
+    Clients(Directory),
     Device(DeviceEvent),
     Action {
         name: &'static str,
@@ -400,39 +428,81 @@ enum Event {
 
 enum ActionCommand {
     SystemKey(crate::system_input::Key),
-    Call {
+    /// A prompt or submit: keyboard events for the frontmost app. Before each
+    /// keystroke, `client` must still be the followed Herdr client, with its
+    /// window focused, in the last report the follower published.
+    Input {
         name: &'static str,
-        route: Box<ActionRoute>,
-        request: FrontendRequest,
+        client: ClientKey,
+        inputs: Vec<OsInput>,
     },
-    Stop,
 }
 
-/// One request sent through the captured TUI route.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum FrontendRequest {
-    /// Focus the captured pane, on any endpoint of the TUI.
-    Navigate,
-    /// Ordinary input following the TUI's own focus, which the route pins to
-    /// the captured source pane.
-    Input(Input),
-    /// An endpoint method advertised on the TUI's client command lane.
-    Call {
-        method: &'static str,
-        params: serde_json::Value,
+/// What a Herdr-facing action does, captured when its control is pressed.
+#[derive(Debug, PartialEq, Eq)]
+enum Planned {
+    /// Ask the followed client to show the slot's agent.
+    Jump(JumpTarget),
+    Input {
+        client: ClientKey,
+        inputs: Vec<OsInput>,
     },
+}
+
+/// Captures a `focus-slot`, `prompt`, or `submit` against the followed
+/// client. Without one, nothing is dispatched. A prompt or submit is typed
+/// into the frontmost app, so it also needs that client's window focused,
+/// here and again before every keystroke.
+fn plan_action(
+    action: &Action,
+    directory: &Directory,
+    slot: Option<&ClientReportAgent>,
+) -> Result<Planned, String> {
+    let client = directory
+        .followed_client()
+        .ok_or("no followed Herdr client")?;
+    let input = |inputs| {
+        if !client.has_focus() {
+            return Err(Refusal::NotFocused.to_string());
+        }
+        Ok(Planned::Input {
+            client: client.key(),
+            inputs,
+        })
+    };
+    match action {
+        Action::FocusSlot { .. } => {
+            let row = slot.ok_or("agent slot is empty")?;
+            client
+                .jump_to(row)
+                .map(Planned::Jump)
+                .ok_or_else(|| "the agent's endpoint is not online".into())
+        }
+        Action::Prompt { text, submit } => input(OsInput::prompt(text, submit.unwrap_or(true))),
+        Action::Submit => input(vec![OsInput::Enter]),
+        Action::SystemEnter | Action::SystemKey { .. } | Action::CycleSession { .. } => {
+            Err("not a Herdr action".into())
+        }
+    }
 }
 
 struct Workers {
     scan_stop: mpsc::Sender<()>,
-    actions: mpsc::Sender<ActionCommand>,
+    /// The action worker's queue. The worker ends when this is dropped.
+    actions: SyncSender<ActionCommand>,
+    /// The followed client and its window focus, as the follower last saw
+    /// them.
+    focus: Focus,
     threads: Vec<JoinHandle<()>>,
 }
 
 impl Workers {
     fn stop(self) {
+        // First, so that queued prompts, submits, and keys are dropped
+        // rather than typed into whatever app is in front by now.
+        self.focus.stop();
         let _ = self.scan_stop.send(());
-        let _ = self.actions.send(ActionCommand::Stop);
+        drop(self.actions);
         for thread in self.threads {
             let _ = thread.join();
         }
@@ -452,15 +522,21 @@ struct Daemon {
     config_modified: Option<SystemTime>,
     config_version: u64,
     filter: SessionFilter,
+    /// Every followed Herdr daemon and its attached clients.
+    directory: Directory,
     model: Option<DisplayModel>,
-    routing: RoutingState,
     slots: Vec<Option<SlotKey>>,
+    /// The client `slots` belong to. They survive a gap in which there is
+    /// no followed client to show, so its keys mean the same afterwards.
+    slots_client: Option<ClientKey>,
     devices: HashMap<String, ManagedDevice>,
     visible: Vec<DeviceInfo>,
     renderer: Renderer,
     events: Receiver<Event>,
     event_sender: mpsc::Sender<Event>,
     workers: Option<Workers>,
+    /// Sends `focus-slot` jumps in the order this loop received the presses.
+    jumps: JumpDispatcher,
     stopped: Arc<AtomicBool>,
     render_dirty: bool,
     failure: Option<String>,
@@ -469,7 +545,6 @@ struct Daemon {
 impl Daemon {
     fn new(path: PathBuf) -> Result<Self, String> {
         let config = load_config(&path)?;
-        let config_modified = fs::metadata(&path).and_then(|value| value.modified()).ok();
         let renderer = Renderer::new().map_err(|error| error.to_string())?;
         let stopped = Arc::new(AtomicBool::new(false));
         signal_hook::flag::register(SIGINT, Arc::clone(&stopped))
@@ -477,25 +552,48 @@ impl Daemon {
             .map_err(|error| error.to_string())?;
         let (event_sender, events) = mpsc::channel();
         let workers = spawn_workers(event_sender.clone(), Arc::clone(&stopped));
-        Ok(Self {
+        Ok(Self::with_workers(
+            path,
+            config,
+            renderer,
+            workers,
+            (event_sender, events),
+            stopped,
+        ))
+    }
+
+    /// The daemon around its workers, which send their events to `events`.
+    fn with_workers(
+        path: PathBuf,
+        config: Config,
+        renderer: Renderer,
+        workers: Workers,
+        (event_sender, events): (mpsc::Sender<Event>, Receiver<Event>),
+        stopped: Arc<AtomicBool>,
+    ) -> Self {
+        let config_modified = fs::metadata(&path).and_then(|value| value.modified()).ok();
+        let jumps = JumpDispatcher::new(workers.focus.clone());
+        Self {
             path,
             filter: SessionFilter::All,
             slots: vec![None; config.herdr.slot_count],
             config,
             config_modified,
             config_version: 0,
+            directory: Directory::default(),
             model: None,
-            routing: RoutingState::default(),
+            slots_client: None,
             devices: HashMap::new(),
             visible: Vec::new(),
             renderer,
             events,
             event_sender,
             workers: Some(workers),
+            jumps,
             stopped,
             render_dirty: true,
             failure: None,
-        })
+        }
     }
 
     fn run(mut self) -> Result<(), String> {
@@ -549,8 +647,9 @@ impl Daemon {
     fn handle_event(&mut self, event: Event) {
         match event {
             Event::Animation => {
-                if self.visible_agents().any(|(_, agent)| {
-                    matches!(agent.agent_status.as_str(), "working" | "done" | "idle")
+                if self.shown_agents().iter().any(|(session, row)| {
+                    session.connected
+                        && matches!(row.agent.agent_status.as_str(), "working" | "done" | "idle")
                 }) {
                     self.render_dirty = true;
                 }
@@ -561,12 +660,16 @@ impl Daemon {
             }
             Event::Scan(Ok(devices)) => self.reconcile(devices),
             Event::Scan(Err(error)) => eprintln!("device scan failed: {error}"),
-            Event::Frontends(routing) => {
-                if self.model.is_some() && routing.model.is_none() {
-                    eprintln!("Herdr frontends unavailable");
+            Event::Clients(directory) => {
+                let model = project_model(&directory);
+                if self.model.is_some() && model.is_none() {
+                    eprintln!("Herdr clients unavailable");
                 }
-                self.routing = routing;
-                self.model = self.routing.model.as_ref().map(project_model);
+                if let Some(line) = selection_change(&self.directory, &directory) {
+                    println!("{line}");
+                }
+                self.directory = directory;
+                self.model = model;
                 self.normalize_filter();
                 self.reassign_slots();
                 self.render_dirty = true;
@@ -706,24 +809,24 @@ impl Daemon {
         let offline = self.model.is_none();
         let filter = self.filter.clone();
         let allowed = self.config.herdr.sessions.clone();
-        let active = self.routing.model.as_ref().and_then(active_endpoint);
-        let agents = self
-            .model
+        let active = active_endpoint(&self.directory);
+        let agents = shown_agents(self.model.as_ref(), &allowed, &filter, active);
+        let by_pane = agents
             .iter()
-            .flat_map(|model| &model.sessions)
-            .filter(|session| session_matches(session, &allowed, &filter, active))
-            .flat_map(|session| session.agents.iter().map(move |agent| (session, agent)))
-            .collect::<Vec<_>>();
-        let by_terminal = agents
-            .iter()
-            .map(|(session, agent)| {
+            .map(|(session, row)| {
                 (
-                    (session.key.as_str(), agent.terminal_id.as_str()),
-                    (*session, *agent),
+                    (row.endpoint_id.as_str(), row.agent.pane_id.as_str()),
+                    (*session, *row),
                 )
             })
             .collect::<HashMap<_, _>>();
-        let touch_agents = agents.iter().map(|(_, agent)| *agent).collect::<Vec<_>>();
+        // The strip counts what is known now: not the agents of an endpoint
+        // that is not online.
+        let touch_agents = agents
+            .iter()
+            .filter(|(session, _)| session.connected)
+            .map(|(_, agent)| *agent)
+            .collect::<Vec<_>>();
         let multiple_sessions = self.connected_session_keys().len() > 1;
         let filter_label = self.filter_label();
         let now_ms = unix_millis();
@@ -737,17 +840,21 @@ impl Daemon {
             for key in 0..device.info.kind.key_count() {
                 let slot = self.slots.get(key as usize).and_then(Option::as_ref);
                 let entry = slot.and_then(|slot| {
-                    by_terminal
-                        .get(&(slot.session.as_str(), slot.terminal_id.as_str()))
+                    by_pane
+                        .get(&(slot.endpoint_id.as_str(), slot.pane_id.as_str()))
                         .copied()
                 });
                 let session = entry.map(|(session, _)| session);
-                let agent = entry.map(|(_, agent)| agent);
-                let workspace =
-                    entry.and_then(|(session, agent)| workspace_for_agent(session, agent));
-                let status = agent.map(|agent| agent.agent_status.as_str());
+                let agent = entry.map(|(_, row)| row);
+                // An agent whose endpoint is not online keeps its key, in
+                // the `unknown` colors: its status is stale and a press is
+                // refused.
+                let reachable = session.is_none_or(|session| session.connected);
+                let status = agent.map(|row| key_status(row, reachable));
                 let animated = matches!(status, Some("working" | "done" | "idle"));
-                let label = agent.map(|agent| agent_label(agent, workspace));
+                let label = agent.map(agent_label);
+                // The row's own focus is the client's: one agent at most.
+                let focused = agent.is_some_and(|row| row.focused);
                 let session_badge = (self.filter == SessionFilter::All && multiple_sessions)
                     .then(|| session.map(session_label))
                     .flatten();
@@ -755,9 +862,9 @@ impl Daemon {
                     session.is_some_and(|session| active == Some(session.key.as_str()));
                 let signature = ButtonSignature {
                     offline,
-                    terminal_id: slot.map(|slot| slot.terminal_id.clone()),
+                    pane_id: slot.map(|slot| slot.pane_id.clone()),
                     status: status.map(str::to_owned),
-                    focused: agent.is_some_and(|agent| agent.focused),
+                    focused,
                     active_session,
                     title: label.as_ref().map(|label| label.title.clone()),
                     subtitle: (!animated)
@@ -773,12 +880,16 @@ impl Daemon {
                 if device.button_signatures.get(&key) == Some(&signature) {
                     continue;
                 }
+                let unreachable = agent.filter(|_| !reachable).map(|row| {
+                    let mut row = row.clone();
+                    row.agent.agent_status = key_status(&row, reachable).into();
+                    row
+                });
                 match self.renderer.render_key(
                     width as u32,
                     height as u32,
-                    agent,
-                    workspace,
-                    agent.is_some_and(|agent| agent.focused),
+                    unreachable.as_ref().or(agent),
+                    focused,
                     active_session,
                     session_badge,
                     &self.config.states,
@@ -799,15 +910,15 @@ impl Daemon {
                     session: filter_label.clone(),
                     working: touch_agents
                         .iter()
-                        .filter(|agent| agent.agent_status.as_str() == "working")
+                        .filter(|row| row.agent.agent_status.as_str() == "working")
                         .count(),
                     done: touch_agents
                         .iter()
-                        .filter(|agent| agent.agent_status.as_str() == "done")
+                        .filter(|row| row.agent.agent_status.as_str() == "done")
                         .count(),
                     blocked: touch_agents
                         .iter()
-                        .filter(|agent| agent.agent_status.as_str() == "blocked")
+                        .filter(|row| row.agent.agent_status.as_str() == "blocked")
                         .count(),
                     config_version: self.config_version,
                 };
@@ -921,92 +1032,77 @@ impl Daemon {
         let Some(actions) = self.workers.as_ref().map(|workers| workers.actions.clone()) else {
             return;
         };
+        let name = action_name(&action);
         if let Some(command) = system_action_command(&action) {
-            if actions.send(command).is_err() {
-                eprintln!(
-                    "{} failed: action worker is unavailable",
-                    action_name(&action)
-                );
-            }
+            queue_action(&actions, name, command);
             return;
         }
-        let action_name = action_name(&action);
-        let target = match &action {
-            Action::FocusSlot { slot } => {
-                let Some(target) = self.agent_for_slot(slot.unwrap_or(0) as usize) else {
-                    eprintln!("focus-slot failed: agent slot is empty");
-                    return;
-                };
-                Some(target)
-            }
+        let slot = match &action {
+            Action::FocusSlot { slot } => self.agent_for_slot(slot.unwrap_or(0) as usize),
             _ => None,
         };
-        let explicit = match &self.filter {
-            SessionFilter::Session(key) => Some(key.as_str()),
-            _ => None,
-        };
-        let route = match self
-            .routing
-            .capture(&self.config.herdr.sessions, explicit, target)
-        {
-            Ok(route) => route,
-            Err(error) => {
-                eprintln!("{action_name} failed: {error}");
-                return;
+        match plan_action(&action, &self.directory, slot) {
+            Err(error) => eprintln!("{name} failed: {error}"),
+            Ok(Planned::Jump(target)) => {
+                let events = self.event_sender.clone();
+                self.jumps.press(target, move |result| {
+                    let result = jump_result(result);
+                    let _ = events.send(Event::Action { name, result });
+                });
             }
-        };
-        let command = action_command(action_name, route, action);
-        if actions.send(command).is_err() {
-            eprintln!("{action_name} failed: action worker is unavailable");
+            Ok(Planned::Input { client, inputs }) => queue_action(
+                &actions,
+                name,
+                ActionCommand::Input {
+                    name,
+                    client,
+                    inputs,
+                },
+            ),
         }
     }
 
-    fn visible_sessions(&self) -> impl Iterator<Item = &SessionState> {
+    fn shown_agents(&self) -> Vec<(&SessionState, &ClientReportAgent)> {
+        shown_agents(
+            self.model.as_ref(),
+            &self.config.herdr.sessions,
+            &self.filter,
+            active_endpoint(&self.directory),
+        )
+    }
+
+    /// Every shown agent keeps its slot; only one a jump can reach takes a
+    /// free one. Without a followed client the slots wait as they are.
+    fn reassign_slots(&mut self) {
+        let Some(client) = self.directory.followed_client() else {
+            return;
+        };
+        let mut owner = self.slots_client.take();
+        let next = sticky_slots(
+            &self.slots,
+            &mut owner,
+            client.key(),
+            self.shown_agents().into_iter().map(|(_, row)| row),
+            self.config.herdr.slot_count,
+            |row| client.can_reach(row),
+        );
+        self.slots = next;
+        self.slots_client = owner;
+    }
+
+    /// The followed client's endpoints that `herdr.sessions` allows.
+    fn allowed_sessions(&self) -> impl Iterator<Item = &SessionState> {
+        let allowed = &self.config.herdr.sessions;
         self.model
             .iter()
             .flat_map(|model| &model.sessions)
-            .filter(|session| {
-                session_matches(
-                    session,
-                    &self.config.herdr.sessions,
-                    &self.filter,
-                    self.routing.model.as_ref().and_then(active_endpoint),
-                )
-            })
-    }
-
-    fn visible_agents(&self) -> impl Iterator<Item = (&SessionState, &AgentInfo)> {
-        self.visible_sessions()
-            .flat_map(|session| session.agents.iter().map(move |agent| (session, agent)))
-    }
-
-    fn reassign_slots(&mut self) {
-        let next = {
-            let agents = self
-                .visible_agents()
-                .map(|(session, agent)| SlotAgent {
-                    key: SlotKey {
-                        session: session.key.clone(),
-                        terminal_id: agent.terminal_id.clone(),
-                    },
-                    agent,
-                })
-                .collect::<Vec<_>>();
-            assign_slots(&self.slots, &agents, self.config.herdr.slot_count)
-        };
-        self.slots = next;
+            .filter(move |session| allowed.is_empty() || allowed.contains(&session.key))
     }
 
     fn connected_session_keys(&self) -> Vec<String> {
         let mut sessions = self
-            .model
-            .iter()
-            .flat_map(|model| &model.sessions)
-            .filter(|session| {
-                session.connected
-                    && (self.config.herdr.sessions.is_empty()
-                        || self.config.herdr.sessions.contains(&session.key))
-            })
+            .allowed_sessions()
+            .filter(|session| session.connected)
             .map(|session| session.key.clone())
             .collect::<Vec<_>>();
         sessions.sort();
@@ -1027,25 +1123,65 @@ impl Daemon {
         }
     }
 
+    /// A filter on one endpoint falls back to all of them once that
+    /// endpoint is gone: the followed client no longer reports it, or
+    /// `herdr.sessions` no longer allows it. An endpoint that is only not
+    /// online keeps its filter, and so does one that cannot be looked up
+    /// because no client is followed or its daemon does not answer.
     fn normalize_filter(&mut self) {
-        let sessions = self.connected_session_keys();
+        if self.directory.followed_client().is_none() {
+            return;
+        }
+        let sessions = self
+            .allowed_sessions()
+            .map(|session| session.key.clone())
+            .collect::<Vec<_>>();
         retain_filter(&mut self.filter, &sessions);
     }
 
-    fn agent_for_slot(&self, slot: usize) -> Option<(&str, &AgentInfo)> {
+    /// The agent behind a key, also while its endpoint is not online.
+    fn agent_for_slot(&self, slot: usize) -> Option<&ClientReportAgent> {
         let key = self.slots.get(slot)?.as_ref()?;
-        let session = self
-            .model
-            .as_ref()?
-            .sessions
-            .iter()
-            .find(|session| session.key == key.session)?;
-        let agent = session
-            .agents
-            .iter()
-            .find(|agent| agent.terminal_id == key.terminal_id)?;
-        Some((&session.key, agent))
+        self.shown_agents()
+            .into_iter()
+            .map(|(_, row)| row)
+            .find(|row| key.is(row))
     }
+}
+
+/// What a key shows as its agent's status: the reported one, or `unknown`
+/// while the agent's endpoint is not online.
+fn key_status(row: &ClientReportAgent, reachable: bool) -> &str {
+    if reachable {
+        row.agent.agent_status.as_str()
+    } else {
+        herdr_client::AgentStatus::UNKNOWN
+    }
+}
+
+/// The agents of the endpoints the allow-list and the filter select, in the
+/// client's order, each with its endpoint. An endpoint that is not online
+/// is selected like any other: its agents keep their keys.
+fn shown_agents<'a>(
+    model: Option<&'a DisplayModel>,
+    allowed: &[String],
+    filter: &SessionFilter,
+    active: Option<&str>,
+) -> Vec<(&'a SessionState, &'a ClientReportAgent)> {
+    let Some(model) = model else {
+        return Vec::new();
+    };
+    model
+        .agents
+        .iter()
+        .filter_map(|row| {
+            let session = model
+                .sessions
+                .iter()
+                .find(|session| session.key == row.endpoint_id)?;
+            session_matches(session, allowed, filter, active).then_some((session, row))
+        })
+        .collect()
 }
 
 fn spawn_workers(events: mpsc::Sender<Event>, stopped: Arc<AtomicBool>) -> Workers {
@@ -1072,37 +1208,54 @@ fn spawn_workers(events: mpsc::Sender<Event>, stopped: Arc<AtomicBool>) -> Worke
         }
     });
 
-    let shared_routing = Arc::new(Mutex::new(RoutingState::default()));
-    let frontend_routing = Arc::clone(&shared_routing);
-    let frontend_events = events.clone();
-    let frontend_worker = directory::spawn_updates(
-        frontend::directory(),
-        move |clients| {
-            let mut routing = frontend_routing.lock().unwrap_or_else(|e| e.into_inner());
-            if routing
-                .model
-                .as_ref()
-                .map(|m| &m.clients)
-                .is_some_and(|old| *old == clients)
-                || (routing.model.is_none() && clients.is_empty())
-            {
-                return true;
-            }
-            routing.update(clients);
-            frontend_events
-                .send(Event::Frontends(routing.clone()))
-                .is_ok()
+    // Every local session is its own daemon; the followed client may be
+    // attached to any of them, so all are followed.
+    let focus = Focus::new(Arc::clone(&stopped));
+    let follower = follow::spawn(
+        sessions::discover,
+        {
+            let focus = focus.clone();
+            let events = events.clone();
+            move |directory| clients_changed(&focus, &events, directory)
         },
+        |line| eprintln!("{line}"),
         stopped,
     );
 
-    let (actions, action_rx) = mpsc::channel();
-    let action = thread::spawn(move || action_worker(action_rx, events, shared_routing));
+    let (actions, action_rx) = mpsc::sync_channel(ACTION_QUEUE_CAPACITY);
+    let action = thread::spawn({
+        let focus = focus.clone();
+        move || {
+            action_worker(action_rx, events, &focus, &macos::post, &|| {
+                thread::sleep(SUBMIT_SETTLE)
+            })
+        }
+    });
 
     Workers {
         scan_stop,
         actions,
-        threads: vec![animation, scan, action, frontend_worker],
+        focus,
+        threads: vec![animation, scan, action, follower],
+    }
+}
+
+/// The follower's callback, run on the follower's thread.
+fn clients_changed(focus: &Focus, events: &mpsc::Sender<Event>, directory: Directory) -> bool {
+    // Before the event, so a queued prompt sees a loss first.
+    focus.follow(directory.followed_client());
+    events.send(Event::Clients(directory)).is_ok()
+}
+
+/// Queues keyboard work for the action worker, which types one command at
+/// a time. A command that finds the queue full is dropped.
+fn queue_action(actions: &SyncSender<ActionCommand>, name: &str, command: ActionCommand) {
+    match actions.try_send(command) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => eprintln!("{name} ignored: action queue full"),
+        Err(TrySendError::Disconnected(_)) => {
+            eprintln!("{name} failed: action worker is unavailable")
+        }
     }
 }
 
@@ -1177,7 +1330,15 @@ fn system_action_command(action: &Action) -> Option<ActionCommand> {
     }
 }
 
-fn has_system_actions(config: &Config) -> bool {
+/// Whether `action` is sent as a macOS keyboard event.
+fn posts_keyboard_event(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::SystemEnter | Action::SystemKey { .. } | Action::Prompt { .. } | Action::Submit
+    )
+}
+
+fn has_keyboard_actions(config: &Config) -> bool {
     config
         .devices
         .iter()
@@ -1200,15 +1361,15 @@ fn has_system_actions(config: &Config) -> bool {
                         })
                         .filter_map(Option::as_ref),
                 )
-                .any(|action| system_action_command(action).is_some())
+                .any(posts_keyboard_event)
         })
 }
 
 fn report_keyboard_access(config: &Config) {
-    if has_system_actions(config) {
+    if has_keyboard_actions(config) {
         println!(
             "system keyboard access: {}",
-            if crate::system_input::permitted() {
+            if macos::permitted() {
                 "ok"
             } else {
                 "not granted; enable Herdr Deck in System Settings > Privacy & Security > Accessibility"
@@ -1217,32 +1378,43 @@ fn report_keyboard_access(config: &Config) {
     }
 }
 
+/// What a finished jump reports. A jump a later press replaced reports
+/// nothing: that later jump answers for itself.
+fn jump_result<T>(result: Result<T, JumpError>) -> Result<(), String> {
+    match result {
+        Err(error) if !error.is_superseded() => Err(error.to_string()),
+        _ => Ok(()),
+    }
+}
+
+/// Runs queued keyboard work in order, until the queue's sender is dropped.
+/// Once `focus` is stopped, what is still queued is dropped, and a prompt
+/// being typed stops at its next keystroke.
 fn action_worker(
     commands: Receiver<ActionCommand>,
     events: mpsc::Sender<Event>,
-    routing: Arc<Mutex<RoutingState>>,
+    focus: &Focus,
+    post: &dyn Fn(Keystroke<'_>) -> Result<(), PostError>,
+    settle: &dyn Fn(),
 ) {
     while let Ok(command) = commands.recv() {
+        if focus.is_stopping() {
+            break;
+        }
         let (name, result) = match command {
-            ActionCommand::Call {
+            ActionCommand::Input {
                 name,
-                route,
-                request,
-            } => {
-                let client = route.client_route.client().with_timeout(ACTION_TIMEOUT);
-                let validate = || {
-                    routing
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .validate(&route)
-                };
-                (
-                    name,
-                    execute_frontend_call(&client, &route, &request, &validate).map(|_| ()),
-                )
-            }
-            ActionCommand::SystemKey(key) => ("system-key", crate::system_input::press(key)),
-            ActionCommand::Stop => break,
+                client,
+                inputs,
+            } => (
+                name,
+                type_inputs(&inputs, &client, focus, post, settle)
+                    .map_err(|error| error.to_string()),
+            ),
+            ActionCommand::SystemKey(key) => (
+                "system-key",
+                crate::system_input::press(key).map_err(|error| error.to_string()),
+            ),
         };
         if events.send(Event::Action { name, result }).is_err() {
             break;
@@ -1250,35 +1422,10 @@ fn action_worker(
     }
 }
 
-fn action_command(name: &'static str, route: ActionRoute, action: Action) -> ActionCommand {
-    let pane_id = &route.target.pane_id;
-    let request = match action {
-        Action::FocusSlot { .. } => FrontendRequest::Navigate,
-        Action::FocusPane { direction } => FrontendRequest::Call {
-            method: "pane.focus_direction",
-            params: json!({ "pane_id": pane_id, "direction": direction_name(direction) }),
-        },
-        Action::SendKeys { keys } => FrontendRequest::Input(Input::Keys(keys)),
-        Action::Prompt {
-            text,
-            submit: Some(false),
-        } => FrontendRequest::Input(Input::Text(text)),
-        Action::Prompt { text, .. } => FrontendRequest::Call {
-            method: "agent.prompt",
-            params: json!({ "target": pane_id, "text": text }),
-        },
-        Action::Submit => FrontendRequest::Input(Input::Keys(vec!["enter".into()])),
-        Action::CycleSession { .. } | Action::SystemEnter | Action::SystemKey { .. } => {
-            unreachable!()
-        }
-    };
-    ActionCommand::Call {
-        name,
-        route: Box::new(route),
-        request,
-    }
-}
-
+/// The filter one step from `current` through all, active, and each of
+/// `sessions`. A filter kept on an endpoint that is not among them, because
+/// it is not online, has no place to step from: either direction leaves it
+/// for all.
 fn cycle_filter(
     current: &SessionFilter,
     sessions: &[String],
@@ -1288,10 +1435,9 @@ fn cycle_filter(
     filters.push(SessionFilter::All);
     filters.push(SessionFilter::Active);
     filters.extend(sessions.iter().cloned().map(SessionFilter::Session));
-    let current = filters
-        .iter()
-        .position(|filter| filter == current)
-        .unwrap_or(0);
+    let Some(current) = filters.iter().position(|filter| filter == current) else {
+        return SessionFilter::All;
+    };
     let index = match direction {
         CycleDirection::Next => (current + 1) % filters.len(),
         CycleDirection::Previous => (current + filters.len() - 1) % filters.len(),
@@ -1307,29 +1453,19 @@ fn retain_filter(filter: &mut SessionFilter, sessions: &[String]) {
     }
 }
 
+/// Whether the allow-list and the filter select `session`, online or not.
 fn session_matches(
     session: &SessionState,
     allowed: &[String],
     filter: &SessionFilter,
     active: Option<&str>,
 ) -> bool {
-    session.connected
-        && (allowed.is_empty() || allowed.contains(&session.key))
+    (allowed.is_empty() || allowed.contains(&session.key))
         && match filter {
             SessionFilter::All => true,
             SessionFilter::Active => active == Some(session.key.as_str()),
             SessionFilter::Session(key) => key == &session.key,
         }
-}
-
-fn workspace_for_agent<'a>(
-    session: &'a SessionState,
-    agent: &AgentInfo,
-) -> Option<&'a herdr_client::WorkspaceInfo> {
-    session
-        .workspaces
-        .iter()
-        .find(|workspace| workspace.workspace_id == agent.workspace_id)
 }
 
 fn session_label(session: &SessionState) -> &str {
@@ -1347,20 +1483,9 @@ fn identity(device: &DeviceInfo) -> DeviceIdentity {
     }
 }
 
-fn direction_name(direction: Direction) -> &'static str {
-    match direction {
-        Direction::Down => "down",
-        Direction::Left => "left",
-        Direction::Right => "right",
-        Direction::Up => "up",
-    }
-}
-
 fn action_name(action: &Action) -> &'static str {
     match action {
         Action::FocusSlot { .. } => "focus-slot",
-        Action::FocusPane { .. } => "focus-pane",
-        Action::SendKeys { .. } => "send-keys",
         Action::Prompt { .. } => "prompt",
         Action::Submit => "submit",
         Action::SystemEnter => "system-enter",
@@ -1392,10 +1517,74 @@ pub fn animation_tick(now_ms: u64, status: Option<&str>, button_index: u8) -> u6
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use std::io::Read;
+    use herdr_client::{ClientEndpointStatus, ClientInfo, ClientJumpError};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
 
-    use herdr_client::WorkspaceInfo;
+    use crate::clients::tests::{client, daemon, directory, fixture_report};
+    use crate::config::parse_config;
+
+    /// Bounds every wait of a test that would otherwise hang.
+    const WAIT: Duration = Duration::from_secs(10);
+
+    /// The endpoint of the fixture's remote agent, which is the third key.
+    const REMOTE: &str = "ssh:0123456789abcdef0123456789abcdef";
+
+    /// A daemon with the shipped configuration, no devices and no worker
+    /// threads. The receiver is the other end of its keyboard queue.
+    fn deck() -> (Daemon, Receiver<ActionCommand>) {
+        let config = serde_json::from_str(include_str!("../herdr-deck.json")).unwrap();
+        let events = mpsc::channel();
+        let (scan_stop, _) = mpsc::channel();
+        let (actions, queued) = mpsc::sync_channel(ACTION_QUEUE_CAPACITY);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let workers = Workers {
+            scan_stop,
+            actions,
+            focus: Focus::new(Arc::clone(&stopped)),
+            threads: Vec::new(),
+        };
+        let deck = Daemon::with_workers(
+            "/nonexistent/herdr-deck.json".into(),
+            parse_config(config).unwrap(),
+            Renderer::new().unwrap(),
+            workers,
+            events,
+            stopped,
+        );
+        (deck, queued)
+    }
+
+    /// The follower publishes `daemons` after what `deck` holds, and the
+    /// event loop takes the event.
+    fn publish(deck: &mut Daemon, daemons: Vec<herdr_client::follow::DaemonClients>) {
+        let focus = deck.workers.as_ref().unwrap().focus.clone();
+        let directory = deck.directory.updated(daemons);
+        assert!(clients_changed(&focus, &deck.event_sender, directory));
+        while let Ok(event) = deck.events.try_recv() {
+            deck.handle_event(event);
+        }
+    }
+
+    fn slot_panes(deck: &Daemon) -> Vec<Option<&str>> {
+        deck.slots
+            .iter()
+            .map(|slot| slot.as_ref().map(|key| key.pane_id.as_str()))
+            .collect()
+    }
+
+    /// What pressing the key of `slot` would do now.
+    fn plan_slot(deck: &Daemon, slot: usize) -> Result<Planned, String> {
+        plan_action(
+            &Action::FocusSlot {
+                slot: Some(slot as u8),
+            },
+            &deck.directory,
+            deck.agent_for_slot(slot),
+        )
+    }
 
     #[test]
     fn executable_install_preserves_open_copy_and_survives_missing_source() {
@@ -1435,67 +1624,16 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
-    fn agent(terminal_id: &str, pane_id: &str, focused: bool) -> AgentInfo {
-        AgentInfo {
-            terminal_id: terminal_id.into(),
-            name: Some(terminal_id.into()),
-            agent: Some("codex".into()),
-            title: None,
-            terminal_title: None,
-            terminal_title_stripped: None,
-            display_agent: None,
-            agent_status: "working".into(),
-            screen_detection_skipped: false,
-            state_labels: HashMap::new(),
-            tokens: HashMap::new(),
-            agent_session: None,
-            workspace_id: "workspace".into(),
-            tab_id: "tab".into(),
-            pane_id: pane_id.into(),
-            focused,
-            launch_pending: false,
-            interactive_ready: true,
-            state_change_seq: 1,
-            cwd: None,
-            foreground_cwd: None,
-            revision: 0,
-        }
-    }
-
-    fn session(key: &str, name: &str, connected: bool, focused: bool) -> SessionState {
+    fn session(key: &str, name: &str, connected: bool) -> SessionState {
         SessionState {
             key: key.into(),
             name: name.into(),
             connected,
-            workspaces: vec![WorkspaceInfo {
-                workspace_id: "workspace".into(),
-                number: 1,
-                label: name.into(),
-                focused,
-                pane_count: 1,
-                tab_count: 1,
-                active_tab_id: "tab".into(),
-                agent_status: "working".into(),
-                tokens: HashMap::new(),
-                worktree: None,
-                group: None,
-                family_anchor_id: None,
-            }],
-            agents: vec![agent("terminal", "pane", focused)],
-        }
-    }
-
-    fn test_client_route(endpoint: &str) -> directory::ClientRoute {
-        directory::ClientRoute {
-            client_id: "client-a".into(),
-            socket_path: "/tmp/test-deck.sock".into(),
-            endpoint_id: endpoint.into(),
-            boot_id: Some("boot-a".into()),
         }
     }
 
     #[test]
-    fn system_keys_create_commands_without_a_frontend_route() {
+    fn system_keys_create_commands_without_a_herdr_client() {
         use crate::system_input::Key;
         assert!(matches!(
             system_action_command(&Action::SystemEnter),
@@ -1554,11 +1692,12 @@ mod tests {
 
     #[test]
     fn filters_cycle_active_and_connected_allowed_sessions() {
-        let alpha = session("local", "alpha", true, false);
-        let beta = session("ssh:beta", "beta", true, false);
-        let stopped = session("ssh:stopped", "stopped", false, false);
+        let alpha = session("local", "alpha", true);
+        let beta = session("ssh:beta", "beta", true);
+        let stopped = session("ssh:stopped", "stopped", false);
         assert!(session_matches(&alpha, &[], &SessionFilter::All, None));
-        assert!(!session_matches(&stopped, &[], &SessionFilter::All, None,));
+        // An endpoint that is not online is selected like any other.
+        assert!(session_matches(&stopped, &[], &SessionFilter::All, None));
         assert!(session_matches(
             &beta,
             &["ssh:beta".into()],
@@ -1610,6 +1749,18 @@ mod tests {
             cycle_filter(&SessionFilter::All, &keys, CycleDirection::Previous),
             SessionFilter::Session("ssh:beta".into())
         );
+        // A filter kept on an endpoint that is not online is not in the
+        // cycle: a press leaves it for all, not for all's neighbour.
+        for direction in [CycleDirection::Next, CycleDirection::Previous] {
+            assert_eq!(
+                cycle_filter(
+                    &SessionFilter::Session("ssh:stopped".into()),
+                    &keys,
+                    direction
+                ),
+                SessionFilter::All
+            );
+        }
 
         let mut vanished = SessionFilter::Session("ssh:beta".into());
         retain_filter(&mut vanished, &["local".into()]);
@@ -1620,28 +1771,10 @@ mod tests {
     }
 
     #[test]
-    fn session_scoped_lookup_handles_duplicate_terminal_and_workspace_ids() {
-        let alpha = session("local", "Alpha", true, true);
-        let beta = session("ssh:beta", "Beta", true, true);
-        assert_eq!(
-            workspace_for_agent(&alpha, &alpha.agents[0]).unwrap().label,
-            "Alpha"
-        );
-        assert_eq!(
-            workspace_for_agent(&beta, &beta.agents[0]).unwrap().label,
-            "Beta"
-        );
-
-        let remote = session("ssh:workbox", "Workbox", true, false);
-        assert_eq!(session_label(&alpha), "Alpha");
-        assert_eq!(session_label(&remote), "Workbox");
-    }
-
-    #[test]
     fn button_signature_tracks_session_indicators() {
         let plain = ButtonSignature {
             offline: false,
-            terminal_id: Some("terminal".into()),
+            pane_id: Some("w1:p1".into()),
             status: Some("blocked".into()),
             focused: false,
             active_session: false,
@@ -1668,278 +1801,641 @@ mod tests {
         );
     }
 
+    fn focused_directory() -> Directory {
+        directory(vec![
+            daemon("default", vec![client(3, Some(false))]),
+            daemon("work", vec![client(7, Some(true))]),
+        ])
+    }
+
+    fn focused_key(directory: &Directory) -> ClientKey {
+        directory.followed_client().unwrap().key()
+    }
+
     #[test]
-    fn queued_action_worker_rejects_latest_frontend_outage_without_sending() {
-        let (commands, receiver) = mpsc::channel();
-        let (events, results) = mpsc::channel();
-        let route = ActionRoute {
-            session: "local".into(),
-            client_route: test_client_route("local"),
-            source_pane: Some("pane".into()),
-            target: crate::routing::AgentIdentity::from(&agent("terminal", "pane", false)),
-            generation: 1,
+    fn shown_agents_follow_the_report_the_allow_list_and_the_filter() {
+        let model = project_model(&focused_directory());
+        let panes = |allowed: &[String], filter: &SessionFilter, active| {
+            shown_agents(model.as_ref(), allowed, filter, active)
+                .into_iter()
+                .map(|(session, row)| (session.name.clone(), row.agent.pane_id.clone()))
+                .collect::<Vec<_>>()
         };
-        commands
-            .send(action_command("submit", route, Action::Submit))
+        let all = panes(&[], &SessionFilter::All, Some("local"));
+        assert_eq!(
+            all,
+            [
+                ("Local".to_owned(), "w1:p1".to_owned()),
+                ("Local".to_owned(), "w2:p1".to_owned()),
+                ("Build".to_owned(), "w1:p4".to_owned()),
+                ("Local".to_owned(), "w2:p2".to_owned()),
+            ]
+        );
+        // `herdr.sessions` lists the endpoint ids to show.
+        let remote = "ssh:0123456789abcdef0123456789abcdef".to_owned();
+        assert_eq!(
+            panes(
+                std::slice::from_ref(&remote),
+                &SessionFilter::All,
+                Some("local")
+            ),
+            [("Build".to_owned(), "w1:p4".to_owned())]
+        );
+        assert_eq!(panes(&[], &SessionFilter::Active, Some("local")).len(), 3);
+        assert_eq!(
+            panes(&[], &SessionFilter::Session(remote), Some("local")),
+            [("Build".to_owned(), "w1:p4".to_owned())]
+        );
+        assert!(shown_agents(None, &[], &SessionFilter::All, None).is_empty());
+    }
+
+    #[test]
+    fn a_reconnecting_endpoint_keeps_its_agents_keys_until_it_is_back() {
+        let (mut deck, _queued) = deck();
+        let mut focused = client(7, Some(true));
+        publish(&mut deck, vec![daemon("work", vec![focused.clone()])]);
+        assert_eq!(
+            slot_panes(&deck)[..5],
+            [
+                Some("w1:p1"),
+                Some("w2:p1"),
+                Some("w1:p4"),
+                Some("w2:p2"),
+                None
+            ]
+        );
+        let slots = deck.slots.clone();
+        let jump = plan_slot(&deck, 2).unwrap();
+        assert!(matches!(&jump, Planned::Jump(target) if target.endpoint_id == REMOTE));
+
+        // The remote endpoint reconnects. The client still reports its
+        // agent, and a new local one besides.
+        let report = focused.report.as_mut().unwrap();
+        report.endpoints[1].status = ClientEndpointStatus::RECONNECTING.into();
+        let mut newcomer = report.agents[0].clone();
+        newcomer.agent.pane_id = "w9:p9".into();
+        newcomer.agent.priority_key = "0.0.0000".into();
+        report.agents.push(newcomer);
+        publish(&mut deck, vec![daemon("work", vec![focused.clone()])]);
+        // The key is still the remote agent's: the newcomer got a free one.
+        assert_eq!(deck.slots[..4], slots[..4]);
+        assert_eq!(slot_panes(&deck)[4], Some("w9:p9"));
+        // It is drawn as unavailable and left out of the touch strip, and a
+        // press on it is refused.
+        let held = deck.agent_for_slot(2).expect("the key is held");
+        let (session, _) = deck
+            .shown_agents()
+            .into_iter()
+            .find(|(_, row)| std::ptr::eq(*row, held))
             .unwrap();
-        commands.send(ActionCommand::Stop).unwrap();
+        assert!(!session.connected);
+        assert_eq!(key_status(held, session.connected), "unknown");
+        assert_eq!(key_status(held, true), "working");
+        assert_eq!(
+            plan_slot(&deck, 2).unwrap_err(),
+            "the agent's endpoint is not online"
+        );
+        assert!(matches!(plan_slot(&deck, 1), Ok(Planned::Jump(_))));
+
+        // The endpoint is back: the key jumps to the same agent again.
+        focused.report.as_mut().unwrap().endpoints[1].status = ClientEndpointStatus::ONLINE.into();
+        publish(&mut deck, vec![daemon("work", vec![focused.clone()])]);
+        assert_eq!(deck.slots[..4], slots[..4]);
+        assert_eq!(plan_slot(&deck, 2).unwrap(), jump);
+
+        // An agent that leaves the report while its endpoint reconnects
+        // gives its key up.
+        let report = focused.report.as_mut().unwrap();
+        report.endpoints[1].status = ClientEndpointStatus::RECONNECTING.into();
+        report.agents.retain(|row| row.endpoint_id != REMOTE);
+        publish(&mut deck, vec![daemon("work", vec![focused])]);
+        assert_eq!(slot_panes(&deck)[2], None);
+    }
+
+    #[test]
+    fn a_filter_outlives_a_failed_listing_and_a_reconnecting_endpoint() {
+        let (mut deck, _queued) = deck();
+        let mut focused = client(7, Some(true));
+        publish(&mut deck, vec![daemon("work", vec![focused.clone()])]);
+        // All, active, `local`, then the remote endpoint.
+        for _ in 0..3 {
+            deck.execute(Action::CycleSession {
+                direction: CycleDirection::Next,
+            });
+        }
+        let filter = SessionFilter::Session(REMOTE.into());
+        assert_eq!(deck.filter, filter);
+        assert_eq!(slot_panes(&deck)[..2], [Some("w1:p4"), None]);
+        let slots = deck.slots.clone();
+
+        // The daemon fails a listing, with and without a client of another
+        // daemon attached; then it answers again.
+        let mut offline = daemon("work", vec![]);
+        offline.state = DaemonState::Offline;
+        let silent = ClientInfo {
+            client_id: 9,
+            report: None,
+        };
+        for daemons in [
+            vec![offline.clone()],
+            vec![offline, daemon("default", vec![silent])],
+            vec![daemon("work", vec![focused.clone()])],
+        ] {
+            publish(&mut deck, daemons);
+            assert_eq!(deck.filter, filter);
+            assert_eq!(deck.slots, slots);
+        }
+        assert!(matches!(plan_slot(&deck, 0), Ok(Planned::Jump(_))));
+
+        // The filtered endpoint reconnects: its agent keeps the key.
+        let report = focused.report.as_mut().unwrap();
+        report.endpoints[1].status = ClientEndpointStatus::RECONNECTING.into();
+        publish(&mut deck, vec![daemon("work", vec![focused.clone()])]);
+        assert_eq!(deck.filter, filter);
+        assert_eq!(deck.slots, slots);
+        assert_eq!(deck.filter_label(), "Build");
+
+        // `herdr.sessions` stops allowing the endpoint: nothing is left for
+        // the filter to select.
+        deck.config.herdr.sessions = vec!["local".into()];
+        deck.normalize_filter();
+        assert_eq!(deck.filter, SessionFilter::All);
+        deck.config.herdr.sessions.clear();
+
+        // So it is once the client no longer reports the endpoint.
+        deck.filter = filter;
+        let report = focused.report.as_mut().unwrap();
+        report.endpoints.remove(1);
+        report.agents.retain(|row| row.endpoint_id != REMOTE);
+        publish(&mut deck, vec![daemon("work", vec![focused])]);
+        assert_eq!(deck.filter, SessionFilter::All);
+        assert_eq!(
+            slot_panes(&deck)[..4],
+            [Some("w1:p1"), Some("w2:p1"), Some("w2:p2"), None]
+        );
+    }
+
+    /// A socket in the place of the followed client's daemon. Nothing here
+    /// touches a real Herdr socket.
+    struct JumpSocket {
+        directory: PathBuf,
+        listener: UnixListener,
+    }
+
+    impl JumpSocket {
+        fn bind() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let directory = std::env::temp_dir().join(format!(
+                "hd-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&directory).unwrap();
+            let listener = UnixListener::bind(directory.join("s")).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            Self {
+                directory,
+                listener,
+            }
+        }
+
+        fn path(&self) -> PathBuf {
+            self.directory.join("s")
+        }
+
+        /// The next request and the connection it arrived on.
+        fn request(&self) -> (UnixStream, serde_json::Value) {
+            let deadline = Instant::now() + WAIT;
+            let stream = loop {
+                match self.listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(_) => {
+                        assert!(Instant::now() < deadline, "no request arrived");
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream.set_read_timeout(Some(WAIT)).unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            (stream, serde_json::from_str(&line).unwrap())
+        }
+    }
+
+    impl Drop for JumpSocket {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    #[test]
+    fn a_slot_press_sends_the_slots_jump_and_reports_its_answer() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../sdk/rust/tests/fixtures/api-client-jump-v1.json"
+        ))
+        .unwrap();
+        let socket = JumpSocket::bind();
+        let (mut deck, _queued) = deck();
+        let mut work = daemon("work", vec![client(7, Some(true))]);
+        work.socket_path = socket.path();
+        publish(
+            &mut deck,
+            vec![daemon("default", vec![client(3, Some(false))]), work],
+        );
+        let outcome = |deck: &Daemon| match deck.events.recv_timeout(WAIT) {
+            Ok(Event::Action { name, result }) => (name, result),
+            _ => panic!("expected the outcome of an action"),
+        };
+
+        // An empty key sends nothing; the request below is the first.
+        deck.execute(Action::FocusSlot { slot: Some(6) });
+        // The third key is the remote agent: its endpoint, that endpoint's
+        // boot and its pane go to the daemon the followed client is
+        // attached to, as the fork's fixture has them.
+        deck.execute(Action::FocusSlot { slot: Some(2) });
+        let (mut stream, request) = socket.request();
+        assert_eq!(request["method"], "client.jump");
+        assert_eq!(request["params"], fixture["request"]["params"]);
+        let mut response = fixture["response"].clone();
+        response["id"] = request["id"].clone();
+        writeln!(stream, "{response}").unwrap();
+        assert_eq!(outcome(&deck), ("focus-slot", Ok(())));
+
+        // The daemon's refusal is logged in the words of the typed error.
+        deck.execute(Action::FocusSlot { slot: Some(0) });
+        let (mut stream, request) = socket.request();
+        assert_eq!(request["params"]["pane_id"], "w1:p1");
+        let refusal = json!({
+            "id": request["id"],
+            "error": {"code": "stale_boot", "message": "endpoint boot changed"},
+        });
+        writeln!(stream, "{refusal}").unwrap();
+        assert_eq!(
+            outcome(&deck),
+            (
+                "focus-slot",
+                Err("jump to local/w1:p1: the endpoint now runs another boot".into())
+            )
+        );
+        // Each press reported once, and the empty key not at all.
+        assert!(deck.events.try_recv().is_err());
+    }
+
+    #[test]
+    fn keyboard_work_beyond_the_queue_is_ignored() {
+        let (mut deck, queued) = deck();
+        publish(&mut deck, vec![daemon("work", vec![client(7, Some(true))])]);
+        // Nothing takes the work, as while a long prompt is typed. Every
+        // press returns at once.
+        for _ in 0..ACTION_QUEUE_CAPACITY + 4 {
+            deck.execute(Action::Submit);
+        }
+        deck.execute(Action::SystemEnter);
+        assert_eq!(queued.try_iter().count(), ACTION_QUEUE_CAPACITY);
+        // With room again, work is taken again.
+        deck.execute(Action::Submit);
+        assert!(matches!(
+            queued.try_recv(),
+            Ok(ActionCommand::Input { name: "submit", .. })
+        ));
+    }
+
+    #[test]
+    fn nothing_is_planned_without_a_followed_client() {
+        let row = fixture_report().agents[0].clone();
+        let actions = [
+            Action::FocusSlot { slot: Some(0) },
+            Action::Prompt {
+                text: "/model".into(),
+                submit: None,
+            },
+            Action::Submit,
+        ];
+        let silent = ClientInfo {
+            client_id: 8,
+            report: None,
+        };
+        // The followed client detached and no other has sent a report.
+        let detached = focused_directory().updated(vec![daemon("work", vec![silent.clone()])]);
+        for directory in [
+            directory(vec![]),
+            directory(vec![daemon("default", vec![])]),
+            directory(vec![daemon("default", vec![silent])]),
+            detached,
+        ] {
+            for action in &actions {
+                assert_eq!(
+                    plan_action(action, &directory, Some(&row)).unwrap_err(),
+                    "no followed Herdr client"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn another_app_in_front_still_jumps_but_types_nothing() {
+        let front = focused_directory();
+        let behind = front.updated(vec![
+            daemon("default", vec![client(3, Some(false))]),
+            daemon("work", vec![client(7, Some(false))]),
+        ]);
+        let row = fixture_report().agents[0].clone();
+        let jump =
+            |directory| plan_action(&Action::FocusSlot { slot: Some(0) }, directory, Some(&row));
+        assert!(matches!(jump(&behind), Ok(Planned::Jump(_))));
+        assert_eq!(jump(&behind), jump(&front));
+        for action in [
+            Action::Prompt {
+                text: "/model".into(),
+                submit: None,
+            },
+            Action::Submit,
+        ] {
+            assert_eq!(
+                plan_action(&action, &behind, None).unwrap_err(),
+                Refusal::NotFocused.to_string()
+            );
+            assert!(plan_action(&action, &front, None).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_client_whose_focus_is_unknown_is_jumped_but_never_typed_into() {
+        // A TUI that has not seen a focus event from its terminal yet.
+        let fresh = directory(vec![daemon("work", vec![client(7, None)])]);
+        let row = fixture_report().agents[0].clone();
+        assert!(matches!(
+            plan_action(&Action::FocusSlot { slot: Some(0) }, &fresh, Some(&row)),
+            Ok(Planned::Jump(_))
+        ));
+        for action in [
+            Action::Prompt {
+                text: "/model".into(),
+                submit: None,
+            },
+            Action::Submit,
+        ] {
+            assert_eq!(
+                plan_action(&action, &fresh, None).unwrap_err(),
+                Refusal::NotFocused.to_string()
+            );
+        }
+    }
+
+    #[test]
+    fn a_replaced_jump_reports_nothing_and_a_failed_one_its_error() {
+        let failed = |source| JumpError::Failed {
+            endpoint_id: "local".into(),
+            pane_id: "w1:p1".into(),
+            source,
+        };
+        assert_eq!(jump_result(Ok(())), Ok(()));
+        assert_eq!(
+            jump_result::<()>(Err(failed(ClientJumpError::Superseded))),
+            Ok(())
+        );
+        assert_eq!(jump_result::<()>(Err(JumpError::Replaced)), Ok(()));
+        assert_eq!(jump_result::<()>(Err(JumpError::Overtaken)), Ok(()));
+        assert_eq!(
+            jump_result::<()>(Err(failed(ClientJumpError::Timeout))),
+            Err(format!("jump to local/w1:p1: {}", ClientJumpError::Timeout))
+        );
+        assert_eq!(
+            jump_result::<()>(Err(Refusal::NotFollowed.into())),
+            Err(Refusal::NotFollowed.to_string())
+        );
+    }
+
+    #[test]
+    fn a_slot_jumps_with_the_rows_endpoint_its_boot_and_the_pane() {
+        let directory = focused_directory();
+        let report = fixture_report();
+        // The remote agent: its endpoint need not be the one presented.
+        let Planned::Jump(target) = plan_action(
+            &Action::FocusSlot { slot: Some(2) },
+            &directory,
+            Some(&report.agents[2]),
+        )
+        .unwrap() else {
+            panic!("expected a jump");
+        };
+        assert_eq!(target.client, focused_key(&directory));
+        assert_eq!(target.client.client_id, 7);
+        assert_eq!(
+            target.client.socket_path,
+            Path::new("/run/herdr/work/herdr.sock")
+        );
+        assert_eq!(target.endpoint_id, "ssh:0123456789abcdef0123456789abcdef");
+        assert_eq!(target.boot_id, "boot-b");
+        assert_eq!(target.pane_id, "w1:p4");
+
+        assert_eq!(
+            plan_action(&Action::FocusSlot { slot: Some(5) }, &directory, None).unwrap_err(),
+            "agent slot is empty"
+        );
+        let mut offline = report.agents[2].clone();
+        offline.endpoint_id = "ssh:fedcba9876543210fedcba9876543210".into();
+        assert_eq!(
+            plan_action(
+                &Action::FocusSlot { slot: Some(2) },
+                &directory,
+                Some(&offline)
+            )
+            .unwrap_err(),
+            "the agent's endpoint is not online"
+        );
+    }
+
+    #[test]
+    fn prompts_and_submits_become_keyboard_events_for_the_followed_client() {
+        let directory = focused_directory();
+        let inputs = |action| match plan_action(&action, &directory, None).unwrap() {
+            Planned::Input { client, inputs } => {
+                assert_eq!(client, focused_key(&directory));
+                inputs
+            }
+            Planned::Jump(_) => panic!("expected input"),
+        };
+        assert_eq!(
+            inputs(Action::Prompt {
+                text: "/model".into(),
+                submit: None
+            }),
+            [OsInput::Text("/model".into()), OsInput::Enter]
+        );
+        assert_eq!(
+            inputs(Action::Prompt {
+                text: "draft".into(),
+                submit: Some(false)
+            }),
+            [OsInput::Text("draft".into())]
+        );
+        assert_eq!(inputs(Action::Submit), [OsInput::Enter]);
+    }
+
+    /// Runs queued commands through the action worker with a recording sink
+    /// instead of the OS, and returns what was posted and each result.
+    /// `during_settle` runs while a prompt settles.
+    fn run_commands(
+        commands: Vec<ActionCommand>,
+        focus: &Focus,
+        during_settle: &dyn Fn(),
+    ) -> (Vec<String>, Vec<Result<(), String>>) {
+        let (sender, receiver) = mpsc::sync_channel(commands.len());
+        let (events, results) = mpsc::channel();
+        for command in commands {
+            sender.send(command).unwrap();
+        }
+        // The worker ends when its queue is empty and has no sender.
+        drop(sender);
+        let posted = Mutex::new(Vec::new());
+        let record = |line: String| posted.lock().unwrap().push(line);
         action_worker(
             receiver,
             events,
-            Arc::new(Mutex::new(RoutingState::default())),
+            focus,
+            &|keystroke| {
+                record(match keystroke {
+                    Keystroke::Text(units) => format!("text {}", String::from_utf16_lossy(units)),
+                    Keystroke::Enter => "enter".into(),
+                });
+                Ok(())
+            },
+            &|| {
+                record("settle".into());
+                during_settle();
+            },
         );
-        let Event::Action { result, .. } = results.recv().unwrap() else {
-            panic!("expected result")
-        };
-        assert_eq!(result.unwrap_err(), "Herdr frontend is unavailable");
+        let results = results
+            .try_iter()
+            .map(|event| match event {
+                Event::Action { result, .. } => result,
+                _ => panic!("expected an action result"),
+            })
+            .collect();
+        (posted.into_inner().unwrap(), results)
     }
 
-    #[test]
-    fn actions_map_to_frontend_requests_with_captured_session() {
-        let cases = [
-            (
-                Action::FocusSlot { slot: Some(0) },
-                FrontendRequest::Navigate,
-            ),
-            (
-                Action::FocusPane {
-                    direction: Direction::Left,
-                },
-                FrontendRequest::Call {
-                    method: "pane.focus_direction",
-                    params: json!({ "pane_id": "pane-1", "direction": "left" }),
-                },
-            ),
-            (
-                Action::SendKeys {
-                    keys: vec!["down".into()],
-                },
-                FrontendRequest::Input(Input::Keys(vec!["down".into()])),
-            ),
-            (
-                Action::Prompt {
-                    text: "review".into(),
-                    submit: Some(false),
-                },
-                FrontendRequest::Input(Input::Text("review".into())),
-            ),
-            (
-                Action::Prompt {
-                    text: "review".into(),
-                    submit: None,
-                },
-                FrontendRequest::Call {
-                    method: "agent.prompt",
-                    params: json!({ "target": "pane-1", "text": "review" }),
-                },
-            ),
-            (
-                Action::Submit,
-                FrontendRequest::Input(Input::Keys(vec!["enter".into()])),
-            ),
-        ];
-
-        for (action, expected) in cases {
-            let ActionCommand::Call {
-                name,
-                route,
-                request,
-            } = action_command(
-                "test",
-                ActionRoute {
-                    session: "local".into(),
-                    client_route: test_client_route("local"),
-                    source_pane: Some("source-pane".into()),
-                    target: crate::routing::AgentIdentity::from(&agent(
-                        "terminal", "pane-1", false,
-                    )),
-                    generation: 2,
-                },
-                action,
-            )
-            else {
-                panic!("expected frontend call");
-            };
-            assert_eq!(name, "test");
-            assert_eq!(route.session, "local");
-            assert_eq!(route.source_pane.as_deref(), Some("source-pane"));
-            assert_eq!(request, expected);
+    fn input_command(client: &ClientKey, inputs: Vec<OsInput>) -> ActionCommand {
+        ActionCommand::Input {
+            name: "prompt",
+            client: client.clone(),
+            inputs,
         }
     }
-}
 
-fn discovery_environment(directory: Option<&std::ffi::OsStr>) -> String {
-    directory.filter(|p| !p.is_empty()).map(|p| format!(
-        "<key>EnvironmentVariables</key><dict><key>HERDR_CLIENT_API_DIR</key><string>{}</string></dict>",
-        escape_xml(&p.to_string_lossy())
-    )).unwrap_or_default()
-}
-
-fn execute_frontend_call(
-    client: &FrontendClient,
-    route: &ActionRoute,
-    request: &FrontendRequest,
-    validate: &impl Fn() -> Result<(), String>,
-) -> Result<serde_json::Value, String> {
-    validate()?;
-    let snapshot = client.snapshot().map_err(|e| e.to_string())?;
-    crate::routing::validate_client(
-        &directory::ClientState {
-            socket_path: client.socket_path().into(),
-            snapshot,
-        },
-        route,
-    )?;
-    // Snapshot I/O can block while another TUI becomes focused or the source
-    // changes. Recheck the global subscription guard after that I/O, without
-    // holding its lock over the request. The server fences the endpoint route.
-    validate()?;
-    let wire = route.client_route.wire();
-    match request {
-        FrontendRequest::Navigate => {
-            client.navigate(&wire, &NavigationTarget::Pane(route.target.pane_id.clone()))
-        }
-        FrontendRequest::Input(input) => client
-            .input(input)
-            .and_then(|accepted| serde_json::to_value(accepted).map_err(Into::into)),
-        FrontendRequest::Call { method, params } => client.call(&wire, method, params.clone()),
-    }
-    .map_err(|e| e.to_string())
-}
-
-#[cfg(test)]
-mod frontend_tests {
-    use super::*;
-    use std::{
-        io::{BufRead, BufReader, Write},
-        os::unix::net::UnixListener,
-    };
-
-    #[test]
-    fn discovery_override_is_preserved_and_xml_escaped() {
-        assert_eq!(discovery_environment(None), "");
-        assert_eq!(discovery_environment(Some(std::ffi::OsStr::new(""))), "");
-        let env = discovery_environment(Some(std::ffi::OsStr::new("/tmp/a&b")));
-        assert!(env.contains("HERDR_CLIENT_API_DIR"));
-        assert!(env.contains("/tmp/a&amp;b"));
+    /// `client` is followed and its window has focus.
+    fn focused_on(client: &ClientKey) -> Focus {
+        let focus = Focus::new(Arc::default());
+        focus.set(Some(client.clone()), true);
+        focus
     }
 
     #[test]
-    fn direct_navigation_input_and_calls_are_fenced_and_never_replayed() {
-        for case in 0..8 {
-            let path =
-                std::env::temp_dir().join(format!("deck-wire-{}-{case}.sock", std::process::id()));
-            let listener = UnixListener::bind(&path).unwrap();
-            let mut observed = crate::routing::tests::client();
-            observed.socket_path = path.clone();
-            let mut routing = RoutingState::default();
-            routing.update(vec![observed.clone()]);
-            let route = routing.capture(&[], None, None).unwrap();
-            let expected_route = route.client_route.wire();
-            let server = thread::spawn(move || {
-                let request = |reply: serde_json::Value| {
-                    listener.set_nonblocking(true).unwrap();
-                    let deadline = Instant::now() + Duration::from_secs(5);
-                    let stream = loop {
-                        if let Ok((stream, _)) = listener.accept() {
-                            break stream;
-                        }
-                        assert!(Instant::now() < deadline, "missing frontend request");
-                        thread::sleep(Duration::from_millis(10));
-                    };
-                    stream.set_nonblocking(false).unwrap();
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(5)))
-                        .unwrap();
-                    let mut reader = BufReader::new(stream);
-                    writeln!(
-                        reader.get_mut(),
-                        "{}",
-                        json!({"type":"hello","protocol":frontend::PROTOCOL,"client_id":"client-a"})
-                    )
-                    .unwrap();
-                    let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
-                    let value: serde_json::Value = serde_json::from_str(&line).unwrap();
-                    assert_eq!(value["protocol"], frontend::PROTOCOL);
-                    if !reply.is_null() {
-                        writeln!(reader.get_mut(), "{reply}").unwrap();
-                    }
-                    value
-                };
-                if case == 6 {
-                    observed.snapshot.focused = Some(false);
-                }
-                assert_eq!(
-                    request(json!({"type":"snapshot","id":1,"snapshot":observed.snapshot}))["type"],
-                    "snapshot"
-                );
-                if case < 6 {
-                    let reply = match case {
-                        1 => {
-                            json!({"type":"error","id":1,"error":{"code":"pane_not_found","message":"gone"}})
-                        }
-                        2 => {
-                            json!({"type":"error","id":1,"error":{"code":"cancelled","message":"timeout"}})
-                        }
-                        3 => serde_json::Value::Null,
-                        _ => json!({"type":"reply","id":1,"result":{"ok":true}}),
-                    };
-                    let value = request(reply);
-                    match case {
-                        4 => {
-                            assert_eq!(value["type"], "call");
-                            assert_eq!(value["route"], json!(expected_route));
-                            assert_eq!(value["method"], "agent.prompt");
-                            assert_eq!(value["params"], json!({"target":"p1","text":"hi"}));
-                        }
-                        5 => {
-                            assert_eq!(value["type"], "input");
-                            assert_eq!(value["keys"], json!(["enter"]));
-                            assert!(value.get("route").is_none());
-                        }
-                        _ => {
-                            assert_eq!(value["type"], "select");
-                            assert_eq!(value["route"], json!(expected_route));
-                            assert_eq!(value["target"], json!({"pane":"p1"}));
-                        }
-                    }
-                }
-                // Any retry becomes an extra queued connection, not another server response.
-                thread::sleep(Duration::from_millis(50));
-                assert!(listener.accept().is_err());
-            });
-            let request = match case {
-                4 => FrontendRequest::Call {
-                    method: "agent.prompt",
-                    params: json!({"target":"p1","text":"hi"}),
-                },
-                5 => FrontendRequest::Input(Input::Keys(vec!["enter".into()])),
-                _ => FrontendRequest::Navigate,
-            };
-            let result = execute_frontend_call(
-                &FrontendClient::connect(&path).with_timeout(Duration::from_secs(2)),
-                &route,
-                &request,
-                &{
-                    let checks = std::cell::Cell::new(0);
-                    move || {
-                        checks.set(checks.get() + 1);
-                        if case == 7 && checks.get() == 2 {
-                            Err("stale during snapshot".into())
-                        } else {
-                            Ok(())
-                        }
-                    }
-                },
+    fn a_prompt_types_settles_and_presses_enter_while_its_client_has_focus() {
+        let key = focused_key(&focused_directory());
+        let focus = focused_on(&key);
+        let (posted, results) = run_commands(
+            vec![
+                input_command(&key, OsInput::prompt("/model", true)),
+                input_command(&key, OsInput::prompt("draft", false)),
+                input_command(&key, vec![OsInput::Enter]),
+            ],
+            &focus,
+            &|| {},
+        );
+        assert_eq!(
+            posted,
+            ["text /model", "settle", "enter", "text draft", "enter"]
+        );
+        assert_eq!(results, [Ok(()), Ok(()), Ok(())]);
+
+        // By the time the input is dispatched, another client is followed,
+        // or the captured one is behind another app.
+        let mut other = key.clone();
+        other.client_id = 8;
+        let behind = Focus::new(Arc::default());
+        behind.set(Some(key.clone()), false);
+        for (focus, refusal) in [
+            (focused_on(&other), Refusal::NotFollowed),
+            (behind, Refusal::NotFocused),
+        ] {
+            let (posted, results) = run_commands(
+                vec![input_command(&key, OsInput::prompt("/model", true))],
+                &focus,
+                &|| {},
             );
-            assert_eq!(
-                result.is_ok(),
-                matches!(case, 0 | 4 | 5),
-                "case {case}: {result:?}"
-            );
-            server.join().unwrap();
-            fs::remove_file(path).unwrap();
+            assert!(posted.is_empty(), "{posted:?}");
+            assert_eq!(results, [Err(refusal.to_string())]);
         }
+
+        // The window loses focus while the text settles: no Enter.
+        let focus = focused_on(&key);
+        let (posted, results) = run_commands(
+            vec![input_command(&key, OsInput::prompt("/model", true))],
+            &focus,
+            &|| focus.set(Some(key.clone()), false),
+        );
+        assert_eq!(posted, ["text /model", "settle"]);
+        assert_eq!(results, [Err(Refusal::NotFocused.to_string())]);
+    }
+
+    #[test]
+    fn stopping_drops_queued_input_and_the_rest_of_a_prompt() {
+        let key = focused_key(&focused_directory());
+        let focus = focused_on(&key);
+        // Shutdown starts while the first prompt settles, with more queued.
+        // (A queued system key is dropped by the same check; it is left out
+        // here because it would post to the OS, not to the recorder.)
+        let (posted, results) = run_commands(
+            vec![
+                input_command(&key, OsInput::prompt("/model", true)),
+                input_command(&key, OsInput::prompt("/copy", true)),
+                input_command(&key, vec![OsInput::Enter]),
+            ],
+            &focus,
+            &|| focus.stop(),
+        );
+        assert_eq!(posted, ["text /model", "settle"]);
+        assert_eq!(results, [Err(Refusal::Stopping.to_string())]);
+    }
+
+    #[test]
+    fn stopping_the_workers_forgets_the_followed_client() {
+        let key = focused_key(&focused_directory());
+        let focus = focused_on(&key);
+        let (scan_stop, _scan) = mpsc::channel();
+        let (actions, _actions) = mpsc::sync_channel(1);
+        Workers {
+            scan_stop,
+            actions,
+            focus: focus.clone(),
+            threads: Vec::new(),
+        }
+        .stop();
+        assert_eq!(focus.check_followed(&key), Err(Refusal::Stopping));
+        // A report the follower delivers late cannot bring it back.
+        focus.set(Some(key.clone()), true);
+        assert_eq!(focus.check_followed(&key), Err(Refusal::Stopping));
+        assert_eq!(focus.check_focused(&key), Err(Refusal::Stopping));
+    }
+
+    #[test]
+    fn the_service_is_given_the_herdr_executable_it_lists_sessions_with() {
+        let plist = service_plist(
+            Path::new("/Users/me/.local/share/herdr-deck/bin/herdr-deck"),
+            Path::new("/Users/me/.config/herdr-deck/config.json"),
+            Path::new("/Users/me/.local/share/herdr-deck"),
+            Path::new("/Users/me/Library/Logs/herdr-deck.log"),
+            Path::new("/opt/a&b/bin/herdr"),
+        );
+        assert!(plist.contains(
+            "<key>EnvironmentVariables</key><dict><key>HERDR_BIN_PATH</key><string>/opt/a&amp;b/bin/herdr</string></dict>"
+        ));
+        assert!(plist.contains(
+            "<array><string>/Users/me/.local/share/herdr-deck/bin/herdr-deck</string><string>run</string><string>/Users/me/.config/herdr-deck/config.json</string></array>"
+        ));
+        assert!(!plist.contains("HERDR_CLIENT_API_DIR"));
     }
 }

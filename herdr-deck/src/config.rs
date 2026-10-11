@@ -44,29 +44,34 @@ pub enum DeviceRole {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Direction {
-    Down,
-    Left,
-    Right,
-    Up,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CycleDirection {
     Next,
     Previous,
 }
 
+/// What a control does. `focus-slot` asks the followed Herdr client to jump
+/// to the slot's agent. `prompt` and `submit` are macOS keyboard events for
+/// the frontmost app, sent only while the followed client reports that its
+/// window has focus. The system keys need no Herdr client at all.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Action {
-    FocusSlot { slot: Option<u8> },
-    FocusPane { direction: Direction },
-    SendKeys { keys: Vec<String> },
-    Prompt { text: String, submit: Option<bool> },
+    FocusSlot {
+        slot: Option<u8>,
+    },
+    /// Type `text`, then press Enter unless `submit` is false.
+    Prompt {
+        text: String,
+        submit: Option<bool>,
+    },
+    /// Press Enter.
     Submit,
     SystemEnter,
-    SystemKey { key: crate::system_input::Key },
-    CycleSession { direction: CycleDirection },
+    SystemKey {
+        key: crate::system_input::Key,
+    },
+    CycleSession {
+        direction: CycleDirection,
+    },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -355,41 +360,18 @@ fn parse_action(value: &Value, label: &str) -> Result<Action, String> {
                 },
             })
         }
-        "focus-pane" => {
-            fields(input, &["action", "direction"], label)?;
-            let direction =
-                match string(required(input, "direction"), &format!("{label}.direction"))?.as_str()
-                {
-                    "down" => Direction::Down,
-                    "left" => Direction::Left,
-                    "right" => Direction::Right,
-                    "up" => Direction::Up,
-                    _ => {
-                        return Err(format!(
-                            "{label}.direction must be down, left, right, or up"
-                        ));
-                    }
-                };
-            Ok(Action::FocusPane { direction })
-        }
-        "send-keys" => {
-            fields(input, &["action", "keys"], label)?;
-            let keys = required(input, "keys")
-                .as_array()
-                .filter(|keys| !keys.is_empty())
-                .ok_or_else(|| format!("{label}.keys must be a non-empty array"))?;
-            Ok(Action::SendKeys {
-                keys: keys
-                    .iter()
-                    .enumerate()
-                    .map(|(index, key)| string(key, &format!("{label}.keys[{index}]")))
-                    .collect::<Result<_, _>>()?,
-            })
-        }
         "prompt" => {
             fields(input, &["action", "text", "submit"], label)?;
+            let text = string(required(input, "text"), &format!("{label}.text"))?;
+            // The text is typed key by key, where a newline is Enter and
+            // would submit early; other control characters are terminal input.
+            if text.chars().any(char::is_control) {
+                return Err(format!(
+                    "{label}.text must not contain control characters such as newlines"
+                ));
+            }
             Ok(Action::Prompt {
-                text: string(required(input, "text"), &format!("{label}.text"))?,
+                text,
                 submit: match input.get("submit") {
                     Some(value) => Some(boolean(value, &format!("{label}.submit"))?),
                     None => None,
@@ -554,15 +536,35 @@ mod tests {
         value["herdr"]["sessions"] = json!(["local", "ssh:0123456789abcdef"]);
         value["devices"][0]["buttons"] = json!({
             "0": { "action": "focus-slot" },
-            "1": { "action": "focus-pane", "direction": "left" },
-            "2": { "action": "send-keys", "keys": ["ctrl-c"] },
+            "1": { "action": "focus-slot", "slot": 3 },
+            "2": { "action": "prompt", "text": "/model" },
             "3": { "action": "prompt", "text": "hello", "submit": false },
             "4": { "action": "submit" },
             "5": { "action": "cycle-session" },
-            "6": { "action": "system-enter" }
+            "6": { "action": "system-enter" },
+            "7": { "action": "system-key", "key": "f19" }
         });
         let config = parse_config(value).unwrap();
         assert_eq!(config.devices[0].buttons["6"], Action::SystemEnter);
+        assert_eq!(
+            config.devices[0].buttons["1"],
+            Action::FocusSlot { slot: Some(3) }
+        );
+        assert_eq!(
+            config.devices[0].buttons["2"],
+            Action::Prompt {
+                text: "/model".into(),
+                submit: None
+            }
+        );
+        assert_eq!(
+            config.devices[0].buttons["3"],
+            Action::Prompt {
+                text: "hello".into(),
+                submit: Some(false)
+            }
+        );
+        assert_eq!(config.devices[0].buttons["4"], Action::Submit);
         assert_eq!(config.herdr.sessions, ["local", "ssh:0123456789abcdef"]);
         assert_eq!(config.devices[0].serial.as_deref(), Some("one"));
         assert_eq!(
@@ -573,6 +575,53 @@ mod tests {
             config.devices[0].buttons["5"],
             Action::CycleSession {
                 direction: CycleDirection::Next
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_actions_are_rejected() {
+        let error = parse_action(&json!({ "action": "launch" }), "binding").unwrap_err();
+        assert_eq!(error, "unknown binding.action: launch");
+    }
+
+    #[test]
+    fn prompts_must_be_typeable_text() {
+        for (text, valid) in [
+            ("/model", true),
+            ("review this ünïcode 🙂", true),
+            (" ", false),
+            ("one\ntwo", false),
+            ("escape\u{1b}", false),
+        ] {
+            assert_eq!(
+                parse_action(&json!({ "action": "prompt", "text": text }), "binding").is_ok(),
+                valid,
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_shipped_configuration_is_valid_and_uses_only_remaining_actions() {
+        let shipped: Value = serde_json::from_str(include_str!("../herdr-deck.json")).unwrap();
+        let config = parse_config(shipped).unwrap();
+        let dashboard = &config.devices[0];
+        assert_eq!(dashboard.role, DeviceRole::Dashboard);
+        assert_eq!(dashboard.encoders["0"].press, Some(Action::Submit));
+        assert_eq!(
+            dashboard.encoders["1"].press,
+            Some(Action::Prompt {
+                text: "/model".into(),
+                submit: None
+            })
+        );
+        assert_eq!(dashboard.touch["2"], Action::Submit);
+        // The pedal never needed Herdr.
+        assert_eq!(
+            config.devices[1].buttons["1"],
+            Action::SystemKey {
+                key: crate::system_input::Key::Enter
             }
         );
     }
@@ -662,7 +711,7 @@ mod tests {
     fn rejects_malformed_actions_colors_booleans_and_ranges() {
         let mut action = valid();
         action["devices"][0]["buttons"]["0"] =
-            json!({ "action": "focus-pane", "direction": "diagonal" });
+            json!({ "action": "cycle-session", "direction": "diagonal" });
         assert!(
             parse_config(action)
                 .unwrap_err()

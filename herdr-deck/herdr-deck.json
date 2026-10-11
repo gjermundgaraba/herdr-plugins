@@ -11,16 +11,14 @@
     {
       "serial": "A00WA4411LI67S", "enabled": true, "role": "dashboard", "brightness": 85, "buttons": {},
       "encoders": {
-        "0": { "press": { "action": "submit" }, "clockwise": { "action": "send-keys", "keys": ["down"] }, "counterclockwise": { "action": "send-keys", "keys": ["up"] } },
-        "1": { "press": { "action": "prompt", "text": "/model" }, "clockwise": { "action": "send-keys", "keys": ["ctrl+shift+right"] }, "counterclockwise": { "action": "send-keys", "keys": ["ctrl+shift+left"] } },
-        "2": { "press": { "action": "prompt", "text": "/copy" }, "clockwise": { "action": "focus-pane", "direction": "right" }, "counterclockwise": { "action": "focus-pane", "direction": "left" } },
+        "0": { "press": { "action": "submit" } },
+        "1": { "press": { "action": "prompt", "text": "/model" } },
+        "2": { "press": { "action": "prompt", "text": "/copy" } },
         "3": { "press": { "action": "cycle-session", "direction": "next" }, "clockwise": { "action": "cycle-session", "direction": "next" }, "counterclockwise": { "action": "cycle-session", "direction": "previous" } }
       },
       "touch": {
         "0": { "action": "cycle-session", "direction": "next" },
-        "1": { "action": "send-keys", "keys": ["ctrl+shift+right"] },
         "2": { "action": "submit" },
-        "3": { "action": "send-keys", "keys": ["ctrl+c"] },
         "swipeLeft": { "action": "cycle-session", "direction": "next" },
         "swipeRight": { "action": "cycle-session", "direction": "previous" }
       }

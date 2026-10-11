@@ -1,10 +1,9 @@
+mod clients;
 mod config;
 mod daemon;
 mod device;
-mod frontends;
 mod plus;
 mod render;
-mod routing;
 mod slots;
 mod system_input;
 
