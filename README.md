@@ -23,30 +23,47 @@ which.
 The plugins target the
 [gjermundgaraba/herdr](https://github.com/gjermundgaraba/herdr) fork on the
 `custom-v3` branch, currently based on upstream 0.9.3. The fork adds the
-per-TUI frontend socket (protocol 7), the `agent.prompt` client command lane
-method, the client-side `[keys]` actions that replaced the picker plugins,
+daemon's client API (`client.list`, the `client.changed` subscription, and
+`client.jump`), the client-side `[keys]` actions that replaced the picker plugins,
 native space groups (`workspace.set_group`) and persisted workspace tokens, the
 priority agent order with configurable lift tokens
 (`ui.agent_priority_tokens`), pinned spaces sidebar sections, the
-native `ui.pick` picker, plugin entries in right-click menus with one
-`plugin.invoke` path, a richer invocation context, and `tab_id` on pane close
+native `ui.pick` picker, one `plugin.invoke` path for manifest entrypoints,
+a richer invocation context, and `tab_id` on pane close
 events plus `pane.cwd_changed`. Stock `herdrdev/herdr` has none of these, so
 only herdr-hub runs against it.
 
-The socket's Rust client is the `herdr-frontend` crate under `sdk/frontend` in
-the fork. Micro and Deck pull it in as a git dependency, so `Cargo.lock` pins
-the exact fork commit the plugins were built against, and
-`cargo update -p herdr-frontend` moves them to a newer one. The fork documents
-the socket and the actions in
-`docs/next/website/src/content/docs/frontend-api.md`.
+Micro and Deck use the client API on the ordinary daemon socket, through the
+typed `client.*` calls in [sdk/rust](sdk/rust). Every attached client (the TUI
+or the native app) reports whether its window has focus, the endpoints it is
+attached to, and its Agents list in the order it shows them; the daemon serves
+those reports and relays a jump to the client that should perform it. The fork
+documents the contract in
+`docs/next/website/src/content/docs/client-contract.md`. No plugin has a git
+dependency on the fork, so nothing in `Cargo.lock` pins a fork commit: a
+daemon that rejects the client API is logged at run time with its own error
+and has no clients.
+
+Each local session is its own daemon. The device tools list them with
+`herdr session list --json`, follow all of them, and show and jump one client:
+the one whose window most recently took focus, also while another app is in
+front. Of several clients that take focus in one listing of a daemon, the one
+with the highest client id wins. While no client is followed, a reporting
+client is followed anyway: one that reports focus before one whose focus is
+unknown before one that reports none, and of equals the last by socket path
+and then client id. The followed client is forgotten when its daemon lists
+its clients without it or its session is no longer listed as running. While
+its daemon only fails to answer it is kept, and the devices show nothing from
+Herdr until the daemon lists it again. Prompts and Enter are typed only while
+that client reports that it has focus; a TUI reports that only after its
+terminal has sent a focus change, so one started in an already focused
+terminal is shown and jumped but not typed into until then.
 
 The agent list, workspace list, Back/Forward history, and the unread hold are
-`[keys]` actions native to the fork; see its configuration docs. Frontend calls carry the
-endpoint ID and the server boot ID whose pane ids they use, and input goes
-through the ordinary TUI dispatcher, including overlays. Hub keeps only the
-session/host inventory and relay. See the
-[Micro bridge](herdr-micro/docs/micro-bridge.md) for routing and script
-behavior.
+`[keys]` actions native to the fork; see its configuration docs. Hub keeps only
+the session/host inventory and relay. See the
+[Micro bridge](herdr-micro/docs/micro-bridge.md) for how a key press becomes a
+jump or a keyboard event.
 
 ## Install
 
@@ -64,7 +81,7 @@ herdr plugin install gjermundgaraba/herdr-plugins/space-groups
 herdr plugin install gjermundgaraba/herdr-plugins/space-priority
 ```
 
-Herdr Micro and Herdr Deck connect directly to per-TUI frontend sockets. Micro
+Herdr Micro and Herdr Deck connect directly to the Herdr daemon sockets. Micro
 is a plugin whose Codex Micro device service runs as a per-user LaunchAgent;
 Deck is not a plugin at all and runs only as a LaunchAgent. See
 [Micro installation](herdr-micro/README.md#install) and
@@ -123,6 +140,10 @@ Enter the repository development shell with the same pinned Rust toolchain using
 
 [`sdk/hub`](sdk/hub) provides the versioned hub protocol, streaming model
 client, and action calls.
+
+[`sdk/device`](sdk/device) is what Micro and Deck do on a press: the checks
+against the followed client and its window focus, `client.jump`, and prompts
+typed as macOS keyboard events.
 
 The reusable client under [`sdk/rust`](sdk/rust) also validates Herdr's plugin
 environment, and its tests keep every plugin manifest version in step with its

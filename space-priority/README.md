@@ -63,8 +63,6 @@ description = "Toggle space priority"
 ```
 
 The action flips the focused space and shows a notification with the result.
-On the fork build, **Toggle space priority** also appears in a space's
-right-click menu and flips the space you clicked.
 
 Point the fork's generic options at the token in the same file. The lift
 and the pinned section are independent; use either or both:

@@ -1,10 +1,12 @@
 # Herdr Hub: session inventory and relay
 
-Hub owns the shared session inventory, not TUI presentation. Navigation,
-history, and the unread hold are native TUI client actions; Herdr owns
-selection, navigation completion, and choice dialogs. Micro and local tools
-connect directly to the per-TUI frontend socket. Hub does not discover
-frontends, choose a focused client, route client input, or activate
+Hub owns the shared session inventory, not client presentation. Navigation
+and Back/Forward history are client actions of the TUI and Herdr GPUI, the
+unread hold lives in the Herdr daemon, and Herdr owns selection, navigation
+completion, and choice dialogs. Micro, Deck, and local
+tools read the attached clients from each Herdr daemon directly (`client.list`,
+`client.changed`) and ask a client to jump with `client.jump`. Hub does not
+follow clients, choose a focused client, route client input, or activate
 endpoints.
 
 ## State ownership

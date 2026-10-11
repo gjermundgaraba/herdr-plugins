@@ -62,10 +62,9 @@ command = "gjermundgaraba.herdr-space-groups.assign"
 description = "Set space group"
 ```
 
-The action opens Herdr's native picker for the focused space. On the fork
-build, **Set space group** also appears in a space's right-click menu and
-targets the space you clicked. Type to filter the existing groups or to name a
-new one, move with `↑`/`↓` (or `ctrl+n`/`ctrl+p`), and press `Enter`.
+The action opens Herdr's native picker for the focused space. Type to filter
+the existing groups or to name a new one, move with `↑`/`↓` (or
+`ctrl+n`/`ctrl+p`), and press `Enter`.
 **Remove from group** clears a grouped space's group. `Esc` cancels.
 
 ## Notes
