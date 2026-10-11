@@ -276,17 +276,27 @@ dependencies = [
 
 [[package]]
 name = "herdr-deck"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "elgato-streamdeck",
  "herdr-client",
- "herdr-frontend",
+ "herdr-device",
  "hidapi",
  "libc",
  "resvg",
  "serde_json",
  "signal-hook",
  "turbojpeg",
+]
+
+[[package]]
+name = "herdr-device"
+version = "0.1.0"
+dependencies = [
+ "herdr-client",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -304,16 +314,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "herdr-client",
- "serde_json",
-]
-
-[[package]]
-name = "herdr-frontend"
-version = "0.1.0"
-source = "git+https://github.com/gjermundgaraba/herdr?branch=custom-v3#74e9c727417917bc95ac2ea788d1414e6585b0df"
-dependencies = [
- "libc",
- "serde",
  "serde_json",
 ]
 
@@ -346,14 +346,13 @@ dependencies = [
 
 [[package]]
 name = "herdr-micro"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "codex-micro",
  "herdr-client",
- "herdr-frontend",
+ "herdr-device",
  "libc",
- "objc2-core-graphics",
  "serde",
  "serde_json",
  "signal-hook",

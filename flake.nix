@@ -205,8 +205,6 @@
               src = pluginSource;
 
               cargoLock.lockFile = ./Cargo.lock;
-              # herdr-frontend is a git dependency on the Herdr fork.
-              cargoLock.allowBuiltinFetchGit = true;
               cargoBuildFlags = [
                 "--package"
                 crate.package.name
