@@ -1,42 +1,13 @@
 use std::{
-    env,
     ffi::{CStr, OsStr},
     fs,
-    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
 
 const LABEL: &str = "dev.herdr.hub";
-
-pub(crate) fn resolve_herdr() -> Result<PathBuf> {
-    if let Some(path) = env::var_os("HERDR_BIN_PATH").filter(|value| !value.is_empty()) {
-        return executable(PathBuf::from(path), "HERDR_BIN_PATH");
-    }
-    let path = env::var_os("PATH").context("PATH is not set")?;
-    for directory in env::split_paths(&path) {
-        let candidate = directory.join("herdr");
-        if is_executable(&candidate) {
-            return executable(candidate, "PATH");
-        }
-    }
-    bail!("cannot find herdr in PATH")
-}
-
-fn executable(path: PathBuf, source: &str) -> Result<PathBuf> {
-    let path = fs::canonicalize(&path)
-        .with_context(|| format!("resolve herdr from {source}: {}", path.display()))?;
-    if !is_executable(&path) {
-        bail!("herdr from {source} is not executable: {}", path.display())
-    }
-    Ok(path)
-}
-
-fn is_executable(path: &Path) -> bool {
-    fs::metadata(path)
-        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-}
 
 pub(crate) fn hub_log_path() -> Result<PathBuf> {
     let path = paths()?.log_dir.join("hub.log");
@@ -154,10 +125,12 @@ fn paths_from_home(home: &Path) -> Result<Paths> {
 #[cfg(target_os = "macos")]
 mod macos {
     use super::*;
+    use herdr_client::sessions::resolve_herdr;
     use std::{
+        env,
         fs::{File, OpenOptions, TryLockError},
         io,
-        os::unix::fs::{MetadataExt, OpenOptionsExt},
+        os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
         process::{Child, Command, Output, Stdio},
         thread,
         time::{Duration, Instant},

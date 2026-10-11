@@ -3,7 +3,8 @@
 Herdr Hub keeps a versioned inventory of local and remote Herdr sessions,
 workspaces, tabs, and agents. It pushes changes and routes session API calls over
 a private per-user socket. It has no TUI client model or focus selection.
-Micro and local tools use each TUI's frontend socket directly.
+Micro, Deck, and local tools read the attached clients from each Herdr daemon
+directly.
 
 Requires stock Herdr >= 0.9.0; the fork build is not needed. The
 `install-service` LaunchAgent is macOS-only.
@@ -32,8 +33,8 @@ Use **Show Herdr Hub status** for a compact summary. A source or Nix install
 also exposes `herdr-hub dump` to print the complete model once.
 
 Hub protocol 6 carries `hello`, `session`, `session_removed`, and `host`
-updates, plus session-scoped `call` replies. It does not discover frontend
-sockets, route client input, or activate endpoints. Rebuild Hub SDK consumers
+updates, plus session-scoped `call` replies. It does not follow attached
+clients, route client input, or activate endpoints. Rebuild Hub SDK consumers
 and local/remote Hub binaries together when updating.
 
 `doctor` checks the linked plugin, installed service, and configured remote hosts.
@@ -98,7 +99,7 @@ service commands on a Linux relay host.
 
 Configured hosts retain one `ssh` relay each for the separate session inventory.
 The remote hub owns one 250 ms snapshot loop per remote-local session and pushes
-changed state through that relay. This inventory is independent of TUI frontend membership and focus.
+changed state through that relay. This inventory is independent of which clients are attached and focused.
 On Linux there is no standalone user service: the plugin hooks and `notify`
 command are supported and the hub runs in-process for `herdr-hub relay` when no
 local hub is already listening.

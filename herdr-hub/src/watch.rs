@@ -12,7 +12,10 @@ use anyhow::{Context, Result, bail};
 use herdr_client::{Client, SessionSnapshot};
 use herdr_hub_client::SessionState;
 
-use crate::{discover::LocalSession, hub::Event};
+use crate::{
+    discover::{LocalSession, session_key},
+    hub::Event,
+};
 
 const MIN_PROTOCOL: u32 = 20;
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
@@ -169,7 +172,7 @@ fn validate_snapshot(snapshot: &SessionSnapshot) -> Result<()> {
 
 fn connected_state(session: &LocalSession, snapshot: SessionSnapshot) -> SessionState {
     SessionState {
-        key: session.key(),
+        key: session_key(session),
         host: "local".into(),
         name: session.name.clone(),
         connected: true,
@@ -225,7 +228,7 @@ fn send_state(
 
 fn disconnected_state(session: &LocalSession, protocol: u32, error: String) -> SessionState {
     SessionState {
-        key: session.key(),
+        key: session_key(session),
         host: "local".into(),
         name: session.name.clone(),
         connected: false,

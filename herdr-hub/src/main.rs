@@ -10,7 +10,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use herdr_client::open_rotating_log;
+use herdr_client::{open_rotating_log, sessions::resolve_herdr};
 use herdr_hub_client::{HubClient, Model};
 use serde_json::{Value, json};
 
@@ -44,7 +44,7 @@ fn run(args: &[&str]) -> Result<()> {
         ["install-service"] => service::install(),
         ["uninstall-service"] => service::uninstall(),
         ["dump"] => dump(),
-        ["relay"] => herdr_hub::run_relay(service::resolve_herdr),
+        ["relay"] => herdr_hub::run_relay(|| Ok(resolve_herdr()?)),
         ["--version" | "-V"] => {
             println!("herdr-hub {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -102,7 +102,7 @@ fn dump() -> Result<()> {
 }
 
 fn doctor() -> Result<()> {
-    let herdr = service::resolve_herdr()?;
+    let herdr = resolve_herdr()?;
     println!("ok herdr: {}", herdr.display());
     check_plugin(&herdr)?;
     println!("ok plugin: {PLUGIN_ID} is linked and enabled");

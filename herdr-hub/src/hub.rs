@@ -8,7 +8,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use herdr_client::Client;
+use herdr_client::{
+    Client,
+    sessions::{SESSION_LIST_TIMEOUT, list_sessions},
+};
 use herdr_hub_client::{HostState, ServerMessage};
 use serde_json::Value;
 use signal_hook::{
@@ -18,7 +21,7 @@ use signal_hook::{
 
 use crate::{
     config::{self, HostConfig},
-    discover::{self, LocalSession},
+    discover::{LocalSession, session_key},
     model::Store,
     remote::{self, Supervisor as RemoteSupervisor},
     server::{self, Request, Server},
@@ -52,7 +55,7 @@ pub fn run(herdr: &Path) -> Result<()> {
     let (remote_events, remote_rx) = mpsc::sync_channel(REMOTE_EVENT_QUEUE);
     forward_remote_events(remote_rx, tx.clone())?;
     let remote = RemoteSupervisor::spawn(config.hosts, remote_events)?;
-    for message in core.reconcile(discover::list_sessions(herdr)?)? {
+    for message in core.reconcile(list_sessions(herdr, SESSION_LIST_TIMEOUT)?)? {
         server.broadcast(&message);
     }
     event_loop(herdr, rx, &mut core, &mut server, &remote)
@@ -177,7 +180,9 @@ fn forward_remote_events(rx: Receiver<remote::Event>, tx: SyncSender<Event>) -> 
 }
 
 fn reconcile_and_broadcast(herdr: &Path, core: &mut Core, server: &mut Server) {
-    let result = discover::list_sessions(herdr).and_then(|sessions| core.reconcile(sessions));
+    let result = list_sessions(herdr, SESSION_LIST_TIMEOUT)
+        .map_err(anyhow::Error::from)
+        .and_then(|sessions| core.reconcile(sessions));
     match result {
         Ok(messages) => {
             for message in messages {
@@ -282,7 +287,7 @@ impl Core {
             entry.listed = false;
         }
         for session in sessions {
-            let key = session.key();
+            let key = session_key(&session);
             let unchanged = self.watchers.get_mut(&key).is_some_and(|entry| {
                 entry.listed = true;
                 entry.session.socket_path == session.socket_path
@@ -511,7 +516,7 @@ impl Core {
 
     #[cfg(test)]
     fn add(&mut self, session: LocalSession) -> Result<()> {
-        let key = session.key();
+        let key = session_key(&session);
         let entry = self.watcher_entry(session)?;
         self.watchers.insert(key, entry);
         Ok(())
