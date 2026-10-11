@@ -7,8 +7,8 @@ use std::{
     env,
     ffi::OsString,
     fs::{self, OpenOptions},
-    io::{Read, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    io::Write,
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     process::Command,
     sync::mpsc,
@@ -21,7 +21,6 @@ use crate::{
     control::{backup_dir, request_status},
 };
 
-pub(crate) const PI_EXTENSION: &str = ".pi/agent/extensions/herdr-micro-effort.ts";
 const ENCODER_SLOTS: [(&str, &str); 3] = [
     ("/encoders/0/0", "KV_OAI_ENC_CC"),
     ("/encoders/0/1", "KV_OAI_ENC_CW"),
@@ -525,81 +524,6 @@ pub fn configure() -> Result<PathBuf> {
     Ok(path)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PiInstall {
-    pub target: PathBuf,
-    pub backup: Option<PathBuf>,
-    pub unchanged: bool,
-}
-
-fn read_pi_target(target: &Path) -> Result<Option<Vec<u8>>> {
-    match fs::symlink_metadata(target) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            bail!("refusing to replace symlink {}", target.display())
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).with_context(|| format!("inspect {}", target.display())),
-    }
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(target)
-        .with_context(|| format!("read {}", target.display()))?;
-    if !file.metadata()?.is_file() {
-        bail!(
-            "Pi extension target is not a regular file: {}",
-            target.display()
-        );
-    }
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    Ok(Some(bytes))
-}
-
-pub fn install_pi_effort(source: &Path, target: &Path, timestamp: u128) -> Result<PiInstall> {
-    let bundled = fs::read(source).with_context(|| format!("read {}", source.display()))?;
-    let current = read_pi_target(target)?;
-    if current.as_deref() == Some(&bundled) {
-        return Ok(PiInstall {
-            target: target.into(),
-            backup: None,
-            unchanged: true,
-        });
-    }
-    let parent = target
-        .parent()
-        .ok_or_else(|| anyhow!("Pi extension target has no parent"))?;
-    fs::create_dir_all(parent)?;
-    let backup = if let Some(bytes) = current {
-        let backup = PathBuf::from(format!("{}.bak-{timestamp}", target.display()));
-        write_new_file(&backup, 0o644, &bytes)?;
-        Some(backup)
-    } else {
-        None
-    };
-    let mut temporary = tempfile::Builder::new()
-        .permissions(fs::Permissions::from_mode(0o644))
-        .tempfile_in(parent)?;
-    temporary.write_all(&bundled)?;
-    temporary.as_file().sync_all()?;
-    temporary.persist(target).map_err(|error| error.error)?;
-    fs::File::open(parent)?.sync_all()?;
-    Ok(PiInstall {
-        target: target.into(),
-        backup,
-        unchanged: false,
-    })
-}
-
-pub fn setup_pi_effort() -> Result<PiInstall> {
-    let source = plugin_root()?.join("integrations/pi/herdr-effort.js");
-    let home = env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
-    let target = PathBuf::from(home).join(PI_EXTENSION);
-    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
-    install_pi_effort(&source, &target, timestamp)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -876,59 +800,5 @@ mod tests {
                 .to_string(),
             "Layer 1 encoder slot /encoders/0/0 must use KV_OAI_ENC_CC"
         );
-    }
-
-    #[test]
-    fn installs_pi_extension_once_and_backs_up_changes() {
-        let root_guard = tempfile::tempdir().unwrap();
-        let root = root_guard.path();
-        let source = root.join("source.js");
-        let target = root.join("nested/extension.ts");
-        fs::write(&source, b"one").unwrap();
-        let first = install_pi_effort(&source, &target, 10).unwrap();
-        assert!(!first.unchanged);
-        assert_eq!(fs::read(&target).unwrap(), b"one");
-        assert!(install_pi_effort(&source, &target, 11).unwrap().unchanged);
-        fs::write(&source, b"two").unwrap();
-        let changed = install_pi_effort(&source, &target, 12).unwrap();
-        assert_eq!(fs::read(changed.backup.unwrap()).unwrap(), b"one");
-        assert_eq!(fs::read(&target).unwrap(), b"two");
-        assert_eq!(
-            fs::metadata(&target).unwrap().permissions().mode() & 0o133,
-            0
-        );
-        assert_eq!(fs::read_dir(target.parent().unwrap()).unwrap().count(), 2);
-    }
-
-    #[test]
-    fn pi_install_refuses_symlinks_without_touching_their_target() {
-        use std::os::unix::fs::symlink;
-
-        let root_guard = tempfile::tempdir().unwrap();
-        let root = root_guard.path();
-        let source = root.join("source.js");
-        let outside = root.join("outside.ts");
-        let target = root.join("extension.ts");
-        fs::write(&source, b"new").unwrap();
-        fs::write(&outside, b"old").unwrap();
-        symlink(&outside, &target).unwrap();
-        assert!(install_pi_effort(&source, &target, 10).is_err());
-        assert_eq!(fs::read(&outside).unwrap(), b"old");
-    }
-
-    #[test]
-    fn pi_install_backup_collision_preserves_live_extension_and_backup() {
-        let root_guard = tempfile::tempdir().unwrap();
-        let root = root_guard.path();
-        let source = root.join("source.js");
-        let target = root.join("extension.ts");
-        fs::write(&source, b"new").unwrap();
-        fs::write(&target, b"old").unwrap();
-        let backup = root.join("extension.ts.bak-10");
-        fs::write(&backup, b"previous backup").unwrap();
-        assert!(install_pi_effort(&source, &target, 10).is_err());
-        assert_eq!(fs::read(&target).unwrap(), b"old");
-        assert_eq!(fs::read(&backup).unwrap(), b"previous backup");
-        assert_eq!(fs::read_dir(root).unwrap().count(), 3);
     }
 }

@@ -1,31 +1,32 @@
-//! Input dispatch and action execution: device events become queued work,
-//! and the action worker executes it through the captured Herdr client route.
+//! Input dispatch and action execution: device events become jumps and
+//! queued work, and the action worker types into the frontmost app while the
+//! client captured at the press is still the followed one and has focus.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use codex_micro::DeviceEvent;
-use herdr_client::AgentStatus;
-use herdr_frontend::{Agent, Input, NavigationTarget};
+use herdr_client::{
+    ClientJumped,
+    follow::{ClientKey, JumpTarget},
+};
+use herdr_device::{
+    Focus, InputError, JumpDispatcher, JumpError, Keystroke, OsInput, PostError, Refusal,
+    SUBMIT_SETTLE, type_inputs,
+};
 use std::{
-    path::Path,
-    process::Command,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
         mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError},
     },
+    thread,
     time::{Duration, Instant},
 };
 
 use crate::{
-    actions::{Call, Caller, focus_pane, prompt as send_prompt, submit},
     config::{Action, Binding, Direction, Modifier, key_action_code, key_binding},
     gestures::{Fired, GestureContext, GestureDispatcher},
     macos,
-    process::{COMMAND_TIMEOUT, run_command_with_timeout},
     protocol::{SLOT_COUNT, joystick_event},
-    setup::plugin_root,
 };
-use herdr_frontend::directory::ClientRoute;
 
 use super::{RuntimeEvent, log, reconcile::InputContext};
 
@@ -35,235 +36,67 @@ struct InputState {
     last_joystick_sector: Option<u8>,
 }
 
+/// A prompt or submit binding, with the client followed at the press.
 pub(super) struct Work {
     source: String,
-    route: ClientRoute,
-    kind: WorkKind,
-}
-
-enum WorkKind {
-    Binding {
-        binding: Box<Binding>,
-        target: Option<Box<Agent>>,
-    },
-    FocusSlot {
-        pane_id: String,
-    },
-}
-
-/// Match Herdr's own prompt gate: only a blocked agent refuses text.
-fn ready_agent(agent: &Agent) -> Result<&Agent> {
-    if agent.agent_status.as_str() == AgentStatus::BLOCKED {
-        bail!("focused agent is blocked")
-    }
-    Ok(agent)
+    client: ClientKey,
+    /// Kind of the agent that client had focused, for `byAgent` bindings.
+    agent: Option<String>,
+    binding: Box<Binding>,
 }
 
 fn action_name(action: &Action) -> &'static str {
     match action {
         Action::Prompt { .. } => "prompt",
-        Action::Input { .. } => "input",
-        Action::Fast => "fast",
         Action::Submit => "submit",
-        Action::Script { .. } => "script",
-        Action::FocusPane { .. } => "focus-pane",
         Action::Key { .. } => "key",
     }
 }
 
-fn script_command(
-    command: &str,
-    args: &[String],
-    root: &Path,
-    route: &ClientRoute,
-    pane: &str,
-) -> Result<Command> {
-    let mut child = Command::new(command);
-    child
-        .args(args)
-        .current_dir(root)
-        .env_remove("HERDR_ACTIVE_PANE_CWD")
-        .env_remove("HERDR_ACTIVE_PANE_ID")
-        .env_remove("HERDR_ACTIVE_TAB_ID")
-        .env_remove("HERDR_ACTIVE_WORKSPACE_ID")
-        .env_remove("HERDR_CLIENT_SOCKET_PATH")
-        .env_remove("HERDR_PLUGIN_CONTEXT_JSON")
-        .env_remove("HERDR_TAB_ID")
-        .env_remove("HERDR_WORKSPACE_ID")
-        .env("HERDR_ENV", "1")
-        .env_remove("HERDR_SOCKET_PATH")
-        .env_remove("HERDR_SESSION")
-        .env_remove("HERDR_BIN_PATH")
-        .env("HERDR_MICRO_BIN_PATH", root.join("bin/herdr-micro"))
-        .env("HERDR_FRONTEND_SOCKET", &route.socket_path)
-        .env("HERDR_PANE_ID", pane);
-    Ok(child)
+fn execute_work(work: Work, focus: &Focus) -> Result<()> {
+    run_work(&work, focus, &herdr_device::macos::post, &|| {
+        thread::sleep(SUBMIT_SETTLE)
+    })
 }
 
-fn execute_script(
-    command: &str,
-    args: &[String],
-    current: &Agent,
-    route: &ClientRoute,
-) -> Result<()> {
-    let mut child = script_command(command, args, &plugin_root()?, route, &current.pane_id)?;
-    run_command_with_timeout(&mut child, COMMAND_TIMEOUT)
-}
-
-fn execute_action(
-    action: &Action,
-    current: &Agent,
-    call: &Caller<'_>,
-    route: &ClientRoute,
-) -> Result<()> {
-    match action {
-        Action::Input { text, keys } => {
-            ordinary_input(call, text, keys)?;
-        }
-        Action::Prompt { prompt, submit } => {
-            let current = ready_agent(current)?;
-            send_prompt(call, prompt, submit.unwrap_or(true), current)?;
-        }
-        Action::Fast => {
-            let current = ready_agent(current)?;
-            match current.agent.as_deref().unwrap_or_default() {
-                "codex" => {
-                    send_prompt(call, "/fast", true, current)?;
-                }
-                "pi" => {
-                    send_prompt(call, "/fast", false, current)?;
-                    submit(call)?;
-                }
-                other => bail!(
-                    "unsupported focused agent: {}",
-                    if other.is_empty() { "none" } else { other }
-                ),
-            }
-        }
-        Action::Submit => {
-            submit(call)?;
-        }
-        Action::Script { command, args } => execute_script(command, args, current, route)?,
-        Action::FocusPane { direction } => {
-            let direction = direction.as_str();
-            let pane = &current.pane_id;
-            focus_pane(call, pane, direction)?;
-            log(format!(
-                "joystick focus {direction}: {}/{pane}",
-                route.client_id
-            ));
-        }
-        // Key actions cannot reach the worker: top-level keys execute inline in
-        // queue_binding and byAgent keys are rejected at parse.
-        Action::Key { .. } => bail!("key action routed to the action worker"),
-    }
-    Ok(())
-}
-
-fn ordinary_input(
-    call: &Caller<'_>,
-    text: &Option<String>,
-    keys: &Option<Vec<String>>,
-) -> Result<()> {
-    let input = match (text, keys) {
-        (Some(text), None) => Input::Text(text.clone()),
-        (None, Some(keys)) => Input::Keys(keys.clone()),
-        _ => bail!("input requires exactly one of text or keys"),
-    };
-    call(Call::Input(input))
-}
-
-fn execute_work(
-    work: Work,
-    stopping: &AtomicBool,
-    context: &Mutex<Arc<InputContext>>,
-) -> Result<()> {
-    let client = work.route.client().with_timeout(COMMAND_TIMEOUT);
-    let transport = |call: Call| {
-        match call {
-            Call::Navigate { pane_id } => {
-                client.navigate(&work.route.wire(), &NavigationTarget::Pane(pane_id))?;
-            }
-            Call::Input(input) => {
-                client.input(&input)?;
-            }
-            // The TUI rejects calls on an inactive endpoint; no pre-check here.
-            Call::Call { method, params } => {
-                client.call(&work.route.wire(), &method, params)?;
-            }
-        }
-        Ok(())
-    };
-    run_work(&work, stopping, context, &transport)
-}
-
-fn selected_client(context: &Mutex<Arc<InputContext>>, route: &ClientRoute) -> bool {
-    let current = context.lock().unwrap_or_else(|e| e.into_inner());
-    current
-        .route
-        .as_ref()
-        .is_some_and(|r| r.socket_path == route.socket_path)
-}
-
-/// Execute captured work, checking before every call that the bridge is
-/// still running and the captured TUI is still the uniquely focused client.
+/// Execute captured work. `focus` is checked before every keystroke: the
+/// bridge must still be running, and the captured client still followed with
+/// its window focused in the last published report. Otherwise the rest is
+/// dropped.
 fn run_work(
     work: &Work,
-    stopping: &AtomicBool,
-    context: &Mutex<Arc<InputContext>>,
-    transport: &Caller<'_>,
+    focus: &Focus,
+    post: &dyn Fn(Keystroke<'_>) -> Result<(), PostError>,
+    settle: &dyn Fn(),
 ) -> Result<()> {
     let Work {
         source,
-        route,
-        kind,
+        client,
+        agent,
+        binding,
     } = work;
-    if stopping.load(Ordering::Acquire) {
+    let Some(action) = binding.resolve(agent.as_deref().unwrap_or("")) else {
         return Ok(());
-    }
-    if !selected_client(context, route) {
-        bail!("captured TUI is no longer the uniquely focused client");
-    }
-    let call = |request: Call| {
-        if stopping.load(Ordering::Acquire) {
-            bail!("Micro bridge is stopping");
-        }
-        if !selected_client(context, route) {
-            bail!("captured TUI is no longer the uniquely focused client");
-        }
-        transport(request)
     };
-    match kind {
-        WorkKind::FocusSlot { pane_id } => {
-            call(Call::Navigate {
-                pane_id: pane_id.clone(),
-            })?;
-            log(format!("{source}: focused {}/{pane_id}", route.client_id));
-        }
-        WorkKind::Binding { binding, target } => {
-            if let Binding::Action(Action::Input { text, keys }) = binding.as_ref() {
-                return ordinary_input(&call, text, keys);
-            }
-            if target.is_none() && matches!(binding.as_ref(), Binding::Action(Action::Submit)) {
-                return submit(&call);
-            }
-            let Some(current) = target else {
-                return Ok(());
-            };
-            let Some(action) = binding.resolve(current.agent.as_deref().unwrap_or("")) else {
-                return Ok(());
-            };
-            execute_action(&action, current, &call, route)
-                .with_context(|| format!("{source}: {}", action_name(&action)))?;
-            log(format!(
-                "{source}: {} in {} for {} in {}",
-                action_name(&action),
-                route.client_id,
-                current.agent.as_deref().unwrap_or("unknown"),
-                current.pane_id
-            ));
-        }
+    let inputs = match &action {
+        Action::Prompt { prompt, submit } => OsInput::prompt(prompt, submit.unwrap_or(true)),
+        Action::Submit => vec![OsInput::Enter],
+        // Key actions cannot reach the worker: top-level keys execute inline in
+        // queue_binding and byAgent keys are rejected at parse.
+        Action::Key { .. } => return Err(anyhow!("key action routed to the action worker")),
+    };
+    match type_inputs(&inputs, client, focus, post, settle) {
+        // The bridge is going away; there is nobody to tell.
+        Err(InputError::Refused(Refusal::Stopping)) => return Ok(()),
+        result => result.with_context(|| format!("{source}: {}", action_name(&action)))?,
     }
+    log(format!(
+        "{source}: {} in {} client {} for {}",
+        action_name(&action),
+        client.socket_path.display(),
+        client.client_id,
+        agent.as_deref().unwrap_or("no agent"),
+    ));
     Ok(())
 }
 
@@ -276,37 +109,51 @@ fn queue_work(sender: &SyncSender<Work>, work: Work) {
     }
 }
 
-pub(super) fn action_worker(
-    receiver: Receiver<Work>,
-    stopping: Arc<AtomicBool>,
-    context: Arc<Mutex<Arc<InputContext>>>,
-) {
-    while !stopping.load(Ordering::Acquire) {
+/// Runs queued work in order. Once `focus` is stopped, what is still queued
+/// is dropped.
+pub(super) fn action_worker(receiver: Receiver<Work>, focus: Focus) {
+    while !focus.is_stopping() {
         let work = match receiver.recv_timeout(Duration::from_millis(50)) {
             Ok(work) => work,
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
         };
-        if stopping.load(Ordering::Acquire) {
+        if focus.is_stopping() {
             break;
         }
-        if let Err(error) = execute_work(work, &stopping, &context) {
+        if let Err(error) = execute_work(work, &focus) {
             log(format!("control failed: {error:#}"));
         }
     }
 }
 
+/// The log line for a finished Agent-key jump. There is none once the
+/// bridge stops, or when a later press replaced the jump: that later jump
+/// reports for itself.
+fn jump_line(source: &str, result: Result<ClientJumped, JumpError>) -> Option<String> {
+    Some(match result {
+        Err(error) if error.is_superseded() => return None,
+        Ok(jumped) => format!(
+            "{source}: jumped to {}/{}",
+            jumped.endpoint_id, jumped.pane_id
+        ),
+        Err(JumpError::Refused(Refusal::Stopping)) => return None,
+        Err(JumpError::Refused(refusal)) => format!("{source} ignored: {refusal}"),
+        Err(error) => format!("{source}: {error}"),
+    })
+}
+
 fn execute_key(key: Option<&str>, keycode: Option<u16>, modifiers: &[Modifier]) -> Result<()> {
     let code = key_action_code(key, keycode).map_err(|error| anyhow!(error))?;
-    macos::post_key(code, modifiers)
+    Ok(macos::post_key(code, modifiers)?)
 }
 
 fn queue_binding(
     sender: &SyncSender<Work>,
     binding: Binding,
     source: String,
-    route: Option<ClientRoute>,
-    target: Option<Agent>,
+    client: Option<ClientKey>,
+    agent: Option<String>,
 ) {
     // Key taps are system-wide by nature: fire from any frontmost app while
     // the bridge owns the device, and never wait on the action queue.
@@ -322,36 +169,34 @@ fn queue_binding(
         }
         return;
     }
-    match route {
-        Some(route) => {
+    match client {
+        Some(client) => {
             queue_work(
                 sender,
                 Work {
                     source,
-                    route,
-                    kind: WorkKind::Binding {
-                        binding: Box::new(binding),
-                        target: target.map(Box::new),
-                    },
+                    client,
+                    agent,
+                    binding: Box::new(binding),
                 },
             );
         }
-        None => log(format!("{source} ignored: no ready Herdr input target")),
+        None => log(format!("{source} ignored: no followed Herdr client")),
     }
 }
 
 fn handle_fired(sender: &SyncSender<Work>, fired: Vec<Fired>) {
     for fired in fired {
-        let (route, target) = fired
+        let (client, agent) = fired
             .context
-            .map(|context| (Some(context.route), context.target))
+            .map(|context| (Some(context.client), context.agent))
             .unwrap_or_default();
         queue_binding(
             sender,
             Binding::Action(fired.action),
             fired.source,
-            route,
-            target,
+            client,
+            agent,
         );
     }
 }
@@ -368,6 +213,7 @@ fn handle_device_event(
     context: &InputContext,
     worker: &SyncSender<Work>,
     notices: &Sender<RuntimeEvent>,
+    jump: &mut dyn FnMut(String, JumpTarget),
 ) {
     let controls = &context.controls;
     match event {
@@ -397,42 +243,30 @@ fn handle_device_event(
                     worker,
                     binding,
                     format!("joystick {}", direction.as_str()),
-                    context.route.clone(),
-                    context.target.clone(),
+                    context.client.clone(),
+                    context.agent.clone(),
                 );
             }
         }
         DeviceEvent::Key { key, action } => {
             if let Some(index) = agent_slot(&key) {
                 if action == 1 {
-                    let slot = context.slots[index].as_ref();
-                    match slot {
-                        Some((route, agent)) => {
-                            queue_work(
-                                worker,
-                                Work {
-                                    source: key,
-                                    route: route.clone(),
-                                    kind: WorkKind::FocusSlot {
-                                        pane_id: agent.pane_id.clone(),
-                                    },
-                                },
-                            );
-                        }
-                        _ => log(format!("{key} ignored: no ready Agent slot")),
+                    match context.slots.get(index).and_then(Option::as_ref) {
+                        Some(target) => jump(key, target.clone()),
+                        None => log(format!("{key} ignored: no ready Agent slot")),
                     }
                 }
                 return;
             }
             let binding = key_binding(controls, &key, action);
-            let captured = context.route.clone();
-            let gesture_context = captured.as_ref().map(|route| GestureContext {
-                route: route.clone(),
-                target: context.target.clone(),
+            let captured = context.client.clone();
+            let gesture_context = captured.as_ref().map(|client| GestureContext {
+                client: client.clone(),
+                agent: context.agent.clone(),
             });
             if matches!(key.as_str(), "ENC_CC" | "ENC_CW") {
                 if let Some(binding) = binding {
-                    queue_binding(worker, binding, key, captured, context.target.clone());
+                    queue_binding(worker, binding, key, captured, context.agent.clone());
                 }
             } else if matches!(action, 0 | 1) {
                 match binding.as_ref() {
@@ -451,7 +285,7 @@ fn handle_device_event(
                         binding.clone(),
                         key,
                         captured,
-                        context.target.clone(),
+                        context.agent.clone(),
                     ),
                     _ => {}
                 }
@@ -477,13 +311,24 @@ pub(super) fn input_worker(
     shared: Arc<Mutex<Arc<InputContext>>>,
     work: SyncSender<Work>,
     notices: Sender<RuntimeEvent>,
-    stopping: Arc<AtomicBool>,
+    focus: Focus,
 ) {
     let mut state = InputState::default();
     let mut context = Arc::clone(&shared.lock().unwrap_or_else(|error| error.into_inner()));
-    while !stopping.load(Ordering::Acquire) {
+    // Agent-key jumps stay off the action queue: a daemon holds a jump
+    // until its client answers. This loop receives the presses in order,
+    // which is the order the dispatcher sends them in.
+    let mut jumps = JumpDispatcher::new(focus.clone());
+    let mut jump = |source: String, target: JumpTarget| {
+        jumps.press(target, move |result| {
+            if let Some(line) = jump_line(&source, result) {
+                log(line);
+            }
+        });
+    };
+    while !focus.is_stopping() {
         refresh_input_context(&shared, &mut context, &mut state);
-        if stopping.load(Ordering::Acquire) {
+        if focus.is_stopping() {
             break;
         }
         handle_fired(&work, state.gestures.drain_due(Instant::now()));
@@ -501,11 +346,11 @@ pub(super) fn input_worker(
             },
         };
         if let Some(event) = event {
-            if stopping.load(Ordering::Acquire) {
+            if focus.is_stopping() {
                 break;
             }
             refresh_input_context(&shared, &mut context, &mut state);
-            handle_device_event(event, &mut state, &context, &work, &notices);
+            handle_device_event(event, &mut state, &context, &work, &notices, &mut jump);
         }
     }
     state.gestures.clear();
@@ -513,115 +358,75 @@ pub(super) fn input_worker(
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, fs, os::unix::fs::PermissionsExt, sync::mpsc};
+    use std::{cell::RefCell, sync::mpsc};
 
     use super::*;
     use crate::config::Config;
-    use serde_json::json;
+    use herdr_client::ClientJumpError;
 
-    fn agent(pane: &str, kind: &str) -> Agent {
-        serde_json::from_value(json!({
-            "agent": kind,
-            "agent_status": "idle",
-            "workspace_id": "w1",
-            "tab_id": "w1:t1",
-            "pane_id": pane,
-            "focused": true,
-            "state_change_seq": 1,
-            "state_labels": [],
-            "tokens": []
-        }))
-        .unwrap()
-    }
-
-    fn route(name: &str) -> ClientRoute {
-        ClientRoute {
-            client_id: name.into(),
-            endpoint_id: "local/work".into(),
-            boot_id: Some("boot".into()),
-            socket_path: format!("/tmp/{name}.sock").into(),
+    fn client(session: &str) -> ClientKey {
+        ClientKey {
+            socket_path: format!("/run/herdr/{session}/herdr.sock").into(),
+            boot_id: "daemon-boot".into(),
+            client_id: 7,
         }
     }
 
-    fn selecting(route: Option<ClientRoute>) -> Mutex<Arc<InputContext>> {
-        let mut context = input_context();
-        context.route = route;
-        Mutex::new(Arc::new(context))
-    }
-
-    fn prompt_call(text: &str) -> Call {
-        Call::Call {
-            method: "agent.prompt".into(),
-            params: json!({"target":"pane","text":text}),
+    fn target(session: &str) -> JumpTarget {
+        JumpTarget {
+            client: client(session),
+            endpoint_id: "ssh:build".into(),
+            boot_id: "boot-b".into(),
+            pane_id: "w1:p4".into(),
         }
     }
 
-    #[test]
-    fn script_context_drives_the_bundled_adapter() {
-        let directory = tempfile::tempdir().unwrap();
-        let dir = directory.path();
-        let fake_herdr = dir.join("herdr");
-        let calls = dir.join("calls");
-        let environment = dir.join("environment");
-        fs::write(
-            &fake_herdr,
-            r#"#!/bin/sh
-if [ ! -e "$HERDR_TEST_ENV" ]; then
-    printf '%s\n' "$HERDR_FRONTEND_SOCKET" "$HERDR_PANE_ID" "$PWD" > "$HERDR_TEST_ENV"
-fi
-printf '%s\n' --call "$@" >> "$HERDR_TEST_LOG"
-"#,
-        )
-        .unwrap();
-        fs::set_permissions(&fake_herdr, fs::Permissions::from_mode(0o700)).unwrap();
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let config = Config::default();
-        let target_route = route("work");
+    fn input_context() -> InputContext {
+        InputContext {
+            controls: Config::default().controls,
+            client: Some(client("work")),
+            agent: Some("codex".into()),
+            slots: vec![Some(target("work"))],
+        }
+    }
 
-        let Action::Script { command, args } = key_binding(&config.controls, "ENC_CC", 1)
-            .unwrap()
-            .resolve("codex")
-            .unwrap()
-        else {
-            panic!("expected Codex script action");
-        };
-        let mut child = script_command(&command, &args, root, &target_route, "w9:p4").unwrap();
-        child
-            .env("HERDR_MICRO_BIN_PATH", &fake_herdr)
-            .env("HERDR_TEST_LOG", &calls)
-            .env("HERDR_TEST_ENV", &environment);
-        run_command_with_timeout(&mut child, COMMAND_TIMEOUT).unwrap();
-        assert_eq!(
-            fs::read_to_string(&environment).unwrap(),
-            format!(
-                "{}\nw9:p4\n{}\n",
-                target_route.socket_path.display(),
-                root.display()
-            )
-        );
-        assert_eq!(
-            fs::read_to_string(&calls).unwrap(),
-            "--call\nclient\ninput\nkeys\nalt+.\n"
-        );
+    /// What the dispatch threads check: `client` is followed and its
+    /// window has focus.
+    fn focused_on(client: Option<ClientKey>) -> Focus {
+        let focus = Focus::new(Arc::default());
+        focus.set(client, true);
+        focus
+    }
 
-        fs::remove_file(&calls).unwrap();
-        let Action::Script { command, args } = key_binding(&config.controls, "ENC_CW", 1)
-            .unwrap()
-            .resolve("claude")
-            .unwrap()
-        else {
-            panic!("expected Claude script action");
+    fn work(binding: Binding, agent: Option<&str>) -> Work {
+        Work {
+            source: "test".into(),
+            client: client("work"),
+            agent: agent.map(str::to_owned),
+            binding: Box::new(binding),
+        }
+    }
+
+    fn prompt(text: &str, submit: Option<bool>) -> Action {
+        Action::Prompt {
+            prompt: text.into(),
+            submit,
+        }
+    }
+
+    /// Runs `work` against `focus` and returns the result and what a
+    /// recording sink received. Tests never post a real macOS event.
+    fn run(work: &Work, focus: &Focus) -> (Result<()>, Vec<OsInput>) {
+        let events = RefCell::new(Vec::new());
+        let post = |keystroke: Keystroke<'_>| {
+            events.borrow_mut().push(match keystroke {
+                Keystroke::Text(units) => OsInput::Text(String::from_utf16_lossy(units)),
+                Keystroke::Enter => OsInput::Enter,
+            });
+            Ok(())
         };
-        let mut child = script_command(&command, &args, root, &target_route, "w9:p4").unwrap();
-        child
-            .env("HERDR_MICRO_BIN_PATH", &fake_herdr)
-            .env("HERDR_TEST_LOG", &calls)
-            .env("HERDR_TEST_ENV", &environment);
-        run_command_with_timeout(&mut child, COMMAND_TIMEOUT).unwrap();
-        assert_eq!(
-            fs::read_to_string(&calls).unwrap(),
-            "--call\nclient\ninput\ntext\n/effort\n--call\nclient\ninput\nkeys\nenter\n--call\nclient\ninput\nkeys\nleft\n--call\nclient\ninput\nkeys\nenter\n"
-        );
+        let result = run_work(work, focus, &post, &|| ());
+        (result, events.into_inner())
     }
 
     #[test]
@@ -630,106 +435,173 @@ printf '%s\n' --call "$@" >> "$HERDR_TEST_LOG"
         assert_eq!(agent_slot("AG05"), Some(5));
         assert_eq!(agent_slot("AG06"), None);
     }
-    fn input_context() -> InputContext {
-        InputContext {
-            controls: Config::default().controls,
-            route: Some(route("work")),
-            target: Some(agent("pane", "codex")),
-            slots: vec![Some((route("other-endpoint"), agent("slot-pane", "pi")))],
+
+    #[test]
+    fn prompt_and_submit_become_keyboard_events_for_the_followed_client() {
+        let focused = focused_on(Some(client("work")));
+        for (binding, agent, expected) in [
+            (
+                Binding::Action(prompt("/model", None)),
+                Some("codex"),
+                vec![OsInput::Text("/model".into()), OsInput::Enter],
+            ),
+            (
+                Binding::Action(prompt("draft", Some(false))),
+                None,
+                vec![OsInput::Text("draft".into())],
+            ),
+            (Binding::Action(Action::Submit), None, vec![OsInput::Enter]),
+            // byAgent follows the kind of agent the client had focused.
+            (
+                Binding::ByAgent(
+                    [
+                        ("codex".to_owned(), Some(prompt("/fast", Some(true)))),
+                        ("default".to_owned(), None),
+                    ]
+                    .into(),
+                ),
+                Some("codex"),
+                vec![OsInput::Text("/fast".into()), OsInput::Enter],
+            ),
+            (
+                Binding::ByAgent(
+                    [
+                        ("codex".to_owned(), Some(prompt("/fast", Some(true)))),
+                        ("default".to_owned(), None),
+                    ]
+                    .into(),
+                ),
+                Some("claude"),
+                vec![],
+            ),
+            // Without a focused agent only the default variant applies.
+            (
+                Binding::ByAgent(
+                    [
+                        ("codex".to_owned(), Some(prompt("/fast", None))),
+                        ("default".to_owned(), Some(Action::Submit)),
+                    ]
+                    .into(),
+                ),
+                None,
+                vec![OsInput::Enter],
+            ),
+        ] {
+            let (result, events) = run(&work(binding, agent), &focused);
+            result.unwrap();
+            assert_eq!(events, expected);
         }
     }
 
     #[test]
-    fn queued_bindings_use_captured_agent_context_without_reading_inventory() {
-        let context = input_context();
-        let actions = [
-            Action::Prompt {
-                prompt: "hello".into(),
-                submit: Some(true),
-            },
-            Action::Submit,
-            Action::Fast,
-            Action::FocusPane {
-                direction: Direction::Left,
-            },
-        ];
-        let (sender, receiver) = mpsc::sync_channel(8);
-        for action in actions {
-            queue_binding(
+    fn prompt_and_submit_are_suppressed_without_a_followed_and_focused_client() {
+        // At the press: no followed client means nothing is queued.
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let (notices, _notices) = mpsc::channel();
+        let mut unfocused = input_context();
+        unfocused.client = None;
+        unfocused.slots = vec![None; SLOT_COUNT];
+        let mut state = InputState::default();
+        for key in ["ACT09", "ACT12", "ENC_CLK", "AG00"] {
+            handle_device_event(
+                DeviceEvent::Key {
+                    key: key.into(),
+                    action: 1,
+                },
+                &mut state,
+                &unfocused,
                 &sender,
-                Binding::ByAgent([("codex".into(), Some(action))].into()),
-                "test".into(),
-                context.route.clone(),
-                context.target.clone(),
+                &notices,
+                &mut |_, _| panic!("a jump was started without a followed client"),
             );
         }
-        let calls = RefCell::new(Vec::new());
-        let caller = |call: Call| {
-            calls.borrow_mut().push(call);
+        assert!(receiver.try_recv().is_err());
+
+        // At dispatch: another client is followed by now, or the captured
+        // one is behind another app. Nothing is typed.
+        let behind = Focus::new(Arc::default());
+        behind.set(Some(client("work")), false);
+        for (focus, refusal) in [
+            (focused_on(Some(client("default"))), Refusal::NotFollowed),
+            (behind, Refusal::NotFocused),
+        ] {
+            let (result, events) = run(
+                &work(Binding::Action(prompt("/copy", None)), Some("codex")),
+                &focus,
+            );
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(error.contains(&refusal.to_string()), "{error}");
+            assert!(events.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_prompt_stops_at_the_chunk_after_the_follower_saw_focus_lost() {
+        use crate::daemon::{
+            clients_changed,
+            reconcile::tests::{client as reporting, daemon},
+        };
+        use herdr_client::follow::Directory;
+        let listing = |focused| vec![daemon("work", vec![reporting(7, focused)])];
+        let front = Directory::default().updated(listing(Some(true)));
+        let behind = front.updated(listing(Some(false)));
+        let key = front.followed_client().unwrap().key();
+        // The loop published the client with its window in front.
+        let focus = Focus::new(Arc::default());
+        focus.follow(front.followed_client());
+        let (events, loop_events) = mpsc::channel();
+
+        let text = "a prompt that takes two keyboard events";
+        let typed = RefCell::new(Vec::new());
+        let post = |keystroke: Keystroke<'_>| {
+            if let Keystroke::Text(units) = keystroke {
+                typed.borrow_mut().push(String::from_utf16_lossy(units));
+            }
+            // Another app takes focus while the first chunk is posted. The
+            // follower says so on its own thread; the loop takes no turn.
+            assert!(clients_changed(&focus, &events, behind.clone()));
             Ok(())
         };
-        let selected = selecting(context.route.clone());
-        for work in receiver.try_iter() {
-            assert_eq!(work.route.client_id, "work");
-            run_work(&work, &AtomicBool::new(false), &selected, &caller).unwrap();
-        }
-        assert_eq!(
-            calls.into_inner(),
-            [
-                prompt_call("hello"),
-                Call::Input(Input::Keys(vec!["enter".into()])),
-                prompt_call("/fast"),
-                Call::Call {
-                    method: "pane.focus_direction".into(),
-                    params: json!({"pane_id":"pane","direction":"left"}),
-                },
-            ]
-        );
+        let work = Work {
+            source: "test".into(),
+            client: key,
+            agent: None,
+            binding: Box::new(Binding::Action(prompt(text, None))),
+        };
+        let error = format!("{:#}", run_work(&work, &focus, &post, &|| ()).unwrap_err());
+        assert!(error.contains(&Refusal::NotFocused.to_string()), "{error}");
+        assert_eq!(*typed.borrow(), [&text[..20]]);
+        // The event that carries the loss is still waiting for the loop.
+        assert!(matches!(
+            loop_events.try_recv(),
+            Ok(RuntimeEvent::Clients(_))
+        ));
     }
 
     #[test]
-    fn stopped_worker_sends_nothing_for_bindings_slots_or_scripts() {
-        let panic_call = |_: Call| -> Result<()> { panic!("stopped worker sent RPC") };
-        for kind in [
-            WorkKind::Binding {
-                binding: Box::new(Binding::Action(Action::Submit)),
-                target: input_context().target.map(Box::new),
-            },
-            WorkKind::Binding {
-                binding: Box::new(Binding::Action(Action::Script {
-                    command: "this-must-not-run".into(),
-                    args: vec![],
-                })),
-                target: input_context().target.map(Box::new),
-            },
-            WorkKind::FocusSlot {
-                pane_id: "pane".into(),
-            },
+    fn a_stopping_bridge_sends_nothing_and_reports_nothing() {
+        for binding in [
+            Binding::Action(Action::Submit),
+            Binding::Action(prompt("/copy", None)),
         ] {
-            run_work(
-                &Work {
-                    source: "test".into(),
-                    route: route("work"),
-                    kind,
-                },
-                &AtomicBool::new(true),
-                &selecting(Some(route("work"))),
-                &panic_call,
-            )
-            .unwrap();
+            let focus = focused_on(Some(client("work")));
+            focus.stop();
+            let (result, events) = run(&work(binding, Some("codex")), &focus);
+            result.unwrap();
+            assert!(events.is_empty());
         }
     }
 
     #[test]
-    fn pending_gestures_keep_initial_destination_across_focus_and_inventory_changes() {
+    fn pending_gestures_keep_the_client_and_agent_of_the_first_press() {
         let initial = Arc::new(input_context());
         let shared = Mutex::new(Arc::clone(&initial));
         let mut context = Arc::clone(&initial);
         let mut state = InputState::default();
         let now = Instant::now();
         let binding = Binding::Gesture(Box::new(crate::config::GestureBinding {
-            hold: Some(Action::Fast),
-            hold_ms: Some(10),
+            hold: Some(prompt("/held", None)),
+            hold_ms: Some(50),
             ..Default::default()
         }));
         state.gestures.handle(
@@ -737,20 +609,20 @@ printf '%s\n' --call "$@" >> "$HERDR_TEST_LOG"
             Some(&binding),
             true,
             Some(GestureContext {
-                route: initial.route.clone().unwrap(),
-                target: initial.target.clone(),
+                client: initial.client.clone().unwrap(),
+                agent: initial.agent.clone(),
             }),
             now,
         );
         for change in ["client", "agent", "inventory", "unavailable"] {
             let mut next = input_context();
             match change {
-                "client" => next.route = Some(route("personal")),
-                "agent" => next.target = Some(agent("pane", "claude")),
+                "client" => next.client = Some(client("personal")),
+                "agent" => next.agent = Some("claude".into()),
                 "inventory" => next.slots.clear(),
                 "unavailable" => {
-                    next.route = None;
-                    next.target = None;
+                    next.client = None;
+                    next.agent = None;
                 }
                 _ => unreachable!(),
             }
@@ -761,76 +633,91 @@ printf '%s\n' --call "$@" >> "$HERDR_TEST_LOG"
         let (sender, receiver) = mpsc::sync_channel(1);
         handle_fired(
             &sender,
-            state.gestures.drain_due(now + Duration::from_millis(20)),
+            state.gestures.drain_due(now + Duration::from_millis(60)),
         );
         let work = receiver.try_recv().unwrap();
-        assert_eq!(work.route, initial.route.clone().unwrap());
-        let calls = RefCell::new(Vec::new());
-        let caller = |call: Call| {
-            calls.borrow_mut().push(call);
-            Ok(())
-        };
-        run_work(
-            &work,
-            &AtomicBool::new(false),
-            &selecting(initial.route.clone()),
-            &caller,
-        )
-        .unwrap();
-        assert_eq!(calls.into_inner(), [prompt_call("/fast")]);
+        assert_eq!(Some(&work.client), initial.client.as_ref());
+        assert_eq!(work.agent.as_deref(), Some("codex"));
+
+        // It is typed only if that same client has focus again by then.
+        let (result, events) = run(&work, &focused_on(None));
+        assert!(result.is_err() && events.is_empty());
+        let (result, events) = run(&work, &focused_on(initial.client.clone()));
+        result.unwrap();
+        assert_eq!(events, [OsInput::Text("/held".into()), OsInput::Enter]);
     }
 
     #[test]
     fn device_events_capture_binding_and_slot_destinations() {
         let context = input_context();
         let (sender, receiver) = mpsc::sync_channel(2);
-        let (notices, _) = mpsc::channel();
+        let (notices, _notices) = mpsc::channel();
         let mut state = InputState::default();
-        for key in ["ACT09", "AG00"] {
+        let jumps = RefCell::new(Vec::new());
+        // A press and its release: only the press acts.
+        for (key, action) in [
+            ("ACT09", 1),
+            ("ACT09", 0),
+            ("AG00", 1),
+            ("AG00", 0),
+            ("AG03", 1),
+        ] {
             handle_device_event(
                 DeviceEvent::Key {
                     key: key.into(),
-                    action: 1,
+                    action,
                 },
                 &mut state,
                 &context,
                 &sender,
                 &notices,
+                &mut |source, target| jumps.borrow_mut().push((source, target)),
             );
         }
         let binding = receiver.try_recv().unwrap();
-        assert_eq!(binding.route, context.route.unwrap());
-        assert!(
-            matches!(binding.kind, WorkKind::Binding {target, ..} if target.as_deref() == context.target.as_ref())
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(Some(&binding.client), context.client.as_ref());
+        assert_eq!(binding.agent, context.agent);
+        assert_eq!(
+            *binding.binding,
+            Binding::Action(prompt("/copy", Some(true)))
         );
-        let slot = receiver.try_recv().unwrap();
-        assert_eq!(slot.route.client_id, "other-endpoint");
-        assert!(matches!(slot.kind, WorkKind::FocusSlot {pane_id} if pane_id == "slot-pane"));
+        // The slot key starts exactly one jump, to the slot's captured pane;
+        // an empty slot starts none.
+        assert_eq!(jumps.into_inner(), [("AG00".to_owned(), target("work"))]);
     }
+
     #[test]
-    fn lost_conflicting_or_changed_focus_rejects_captured_work_without_dispatch() {
-        let work = Work {
-            source: "held".into(),
-            route: route("work"),
-            kind: WorkKind::Binding {
-                binding: Box::new(Binding::Action(Action::Input {
-                    text: Some("hello".into()),
-                    keys: None,
-                })),
-                target: None,
-            },
+    fn each_jump_outcome_becomes_one_log_line() {
+        let failed = |source| JumpError::Failed {
+            endpoint_id: "ssh:build".into(),
+            pane_id: "w1:p4".into(),
+            source,
         };
-        let panic_call = |_: Call| -> Result<()> { panic!("unfocused work dispatched") };
-        for selected in [None, Some(route("another"))] {
-            assert!(
-                run_work(
-                    &work,
-                    &AtomicBool::new(false),
-                    &selecting(selected),
-                    &panic_call
-                )
-                .is_err()
-            );
+        for (result, expected) in [
+            (
+                Ok(ClientJumped {
+                    client_id: 7,
+                    endpoint_id: "ssh:build".into(),
+                    pane_id: "w1:p4".into(),
+                }),
+                Some("AG02: jumped to ssh:build/w1:p4".to_owned()),
+            ),
+            (
+                Err(failed(ClientJumpError::EndpointUnavailable)),
+                Some("AG02: jump to ssh:build/w1:p4: the client could not reach the endpoint; the jump may still have happened".into()),
+            ),
+            (
+                Err(Refusal::NotFollowed.into()),
+                Some(format!("AG02 ignored: {}", Refusal::NotFollowed)),
+            ),
+            // A later press replaced this jump: expected, and not logged.
+            (Err(failed(ClientJumpError::Superseded)), None),
+            (Err(JumpError::Replaced), None),
+            (Err(JumpError::Overtaken), None),
+            (Err(Refusal::Stopping.into()), None),
+        ] {
+            assert_eq!(jump_line("AG02", result), expected);
         }
     }
 }

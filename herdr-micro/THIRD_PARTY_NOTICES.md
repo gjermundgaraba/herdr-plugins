@@ -15,9 +15,5 @@ licenses are declared in the crates' published metadata or source;
 (AppKit, CoreFoundation, CoreGraphics, Foundation, and IOKit) are provided by
 Apple and are not bundled.
 
-`herdr-frontend` is consumed as a git dependency from the Apache-2.0
-[gjermundgaraba/herdr](https://github.com/gjermundgaraba/herdr) fork;
-`Cargo.lock` pins the exact commit.
-
 Work Louder, Codex, OpenAI, Claude, and Pi are trademarks of their respective
 owners. This is an unofficial community project.

@@ -1,8 +1,8 @@
 id = "gjermundgaraba.herdr-micro"
 name = "Herdr Micro"
-version = "0.2.0"
-min_herdr_version = "0.9.1"
-description = "Shows Herdr agent state on a Work Louder Codex Micro keypad and sends its controls to the focused agent. Needs the keypad and the gjermundgaraba/herdr custom-v3 fork build; stock Herdr won't work"
+version = "0.3.0"
+min_herdr_version = "0.9.3"
+description = "Shows Herdr agent state on a Work Louder Codex Micro keypad, jumps to an agent from its key, and types prompts into the focused Herdr client. Needs the keypad and the gjermundgaraba/herdr custom-v3 fork build with the client.list API; stock Herdr won't work"
 platforms = ["macos"]
 
 [[build]]
@@ -64,11 +64,6 @@ command = ["bin/herdr-micro", "status"]
 id = "micro-configure"
 title = "Configure Herdr Micro"
 command = ["bin/herdr-micro", "configure"]
-
-[[actions]]
-id = "setup-pi-effort"
-title = "Install Pi effort controls"
-command = ["bin/herdr-micro", "setup-pi-effort"]
 
 [[actions]]
 id = "micro-stop"

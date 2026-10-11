@@ -1,8 +1,9 @@
 # herdr-micro
 
 Unofficial macOS [Herdr](https://herdr.dev/) integration for the Work Louder
-Codex Micro. It shows Herdr agent state on the six Agent keys and routes the
-configurable controls to the focused Codex, Claude Code, or Pi agent.
+Codex Micro. It shows the agents of the Herdr client that last took focus on
+the six Agent keys, jumps to an agent when its key is pressed, and types
+configured prompts and Enter into that client while it has focus.
 
 The device transport is a separate per-user service. It uses the stock Codex
 Micro firmware and shared macOS IOHIDManager access over USB or Bluetooth Low
@@ -13,13 +14,16 @@ a root helper, or use `sudo`.
 
 - macOS and a Codex Micro; the current hardware baseline is stock firmware
   0.6.2
-- The [Herdr fork build](../README.md#herdr-build) with frontend socket
-  protocol 7 (Hub is not required)
+- The [Herdr fork build](../README.md#herdr-build) with the daemon's client
+  API (`client.list`, `client.changed`, `client.jump`); Hub is not required
+- `herdr` on `PATH`, or `HERDR_BIN_PATH` set, in the environment the bridge
+  is started from, to list the local sessions
 - Rust 1.89 or newer when building from source
 - An Apple Development code-signing identity when building from source
 - Work Louder Input for the one-time Layer 2 setup
 - macOS Input Monitoring permission for the installed Codex Micro service
-- macOS Accessibility permission only for configured system `key` bindings
+- macOS Accessibility permission for every bound control: prompts, Enter, and
+  system `key` taps are all sent as macOS keyboard events
 - Handy installed at `/Applications/Handy.app` for the reserved voice-control
   button
 - [Hunk](https://www.hunk.dev/) on `PATH` for the optional `diff` popup pane
@@ -118,24 +122,39 @@ in the Herdr client. The stock wide keycap spans switches 5 and 6, so Button 6
 is also `null` by default. Changing which non-reserved buttons are enabled
 requires stopping the bridge, rerunning `micro-setup`, and restarting it.
 
-The two top-level fields, `controls` and `lighting`, are required. Besides the
-Herdr actions in the default configuration, a binding can tap a system key from
-any frontmost app (requires Accessibility):
+The two top-level fields, `controls` and `lighting`, are required. There are
+three actions, and each one is a macOS keyboard event:
 
 ```json
+"4": { "action": "prompt", "prompt": "/copy" },
+"3": { "action": "prompt", "prompt": "draft: ", "submit": false },
+"7": { "action": "submit" },
 "2": { "action": "key", "key": "F19" }
 ```
 
-`key` names cover F13 to F20; `keycode` accepts any macOS virtual keycode (0 to 127)
-instead of `key`, and optional `modifiers` adds any of `cmd`, `shift`, `alt`,
-`ctrl`, and `fn`.
+- `prompt` types its text into the frontmost app, then presses Enter unless
+  `submit` is `false`. The text must not contain newlines or other control
+  characters.
+- `submit` presses Enter.
+- `key` taps a system key. `key` names cover F13 to F20; `keycode` accepts any
+  macOS virtual keycode (0 to 127) instead of `key`, and optional `modifiers`
+  adds any of `cmd`, `shift`, `alt`, `ctrl`, and `fn`.
 
-The actions are `prompt`, `input`, `submit`, `fast`, `focus-pane`, `script`,
-and `key`; the default configuration demonstrates most of them plus `byAgent`
-variants. Buttons also accept gesture bindings:
+`prompt` and `submit` are sent only while the followed Herdr client (see
+[Routing and operation](#routing-and-operation)) reports that its window has
+focus, so the frontmost app is that client and the text lands where its
+keyboard focus is. `key` is sent from any frontmost app.
+
+A binding can depend on the kind of agent the client has focused:
 
 ```json
-"1": { "tap": { "action": "submit" }, "hold": { "action": "fast" }, "holdMs": 400 }
+"3": { "byAgent": { "codex": { "action": "prompt", "prompt": "/fast" }, "default": null } }
+```
+
+Buttons also accept gesture bindings:
+
+```json
+"1": { "tap": { "action": "submit" }, "hold": { "action": "prompt", "prompt": "/model" }, "holdMs": 400 }
 ```
 
 `tap`, `doubleTap`, `hold`, and `release` each take an action. `holdMs`
@@ -153,51 +172,100 @@ in the current workspace. No button is bound to it by default; open it with
 `herdr plugin pane open --plugin gjermundgaraba.herdr-micro --entrypoint diff`.
 `doctor` warns when Hunk is missing.
 
-## Effort controls
-
-Install the bundled Pi extension once, then run `/reload` in existing Pi
-sessions:
-
-```sh
-herdr plugin invoke gjermundgaraba.herdr-micro.setup-pi-effort
-```
-
-Codex uses its native `alt+.` and `alt+,` TUI defaults; if those bindings are
-overridden in `~/.codex/config.toml`, update the adapter arguments in
-`config.json`. Claude Code uses the same adapter with its `/effort` picker. See
-[thinking-effort control](docs/micro-bridge.md#thinking-effort-control) for the
-boundaries.
-
 ## Routing and operation
 
-The bridge discovers owner-only per-TUI frontend sockets and subscribes directly.
-Exactly one TUI must report `focused: true`; absent, unknown, or conflicting
-focus blanks lights and disables Herdr routing. Quiet subscriptions stay live
-until EOF. The six sticky agent slots use `(endpoint_id, pane_id)` identity;
-server `agent.focused` highlights the active endpoint's focused slot.
+The bridge lists the running local sessions with `herdr session list --json`
+and follows every one of them: each session is its own daemon, and the client
+the keypad follows may be attached to any. From each daemon it reads the attached clients'
+reports (`client.list`) and subscribes to their changes (`client.changed`).
 
-Agent buttons use `navigate`, including SSH endpoints. Ordinary keys/text use
-`input`, so they work in a plain shell or an open Navigator, even when a runtime
-lease is unavailable. For configuration use `{"action":"input","keys":["enter"]}`
-or `{"action":"input","text":"hello"}`. Targeted agent prompts require their
-captured endpoint to already be active; they never activate implicitly. Calls
-carry the endpoint and the server boot whose pane ids they use, so a restarted
-server rejects them instead of acting on a reused id; cancelled or disconnected
-mutations are never replayed. Gesture routes are captured at the first press.
-Delayed work is rejected if that TUI is no longer the uniquely focused client;
-it never retargets to a different TUI.
+The keypad follows one client, across all daemons. That client supplies
+everything the keypad shows. It is the client whose window most recently took
+focus, which is the client whose report changed to `focused: true` last, and
+it stays followed while another app is in front. Of several clients that take
+focus in one listing of a daemon, the one with the highest client id wins.
 
-Two bindings work OS-globally. `action: "key"` bindings synthesize macOS
-keycodes (named F13 to F20, or a configured keycode with modifiers) even
-without a focused Herdr TUI, and the device service's reserved Handy button is
-global too. Neither is a Herdr input route, and official device ownership still
-gates all bridge work.
+While no client is followed, the keypad follows a reporting client anyway:
+one that reports focus before one whose focus is unknown before one that
+reports none, and of equals the last by socket path and then client id. A TUI
+reports unknown focus until its terminal sends a focus change, so a TUI
+started in an already focused terminal is followed this way. It then stays
+followed until another client takes focus.
 
-Scripts run locally from the plugin root and receive `HERDR_FRONTEND_SOCKET`,
-`HERDR_PANE_ID`, and `HERDR_MICRO_BIN_PATH` (the plugin's own `bin/herdr-micro`).
-Use `client input text TEXT` or `client input keys KEY...`. Input is
-deliberately untargeted. External commands run normally, outside frontend
-validation.
+The followed client is forgotten when its daemon lists its clients without it
+(it detached, or the daemon restarted) or when `herdr session list` no longer
+lists its session as running. A daemon that only fails to answer, for example
+one listing that times out, does not lose it: the lights are blank and
+nothing is sent until the daemon lists the client again, and no other client
+is followed in the meantime unless one takes focus. With no reporting client
+anywhere, the lights are blank as well. `doctor` names the client the running
+bridge follows and says whether its window has focus.
+
+The six Agent keys are sticky slots for the followed client's Agents list.
+Free slots fill in the daemon's priority order (`priority_key`), and an agent
+keeps its key while it stays in the list, also while the client's window is
+not in front. When every slot is taken, a new agent replaces the last one in
+priority order only if the daemon ranks it ahead and it is in a louder state
+(blocked over done over working over idle). Slots use `(endpoint_id, pane_id)`
+identity, so the same pane id on two machines is two agents. The brighter key
+is the agent the client has focused, and the aggregate lights follow the first
+lit slotted agent in priority order.
+
+A client goes on listing the agents of an endpoint that is not online, for
+example one that is reconnecting. Such an agent keeps its key as any other
+agent does, so a louder agent can still replace it when every slot is taken.
+The key is dark, and a press on it is logged as `ignored: no ready Agent
+slot`. An agent that cannot be reached takes no key it does not already hold.
+
+Pressing an Agent key sends one `client.jump` to the daemon the followed
+client is attached to, with the agent's endpoint, that endpoint's boot ID, and
+the pane. It works while another app is in front. The client switches
+endpoint when it has to. The daemon holds the request until the client
+answers, for up to twenty seconds. A press never waits for that answer: a
+second press during that time sends a new jump, which replaces the first, and
+nothing is logged for the replaced one. One thread writes the jumps to the
+daemon, one at a time and in the order the presses arrived, and it only ever
+holds the newest press: a press that is followed by another before it is
+written is not sent at all. So an older press is never written after a newer
+one. A second thread reads the answers, also one at a time, and of the jumps
+waiting to be read only the newest is kept: the connection of an older one is
+closed unread. However fast keys are pressed, the bridge therefore has two
+threads and at most three connections for jumps. Of the jumps written, the
+daemon lets the one it takes up last win; it reads each on a connection of
+its own, so two written at the same instant can still be taken up in the
+other order. Presses on another device, such as a Stream Deck, are not
+ordered against these. A jump is never retried: after a timeout, a client
+that left, or an endpoint the client could not reach, it may still have
+happened. The outcome is written to `logs/micro.log`: `jumped to
+<endpoint>/<pane>`, or `jump to <endpoint>/<pane>:` and the reason in words,
+such as `the endpoint now runs another boot`, `the client knows no such
+endpoint or pane`, `the client could not reach the endpoint; the jump may
+still have happened`, or `the client did not confirm the jump in time; it may
+still have happened`. A press that was not
+sent because its client is no longer the followed one is logged as `ignored:`
+and that reason. The API's error codes (`stale_boot`,
+`jump_target_not_found`, `jump_endpoint_unavailable`, `jump_timeout`) do not
+appear in the log.
+
+Prompts and Enter do not go through Herdr. They are typed into the frontmost
+app as keyboard events, so they are sent only while the followed client
+reports that its window has focus; with another app in front they are refused
+and logged. So are they while the client's focus is unknown: a TUI cannot be
+typed into until its terminal has sent it a focus change, which a terminal
+that already had focus when the TUI started does only once you leave it and
+come back. A gesture captures the followed client at its first press; if it
+is no longer the followed client, or its window does not have focus, when the
+action fires or before any later keystroke (each chunk of text, and the
+Enter), nothing more is sent. Text is typed as Unicode keyboard events,
+so the keyboard layout does not matter and the pasteboard is not touched.
+
+A daemon whose `client.list` or subscription fails is logged with its own
+error, once per distinct error, and has no clients until it answers; it is
+asked again with a backoff of up to five seconds.
+
+`action: "key"` bindings and the device service's reserved Handy button work
+without any Herdr client. Official device ownership still gates all
+bridge work.
 
 Useful actions:
 

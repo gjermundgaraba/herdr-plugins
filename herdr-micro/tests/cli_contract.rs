@@ -3,7 +3,6 @@ use std::{
     io::{BufRead, BufReader, Write},
     os::unix::fs::PermissionsExt,
     os::unix::net::{UnixListener, UnixStream},
-    os::unix::process::CommandExt,
     path::Path,
     process::{Command, Output},
     thread,
@@ -118,46 +117,4 @@ fn status_stop_and_start_use_the_newline_json_socket_without_spawning() {
         fs::read_to_string(state.join("service-command")).unwrap(),
         "install\n"
     );
-}
-
-#[test]
-fn setup_pi_effort_uses_plugin_root_outside_the_repository() {
-    let directory = tempfile::Builder::new()
-        .prefix("hm-")
-        .tempdir_in("/tmp")
-        .unwrap();
-    let dir = directory.path();
-    let root = dir.join("plugin");
-    let source = root.join("integrations/pi/herdr-effort.js");
-    fs::create_dir_all(source.parent().unwrap()).unwrap();
-    let bundled =
-        fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("integrations/pi/herdr-effort.js"))
-            .unwrap();
-    fs::write(&source, &bundled).unwrap();
-    let home = dir.join("home");
-    let outside = dir.join("outside");
-    fs::create_dir(&home).unwrap();
-    fs::create_dir(&outside).unwrap();
-    let target = home.join(".pi/agent/extensions/herdr-micro-effort.ts");
-
-    let mut install = command(&["setup-pi-effort"]);
-    install
-        .current_dir(&outside)
-        .env("HERDR_PLUGIN_ROOT", &root)
-        .env("HOME", &home);
-    // SAFETY: umask is async-signal-safe and runs only in the child process.
-    unsafe {
-        install.pre_exec(|| {
-            libc::umask(0o077);
-            Ok(())
-        });
-    }
-    let install = install.output().unwrap();
-    assert!(install.status.success());
-    assert_eq!(fs::read(&target).unwrap(), bundled);
-    assert_eq!(
-        fs::metadata(&target).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
-    assert!(String::from_utf8_lossy(&install.stdout).contains("Installed Pi effort extension:"));
 }

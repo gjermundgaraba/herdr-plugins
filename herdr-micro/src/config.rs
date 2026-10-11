@@ -9,30 +9,20 @@ use std::{
 #[cfg(test)]
 use std::os::unix::fs::PermissionsExt;
 
+/// What a control does. `prompt` and `submit` are macOS keyboard events sent
+/// to the frontmost app while the followed Herdr client has focus; `key` is a
+/// macOS key tap that needs no Herdr client at all.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(tag = "action", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Action {
+    /// Type `prompt`, then press Enter unless `submit` is false.
     Prompt {
         prompt: String,
         #[serde(default)]
         submit: Option<bool>,
     },
-    Input {
-        #[serde(default)]
-        text: Option<String>,
-        #[serde(default)]
-        keys: Option<Vec<String>>,
-    },
-    Fast,
+    /// Press Enter.
     Submit,
-    Script {
-        command: String,
-        #[serde(default)]
-        args: Vec<String>,
-    },
-    FocusPane {
-        direction: Direction,
-    },
     Key {
         #[serde(default)]
         key: Option<String>,
@@ -147,13 +137,12 @@ impl Binding {
     }
 }
 
+/// Every action is a macOS keyboard event, so any bound control needs the
+/// permission to post one.
 fn binding_requires_accessibility(binding: &Binding) -> bool {
     match binding {
-        Binding::Action(action) => matches!(action, Action::Key { .. }),
-        Binding::ByAgent(actions) => actions
-            .values()
-            .flatten()
-            .any(|action| matches!(action, Action::Key { .. })),
+        Binding::Action(_) => true,
+        Binding::ByAgent(actions) => actions.values().any(Option::is_some),
         Binding::Gesture(gesture) => [
             &gesture.tap,
             &gesture.double_tap,
@@ -161,8 +150,7 @@ fn binding_requires_accessibility(binding: &Binding) -> bool {
             &gesture.release,
         ]
         .into_iter()
-        .flatten()
-        .any(|action| matches!(action, Action::Key { .. })),
+        .any(Option::is_some),
     }
 }
 
@@ -365,11 +353,10 @@ fn validate_action(action: &Action, label: &str) -> Result<(), String> {
         Action::Prompt { prompt, .. } if prompt.trim().is_empty() => {
             Err(format!("{label}.prompt must be a non-empty string"))
         }
-        Action::Script { command, .. } if command.trim().is_empty() => {
-            Err(format!("{label}.command must be a non-empty string"))
-        }
-        Action::Input { text, keys } if text.is_some() == keys.is_some() => Err(format!(
-            "{label}: input requires exactly one of text or keys"
+        // The prompt is typed key by key, where a newline is Enter and would
+        // submit early; other control characters are terminal input.
+        Action::Prompt { prompt, .. } if prompt.chars().any(char::is_control) => Err(format!(
+            "{label}.prompt must not contain control characters such as newlines"
         )),
         Action::Key { key, keycode, .. } => key_action_code(key.as_deref(), *keycode)
             .map(|_| ())
@@ -535,23 +522,21 @@ fn parse_config(value: &Value) -> Result<Config, String> {
 fn config_json() -> Value {
     serde_json::json!({
         "controls": {
-            "buttons": {"1":null,"2":null,"3":{"byAgent":{"codex":{"action":"fast"},"pi":{"action":"fast"},"default":null}},"4":{"action":"prompt","prompt":"/copy","submit":true},"5":null,"6":null,"7":{"action":"submit"}},
-            "dial":{
-                "clockwise":{"byAgent":{
-                    "codex":{"action":"script","command":"/bin/sh","args":["./integrations/thinking-effort.sh","alt+."]},
-                    "claude":{"action":"script","command":"/bin/sh","args":["./integrations/thinking-effort.sh","claude","raise"]},
-                    "pi":{"action":"script","command":"/bin/sh","args":["./integrations/thinking-effort.sh","ctrl+shift+right"]},
+            "buttons": {
+                "1":null,
+                "2":null,
+                "3":{"byAgent":{
+                    "codex":{"action":"prompt","prompt":"/fast","submit":true},
+                    "pi":{"action":"prompt","prompt":"/fast","submit":true},
                     "default":null
                 }},
-                "counterclockwise":{"byAgent":{
-                    "codex":{"action":"script","command":"/bin/sh","args":["./integrations/thinking-effort.sh","alt+,"]},
-                    "claude":{"action":"script","command":"/bin/sh","args":["./integrations/thinking-effort.sh","claude","lower"]},
-                    "pi":{"action":"script","command":"/bin/sh","args":["./integrations/thinking-effort.sh","ctrl+shift+left"]},
-                    "default":null
-                }},
-                "press":{"action":"prompt","prompt":"/model","submit":true}
+                "4":{"action":"prompt","prompt":"/copy","submit":true},
+                "5":null,
+                "6":null,
+                "7":{"action":"submit"}
             },
-            "joystick":{"engageDistance":0.75,"releaseDistance":0.3,"up":null,"down":null,"left":{"action":"focus-pane","direction":"left"},"right":{"action":"focus-pane","direction":"right"}}
+            "dial":{"clockwise":null,"counterclockwise":null,"press":{"action":"prompt","prompt":"/model","submit":true}},
+            "joystick":{"engageDistance":0.75,"releaseDistance":0.3,"up":null,"down":null,"left":null,"right":null}
         },
         "lighting": {
             "states": {
@@ -575,46 +560,83 @@ fn read_json(path: &Path) -> Result<Value, String> {
 mod tests {
     use super::*;
 
+    fn prompt(text: &str) -> Action {
+        Action::Prompt {
+            prompt: text.into(),
+            submit: Some(true),
+        }
+    }
+
+    #[test]
+    fn default_controls_use_only_prompt_and_submit() {
+        let controls = Config::default().controls;
+        assert_eq!(
+            key_binding(&controls, "ACT08", 1).unwrap().resolve("codex"),
+            Some(prompt("/fast"))
+        );
+        assert_eq!(
+            key_binding(&controls, "ACT08", 1).unwrap().resolve("pi"),
+            Some(prompt("/fast"))
+        );
+        assert_eq!(
+            key_binding(&controls, "ACT08", 1)
+                .unwrap()
+                .resolve("claude"),
+            None
+        );
+        assert_eq!(
+            key_binding(&controls, "ACT09", 1).unwrap().resolve(""),
+            Some(prompt("/copy"))
+        );
+        assert_eq!(
+            key_binding(&controls, "ACT12", 1),
+            Some(Binding::Action(Action::Submit))
+        );
+        assert_eq!(
+            key_binding(&controls, "ENC_CLK", 1),
+            Some(Binding::Action(prompt("/model")))
+        );
+        // Nothing is bound to dial rotation or the joystick by default.
+        for key in ["ENC_CC", "ENC_CW"] {
+            assert!(key_binding(&controls, key, 1).is_none());
+        }
+        assert_eq!(
+            [
+                &controls.joystick.up,
+                &controls.joystick.down,
+                &controls.joystick.left,
+                &controls.joystick.right
+            ],
+            [&None; 4]
+        );
+        assert_eq!(
+            enabled_buttons(&controls),
+            [false, false, true, true, true, false, true]
+        );
+        // Prompts and submits are keyboard events, like `key` taps.
+        assert!(requires_accessibility(&controls));
+    }
+
     #[test]
     fn controls_reject_unknown_fields_and_map_reversed_dial_labels() {
-        let controls = Config::default().controls;
-        assert!(controls.joystick.up.is_none());
-        assert!(controls.joystick.down.is_none());
+        let mut dial = config_json();
+        dial["controls"]["dial"]["clockwise"] = serde_json::json!({"action":"submit"});
+        dial["controls"]["dial"]["counterclockwise"] =
+            serde_json::json!({"action":"prompt","prompt":"/model"});
+        let controls = parse_config(&dial).unwrap().controls;
         for action in [-1, 0, 1, 2, 3] {
-            assert!(key_binding(&controls, "ENC_CC", action).is_some());
+            assert_eq!(
+                key_binding(&controls, "ENC_CC", action),
+                Some(Binding::Action(Action::Submit))
+            );
         }
-        for (key, agent, expected) in [
-            ("ENC_CC", "codex", "alt+."),
-            ("ENC_CW", "codex", "alt+,"),
-            ("ENC_CC", "pi", "ctrl+shift+right"),
-            ("ENC_CW", "pi", "ctrl+shift+left"),
-        ] {
-            match key_binding(&controls, key, 1)
-                .unwrap()
-                .resolve(agent)
-                .unwrap()
-            {
-                Action::Script { args, .. } => {
-                    assert_eq!(args[1], expected);
-                }
-                action => panic!("unexpected {agent} dial action: {action:?}"),
-            }
-        }
-        for (key, direction) in [("ENC_CC", "raise"), ("ENC_CW", "lower")] {
-            match key_binding(&controls, key, 1)
-                .unwrap()
-                .resolve("claude")
-                .unwrap()
-            {
-                Action::Script { args, .. } => {
-                    assert_eq!(
-                        args,
-                        ["./integrations/thinking-effort.sh", "claude", direction]
-                    );
-                }
-                action => panic!("unexpected Claude dial action: {action:?}"),
-            }
-        }
+        assert_eq!(
+            key_binding(&controls, "ENC_CW", 1),
+            Some(Binding::Action(Action::Prompt {
+                prompt: "/model".into(),
+                submit: None
+            }))
+        );
         assert_eq!(device_button("ACT06"), Some(1));
         assert_eq!(device_button("ACT10"), Some(5));
         assert_eq!(device_button("ACT12"), Some(7));
@@ -626,10 +648,6 @@ mod tests {
         );
         assert_eq!(device_button("F21"), None);
         assert_eq!(device_button("F13"), None);
-        assert_eq!(
-            enabled_buttons(&controls),
-            [false, false, true, true, true, false, true]
-        );
         let mut reserved = config_json();
         reserved["controls"]["buttons"]["5"] = serde_json::json!({"action":"submit"});
         assert_eq!(
@@ -645,10 +663,6 @@ mod tests {
         let mut stale = config_json();
         stale["controls"]["actionDeviceKeys"] = serde_json::json!({});
         assert!(parse_config(&stale).is_err());
-        let mut removed_scroll = config_json();
-        removed_scroll["controls"]["joystick"]["up"] =
-            serde_json::json!({"action":"scroll","direction":"up","percent":50});
-        assert!(parse_config(&removed_scroll).is_err());
         let mut extra = config_json();
         extra["controls"]["dial"]["extra"] = Value::Bool(true);
         assert!(parse_config(&extra).is_err());
@@ -662,8 +676,41 @@ mod tests {
     }
 
     #[test]
+    fn unknown_actions_are_rejected() {
+        let mut config = config_json();
+        config["controls"]["buttons"]["1"] = serde_json::json!({"action":"launch"});
+        let error = parse_config(&config).unwrap_err();
+        assert!(error.contains("unknown variant `launch`"), "{error}");
+    }
+
+    #[test]
+    fn prompts_must_be_typeable_text() {
+        for (prompt, valid) in [
+            ("/model", true),
+            ("review this ünïcode 🙂", true),
+            ("  ", false),
+            ("", false),
+            ("one\ntwo", false),
+            ("tab\there", false),
+            ("escape\u{1b}", false),
+        ] {
+            let mut config = config_json();
+            config["controls"]["buttons"]["1"] =
+                serde_json::json!({"action":"prompt","prompt":prompt});
+            assert_eq!(parse_config(&config).is_ok(), valid, "{prompt:?}");
+        }
+    }
+
+    #[test]
     fn key_actions_resolve_names_or_raw_keycodes() {
-        assert!(!requires_accessibility(&Config::default().controls));
+        let mut unbound = config_json();
+        unbound["controls"]["buttons"] = serde_json::json!({});
+        unbound["controls"]["dial"]["press"] = serde_json::Value::Null;
+        unbound["controls"]["joystick"]["up"] =
+            serde_json::json!({"byAgent":{"codex":null,"default":null}});
+        assert!(!requires_accessibility(
+            &parse_config(&unbound).unwrap().controls
+        ));
         let mut named = config_json();
         named["controls"]["buttons"]["6"] = serde_json::json!({"action":"key","key":"F19"});
         let named = parse_config(&named).unwrap().controls;
@@ -704,11 +751,7 @@ mod tests {
     }
 
     #[test]
-    fn validates_scripts_and_lighting() {
-        let mut config = config_json();
-        config["controls"]["dial"]["clockwise"] =
-            serde_json::json!({"action":"script","command":" "});
-        assert!(parse_config(&config).is_err());
+    fn validates_lighting() {
         let mut lighting = config_json();
         lighting["lighting"] =
             serde_json::json!({"states":{},"focusedBrightness":1,"ambient":true,"keys":false});

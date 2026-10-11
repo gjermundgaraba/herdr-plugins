@@ -5,7 +5,6 @@ pub mod daemon;
 pub mod doctor;
 pub mod gestures;
 pub mod macos;
-pub mod process;
 pub mod protocol;
 pub mod setup;
 

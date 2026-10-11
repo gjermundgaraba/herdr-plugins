@@ -4,10 +4,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[derive(Clone, Debug, PartialEq)]
+/// What a gesture's actions act on, captured at its first press: the
+/// followed client, and the kind of agent it had focused.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GestureContext {
-    pub route: herdr_frontend::directory::ClientRoute,
-    pub target: Option<herdr_frontend::Agent>,
+    pub client: herdr_client::follow::ClientKey,
+    pub agent: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -193,15 +195,21 @@ mod tests {
     use super::*;
     use crate::config::Action;
 
-    fn context(client_id: &str, generation: u64) -> Option<GestureContext> {
+    fn prompt(text: &str) -> Action {
+        Action::Prompt {
+            prompt: text.into(),
+            submit: None,
+        }
+    }
+
+    fn context(session: &str, client_id: u64) -> Option<GestureContext> {
         Some(GestureContext {
-            route: herdr_frontend::directory::ClientRoute {
-                client_id: client_id.into(),
-                endpoint_id: "endpoint".into(),
-                boot_id: Some(format!("boot-{generation}")),
-                socket_path: "/tmp/test.sock".into(),
+            client: herdr_client::follow::ClientKey {
+                socket_path: format!("/tmp/{session}.sock").into(),
+                boot_id: "boot".into(),
+                client_id,
             },
-            target: None,
+            agent: None,
         })
     }
 
@@ -210,7 +218,7 @@ mod tests {
         let mut dispatcher = GestureDispatcher::default();
         let binding = Binding::Gesture(Box::new(GestureBinding {
             tap: Some(Action::Submit),
-            double_tap: Some(Action::Fast),
+            double_tap: Some(prompt("/second")),
             ..Default::default()
         }));
         let now = Instant::now();
@@ -227,7 +235,7 @@ mod tests {
         let fired = dispatcher.handle("key", Some(&binding), true, context("second", 2), now);
         assert!(fired.is_empty());
         let fired = dispatcher.handle("key", Some(&binding), false, context("second", 2), now);
-        assert_eq!(fired[0].action, Action::Fast);
+        assert_eq!(fired[0].action, prompt("/second"));
         assert_eq!(fired[0].context, context("first", 1));
     }
 
@@ -236,7 +244,7 @@ mod tests {
         let mut dispatcher = GestureDispatcher::default();
         let binding = Binding::Gesture(Box::new(GestureBinding {
             tap: Some(Action::Submit),
-            double_tap: Some(Action::Fast),
+            double_tap: Some(prompt("/second")),
             double_tap_ms: Some(100),
             ..Default::default()
         }));
@@ -258,7 +266,7 @@ mod tests {
     fn deferred_hold_fires_once_at_its_deadline() {
         let mut dispatcher = GestureDispatcher::default();
         let binding = Binding::Gesture(Box::new(GestureBinding {
-            hold: Some(Action::Fast),
+            hold: Some(prompt("/held")),
             hold_ms: Some(100),
             ..Default::default()
         }));
@@ -271,7 +279,7 @@ mod tests {
         );
         let fired = dispatcher.drain_due(now + Duration::from_millis(100));
         assert_eq!(fired.len(), 1);
-        assert_eq!(fired[0].action, Action::Fast);
+        assert_eq!(fired[0].action, prompt("/held"));
         assert!(
             dispatcher
                 .drain_due(now + Duration::from_millis(200))
