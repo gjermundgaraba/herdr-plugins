@@ -1,0 +1,221 @@
+{
+  "boot_id": "boot-a",
+  "revision": 7,
+  "config_diagnostic": null,
+  "product_announcement": null,
+  "update_available": null,
+  "update_install_command": "herdr update",
+  "server_keybindings_toml": null,
+  "latest_release_notes_available": false,
+  "integration_updates_available": false,
+  "worktree_directory": "/worktrees",
+  "release_notes": null,
+  "focused_workspace_id": "w2",
+  "focused_tab_id": "w2:t1",
+  "focused_pane_id": "w2:p1",
+  "tab_bar_right": [],
+  "tab_bar_right_separator": " ",
+  "agent_view_label": null,
+  "agent_order": [
+    "w1:p1",
+    "w2:p1",
+    "w2:p2"
+  ],
+  "workspaces": [
+    {
+      "workspace_id": "w1",
+      "active_tab_id": "w1:t1",
+      "new_workspace_cwd": "/work/api",
+      "number": 1,
+      "label": "api",
+      "custom_label": false,
+      "branch": "main",
+      "git_ahead_behind": null,
+      "tokens": [
+        [
+          "prio",
+          "high"
+        ],
+        [
+          "team",
+          "platform"
+        ]
+      ],
+      "worktree": null,
+      "focused": false,
+      "agent_status": "done"
+    },
+    {
+      "workspace_id": "w2",
+      "active_tab_id": "w2:t1",
+      "new_workspace_cwd": "/work/web",
+      "number": 2,
+      "label": "web",
+      "custom_label": false,
+      "branch": "main",
+      "git_ahead_behind": null,
+      "tokens": [
+        [
+          "team",
+          "platform"
+        ]
+      ],
+      "worktree": null,
+      "focused": true,
+      "agent_status": "blocked"
+    }
+  ],
+  "tabs": [
+    {
+      "tab_id": "w1:t1",
+      "workspace_id": "w1",
+      "number": 1,
+      "label": "main",
+      "custom_label": false,
+      "zoomed": false,
+      "focused": false,
+      "agent_status": "done"
+    },
+    {
+      "tab_id": "w2:t1",
+      "workspace_id": "w2",
+      "number": 1,
+      "label": "main",
+      "custom_label": false,
+      "zoomed": false,
+      "focused": true,
+      "agent_status": "blocked"
+    }
+  ],
+  "panes": [
+    {
+      "pane_id": "w1:p1",
+      "workspace_id": "w1",
+      "tab_id": "w1:t1",
+      "label": null,
+      "cwd": "/work/w1",
+      "foreground_cwd": null,
+      "focused": false,
+      "right_click_passthrough": false
+    },
+    {
+      "pane_id": "w2:p1",
+      "workspace_id": "w2",
+      "tab_id": "w2:t1",
+      "label": null,
+      "cwd": "/work/w2",
+      "foreground_cwd": null,
+      "focused": true,
+      "right_click_passthrough": false
+    },
+    {
+      "pane_id": "w2:p2",
+      "workspace_id": "w2",
+      "tab_id": "w2:t1",
+      "label": null,
+      "cwd": "/work/w2",
+      "foreground_cwd": null,
+      "focused": false,
+      "right_click_passthrough": false
+    }
+  ],
+  "agents": [
+    {
+      "pane_id": "w1:p1",
+      "workspace_id": "w1",
+      "tab_id": "w1:t1",
+      "name": null,
+      "display_agent": "Claude",
+      "agent": "claude",
+      "title": "Review",
+      "terminal_title": "Claude Review",
+      "terminal_title_stripped": "Claude Review",
+      "agent_status": "done",
+      "state_change_seq": 12,
+      "state_labels": [],
+      "tokens": [
+        [
+          "task",
+          "review"
+        ]
+      ],
+      "focused": false,
+      "priority_key": "0.1.00065d7128fb2820",
+      "priority_mark": "high"
+    },
+    {
+      "pane_id": "w2:p1",
+      "workspace_id": "w2",
+      "tab_id": "w2:t1",
+      "name": null,
+      "display_agent": "Claude",
+      "agent": "claude",
+      "title": "Review",
+      "terminal_title": "Claude Review",
+      "terminal_title_stripped": "Claude Review",
+      "agent_status": "blocked",
+      "state_change_seq": 11,
+      "state_labels": [],
+      "tokens": [
+        [
+          "task",
+          "review"
+        ]
+      ],
+      "focused": true,
+      "priority_key": "1.0.00065d7125600000",
+      "priority_mark": null
+    },
+    {
+      "pane_id": "w2:p2",
+      "workspace_id": "w2",
+      "tab_id": "w2:t1",
+      "name": null,
+      "display_agent": "Claude",
+      "agent": "claude",
+      "title": "Review",
+      "terminal_title": "Claude Review",
+      "terminal_title_stripped": "Claude Review",
+      "agent_status": "idle",
+      "state_change_seq": 13,
+      "state_labels": [],
+      "tokens": [
+        [
+          "task",
+          "review"
+        ]
+      ],
+      "focused": false,
+      "priority_key": "1.3.fff9a28ed378f1ff",
+      "priority_mark": null
+    }
+  ],
+  "commands": [
+    {
+      "command_id": "deploy",
+      "binding_label": "prefix+d",
+      "binding_labels": [
+        "prefix+d"
+      ],
+      "action": "Shell",
+      "description": null
+    }
+  ],
+  "pinned_sections": [
+    {
+      "title": "Priority",
+      "fg": "#ff8800",
+      "workspace_ids": [
+        "w1"
+      ]
+    },
+    {
+      "title": "Platform",
+      "fg": null,
+      "workspace_ids": [
+        "w1",
+        "w2"
+      ]
+    }
+  ]
+}

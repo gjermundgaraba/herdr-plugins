@@ -1,0 +1,21 @@
+{
+  "request": {
+    "id": "req_jump",
+    "method": "client.jump",
+    "params": {
+      "client_id": 7,
+      "endpoint_id": "ssh:0123456789abcdef0123456789abcdef",
+      "boot_id": "boot-b",
+      "pane_id": "w1:p4"
+    }
+  },
+  "response": {
+    "id": "req_jump",
+    "result": {
+      "type": "client_jumped",
+      "client_id": 7,
+      "endpoint_id": "ssh:0123456789abcdef0123456789abcdef",
+      "pane_id": "w1:p4"
+    }
+  }
+}

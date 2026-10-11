@@ -11,9 +11,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    AgentInfo, AgentStartParams, EventEnvelope, EventSubscription, LayoutDescription,
-    LayoutExportParams, LayoutSetSplitRatioParams, PaneInfo, PaneSplitParams, PickOutcome,
-    PickParams, SessionSnapshot,
+    AgentInfo, AgentStartParams, ClientChanged, ClientJumpError, ClientJumpParams, ClientJumped,
+    ClientList, EventEnvelope, EventSubscription, LayoutDescription, LayoutExportParams,
+    LayoutSetSplitRatioParams, PaneInfo, PaneSplitParams, PickOutcome, PickParams, SessionSnapshot,
 };
 
 type LocalStream = interprocess::local_socket::Stream;
@@ -116,6 +116,36 @@ impl Client {
         Ok(result.agent)
     }
 
+    /// Every attached client with its latest report.
+    pub fn list_clients(&self) -> Result<ClientList, Error> {
+        self.call("client.list", &json!({}))
+    }
+
+    /// Asks one client to show a pane, switching endpoint when it has to:
+    /// connects and writes one `client.jump`, without waiting for its
+    /// answer, which [`PendingJump::wait`] reads. Dropping the pending jump
+    /// closes the connection and withdraws nothing.
+    /// The daemon answers once the client did, or after twenty
+    /// seconds; give this client a timeout of [`crate::CLIENT_JUMP_TIMEOUT`]
+    /// so the typed answer arrives first. The jump is written once and never
+    /// retried.
+    pub fn start_jump(&self, params: &ClientJumpParams) -> Result<PendingJump, ClientJumpError> {
+        let id = self.request_id();
+        let mut stream = self.connect()?;
+        self.set_timeouts(&stream)?;
+        write_request(&mut stream, &id, "client.jump", params)?;
+        Ok(PendingJump {
+            id,
+            reader: BufReader::new(stream),
+        })
+    }
+
+    /// Subscribe to `client.changed`. Subscribe first and call
+    /// [`Client::list_clients`] afterwards, so no change falls between them.
+    pub fn subscribe_client_changes(&self) -> Result<Subscription, Error> {
+        self.subscribe(&[ClientChanged::subscription()])
+    }
+
     /// Show a native picker and wait until the user answers it. The wait
     /// ignores this client's timeout, because it lasts as long as the user takes.
     pub fn pick(&self, params: &PickParams) -> Result<PickOutcome, Error> {
@@ -169,6 +199,20 @@ impl Client {
         };
         set_timeout_best_effort(stream.set_send_timeout(Some(timeout)))?;
         set_timeout_best_effort(stream.set_recv_timeout(Some(timeout)))
+    }
+}
+
+/// A `client.jump` the daemon has been sent and has not answered yet.
+pub struct PendingJump {
+    id: String,
+    reader: BufReader<LocalStream>,
+}
+
+impl PendingJump {
+    /// Waits for the daemon's answer, as long as the timeout of the client
+    /// that started the jump allows.
+    pub fn wait(mut self) -> Result<ClientJumped, ClientJumpError> {
+        read_response(&mut self.reader, &self.id).map_err(Into::into)
     }
 }
 
