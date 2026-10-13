@@ -56,9 +56,22 @@ impl Client {
         P: Serialize + ?Sized,
         R: DeserializeOwned,
     {
+        self.call_with_timeout(method, params, self.timeout)
+    }
+
+    fn call_with_timeout<P, R>(
+        &self,
+        method: &str,
+        params: &P,
+        timeout: Option<Duration>,
+    ) -> Result<R, Error>
+    where
+        P: Serialize + ?Sized,
+        R: DeserializeOwned,
+    {
         let id = self.request_id();
         let mut stream = self.connect()?;
-        self.set_timeouts(&stream)?;
+        set_timeouts(&stream, timeout)?;
         write_request(&mut stream, &id, method, params)?;
         read_response(&mut BufReader::new(stream), &id)
     }
@@ -214,12 +227,16 @@ impl Client {
     }
 
     fn set_timeouts(&self, stream: &LocalStream) -> Result<(), Error> {
-        let Some(timeout) = self.timeout else {
-            return Ok(());
-        };
-        set_timeout_best_effort(stream.set_send_timeout(Some(timeout)))?;
-        set_timeout_best_effort(stream.set_recv_timeout(Some(timeout)))
+        set_timeouts(stream, self.timeout)
     }
+}
+
+fn set_timeouts(stream: &LocalStream, timeout: Option<Duration>) -> Result<(), Error> {
+    let Some(timeout) = timeout else {
+        return Ok(());
+    };
+    set_timeout_best_effort(stream.set_send_timeout(Some(timeout)))?;
+    set_timeout_best_effort(stream.set_recv_timeout(Some(timeout)))
 }
 
 /// A `client.jump` the daemon has been sent and has not answered yet.

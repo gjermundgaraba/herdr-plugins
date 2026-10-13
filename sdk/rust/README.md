@@ -49,8 +49,10 @@ if let Some(pane_id) = context.focused_pane_id.as_deref() {
 
 `start_agent` returns once the daemon launched the agent; unlike `herdr agent
 start`, it does not wait for the agent to become ready. It retries for up to
-two seconds while the target pane's shell is still starting, as the CLI does,
-and then returns the daemon's `agent_pane_busy`.
+two seconds from the first busy answer while the target pane's shell is still
+starting, as the CLI does, and then returns the daemon's `agent_pane_busy`. The
+reads between attempts share those two seconds where the platform supports
+socket timeouts, so a stalled daemon also ends in `agent_pane_busy`.
 
 Methods added after this crate's tested Herdr version remain usable:
 

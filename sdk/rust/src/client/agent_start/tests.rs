@@ -1,16 +1,35 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 
 use super::*;
 use crate::ApiError;
 
 const STOP: &str = "test.stop";
+/// A short retry budget for tests that run it out.
+const BUDGET: Duration = Duration::from_millis(300);
+const TRICKLE_PIECES: usize = 15;
+
+/// How a test daemon writes an answer.
+enum Reply {
+    /// The whole answer at once; [`hang_up`] closes the connection unanswered.
+    Now(Value),
+    /// The answer in small pieces, each sent before a socket timeout set for
+    /// the whole read could expire, so only the total time is slow.
+    Trickle(Value, Duration),
+}
+
+impl From<Value> for Reply {
+    fn from(answer: Value) -> Self {
+        Self::Now(answer)
+    }
+}
 
 /// A daemon that answers one request per connection and records the
-/// methods it was asked. An answer of [`hang_up`] closes the connection
-/// unanswered.
+/// methods it was asked. While `answer` runs, the request's connection stays
+/// open and unanswered.
 struct Daemon {
     dir: tempfile::TempDir,
     path: PathBuf,
@@ -18,7 +37,7 @@ struct Daemon {
 }
 
 impl Daemon {
-    fn start(mut answer: impl FnMut(&str) -> Value + Send + 'static) -> Self {
+    fn start<R: Into<Reply>>(mut answer: impl FnMut(&str) -> R + Send + 'static) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.sock");
         let listener = UnixListener::bind(&path).unwrap();
@@ -35,10 +54,23 @@ impl Daemon {
                 if method == STOP {
                     return methods;
                 }
-                let mut response = answer(&method);
+                let (mut response, gap) = match answer(&method).into() {
+                    Reply::Now(response) => (response, None),
+                    Reply::Trickle(response, gap) => (response, Some(gap)),
+                };
                 if !response.is_null() {
                     response["id"] = request["id"].clone();
-                    writeln!(stream, "{response}").unwrap();
+                    let line = format!("{response}\n");
+                    match gap {
+                        None => stream.write_all(line.as_bytes()).unwrap(),
+                        Some(gap) => {
+                            let size = line.len().div_ceil(TRICKLE_PIECES);
+                            for piece in line.as_bytes().chunks(size) {
+                                thread::sleep(gap);
+                                stream.write_all(piece).unwrap();
+                            }
+                        }
+                    }
                 }
                 methods.push(method);
             }
@@ -202,6 +234,75 @@ fn gives_up_two_seconds_after_the_first_busy_answer() {
     assert!(elapsed < Duration::from_secs(4), "{elapsed:?}");
     let starts = start_calls(&daemon.finish());
     assert!(starts > 1, "{starts} starts");
+}
+
+/// A read that never answers runs out with the budget instead of holding
+/// the caller, which then gets the busy answer and can roll back.
+#[test]
+fn a_stalled_read_returns_the_busy_answer_within_the_budget() {
+    for stalled in ["pane.get", "pane.process_info"] {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let daemon = Daemon::start(move |method| match method {
+            _ if method == stalled => {
+                entered_tx.send(()).unwrap();
+                // Held open until the test has the client's result.
+                release_rx.recv().unwrap();
+                hang_up()
+            }
+            "pane.get" => pane("t1"),
+            "pane.process_info" => starting(),
+            "agent.start" => error(PANE_BUSY),
+            other => panic!("unexpected {other}"),
+        });
+        let client = daemon.client();
+        let (done_tx, done_rx) = mpsc::channel();
+        let started_at = Instant::now();
+        let caller = thread::spawn(move || {
+            done_tx
+                .send(client.start_agent_within(&params(), BUDGET))
+                .unwrap();
+        });
+        entered_rx.recv().unwrap();
+        let result = done_rx.recv_timeout(BUDGET + Duration::from_secs(2));
+        let elapsed = started_at.elapsed();
+        release_tx.send(()).unwrap();
+        let result = result.expect("start_agent waited on a stalled read");
+        assert_eq!(busy_code(result), PANE_BUSY, "{stalled}");
+        assert!(elapsed >= BUDGET, "{stalled}: {elapsed:?}");
+        caller.join().unwrap();
+        assert_eq!(start_calls(&daemon.finish()), 1, "{stalled}");
+    }
+}
+
+/// The read before another attempt answers, but only after the budget ran
+/// out, so no further start is sent.
+#[test]
+fn a_read_that_answers_after_the_budget_sends_no_further_start() {
+    let mut reads = 0;
+    let daemon = Daemon::start(move |method| match method {
+        "pane.get" => pane("t1").into(),
+        "pane.process_info" => {
+            reads += 1;
+            if reads == 1 {
+                starting().into()
+            } else {
+                // Each piece arrives well within the read's timeout, the
+                // whole answer only after the budget.
+                Reply::Trickle(starting(), BUDGET / TRICKLE_PIECES as u32)
+            }
+        }
+        "agent.start" => error(PANE_BUSY).into(),
+        other => panic!("unexpected {other}"),
+    });
+    let result = daemon.client().start_agent_within(&params(), BUDGET);
+    assert_eq!(busy_code(result), PANE_BUSY);
+    let methods = daemon.finish();
+    assert_eq!(start_calls(&methods), 1, "{methods:?}");
+    assert_eq!(
+        methods.iter().filter(|m| *m == "pane.process_info").count(),
+        2
+    );
 }
 
 #[test]
