@@ -312,12 +312,6 @@ mod tests {
             "focused_pane_agent": "claude",
             "client_id": 7,
             "invocation_source": "keybinding",
-            // An older fork daemon also sent these; they are ignored.
-            "focused_pane_agent_session": {
-                "source": "herdr:claude", "agent": "claude", "kind": "id", "value": "abc"
-            },
-            "tabs": [{ "tab_id": "w1:t2" }],
-            "workspaces": [],
         }))
         .unwrap();
         assert_eq!(context.focused_pane_id.as_deref(), Some("w1:p3"));

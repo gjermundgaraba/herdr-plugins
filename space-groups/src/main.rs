@@ -45,12 +45,12 @@ fn run() -> Result<()> {
     let environment = Environment::load()?;
     let client = Client::from_env()?.with_timeout(SOCKET_TIMEOUT);
     let context = environment.context.clone().unwrap_or_default();
-    let workspaces = || client.list_workspaces().context("list the spaces");
     match environment.invocation() {
-        Some(PluginInvocation::Startup) => {
-            import_saved_groups(&environment, &client, &workspaces()?)
+        Some(PluginInvocation::Startup) => import_saved_groups(&environment, &client),
+        Some(PluginInvocation::Action(_)) => {
+            let workspaces = client.list_workspaces().context("list the spaces")?;
+            assign(&client, &context, &workspaces)
         }
-        Some(PluginInvocation::Action(_)) => assign(&client, &context, &workspaces()?),
         _ => bail!("run this through the plugin's action or startup hook"),
     }
 }
@@ -68,11 +68,7 @@ fn set_group(client: &Client, workspace_id: &str, group: Option<&str>) -> Result
 /// One-shot import of the per-session file earlier versions saved groups in.
 /// The file is kept as `groups.json.imported`. Remove this once every session
 /// has started with this version.
-fn import_saved_groups(
-    environment: &Environment,
-    client: &Client,
-    workspaces: &[WorkspaceInfo],
-) -> Result<()> {
+fn import_saved_groups(environment: &Environment, client: &Client) -> Result<()> {
     #[derive(serde::Deserialize)]
     struct Saved {
         #[serde(default)]
@@ -90,6 +86,7 @@ fn import_saved_groups(
         Err(error) => return Err(error).context("read saved groups"),
     };
     let saved: Saved = serde_json::from_slice(&bytes).context("parse saved groups")?;
+    let workspaces = client.list_workspaces().context("list the spaces")?;
     for (workspace_id, group) in &saved.workspaces {
         if workspaces
             .iter()

@@ -47,9 +47,10 @@ if let Some(pane_id) = context.focused_pane_id.as_deref() {
 }
 ```
 
-`start_agent` retries for up to two seconds while the target pane's shell is
-still starting, as `herdr agent start` does, and then returns the daemon's
-`agent_pane_busy`.
+`start_agent` returns once the daemon launched the agent; unlike `herdr agent
+start`, it does not wait for the agent to become ready. It retries for up to
+two seconds while the target pane's shell is still starting, as the CLI does,
+and then returns the daemon's `agent_pane_busy`.
 
 Methods added after this crate's tested Herdr version remain usable:
 

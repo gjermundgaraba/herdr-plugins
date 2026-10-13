@@ -43,13 +43,11 @@ fn run() -> Result<()> {
     let environment = Environment::load()?;
     let client = Client::from_env()?.with_timeout(SOCKET_TIMEOUT);
     let context = environment.context.clone().unwrap_or_default();
-    let workspaces = || client.list_workspaces().context("list the spaces");
     match environment.invocation() {
-        Some(PluginInvocation::Startup) => {
-            import_saved_marks(&environment, &client, &workspaces()?)
-        }
+        Some(PluginInvocation::Startup) => import_saved_marks(&environment, &client),
         Some(PluginInvocation::Action(_)) => {
-            toggle(&client, context.workspace_id.as_deref(), &workspaces()?)
+            let workspaces = client.list_workspaces().context("list the spaces")?;
+            toggle(&client, context.workspace_id.as_deref(), &workspaces)
         }
         _ => bail!("run this through the plugin's action or startup hook"),
     }
@@ -96,11 +94,7 @@ fn publish(client: &Client, workspace_id: &str, marked: bool) -> Result<()> {
 /// One-shot import of the per-session file earlier versions saved marks in.
 /// The file is kept as `priority.json.imported`. Remove this once every
 /// session has started with this version.
-fn import_saved_marks(
-    environment: &Environment,
-    client: &Client,
-    workspaces: &[WorkspaceInfo],
-) -> Result<()> {
+fn import_saved_marks(environment: &Environment, client: &Client) -> Result<()> {
     #[derive(serde::Deserialize)]
     struct Saved {
         #[serde(default)]
@@ -113,6 +107,7 @@ fn import_saved_marks(
         Err(error) => return Err(error).context("read saved priority spaces"),
     };
     let saved: Saved = serde_json::from_slice(&bytes).context("parse saved priority spaces")?;
+    let workspaces = client.list_workspaces().context("list the spaces")?;
     for workspace in workspaces
         .iter()
         .filter(|workspace| saved.workspaces.contains(&workspace.workspace_id))

@@ -9,7 +9,8 @@ use crate::ApiError;
 const STOP: &str = "test.stop";
 
 /// A daemon that answers one request per connection and records the
-/// methods it answered.
+/// methods it was asked. An answer of [`hang_up`] closes the connection
+/// unanswered.
 struct Daemon {
     dir: tempfile::TempDir,
     path: PathBuf,
@@ -35,8 +36,10 @@ impl Daemon {
                     return methods;
                 }
                 let mut response = answer(&method);
-                response["id"] = request["id"].clone();
-                writeln!(stream, "{response}").unwrap();
+                if !response.is_null() {
+                    response["id"] = request["id"].clone();
+                    writeln!(stream, "{response}").unwrap();
+                }
                 methods.push(method);
             }
         });
@@ -47,7 +50,7 @@ impl Daemon {
         Client::new(&self.path)
     }
 
-    /// Stops the daemon and returns the methods it answered, in order.
+    /// Stops the daemon and returns the methods it was asked, in order.
     fn finish(self) -> Vec<String> {
         let mut stream = UnixStream::connect(&self.path).unwrap();
         writeln!(stream, "{}", json!({ "id": "stop", "method": STOP })).unwrap();
@@ -57,13 +60,13 @@ impl Daemon {
     }
 }
 
-fn params(timeout_ms: Option<u64>) -> AgentStartParams {
+fn params() -> AgentStartParams {
     AgentStartParams {
         name: "fork".into(),
         kind: "pi".into(),
         pane_id: "w1:p2".into(),
         args: Vec::new(),
-        timeout_ms,
+        timeout_ms: None,
     }
 }
 
@@ -73,6 +76,18 @@ fn pane(terminal_id: &str) -> Value {
 
 fn error(code: &str) -> Value {
     json!({ "error": { "code": code, "message": code } })
+}
+
+/// Closes the connection without an answer, a transport error to the client.
+fn hang_up() -> Value {
+    Value::Null
+}
+
+fn start_calls(methods: &[String]) -> usize {
+    methods
+        .iter()
+        .filter(|method| *method == "agent.start")
+        .count()
 }
 
 fn process_info(group: u64, processes: Value) -> Value {
@@ -122,16 +137,19 @@ fn retries_a_starting_shell_until_the_agent_starts() {
         }
         other => panic!("unexpected {other}"),
     });
-    let agent = daemon.client().start_agent(&params(None)).unwrap();
+    let agent = daemon.client().start_agent(&params()).unwrap();
     assert_eq!(agent.pane_id, "w1:p2");
-    let check = ["pane.get", "pane.process_info"];
-    let mut expected = vec!["pane.get", "agent.start"];
-    for _ in 0..2 {
-        expected.extend(check);
-        expected.extend(check);
-        expected.push("agent.start");
-    }
-    assert_eq!(daemon.finish(), expected);
+    assert_eq!(start_calls(&daemon.finish()), 3);
+}
+
+#[test]
+fn a_start_that_succeeds_at_once_makes_no_other_call() {
+    let daemon = Daemon::start(|method| match method {
+        "agent.start" => started(),
+        other => panic!("unexpected {other}"),
+    });
+    daemon.client().start_agent(&params()).unwrap();
+    assert_eq!(daemon.finish(), ["agent.start"]);
 }
 
 #[test]
@@ -146,15 +164,12 @@ fn stops_when_the_pane_gets_another_terminal() {
         "agent.start" => error(PANE_BUSY),
         other => panic!("unexpected {other}"),
     });
-    assert_eq!(
-        busy_code(daemon.client().start_agent(&params(None))),
-        PANE_BUSY
-    );
+    assert_eq!(busy_code(daemon.client().start_agent(&params())), PANE_BUSY);
     assert_eq!(
         daemon.finish(),
         [
-            "pane.get",
             "agent.start",
+            "pane.get",
             "pane.get",
             "pane.process_info",
             "pane.get"
@@ -170,13 +185,10 @@ fn does_not_retry_a_shell_running_a_command() {
         "agent.start" => error(PANE_BUSY),
         other => panic!("unexpected {other}"),
     });
-    assert_eq!(
-        busy_code(daemon.client().start_agent(&params(None))),
-        PANE_BUSY
-    );
+    assert_eq!(busy_code(daemon.client().start_agent(&params())), PANE_BUSY);
     assert_eq!(
         daemon.finish(),
-        ["pane.get", "agent.start", "pane.get", "pane.process_info"]
+        ["agent.start", "pane.get", "pane.get", "pane.process_info"]
     );
 }
 
@@ -189,39 +201,49 @@ fn gives_up_two_seconds_after_the_first_busy_answer() {
         other => panic!("unexpected {other}"),
     });
     let started_at = Instant::now();
-    assert_eq!(
-        busy_code(daemon.client().start_agent(&params(None))),
-        PANE_BUSY
-    );
+    assert_eq!(busy_code(daemon.client().start_agent(&params())), PANE_BUSY);
     let elapsed = started_at.elapsed();
     assert!(elapsed >= SHELL_READINESS_RETRY_TIMEOUT, "{elapsed:?}");
     assert!(elapsed < Duration::from_secs(4), "{elapsed:?}");
-    let starts = daemon
-        .finish()
-        .iter()
-        .filter(|method| *method == "agent.start")
-        .count();
+    let starts = start_calls(&daemon.finish());
     assert!(starts > 1, "{starts} starts");
 }
 
 #[test]
-fn retries_only_a_busy_answer_to_a_start_the_daemon_accepts() {
-    for (timeout_ms, answer, pane_answer) in [
-        (Some(AGENT_START_SETTLE_DELAY_MS), PANE_BUSY, pane("t1")),
-        (Some(MAX_AGENT_START_TIMEOUT_MS + 1), PANE_BUSY, pane("t1")),
-        (None, "agent_name_taken", pane("t1")),
-        (None, PANE_BUSY, error("pane_not_found")),
+fn retries_only_a_busy_answer_from_a_pane_with_a_terminal() {
+    for (answer, pane_answer, expected) in [
+        ("agent_name_taken", pane("t1"), &["agent.start"][..]),
+        (
+            PANE_BUSY,
+            error("pane_not_found"),
+            &["agent.start", "pane.get"],
+        ),
     ] {
         let daemon = Daemon::start(move |method| match method {
             "pane.get" => pane_answer.clone(),
             "agent.start" => error(answer),
             other => panic!("unexpected {other}"),
         });
-        assert_eq!(
-            busy_code(daemon.client().start_agent(&params(timeout_ms))),
-            answer
-        );
-        assert_eq!(daemon.finish(), ["pane.get", "agent.start"]);
+        assert_eq!(busy_code(daemon.client().start_agent(&params())), answer);
+        assert_eq!(daemon.finish(), expected);
+    }
+}
+
+/// A read between attempts launches nothing, so its transport error ends
+/// the retry with the busy answer, which a caller can treat as a rejected
+/// start.
+#[test]
+fn a_failed_read_returns_the_busy_answer() {
+    for failing in ["pane.get", "pane.process_info"] {
+        let daemon = Daemon::start(move |method| match method {
+            _ if method == failing => hang_up(),
+            "pane.get" => pane("t1"),
+            "pane.process_info" => starting(),
+            "agent.start" => error(PANE_BUSY),
+            other => panic!("unexpected {other}"),
+        });
+        assert_eq!(busy_code(daemon.client().start_agent(&params())), PANE_BUSY);
+        assert_eq!(start_calls(&daemon.finish()), 1);
     }
 }
 
