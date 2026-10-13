@@ -28,8 +28,9 @@ pub struct Environment {
 /// What Herdr passes in `HERDR_PLUGIN_CONTEXT_JSON`. Menu, key, and API
 /// invocations describe their target; the `focused_pane_*` fields name the
 /// target pane. Actions, panes, and startup hooks also get `client_id` when a
-/// TUI client started them. Read anything else, such as the space's tabs or
-/// the pane's agent session, through the [`crate::Client`].
+/// shell client, the TUI or Herdr GPUI, started them. Read anything else, such
+/// as the space's tabs or the pane's agent session, through the
+/// [`crate::Client`].
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct PluginContext {

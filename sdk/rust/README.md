@@ -34,8 +34,8 @@ match Environment::load()?.invocation() {
 
 `Environment::context` is the typed `HERDR_PLUGIN_CONTEXT_JSON`. Menu, key, and
 API invocations describe their target pane, tab, and space, and actions, panes,
-and startup hooks also get the invoking TUI's `client_id`. Read anything else
-through the client:
+and startup hooks also get the `client_id` of the shell client, the TUI or Herdr
+GPUI, that invoked them. Read anything else through the client:
 
 ```rust
 let context = Environment::load()?.context.unwrap_or_default();
