@@ -204,14 +204,13 @@ pub enum ClientJumpError {
     StaleBoot,
     #[error("the client knows no such endpoint or pane")]
     TargetNotFound,
-    /// The endpoint is not online, or the client withdrew the request it had
-    /// sent there. In the second case the jump may still have happened.
+    /// The endpoint is not online, or has sent the client no snapshot yet.
+    /// When it went away while the client was navigating there, the jump may
+    /// still have happened.
     #[error("the client could not reach the endpoint; the jump may still have happened")]
     EndpointUnavailable,
     #[error("the client did not confirm the jump in time; it may still have happened")]
     Timeout,
-    #[error("the client could not perform the jump: {0}")]
-    Failed(String),
     /// Any other API error, or a transport failure. After a transport
     /// failure the jump may still have happened.
     #[error("{0}")]
@@ -232,7 +231,6 @@ impl From<Error> for ClientJumpError {
             "jump_target_not_found" => Self::TargetNotFound,
             "jump_endpoint_unavailable" => Self::EndpointUnavailable,
             "jump_timeout" => Self::Timeout,
-            "jump_failed" => Self::Failed(message),
             _ => Self::Other(Error::Api(ApiError { code, message })),
         }
     }

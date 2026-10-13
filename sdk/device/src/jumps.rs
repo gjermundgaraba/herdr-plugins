@@ -845,7 +845,6 @@ mod tests {
             ClientJumpError::TargetNotFound,
             ClientJumpError::EndpointUnavailable,
             ClientJumpError::Timeout,
-            ClientJumpError::Failed("no such tab".into()),
             ClientJumpError::Other(Error::EmptyResponse),
         ];
         let count = errors.len();

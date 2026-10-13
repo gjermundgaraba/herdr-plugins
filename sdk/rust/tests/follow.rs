@@ -574,7 +574,6 @@ fn each_jump_error_code_is_typed_and_no_jump_is_retried() {
         "jump_target_not_found",
         "jump_endpoint_unavailable",
         "jump_timeout",
-        "jump_failed",
         "invalid_params",
     ];
     for code in codes {
@@ -589,7 +588,6 @@ fn each_jump_error_code_is_typed_and_no_jump_is_retried() {
             | (ClientJumpError::TargetNotFound, "jump_target_not_found")
             | (ClientJumpError::EndpointUnavailable, "jump_endpoint_unavailable")
             | (ClientJumpError::Timeout, "jump_timeout") => true,
-            (ClientJumpError::Failed(message), "jump_failed") => message == "the client's words",
             (ClientJumpError::Other(Error::Api(api)), "invalid_params") => {
                 api.code == "invalid_params"
             }

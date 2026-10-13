@@ -127,7 +127,7 @@ while let Some(event) = changes.next_event()? {
 `wait` reads the answer: the jump, or a typed
 `ClientJumpError` (`ClientNotFound`, `ClientNotReporting`, `Superseded`,
 `ClientDeparted`, `StaleBoot`, `TargetNotFound`, `EndpointUnavailable`,
-`Timeout`, `Failed`). The two are separate so that a caller can write a
+`Timeout`). The two are separate so that a caller can write a
 second jump while the first is unanswered. The daemon holds a jump for up to twenty seconds while
 the client performs it. The newest jump to a client wins: a second jump
 replaces the pending one, whose caller gets `Superseded`, so that answer to an
