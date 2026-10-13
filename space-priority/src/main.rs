@@ -1,8 +1,8 @@
 //! Space Priority: marks spaces as priority through the persisted
-//! `space_priority` workspace metadata token. Listed in the fork's
-//! `ui.agent_priority_tokens`, it sorts blocked and done agents in those spaces
-//! ahead of every other agent; `[[ui.sidebar.spaces.pinned]]` can gather the
-//! spaces at the top of the sidebar, and the token's value doubles as a marker.
+//! `space_priority` workspace metadata token. The fork's priority order sorts
+//! blocked and done agents in those spaces ahead of every other agent;
+//! `[[ui.sidebar.spaces.pinned]]` can gather the spaces at the top of the TUI's
+//! sidebar, and the token's value doubles as a marker.
 //!
 //! Herdr saves the token with the session and drops it with its space, so the
 //! plugin keeps no state of its own.

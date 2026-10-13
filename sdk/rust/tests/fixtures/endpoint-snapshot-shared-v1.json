@@ -200,22 +200,5 @@
       "action": "Shell",
       "description": null
     }
-  ],
-  "pinned_sections": [
-    {
-      "title": "Priority",
-      "fg": "#ff8800",
-      "workspace_ids": [
-        "w1"
-      ]
-    },
-    {
-      "title": "Platform",
-      "fg": null,
-      "workspace_ids": [
-        "w1",
-        "w2"
-      ]
-    }
   ]
 }

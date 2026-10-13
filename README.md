@@ -26,8 +26,8 @@ The plugins target the
 daemon's client API (`client.list`, the `client.changed` subscription, and
 `client.jump`), the client-side `[keys]` actions that replaced the picker plugins,
 native space groups (`workspace.set_group`) and persisted workspace tokens, the
-priority agent order with configurable lift tokens
-(`ui.agent_priority_tokens`), pinned spaces sidebar sections, the
+priority agent order that lifts spaces marked with the `space_priority`
+token, pinned spaces sidebar sections in the TUI, the
 native `ui.pick` picker, one `plugin.invoke` path for manifest entrypoints,
 a richer invocation context, and `tab_id` on pane close
 events plus `pane.cwd_changed`. Stock `herdrdev/herdr` has none of these, so

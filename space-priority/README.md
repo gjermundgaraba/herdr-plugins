@@ -5,15 +5,14 @@ and optionally gather them in a pinned section at the top of the spaces
 sidebar.
 
 Requires the [Herdr fork build](../README.md#herdr-build): stock Herdr ignores
-the token this plugin sets. The fork itself knows nothing about priority; you
-point its generic options at the token in your config (see
+the token this plugin sets. The fork's priority order lifts spaces carrying
+the `space_priority` token; the pinned section is optional TUI config (see
 [Setup](#setup)).
 
 ## How it works
 
 The plugin sets the `space_priority` workspace metadata token to `★` on
-priority spaces. With `ui.agent_priority_tokens` listing that token, the
-fork's priority agent order puts:
+priority spaces. The fork's priority agent order reads that token and puts:
 
 1. Blocked agents in priority spaces, then done agents in priority spaces.
 2. Everyone else in the usual priority order: blocked, done, working, idle.
@@ -34,9 +33,10 @@ through `agent.view.set` with its own sort replaces the priority order, and
 with it this lift.
 
 A `[[ui.sidebar.spaces.pinned]]` section for the token shows copies of the
-priority spaces under a header at the top of the spaces sidebar, and only
-while at least one space is marked. The spaces also keep their regular place
-and space group.
+priority spaces under a header at the top of the TUI's spaces sidebar, on
+every machine it shows, and only while at least one space is marked. The
+spaces also keep their regular place and space group. Herdr GPUI does not
+show pinned sections.
 
 Each space carries its own mark. A linked worktree and its checkout are
 marked separately.
@@ -64,13 +64,13 @@ description = "Toggle space priority"
 
 The action flips the focused space and shows a notification with the result.
 
-Point the fork's generic options at the token in the same file. The lift
-and the pinned section are independent; use either or both:
+The lift needs no configuration. To sort the Agents sidebar by priority, and
+to gather priority spaces in a pinned section of the TUI's sidebar, add to
+the same file:
 
 ```toml
 [ui]
 agent_panel_sort = "priority"
-agent_priority_tokens = ["space_priority"]
 
 [[ui.sidebar.spaces.pinned]]
 title = "Priority"
