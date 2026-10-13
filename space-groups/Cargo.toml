@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "Assign Herdr spaces to named sidebar groups and restore the groups across restarts"
+description = "Assign Herdr spaces to named sidebar groups"
 repository.workspace = true
 
 [dependencies]
