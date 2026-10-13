@@ -3,14 +3,19 @@
 //! `agent_pane_busy` while a new pane's shell still runs its startup files;
 //! the CLI retries that answer for up to two seconds while the pane keeps the
 //! same terminal and its shell still leads the foreground job. Here the two
-//! seconds also bound the reads between attempts, so a stalled daemon cannot
-//! hold a caller past them.
+//! seconds also bound the wait for the answer to each read between attempts,
+//! so a daemon that stalls on one, or sends it piece by piece, ends the retry
+//! with the busy answer.
 
+use std::io::{self, BufReader, Read};
 use std::time::{Duration, Instant};
 
+use interprocess::local_socket::traits::Stream as _;
 use serde_json::{Value, json};
 
-use super::{AgentStartedResult, Client, Error};
+use super::{
+    AgentStartedResult, Client, Error, LocalStream, read_response, set_timeouts, write_request,
+};
 use crate::{AgentInfo, AgentStartParams};
 
 /// How long a busy answer is retried, counted from the first one.
@@ -23,10 +28,10 @@ impl Client {
     /// daemon launched it; unlike `herdr agent start`, it does not wait for
     /// the agent to become ready. A pane whose shell is still starting is
     /// retried for up to two seconds from the first busy answer, as the CLI
-    /// does, and each read between attempts may wait only for what is left of
-    /// them, where the platform supports socket timeouts. When the time is
-    /// up, or a read fails or runs out of it, the daemon's last
-    /// `agent_pane_busy` is returned.
+    /// does, and the answer to each read between attempts is awaited only
+    /// for what is left of them, however it arrives, where the platform
+    /// supports socket timeouts. When the time is up, or a read fails or runs
+    /// out of it, the daemon's last `agent_pane_busy` is returned.
     pub fn start_agent(&self, params: &AgentStartParams) -> Result<AgentInfo, Error> {
         self.start_agent_within(params, SHELL_READINESS_RETRY_TIMEOUT)
     }
@@ -98,20 +103,55 @@ impl Client {
         result["pane"]["terminal_id"].as_str().map(str::to_owned)
     }
 
-    /// A read of the pane that may wait only until `deadline`, or less when
-    /// the client has a shorter timeout. `None` when the deadline has passed
-    /// or the read fails, which includes running out of time.
+    /// A read of the pane whose answer is awaited only until `deadline`.
+    /// `None` when the deadline has passed or the read fails, which includes
+    /// running out of time.
     fn read_before(&self, method: &str, pane_id: &str, deadline: Instant) -> Option<Value> {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        // A zero socket timeout is rejected, not treated as an instant one.
-        if remaining.is_zero() {
-            return None;
+        let timeout = time_left(deadline, self.timeout).ok()?;
+        let id = self.request_id();
+        let mut stream = self.connect().ok()?;
+        set_timeouts(&stream, Some(timeout)).ok()?;
+        write_request(&mut stream, &id, method, &json!({ "pane_id": pane_id })).ok()?;
+        let answer = DeadlineRead {
+            stream,
+            deadline,
+            limit: self.timeout,
+        };
+        read_response(&mut BufReader::new(answer), &id).ok()
+    }
+}
+
+/// What is left until `deadline`, or `limit` when that is shorter. Fails
+/// with `TimedOut` once nothing is left, since a zero socket timeout is
+/// rejected rather than treated as an instant one.
+fn time_left(deadline: Instant, limit: Option<Duration>) -> io::Result<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(io::ErrorKind::TimedOut.into());
+    }
+    Ok(limit.map_or(remaining, |limit| limit.min(remaining)))
+}
+
+/// An answer read against an absolute deadline. A line may take many reads,
+/// so each one gets only what is left, and an answer that keeps arriving in
+/// pieces still ends at the deadline.
+struct DeadlineRead {
+    stream: LocalStream,
+    deadline: Instant,
+    limit: Option<Duration>,
+}
+
+impl Read for DeadlineRead {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let timeout = time_left(self.deadline, self.limit)?;
+        // Windows may not support socket timeouts, as `set_timeout_best_effort`
+        // allows; there the deadline is checked only before each read.
+        if let Err(error) = self.stream.set_recv_timeout(Some(timeout))
+            && !(cfg!(windows) && error.kind() == io::ErrorKind::Unsupported)
+        {
+            return Err(error);
         }
-        let timeout = self
-            .timeout
-            .map_or(remaining, |timeout| timeout.min(remaining));
-        self.call_with_timeout(method, &json!({ "pane_id": pane_id }), Some(timeout))
-            .ok()
+        self.stream.read(buf)
     }
 }
 

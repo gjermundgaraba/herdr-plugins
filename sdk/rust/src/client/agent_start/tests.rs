@@ -10,15 +10,18 @@ use crate::ApiError;
 const STOP: &str = "test.stop";
 /// A short retry budget for tests that run it out.
 const BUDGET: Duration = Duration::from_millis(300);
-const TRICKLE_PIECES: usize = 15;
+/// How often a dripping answer sends another piece, well within the budget.
+const DRIP_GAP: Duration = Duration::from_millis(20);
 
 /// How a test daemon writes an answer.
 enum Reply {
     /// The whole answer at once; [`hang_up`] closes the connection unanswered.
     Now(Value),
-    /// The answer in small pieces, each sent before a socket timeout set for
-    /// the whole read could expire, so only the total time is slow.
-    Trickle(Value, Duration),
+    /// A space, which JSON allows before the answer, every [`DRIP_GAP`]
+    /// until the receiver gets a message, then the answer. Each piece
+    /// arrives before a socket timeout could expire, so only an absolute
+    /// deadline ends the read.
+    Drip(Value, mpsc::Receiver<()>),
 }
 
 impl From<Value> for Reply {
@@ -54,21 +57,21 @@ impl Daemon {
                 if method == STOP {
                     return methods;
                 }
-                let (mut response, gap) = match answer(&method).into() {
+                let (mut response, release) = match answer(&method).into() {
                     Reply::Now(response) => (response, None),
-                    Reply::Trickle(response, gap) => (response, Some(gap)),
+                    Reply::Drip(response, release) => (response, Some(release)),
                 };
                 if !response.is_null() {
                     response["id"] = request["id"].clone();
                     let line = format!("{response}\n");
-                    match gap {
+                    match release {
                         None => stream.write_all(line.as_bytes()).unwrap(),
-                        Some(gap) => {
-                            let size = line.len().div_ceil(TRICKLE_PIECES);
-                            for piece in line.as_bytes().chunks(size) {
-                                thread::sleep(gap);
-                                stream.write_all(piece).unwrap();
+                        // The client may have hung up by now, so writes may fail.
+                        Some(release) => {
+                            while release.recv_timeout(DRIP_GAP).is_err() {
+                                let _ = stream.write_all(b" ");
                             }
+                            let _ = stream.write_all(line.as_bytes());
                         }
                     }
                 }
@@ -275,34 +278,56 @@ fn a_stalled_read_returns_the_busy_answer_within_the_budget() {
     }
 }
 
-/// The read before another attempt answers, but only after the budget ran
-/// out, so no further start is sent.
+/// A read whose answer keeps arriving in pieces ends at the deadline, and
+/// the caller gets the busy answer before the daemon finishes it. The second
+/// `pane.process_info` is the read right before another start.
 #[test]
-fn a_read_that_answers_after_the_budget_sends_no_further_start() {
-    let mut reads = 0;
-    let daemon = Daemon::start(move |method| match method {
-        "pane.get" => pane("t1").into(),
-        "pane.process_info" => {
-            reads += 1;
-            if reads == 1 {
-                starting().into()
-            } else {
-                // Each piece arrives well within the read's timeout, the
-                // whole answer only after the budget.
-                Reply::Trickle(starting(), BUDGET / TRICKLE_PIECES as u32)
+fn a_read_answered_piece_by_piece_ends_at_the_deadline() {
+    for (dripping, nth) in [
+        ("pane.get", 1),
+        ("pane.process_info", 1),
+        ("pane.process_info", 2),
+    ] {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut release_rx = Some(release_rx);
+        let mut calls = 0;
+        let daemon = Daemon::start(move |method| {
+            let answer = match method {
+                "pane.get" => pane("t1"),
+                "pane.process_info" => starting(),
+                "agent.start" => error(PANE_BUSY),
+                other => panic!("unexpected {other}"),
+            };
+            if method != dripping {
+                return answer.into();
             }
-        }
-        "agent.start" => error(PANE_BUSY).into(),
-        other => panic!("unexpected {other}"),
-    });
-    let result = daemon.client().start_agent_within(&params(), BUDGET);
-    assert_eq!(busy_code(result), PANE_BUSY);
-    let methods = daemon.finish();
-    assert_eq!(start_calls(&methods), 1, "{methods:?}");
-    assert_eq!(
-        methods.iter().filter(|m| *m == "pane.process_info").count(),
-        2
-    );
+            calls += 1;
+            if calls != nth {
+                return answer.into();
+            }
+            entered_tx.send(()).unwrap();
+            Reply::Drip(answer, release_rx.take().unwrap())
+        });
+        let client = daemon.client();
+        let (done_tx, done_rx) = mpsc::channel();
+        let started_at = Instant::now();
+        let caller = thread::spawn(move || {
+            done_tx
+                .send(client.start_agent_within(&params(), BUDGET))
+                .unwrap();
+        });
+        entered_rx.recv().unwrap();
+        let result = done_rx.recv_timeout(BUDGET + Duration::from_secs(2));
+        let elapsed = started_at.elapsed();
+        // Only now does the daemon finish its answer.
+        release_tx.send(()).unwrap();
+        let result = result.expect("start_agent waited for the whole answer");
+        assert_eq!(busy_code(result), PANE_BUSY, "{dripping} #{nth}");
+        assert!(elapsed >= BUDGET, "{dripping} #{nth}: {elapsed:?}");
+        caller.join().unwrap();
+        assert_eq!(start_calls(&daemon.finish()), 1, "{dripping} #{nth}");
+    }
 }
 
 #[test]

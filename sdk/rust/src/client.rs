@@ -56,22 +56,9 @@ impl Client {
         P: Serialize + ?Sized,
         R: DeserializeOwned,
     {
-        self.call_with_timeout(method, params, self.timeout)
-    }
-
-    fn call_with_timeout<P, R>(
-        &self,
-        method: &str,
-        params: &P,
-        timeout: Option<Duration>,
-    ) -> Result<R, Error>
-    where
-        P: Serialize + ?Sized,
-        R: DeserializeOwned,
-    {
         let id = self.request_id();
         let mut stream = self.connect()?;
-        set_timeouts(&stream, timeout)?;
+        set_timeouts(&stream, self.timeout)?;
         write_request(&mut stream, &id, method, params)?;
         read_response(&mut BufReader::new(stream), &id)
     }
@@ -165,7 +152,7 @@ impl Client {
     pub fn start_jump(&self, params: &ClientJumpParams) -> Result<PendingJump, ClientJumpError> {
         let id = self.request_id();
         let mut stream = self.connect()?;
-        self.set_timeouts(&stream)?;
+        set_timeouts(&stream, self.timeout)?;
         write_request(&mut stream, &id, "client.jump", params)?;
         Ok(PendingJump {
             id,
@@ -193,7 +180,7 @@ impl Client {
     pub fn subscribe(&self, subscriptions: &[EventSubscription]) -> Result<Subscription, Error> {
         let id = self.request_id();
         let mut stream = self.connect()?;
-        self.set_timeouts(&stream)?;
+        set_timeouts(&stream, self.timeout)?;
         write_request(
             &mut stream,
             &id,
@@ -224,10 +211,6 @@ impl Client {
 
     fn connect(&self) -> Result<LocalStream, Error> {
         connect_local_stream(&self.socket_path).map_err(Error::Io)
-    }
-
-    fn set_timeouts(&self, stream: &LocalStream) -> Result<(), Error> {
-        set_timeouts(stream, self.timeout)
     }
 }
 
