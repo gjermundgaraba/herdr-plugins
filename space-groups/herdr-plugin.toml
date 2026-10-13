@@ -17,9 +17,6 @@ command = ["install", "-m", "750", "../target/release/herdr-space-groups", "bin/
 [[build]]
 command = ["mv", "-f", "bin/.herdr-space-groups.new", "bin/herdr-space-groups"]
 
-[[startup]]
-command = ["bin/herdr-space-groups"]
-
 [[actions]]
 id = "assign"
 title = "Set space group"

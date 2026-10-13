@@ -4,21 +4,16 @@
 //! into place, and saves the group with the session. Herdr regroups spaces
 //! moved by other means, such as a sidebar drag, itself.
 
-use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use herdr_client::{
     Client, Environment, PickCreate, PickItem, PickOutcome, PickParams, PluginContext,
-    PluginInvocation, WorkspaceInfo, socket_scope_dir,
+    PluginInvocation, WorkspaceInfo,
 };
 use serde_json::json;
 
-const SOURCE_ID: &str = "gjermundgaraba.herdr-space-groups";
-/// Workspace metadata key Herdr's space groups read.
-const TOKEN_KEY: &str = "space_group";
 /// Picker item id for clearing the group; group names are never empty.
 const REMOVE: &str = "";
 /// Longest group name accepted from the picker.
@@ -46,12 +41,11 @@ fn run() -> Result<()> {
     let client = Client::from_env()?.with_timeout(SOCKET_TIMEOUT);
     let context = environment.context.clone().unwrap_or_default();
     match environment.invocation() {
-        Some(PluginInvocation::Startup) => import_saved_groups(&environment, &client),
         Some(PluginInvocation::Action(_)) => {
             let workspaces = client.list_workspaces().context("list the spaces")?;
             assign(&client, &context, &workspaces)
         }
-        _ => bail!("run this through the plugin's action or startup hook"),
+        _ => bail!("run this through the plugin's action"),
     }
 }
 
@@ -63,51 +57,6 @@ fn set_group(client: &Client, workspace_id: &str, group: Option<&str>) -> Result
         )
         .with_context(|| format!("set the group of {workspace_id}"))?;
     Ok(())
-}
-
-/// One-shot import of the per-session file earlier versions saved groups in.
-/// The file is kept as `groups.json.imported`. Remove this once every session
-/// has started with this version.
-fn import_saved_groups(environment: &Environment, client: &Client) -> Result<()> {
-    #[derive(serde::Deserialize)]
-    struct Saved {
-        #[serde(default)]
-        workspaces: BTreeMap<String, String>,
-    }
-    let plugin = environment.require_plugin()?;
-    let socket = environment
-        .socket_path
-        .as_deref()
-        .context("HERDR_SOCKET_PATH is not set")?;
-    let path: PathBuf = socket_scope_dir(&plugin.data_dir(), socket).join("groups.json");
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error).context("read saved groups"),
-    };
-    let saved: Saved = serde_json::from_slice(&bytes).context("parse saved groups")?;
-    let workspaces = client.list_workspaces().context("list the spaces")?;
-    for (workspace_id, group) in &saved.workspaces {
-        if workspaces
-            .iter()
-            .any(|workspace| &workspace.workspace_id == workspace_id)
-        {
-            // The saved order already holds each group together, so this
-            // only restores the token.
-            client
-                .call_value(
-                    "workspace.report_metadata",
-                    &json!({
-                        "workspace_id": workspace_id,
-                        "source": SOURCE_ID,
-                        "tokens": {TOKEN_KEY: group},
-                        "persist": true,
-                    }),
-                )
-                .with_context(|| format!("restore the group of {workspace_id}"))?;
-        }
-    }
-    std::fs::rename(&path, path.with_extension("json.imported")).context("retire saved groups")
 }
 
 /// Asks for the group of the invocation's space in Herdr's native picker.

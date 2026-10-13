@@ -17,9 +17,6 @@ command = ["install", "-m", "750", "../target/release/herdr-space-priority", "bi
 [[build]]
 command = ["mv", "-f", "bin/.herdr-space-priority.new", "bin/herdr-space-priority"]
 
-[[startup]]
-command = ["bin/herdr-space-priority"]
-
 [[actions]]
 id = "toggle"
 title = "Toggle space priority"

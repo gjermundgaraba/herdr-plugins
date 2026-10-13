@@ -43,8 +43,7 @@ marked separately.
 
 The plugin reports the token as persisted, so Herdr saves it with the session
 and it survives restarts and live handoffs; closing a space drops it. The
-plugin keeps no state of its own. Its `startup` hook imports the marks earlier
-versions saved per session and renames that file to `priority.json.imported`.
+plugin keeps no state of its own.
 
 ## Setup
 
@@ -106,5 +105,4 @@ mv -f space-priority/bin/.herdr-space-priority.new space-priority/bin/herdr-spac
 herdr plugin link "$PWD/space-priority"
 ```
 
-The plugin runs its `bin/` copy; `target/` is only used while building. A
-linked plugin's startup hook first runs at the next server start or handoff.
+The plugin runs its `bin/` copy; `target/` is only used while building.

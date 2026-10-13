@@ -42,9 +42,7 @@ regrouped by Herdr:
   above it (the one below at the very top).
 
 Herdr saves the token with the session, so it survives restarts and live
-handoffs; closing a space drops it. The plugin keeps no state of its own. Its
-`startup` hook imports the assignments earlier versions saved per session and
-renames that file to `groups.json.imported`.
+handoffs; closing a space drops it. The plugin keeps no state of its own.
 
 ## Setup
 
@@ -92,5 +90,4 @@ mv -f space-groups/bin/.herdr-space-groups.new space-groups/bin/herdr-space-grou
 herdr plugin link "$PWD/space-groups"
 ```
 
-The plugin runs its `bin/` copy; `target/` is only used while building. A
-linked plugin's startup hook first runs at the next server start or handoff.
+The plugin runs its `bin/` copy; `target/` is only used while building.
