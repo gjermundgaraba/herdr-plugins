@@ -14,7 +14,8 @@ use interprocess::local_socket::traits::Stream as _;
 use serde_json::{Value, json};
 
 use super::{
-    AgentStartedResult, Client, Error, LocalStream, read_response, set_timeouts, write_request,
+    AgentStartedResult, Client, Error, LocalStream, read_response, set_timeout_best_effort,
+    write_request,
 };
 use crate::{AgentInfo, AgentStartParams};
 
@@ -110,7 +111,9 @@ impl Client {
         let timeout = time_left(deadline, self.timeout).ok()?;
         let id = self.request_id();
         let mut stream = self.connect().ok()?;
-        set_timeouts(&stream, Some(timeout)).ok()?;
+        // Only the request's write: `DeadlineRead` sets the receive timeout
+        // before each read.
+        set_timeout_best_effort(stream.set_send_timeout(Some(timeout))).ok()?;
         write_request(&mut stream, &id, method, &json!({ "pane_id": pane_id })).ok()?;
         let answer = DeadlineRead {
             stream,
@@ -144,13 +147,9 @@ struct DeadlineRead {
 impl Read for DeadlineRead {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let timeout = time_left(self.deadline, self.limit)?;
-        // Windows may not support socket timeouts, as `set_timeout_best_effort`
-        // allows; there the deadline is checked only before each read.
-        if let Err(error) = self.stream.set_recv_timeout(Some(timeout))
-            && !(cfg!(windows) && error.kind() == io::ErrorKind::Unsupported)
-        {
-            return Err(error);
-        }
+        // Where no timeout can be set, the deadline is checked only before
+        // each read; after Herdr has closed, the answer is already buffered.
+        set_timeout_best_effort(self.stream.set_recv_timeout(Some(timeout)))?;
         self.stream.read(buf)
     }
 }

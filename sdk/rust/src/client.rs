@@ -219,7 +219,8 @@ fn set_timeouts(stream: &LocalStream, timeout: Option<Duration>) -> Result<(), E
         return Ok(());
     };
     set_timeout_best_effort(stream.set_send_timeout(Some(timeout)))?;
-    set_timeout_best_effort(stream.set_recv_timeout(Some(timeout)))
+    set_timeout_best_effort(stream.set_recv_timeout(Some(timeout)))?;
+    Ok(())
 }
 
 /// A `client.jump` the daemon has been sent and has not answered yet.
@@ -424,12 +425,18 @@ fn connect_local_stream(path: &Path) -> io::Result<LocalStream> {
     }
 }
 
-fn set_timeout_best_effort(result: io::Result<()>) -> Result<(), Error> {
+/// Applies a socket timeout where it can take effect. Windows may not
+/// support socket timeouts. macOS refuses one with `EINVAL` once the peer
+/// has closed the connection, as Herdr does after its one answer; what the
+/// peer sent is then buffered and no read or write can stall, so there is
+/// nothing left to bound.
+fn set_timeout_best_effort(result: io::Result<()>) -> io::Result<()> {
     match result {
-        Ok(()) => Ok(()),
         #[cfg(windows)]
         Err(error) if error.kind() == io::ErrorKind::Unsupported => Ok(()),
-        Err(error) => Err(Error::Io(error)),
+        #[cfg(unix)]
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => Ok(()),
+        result => result,
     }
 }
 

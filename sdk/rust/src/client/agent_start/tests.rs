@@ -388,3 +388,25 @@ fn a_shell_that_leads_its_job_is_starting() {
         assert!(!process_info_shows_shell_initialization(&not_starting));
     }
 }
+
+/// Herdr answers one request per connection and closes it, which can happen
+/// before the client's first read. macOS then refuses to set a socket
+/// timeout, but the answer is already buffered and must still be read.
+#[test]
+fn reads_an_answer_whose_connection_has_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let stream = crate::client::connect_local_stream(&path).unwrap();
+    let (mut daemon, _) = listener.accept().unwrap();
+    writeln!(daemon, "{}", json!({ "id": "x", "result": { "ok": true } })).unwrap();
+    drop(daemon);
+
+    let answer = DeadlineRead {
+        stream,
+        deadline: Instant::now() + BUDGET,
+        limit: None,
+    };
+    let result: Value = read_response(&mut BufReader::new(answer), "x").unwrap();
+    assert_eq!(result, json!({ "ok": true }));
+}
