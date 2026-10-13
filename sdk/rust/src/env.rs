@@ -8,7 +8,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use serde::Deserialize;
 
-use crate::{AgentSessionInfo, EventEnvelope, TabInfo, WorkspaceInfo};
+use crate::EventEnvelope;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Environment {
@@ -27,9 +27,9 @@ pub struct Environment {
 
 /// What Herdr passes in `HERDR_PLUGIN_CONTEXT_JSON`. Menu, key, and API
 /// invocations describe their target; the `focused_pane_*` fields name the
-/// target pane. Actions, panes, and startup hooks also get `tabs` (of the
-/// context workspace), `workspaces` (all, in server order), and `client_id`
-/// when a TUI client started them; event hooks get neither list.
+/// target pane. Actions, panes, and startup hooks also get `client_id` when a
+/// TUI client started them. Read anything else, such as the space's tabs or
+/// the pane's agent session, through the [`crate::Client`].
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct PluginContext {
@@ -37,12 +37,8 @@ pub struct PluginContext {
     pub tab_id: Option<String>,
     pub focused_pane_id: Option<String>,
     pub focused_pane_cwd: Option<String>,
-    pub focused_pane_foreground_cwd: Option<String>,
     pub focused_pane_agent: Option<String>,
-    pub focused_pane_agent_session: Option<AgentSessionInfo>,
     pub client_id: Option<u64>,
-    pub tabs: Vec<TabInfo>,
-    pub workspaces: Vec<WorkspaceInfo>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -313,22 +309,20 @@ mod tests {
             "workspace_id": "w1",
             "tab_id": "w1:t2",
             "focused_pane_id": "w1:p3",
+            "focused_pane_agent": "claude",
+            "client_id": 7,
+            "invocation_source": "keybinding",
+            // An older fork daemon also sent these; they are ignored.
             "focused_pane_agent_session": {
                 "source": "herdr:claude", "agent": "claude", "kind": "id", "value": "abc"
             },
-            "client_id": 7,
-            "tabs": [{
-                "tab_id": "w1:t2", "workspace_id": "w1", "number": 2, "label": "two",
-                "focused": true, "pane_count": 1, "agent_status": "idle"
-            }],
-            "invocation_source": "keybinding",
+            "tabs": [{ "tab_id": "w1:t2" }],
+            "workspaces": [],
         }))
         .unwrap();
         assert_eq!(context.focused_pane_id.as_deref(), Some("w1:p3"));
-        assert_eq!(context.focused_pane_agent_session.unwrap().value, "abc");
+        assert_eq!(context.focused_pane_agent.as_deref(), Some("claude"));
         assert_eq!(context.client_id, Some(7));
-        assert_eq!(context.tabs[0].number, 2);
-        assert!(context.workspaces.is_empty());
     }
 
     #[test]

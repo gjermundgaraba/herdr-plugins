@@ -11,10 +11,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    AgentInfo, AgentStartParams, ClientChanged, ClientJumpError, ClientJumpParams, ClientJumped,
-    ClientList, EventEnvelope, EventSubscription, LayoutDescription, LayoutExportParams,
+    AgentInfo, ClientChanged, ClientJumpError, ClientJumpParams, ClientJumped, ClientList,
+    EventEnvelope, EventSubscription, LayoutDescription, LayoutExportParams,
     LayoutSetSplitRatioParams, PaneInfo, PaneSplitParams, PickOutcome, PickParams, SessionSnapshot,
+    TabInfo, WorkspaceInfo,
 };
+
+mod agent_start;
 
 type LocalStream = interprocess::local_socket::Stream;
 
@@ -111,9 +114,26 @@ impl Client {
         Ok(result.layout)
     }
 
-    pub fn start_agent(&self, params: &AgentStartParams) -> Result<AgentInfo, Error> {
-        let result: AgentStartedResult = self.call("agent.start", params)?;
-        Ok(result.agent)
+    pub fn get_pane(&self, pane_id: &str) -> Result<PaneInfo, Error> {
+        let result: PaneResult = self.call("pane.get", &json!({ "pane_id": pane_id }))?;
+        Ok(result.pane)
+    }
+
+    /// The tabs of one workspace, or of every workspace, in server order.
+    pub fn list_tabs(&self, workspace_id: Option<&str>) -> Result<Vec<TabInfo>, Error> {
+        let result: TabListResult = self.call(
+            "tab.list",
+            &workspace_id
+                .map(|id| json!({ "workspace_id": id }))
+                .unwrap_or_else(|| json!({})),
+        )?;
+        Ok(result.tabs)
+    }
+
+    /// Every workspace in server order.
+    pub fn list_workspaces(&self) -> Result<Vec<WorkspaceInfo>, Error> {
+        let result: WorkspaceListResult = self.call("workspace.list", &json!({}))?;
+        Ok(result.workspaces)
     }
 
     /// Every attached client with its latest report.
@@ -331,6 +351,16 @@ struct PickedResult {
 #[derive(Deserialize)]
 struct AgentStartedResult {
     agent: AgentInfo,
+}
+
+#[derive(Deserialize)]
+struct TabListResult {
+    tabs: Vec<TabInfo>,
+}
+
+#[derive(Deserialize)]
+struct WorkspaceListResult {
+    workspaces: Vec<WorkspaceInfo>,
 }
 
 #[derive(Deserialize)]

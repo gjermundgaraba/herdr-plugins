@@ -9,8 +9,8 @@ filter, move with the arrow keys or `ctrl+n`/`ctrl+p`, press `Enter` to move the
 pane, or `Esc` to cancel. Moving into an existing tab splits to the right of its
 focused pane and follows the pane.
 
-Requires the fork build of Herdr for the invocation context and the `ui.pick`
-picker.
+Requires the fork build of Herdr for the `ui.pick` picker, which opens on the
+TUI named by the invocation context's `client_id`.
 
 ## Install
 

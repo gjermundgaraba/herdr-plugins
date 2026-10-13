@@ -36,10 +36,12 @@ fn run() -> Result<()> {
         .workspace_id
         .context("the invocation names no space")?;
     let tab_id = context.tab_id.context("the invocation names no tab")?;
-    let mut tabs = context.tabs;
+    let client = Client::from_env()?;
+    let mut tabs = client
+        .list_tabs(Some(&workspace_id))
+        .context("list the space's tabs")?;
     tabs.sort_by_key(|tab| tab.number);
     let destinations = destinations(&workspace_id, &tabs, &tab_id);
-    let client = Client::from_env()?;
     let destination = match destinations.as_slice() {
         [only] => only,
         _ => {

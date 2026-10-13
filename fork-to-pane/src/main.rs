@@ -34,28 +34,28 @@ fn run() -> Result<()> {
     let source_pane_id = source
         .focused_pane_id
         .context("the invocation names no pane")?;
-    let session = source.focused_pane_agent_session.as_ref().ok_or_else(|| {
-        anyhow!(missing_session_message(
-            source.focused_pane_agent.as_deref()
-        ))
-    })?;
-    let (kind, args) = fork_command(session)?;
     let client = Client::from_env()?;
+    let source = client
+        .get_pane(&source_pane_id)
+        .with_context(|| format!("read pane {source_pane_id}"))?;
+    let session = source
+        .agent_session
+        .as_ref()
+        .ok_or_else(|| anyhow!(missing_session_message(source.agent.as_deref())))?;
+    let (kind, args) = fork_command(session)?;
     let pane = client
         .split_pane(&PaneSplitParams {
             workspace_id: None,
             target_pane_id: Some(source_pane_id),
             direction: SplitDirection::Right,
             ratio: None,
-            cwd: source
-                .focused_pane_foreground_cwd
-                .or(source.focused_pane_cwd),
+            cwd: source.foreground_cwd.or(source.cwd),
             focus: false,
             env: HashMap::new(),
         })
         .context("split pane")?;
 
-    // Herdr waits for the new pane's shell to finish starting.
+    // `start_agent` retries while the new pane's shell is still starting.
     if let Err(error) = client.start_agent(&AgentStartParams {
         name: format!("f-{}", pane.pane_id.to_ascii_lowercase().replace(':', "-")),
         kind: kind.into(),

@@ -45,11 +45,12 @@ fn run() -> Result<()> {
     let environment = Environment::load()?;
     let client = Client::from_env()?.with_timeout(SOCKET_TIMEOUT);
     let context = environment.context.clone().unwrap_or_default();
+    let workspaces = || client.list_workspaces().context("list the spaces");
     match environment.invocation() {
         Some(PluginInvocation::Startup) => {
-            import_saved_groups(&environment, &client, &context.workspaces)
+            import_saved_groups(&environment, &client, &workspaces()?)
         }
-        Some(PluginInvocation::Action(_)) => assign(&client, &context),
+        Some(PluginInvocation::Action(_)) => assign(&client, &context, &workspaces()?),
         _ => bail!("run this through the plugin's action or startup hook"),
     }
 }
@@ -113,12 +114,11 @@ fn import_saved_groups(
 }
 
 /// Asks for the group of the invocation's space in Herdr's native picker.
-fn assign(client: &Client, context: &PluginContext) -> Result<()> {
+fn assign(client: &Client, context: &PluginContext, workspaces: &[WorkspaceInfo]) -> Result<()> {
     let workspace_id = context
         .workspace_id
         .as_deref()
         .context("the invocation names no space")?;
-    let workspaces = &context.workspaces;
     let target = workspaces
         .iter()
         .find(|workspace| workspace.workspace_id == workspace_id)

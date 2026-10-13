@@ -41,10 +41,12 @@ description = "fork agent into right pane"
 
 Reload keybindings with `herdr server reload-config`.
 
-Requires the [Herdr fork build](../README.md#herdr-build), which supplies the
-pane's agent session in the invocation context and waits for the new pane's
-shell, and a Pi, Codex, Claude Code, or OpenCode version with the fork
-command shown above.
+Requires the [Herdr fork build](../README.md#herdr-build) for the
+`type = "plugin"` key and `herdr plugin invoke`, and a Pi, Codex, Claude Code,
+or OpenCode version with the fork command shown above. The plugin reads the
+pane's agent session with `pane.get`, and retries `agent.start` for up to two
+seconds while the new pane's shell is still starting, as `herdr agent start`
+does.
 
 ## Development
 

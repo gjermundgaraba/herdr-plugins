@@ -33,15 +33,23 @@ match Environment::load()?.invocation() {
 ```
 
 `Environment::context` is the typed `HERDR_PLUGIN_CONTEXT_JSON`. Menu, key, and
-API invocations describe their target pane, tab, and space. Actions, panes, and
-startup hooks also get the space's `tabs`, every space as `workspaces`, and the
-invoking TUI's `client_id`, so they rarely need a snapshot first:
+API invocations describe their target pane, tab, and space, and actions, panes,
+and startup hooks also get the invoking TUI's `client_id`. Read anything else
+through the client:
 
 ```rust
 let context = Environment::load()?.context.unwrap_or_default();
-let pane_id = context.focused_pane_id;
-let spaces = context.workspaces;
+let client = Client::from_env()?;
+let spaces = client.list_workspaces()?;
+let tabs = client.list_tabs(context.workspace_id.as_deref())?;
+if let Some(pane_id) = context.focused_pane_id.as_deref() {
+    let session = client.get_pane(pane_id)?.agent_session;
+}
 ```
+
+`start_agent` retries for up to two seconds while the target pane's shell is
+still starting, as `herdr agent start` does, and then returns the daemon's
+`agent_pane_busy`.
 
 Methods added after this crate's tested Herdr version remain usable:
 

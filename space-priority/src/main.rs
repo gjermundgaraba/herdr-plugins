@@ -43,15 +43,14 @@ fn run() -> Result<()> {
     let environment = Environment::load()?;
     let client = Client::from_env()?.with_timeout(SOCKET_TIMEOUT);
     let context = environment.context.clone().unwrap_or_default();
+    let workspaces = || client.list_workspaces().context("list the spaces");
     match environment.invocation() {
         Some(PluginInvocation::Startup) => {
-            import_saved_marks(&environment, &client, &context.workspaces)
+            import_saved_marks(&environment, &client, &workspaces()?)
         }
-        Some(PluginInvocation::Action(_)) => toggle(
-            &client,
-            context.workspace_id.as_deref(),
-            &context.workspaces,
-        ),
+        Some(PluginInvocation::Action(_)) => {
+            toggle(&client, context.workspace_id.as_deref(), &workspaces()?)
+        }
         _ => bail!("run this through the plugin's action or startup hook"),
     }
 }

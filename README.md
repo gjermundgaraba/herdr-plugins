@@ -29,7 +29,7 @@ native space groups (`workspace.set_group`) and persisted workspace tokens, the
 priority agent order that lifts spaces marked with the `space_priority`
 token, pinned spaces sidebar sections in the TUI, the
 native `ui.pick` picker, one `plugin.invoke` path for manifest entrypoints,
-a richer invocation context, and `tab_id` on pane close
+the invoking client's id in the invocation context, and `tab_id` on pane close
 events plus `pane.cwd_changed`. Stock `herdrdev/herdr` has none of these, so
 only herdr-hub runs against it.
 
