@@ -53,8 +53,9 @@ two seconds from the first busy answer while the target pane's shell is still
 starting, as the CLI does, and then returns the daemon's `agent_pane_busy`. The
 answers to the reads between attempts are awaited only within those two
 seconds, where the platform supports socket timeouts, so a daemon that stalls
-on one of them, or sends it piece by piece, also ends in `agent_pane_busy`; a
-stall on `agent.start` itself is a transport error.
+on one of them, or sends it piece by piece, also ends in `agent_pane_busy`. A
+stall on `agent.start` itself blocks unless the client has a timeout
+(`with_timeout`), and is then a transport error.
 
 Methods added after this crate's tested Herdr version remain usable:
 
