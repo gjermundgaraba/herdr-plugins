@@ -52,7 +52,8 @@ start`, it does not wait for the agent to become ready. It retries for up to
 two seconds from the first busy answer while the target pane's shell is still
 starting, as the CLI does, and then returns the daemon's `agent_pane_busy`. The
 reads between attempts share those two seconds where the platform supports
-socket timeouts, so a stalled daemon also ends in `agent_pane_busy`.
+socket timeouts, so a daemon that stalls on one of them also ends in
+`agent_pane_busy`; a stall on `agent.start` itself is a transport error.
 
 Methods added after this crate's tested Herdr version remain usable:
 
