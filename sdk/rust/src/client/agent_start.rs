@@ -35,13 +35,21 @@ impl Client {
                 Err(Error::Api(error)) if error.code == PANE_BUSY => Error::Api(error),
                 Err(error) => return Err(error),
             };
-            if pinned_terminal_id.is_none() {
+            let first_busy = pinned_terminal_id.is_none();
+            if first_busy {
                 pinned_terminal_id = self.pane_terminal_id(pane_id);
             }
             let Some(pinned) = pinned_terminal_id.as_deref() else {
                 return Err(busy);
             };
-            if !self.shell_still_starting(pane_id, pinned) {
+            // The first busy answer just read the terminal it pins, so only
+            // the shell is left to check.
+            let starting = if first_busy {
+                self.shell_initializing(pane_id)
+            } else {
+                self.shell_still_starting(pane_id, pinned)
+            };
+            if !starting {
                 return Err(busy);
             }
             let deadline = *retry_deadline
@@ -61,9 +69,13 @@ impl Client {
     /// still starting. These reads launch nothing, so a failed one only ends
     /// the retry.
     fn shell_still_starting(&self, pane_id: &str, pinned: &str) -> bool {
-        if self.pane_terminal_id(pane_id).as_deref() != Some(pinned) {
-            return false;
-        }
+        self.pane_terminal_id(pane_id).as_deref() == Some(pinned)
+            && self.shell_initializing(pane_id)
+    }
+
+    /// Whether the pane's shell is still running its startup files; a
+    /// failed read counts as no.
+    fn shell_initializing(&self, pane_id: &str) -> bool {
         self.call_value("pane.process_info", &json!({ "pane_id": pane_id }))
             .is_ok_and(|result| process_info_shows_shell_initialization(&result["process_info"]))
     }

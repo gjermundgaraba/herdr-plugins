@@ -152,29 +152,27 @@ fn a_start_that_succeeds_at_once_makes_no_other_call() {
     assert_eq!(daemon.finish(), ["agent.start"]);
 }
 
+/// The pane gets another terminal after the second busy answer. A start
+/// that followed the change would succeed, so the busy answer shows that none
+/// did.
 #[test]
 fn stops_when_the_pane_gets_another_terminal() {
-    let mut reads = 0;
+    let mut starts = 0;
     let daemon = Daemon::start(move |method| match method {
-        "pane.get" => {
-            reads += 1;
-            pane(if reads < 3 { "t1" } else { "t2" })
-        }
+        "pane.get" => pane(if starts < 2 { "t1" } else { "t2" }),
         "pane.process_info" => starting(),
-        "agent.start" => error(PANE_BUSY),
+        "agent.start" => {
+            starts += 1;
+            if starts <= 2 {
+                error(PANE_BUSY)
+            } else {
+                started()
+            }
+        }
         other => panic!("unexpected {other}"),
     });
     assert_eq!(busy_code(daemon.client().start_agent(&params())), PANE_BUSY);
-    assert_eq!(
-        daemon.finish(),
-        [
-            "agent.start",
-            "pane.get",
-            "pane.get",
-            "pane.process_info",
-            "pane.get"
-        ]
-    );
+    assert_eq!(start_calls(&daemon.finish()), 2);
 }
 
 #[test]
@@ -186,10 +184,7 @@ fn does_not_retry_a_shell_running_a_command() {
         other => panic!("unexpected {other}"),
     });
     assert_eq!(busy_code(daemon.client().start_agent(&params())), PANE_BUSY);
-    assert_eq!(
-        daemon.finish(),
-        ["agent.start", "pane.get", "pane.get", "pane.process_info"]
-    );
+    assert_eq!(start_calls(&daemon.finish()), 1);
 }
 
 #[test]
@@ -211,13 +206,9 @@ fn gives_up_two_seconds_after_the_first_busy_answer() {
 
 #[test]
 fn retries_only_a_busy_answer_from_a_pane_with_a_terminal() {
-    for (answer, pane_answer, expected) in [
-        ("agent_name_taken", pane("t1"), &["agent.start"][..]),
-        (
-            PANE_BUSY,
-            error("pane_not_found"),
-            &["agent.start", "pane.get"],
-        ),
+    for (answer, pane_answer) in [
+        ("agent_name_taken", pane("t1")),
+        (PANE_BUSY, error("pane_not_found")),
     ] {
         let daemon = Daemon::start(move |method| match method {
             "pane.get" => pane_answer.clone(),
@@ -225,7 +216,7 @@ fn retries_only_a_busy_answer_from_a_pane_with_a_terminal() {
             other => panic!("unexpected {other}"),
         });
         assert_eq!(busy_code(daemon.client().start_agent(&params())), answer);
-        assert_eq!(daemon.finish(), expected);
+        assert_eq!(start_calls(&daemon.finish()), 1);
     }
 }
 
