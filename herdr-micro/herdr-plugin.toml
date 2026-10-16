@@ -2,7 +2,7 @@ id = "gjermundgaraba.herdr-micro"
 name = "Herdr Micro"
 version = "0.3.0"
 min_herdr_version = "0.9.3"
-description = "Shows Herdr agent state on a Work Louder Codex Micro keypad, jumps to an agent from its key, and types prompts into the focused Herdr client. Needs the keypad and the gjermundgaraba/herdr custom-v3 fork build with the client.list API; stock Herdr won't work"
+description = "Shows Herdr agent state on a Work Louder Codex Micro keypad, jumps to an agent from its key, and types prompts into the focused Herdr client. Needs the keypad and the gjermundgaraba/herdr custom fork build with the client.list API; stock Herdr won't work"
 platforms = ["macos"]
 
 [[build]]

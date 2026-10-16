@@ -22,7 +22,7 @@ which.
 
 The plugins target the
 [gjermundgaraba/herdr](https://github.com/gjermundgaraba/herdr) fork on the
-`custom-v3` branch, currently based on upstream 0.9.3. The fork adds the
+`custom` branch, currently based on upstream 0.9.4. The fork adds the
 daemon's client API (`client.list`, the `client.changed` subscription, and
 `client.jump`), the client-side `[keys]` actions that replaced the picker plugins,
 native space groups (`workspace.set_group`) and persisted workspace tokens, the
