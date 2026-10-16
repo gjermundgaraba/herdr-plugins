@@ -210,6 +210,7 @@
                 crate.package.name
               ];
               doCheck = true;
+              nativeCheckInputs = [ pkgs.gitMinimal ];
 
               postPatch = ''
                 install -m644 ${selectedCargoToml} Cargo.toml
