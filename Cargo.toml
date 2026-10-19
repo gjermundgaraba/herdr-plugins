@@ -1,17 +1,13 @@
 [workspace]
 resolver = "3"
 members = [
-    "herdr-deck",
     "herdr-hub",
     "move-pane",
     "equalize-splits",
     "fork-to-pane",
-    "herdr-micro",
-    "codex-micro",
     "space-meta",
     "space-groups",
     "space-priority",
-    "sdk/device",
     "sdk/hub",
     "sdk/rust",
 ]
@@ -25,11 +21,9 @@ repository = "https://github.com/gjermundgaraba/herdr-plugins"
 [workspace.dependencies]
 anyhow = "1.0.104"
 herdr-client = { path = "sdk/rust" }
-herdr-device = { path = "sdk/device" }
 herdr-hub-client = { path = "sdk/hub" }
 libc = "0.2.189"
 objc2-core-foundation = { version = "0.3.2", default-features = false }
-objc2-core-graphics = { version = "0.3.2", default-features = false }
 ratatui = { version = "0.30.2", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

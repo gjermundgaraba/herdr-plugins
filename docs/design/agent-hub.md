@@ -3,11 +3,8 @@
 Hub owns the shared session inventory, not client presentation. Navigation
 and Back/Forward history are client actions of the TUI and Herdr GPUI, the
 unread hold lives in the Herdr daemon, and Herdr owns selection, navigation
-completion, and choice dialogs. Micro, Deck, and local
-tools read the attached clients from each Herdr daemon directly (`client.list`,
-`client.changed`) and ask a client to jump with `client.jump`. Hub does not
-follow clients, choose a focused client, route client input, or activate
-endpoints.
+completion, and choice dialogs. Hub does not follow clients, choose a focused
+client, route client input, or activate endpoints.
 
 ## State ownership
 

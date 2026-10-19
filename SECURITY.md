@@ -6,7 +6,5 @@ Do not open a public issue for a suspected vulnerability. Report it through
 [GitHub private vulnerability reporting](https://github.com/gjermundgaraba/herdr-plugins/security/advisories/new)
 with the affected plugin, impact, and reproduction steps.
 
-Reports involving `herdr-micro`'s per-user Codex Micro device service,
-`herdr-deck`'s Stream Deck service and synthetic system input, Herdr Hub's
-per-user socket and SSH relays, or file permissions on any of these are
-especially important.
+Reports involving Herdr Hub's per-user socket and SSH relays, or file
+permissions on either, are especially important.

@@ -2,7 +2,6 @@
 /result
 .DS_Store
 __pycache__/
-/herdr-micro/bin/
 /herdr-hub/bin/
 /move-pane/bin/
 /equalize-splits/bin/

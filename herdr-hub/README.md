@@ -3,8 +3,6 @@
 Herdr Hub keeps a versioned inventory of local and remote Herdr sessions,
 workspaces, tabs, and agents. It pushes changes and routes session API calls over
 a private per-user socket. It has no TUI client model or focus selection.
-Micro, Deck, and local tools read the attached clients from each Herdr daemon
-directly.
 
 Requires stock Herdr >= 0.9.0; the fork build is not needed. The
 `install-service` LaunchAgent is macOS-only.
