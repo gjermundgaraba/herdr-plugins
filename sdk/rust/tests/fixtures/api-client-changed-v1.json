@@ -1,9 +1,0 @@
-[
-  {
-    "event": "client_changed",
-    "data": {
-      "type": "client_changed",
-      "client_id": 7
-    }
-  }
-]

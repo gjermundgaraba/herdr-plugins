@@ -1,6 +1,6 @@
 //! Local session discovery. The listing and its path validation live in
-//! `herdr_client::sessions`, shared with the device tools; Hub adds the key
-//! its inventory files a local session under.
+//! `herdr_client::sessions`; Hub adds the key its inventory files a local
+//! session under.
 
 pub(crate) use herdr_client::sessions::LocalSession;
 
