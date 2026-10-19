@@ -90,7 +90,7 @@ subscription starts when the request is accepted and does not replay retained
 events, and the stable API has no snapshot cursor or server-generation token,
 so consumers must refresh state after reconnecting.
 
-Written against the [Herdr fork build](../../README.md#herdr-build) (0.9.3,
+Written against the [Herdr fork build](../../README.md#herdr-build) (0.9.5,
 socket protocol 23).
 
 `sessions`, which is Unix-only, lists the running local sessions with `herdr
