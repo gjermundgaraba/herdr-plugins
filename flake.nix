@@ -50,15 +50,6 @@
       # (sourceRoots) and how the output is laid out. Platforms come from each
       # plugin's herdr-plugin.toml and binaries from the crate itself.
       pluginDefinitions = {
-        herdr-hub = {
-          sourceRoots = [
-            "herdr-hub"
-            "sdk/hub"
-            "sdk/rust"
-          ];
-          alsoBin = true;
-        };
-
         move-pane = {
           sourceRoots = [
             "move-pane"
@@ -172,10 +163,6 @@
                 binary:
                 ''
                   install -Dm755 "${cargoReleaseDir}/${binary}" "$out/${name}/bin/${binary}"
-                  ${lib.optionalString (definition.alsoBin or false) ''
-                    mkdir -p "$out/bin"
-                    ln -s "../${name}/bin/${binary}" "$out/bin/${binary}"
-                  ''}
                 ''
               ) (binariesFor name crate);
             in

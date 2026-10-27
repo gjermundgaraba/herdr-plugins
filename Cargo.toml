@@ -1,12 +1,10 @@
 [workspace]
 resolver = "3"
 members = [
-    "herdr-hub",
     "move-pane",
     "equalize-splits",
     "fork-to-pane",
     "space-meta",
-    "sdk/hub",
     "sdk/rust",
 ]
 
@@ -19,7 +17,6 @@ repository = "https://github.com/gjermundgaraba/herdr-plugins"
 [workspace.dependencies]
 anyhow = "1.0.104"
 herdr-client = { path = "sdk/rust" }
-herdr-hub-client = { path = "sdk/hub" }
 libc = "0.2.189"
 objc2-core-foundation = { version = "0.3.2", default-features = false }
 ratatui = { version = "0.30.2", default-features = false }

@@ -2,9 +2,7 @@
 
 Independent plugins and tools for [Herdr](https://herdr.dev/).
 
-Everything here except [herdr-hub](herdr-hub) needs the
-[Herdr fork build](#herdr-build); the **Requires** column below says which is
-which.
+Every plugin here needs the [Herdr fork build](#herdr-build).
 
 | Package | Description | Requires |
 | --- | --- | --- |
@@ -12,7 +10,6 @@ which.
 | [fork-to-pane](fork-to-pane) | Fork Pi, Codex, Claude Code, or OpenCode into a new pane | [Fork build](#herdr-build) |
 | [move-pane](move-pane) | Move a pane to another tab or a new tab from Herdr's native picker | [Fork build](#herdr-build) |
 | [space-meta](space-meta) | Space numbers, branch names, git-dirty markers, and PR badges in the spaces sidebar (macOS) | [Fork build](#herdr-build) |
-| [herdr-hub](herdr-hub) | Background inventory and relay for local and remote Herdr sessions | Stock Herdr >= 0.9.0 |
 
 ## Herdr build
 
@@ -22,13 +19,11 @@ The plugins target the
 client-side `[keys]` actions that replaced the picker plugins,
 persisted workspace tokens, the native `ui.pick` picker, one `plugin.invoke` path for manifest entrypoints,
 the invoking client's id in the invocation context, and `tab_id` on pane close
-events plus `pane.cwd_changed`. Stock `herdrdev/herdr` has none of these, so
-only herdr-hub runs against it. No plugin has a git dependency on the fork,
+events plus `pane.cwd_changed`. Stock `herdrdev/herdr` has none of these. No plugin has a git dependency on the fork,
 so nothing in `Cargo.lock` pins a fork commit.
 
 The agent list, workspace list, Back/Forward history, and the unread hold are
-`[keys]` actions native to the fork; see its configuration docs. Hub keeps only
-the session/host inventory and relay.
+`[keys]` actions native to the fork; see its configuration docs.
 
 ## Install
 
@@ -38,7 +33,6 @@ from source when installed, so you need a Rust toolchain with cargo.
 ```sh
 herdr plugin install gjermundgaraba/herdr-plugins/equalize-splits
 herdr plugin install gjermundgaraba/herdr-plugins/fork-to-pane
-herdr plugin install gjermundgaraba/herdr-plugins/herdr-hub
 herdr plugin install gjermundgaraba/herdr-plugins/move-pane
 herdr plugin install gjermundgaraba/herdr-plugins/space-meta
 ```
@@ -46,8 +40,7 @@ herdr plugin install gjermundgaraba/herdr-plugins/space-meta
 For local development, build each plugin using its README before linking it.
 `herdr plugin link` only registers the working tree; it does not run manifest
 `[[build]]` commands. Each plugin runs its installed copy under its own `bin/`;
-Cargo `target/` is only needed while building and staging. Hub also needs the
-staging and service steps in its package README.
+Cargo `target/` is only needed while building and staging.
 
 ```sh
 herdr plugin link "$PWD/equalize-splits"
@@ -55,9 +48,6 @@ herdr plugin link "$PWD/fork-to-pane"
 herdr plugin link "$PWD/move-pane"
 herdr plugin link "$PWD/space-meta"
 ```
-
-Use the [Hub local-development sequence](herdr-hub/README.md#local-development)
-for that service-backed plugin.
 
 Each plugin directory above has its own `herdr-plugin.toml`. Herdr does not
 install cross-plugin dependencies.
@@ -68,16 +58,11 @@ The flake builds each plugin independently with the Rust version in
 `rust-toolchain.toml` and the committed `Cargo.lock`:
 
 ```sh
-nix build .#herdr-hub
-result/bin/herdr-hub --version
+nix build .#space-meta
 ```
 
-Every output contains a linkable plugin root at `<out>/<name>`; the hub output
-is also a CLI package.
-Follow the [Hub setup](herdr-hub/README.md#setup) to install and start it.
-
-The other Nix packages are `equalize-splits`, `fork-to-pane`, `move-pane`,
-and `space-meta`.
+Every output contains a linkable plugin root at `<out>/<name>`. The packages
+are `equalize-splits`, `fork-to-pane`, `move-pane`, and `space-meta`.
 
 Each package's filtered source contains its full local path-dependency closure,
 so editing one plugin does not invalidate unrelated plugin outputs, while edits
@@ -87,9 +72,6 @@ Enter the repository development shell with the same pinned Rust toolchain using
 `nix develop`.
 
 ## Plugin SDK and files
-
-[`sdk/hub`](sdk/hub) provides the versioned hub protocol, streaming model
-client, and action calls.
 
 The reusable client under [`sdk/rust`](sdk/rust) also validates Herdr's plugin
 environment, and its tests keep every plugin manifest version in step with its
