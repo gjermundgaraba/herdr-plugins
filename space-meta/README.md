@@ -97,9 +97,7 @@ a rebuild.
 - Herdr's plugin snapshot does not expose desktop worktree-group collapse
   state, so numbering remains in stable expanded order while a group is
   collapsed.
-- Numbering follows Herdr's workspace order. The fork's grouped sidebar
-  shows that same order (see [space-groups](../space-groups)), so the
-  numbers match it too.
+- Numbering follows Herdr's workspace order, which the sidebar shows.
 - Herdr's plugin snapshot also does not expose whether a linked worktree has a
   custom name. Grouped child rows therefore use the branch (with a leading
   `worktree/` removed), even when Herdr's built-in row uses a custom name.

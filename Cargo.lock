@@ -121,15 +121,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "herdr-space-groups"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "herdr-client",
- "serde_json",
-]
-
-[[package]]
 name = "herdr-space-meta"
 version = "0.2.0"
 dependencies = [
@@ -138,15 +129,6 @@ dependencies = [
  "objc2-core-foundation",
  "serde_json",
  "tempfile",
-]
-
-[[package]]
-name = "herdr-space-priority"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "herdr-client",
- "serde_json",
 ]
 
 [[package]]

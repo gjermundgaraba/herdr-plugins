@@ -86,20 +86,6 @@
             "sdk/rust"
           ];
         };
-
-        space-groups = {
-          sourceRoots = [
-            "space-groups"
-            "sdk/rust"
-          ];
-        };
-
-        space-priority = {
-          sourceRoots = [
-            "space-priority"
-            "sdk/rust"
-          ];
-        };
       };
 
       # Plugin manifests declare "macos"/"linux"; Nix says "darwin"/"linux".

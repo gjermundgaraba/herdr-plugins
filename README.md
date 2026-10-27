@@ -12,8 +12,6 @@ which.
 | [fork-to-pane](fork-to-pane) | Fork Pi, Codex, Claude Code, or OpenCode into a new pane | [Fork build](#herdr-build) |
 | [move-pane](move-pane) | Move a pane to another tab or a new tab from Herdr's native picker | [Fork build](#herdr-build) |
 | [space-meta](space-meta) | Space numbers, branch names, git-dirty markers, and PR badges in the spaces sidebar (macOS) | [Fork build](#herdr-build) |
-| [space-groups](space-groups) | Named space groups under collapsible sidebar headers | [Fork build](#herdr-build) |
-| [space-priority](space-priority) | Priority spaces whose blocked and done agents sort first, optionally pinned in the sidebar | [Fork build](#herdr-build) |
 | [herdr-hub](herdr-hub) | Background inventory and relay for local and remote Herdr sessions | Stock Herdr >= 0.9.0 |
 
 ## Herdr build
@@ -22,10 +20,7 @@ The plugins target the
 [gjermundgaraba/herdr](https://github.com/gjermundgaraba/herdr) fork on the
 `custom` branch, currently based on upstream 0.9.5. The fork adds the
 client-side `[keys]` actions that replaced the picker plugins,
-native space groups (`workspace.set_group`) and persisted workspace tokens, the
-priority agent order that lifts spaces marked with the `space_priority`
-token, pinned spaces sidebar sections in the TUI, the
-native `ui.pick` picker, one `plugin.invoke` path for manifest entrypoints,
+persisted workspace tokens, the native `ui.pick` picker, one `plugin.invoke` path for manifest entrypoints,
 the invoking client's id in the invocation context, and `tab_id` on pane close
 events plus `pane.cwd_changed`. Stock `herdrdev/herdr` has none of these, so
 only herdr-hub runs against it. No plugin has a git dependency on the fork,
@@ -46,8 +41,6 @@ herdr plugin install gjermundgaraba/herdr-plugins/fork-to-pane
 herdr plugin install gjermundgaraba/herdr-plugins/herdr-hub
 herdr plugin install gjermundgaraba/herdr-plugins/move-pane
 herdr plugin install gjermundgaraba/herdr-plugins/space-meta
-herdr plugin install gjermundgaraba/herdr-plugins/space-groups
-herdr plugin install gjermundgaraba/herdr-plugins/space-priority
 ```
 
 For local development, build each plugin using its README before linking it.
@@ -61,8 +54,6 @@ herdr plugin link "$PWD/equalize-splits"
 herdr plugin link "$PWD/fork-to-pane"
 herdr plugin link "$PWD/move-pane"
 herdr plugin link "$PWD/space-meta"
-herdr plugin link "$PWD/space-groups"
-herdr plugin link "$PWD/space-priority"
 ```
 
 Use the [Hub local-development sequence](herdr-hub/README.md#local-development)
@@ -86,7 +77,7 @@ is also a CLI package.
 Follow the [Hub setup](herdr-hub/README.md#setup) to install and start it.
 
 The other Nix packages are `equalize-splits`, `fork-to-pane`, `move-pane`,
-`space-meta`, `space-groups`, and `space-priority`.
+and `space-meta`.
 
 Each package's filtered source contains its full local path-dependency closure,
 so editing one plugin does not invalidate unrelated plugin outputs, while edits
